@@ -1,12 +1,10 @@
-# Contributing to Helium
+# Contributing to Arcium
 
-This repository contains Helium's shared Chromium patches, resources, and
-development tooling. Platform-specific packaging and build environments live in
-the platform repositories:
+This repository contains Arcium's shared Chromium patches, resources, and
+development tools. Platform repositories contain the build, packaging, and
+operating-system integration:
 
-- [Helium for macOS](https://github.com/imputnet/helium-macos)
-- [Helium for Linux](https://github.com/imputnet/helium-linux)
-- [Helium for Windows](https://github.com/imputnet/helium-windows)
+- [Arcium for macOS](https://github.com/dr-baker/Arcium-macOS)
 
 The same contribution guidelines apply to all platform repos.
 
@@ -16,16 +14,16 @@ The same contribution guidelines apply to all platform repos.
 
 - For platform-specific issues or features, open the issue or PR in the
   related platform repository instead of this one.
-- Do not use AI to generate issue or PR descriptions. You will get banned
-  for spam without review. We want contributions from people, not bots.
+- You can use AI-assisted tools. You remain responsible for the result.
+- Understand and review all generated text and code before you submit it.
+- State any uncertainty or missing verification in the issue or pull request.
 
 ### Issues
 
 - Search existing issues before opening a new bug report or feature request.
-- When creating an issue, please follow the template and be as specific
-  as possible.
-- Please do not create duplicate issues. We reserve the right to ban you
-  for repeatedly wasting our time through ignorance.
+- Follow the template and include enough detail to reproduce or evaluate the
+  request.
+- Do not create duplicate, automated, or unreviewed issues.
 
 ### Contributions
 
@@ -33,17 +31,18 @@ The same contribution guidelines apply to all platform repos.
   confirms the bug or agrees that the feature should be implemented.
 - If an issue you want to work on is stale, mention an active maintainer
   and show your intent to contribute.
-- Please do not use AI for contributing if you don't fully understand its
-  output. We will permanently ban you if you spam our repos with AI slop.
+- Review and test every contribution, including work made with AI-assisted
+  tools. Disclose generated work that needs extra review.
+- Do not submit generated changes that you do not understand.
 
 ## Development
-macOS is our primary development platform, so it's the recommended
-development environment for community contributions.
+macOS is the primary development platform and the recommended environment for
+contributions.
 
 Linux packaging includes a similar development script, so the same guide
 can be applied there too.
 
-[> See development docs in macOS repo][macos-guide]
+[See the Arcium-macOS development guide][macos-guide].
 
 ## Working with patches
 
@@ -69,12 +68,12 @@ When working in a platform repository, the usual workflow is:
 ## Code style
 
 - Follow Chromium style and conventions.
-- Prefer existing Chromium or Helium patterns over introducing new abstractions.
+- Prefer existing Chromium or Arcium patterns over new abstractions.
 - Keep changes focused and minimal.
 - Proofread surrounding code before submitting.
-- When adding new Helium-authored files to the Chromium tree, include the Helium
-  copyright header used in other patches.
-- Refer to existing Helium patches for guidance if necessary.
+- When adding new Arcium-authored files to the Chromium tree, use the copyright
+  header found in adjacent project files.
+- Refer to existing Arcium patches when you need an example.
 
 ## Git style
 
@@ -154,9 +153,9 @@ changes into several follow-up PRs if necessary.
 
 ## Licensing
 
-By contributing to Helium, you agree that your changes will be licensed under
+By contributing to Arcium, you agree that your changes will be licensed under
 the repository's existing licensing terms.
 
 <!-- Long referenced links -->
-[macos-guide]: https://github.com/imputnet/helium-macos/blob/main/docs/building.md#development-build-and-environment
+[macos-guide]: https://github.com/dr-baker/Arcium-macOS/blob/main/docs/building.md#development-build-and-environment
 [linux-style]: https://docs.kernel.org/process/submitting-patches.html#the-canonical-patch-format
