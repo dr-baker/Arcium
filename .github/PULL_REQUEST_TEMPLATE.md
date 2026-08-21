@@ -1,18 +1,18 @@
-For your pull request to not get closed without review, please confirm that:
+Before you submit the pull request, confirm that:
 
-- [ ] An issue exists where the maintainers agreed that this should be implemented
-      (an approved feature request, or confirmed bug).
-- [ ] I tested that my contribution works locally, and does not break anything,
-      otherwise I have marked my PR as draft.
-- [ ] If my contribution is non-trivial, I did not use AI to write most of it.
-- [x] I understand that I will be permanently banned from interacting with this
-      organization if I lied by checking any of these checkboxes.
+- [ ] An approved feature request or confirmed bug describes this change.
+- [ ] I understand and reviewed every change, including AI-assisted work.
+- [ ] I tested the affected behavior. I marked this pull request as a draft if
+      required tests are incomplete.
+- [ ] I described the completed tests, missing tests, and any uncertainty.
+- [ ] This change belongs in the shared Arcium browser product.
 
-Tested on (check one or more):
+Tested on:
+
 - [ ] Windows
 - [ ] macOS
 - [ ] Linux
 
 ---
 
-[short description of your PR goes here]
+[Describe the change, why it belongs in Arcium core, and the verification here.]
