@@ -108,6 +108,7 @@ def _materialize_sources(
 
 def verify(
     source_dir: Path | None,
+    source_is_series_tip: bool,
     fixture: Path | None,
     version: str,
     patch_path: Path,
@@ -126,19 +127,22 @@ def verify(
 
     _materialize_sources(target_paths, added_paths, source_dir, version, fixture_path)
 
-    temporary_patch = fixture_path / ".existing-series.patch"
     applied_existing = 0
-    for entry in parse_series(series_path):
-        candidate = series_path.parent / entry
-        if candidate.resolve() == patch_path.resolve():
-            continue
-        selected = _write_filtered_patch(candidate, target_paths, temporary_patch)
-        if not selected:
-            continue
-        print(f"existing {entry}: {selected} touched file section(s)")
-        _run_patch(temporary_patch, fixture_path, dry_run=True)
-        _run_patch(temporary_patch, fixture_path, dry_run=False)
-        applied_existing += 1
+    if source_is_series_tip:
+        print("existing patches: supplied by series-tip source snapshot")
+    else:
+        temporary_patch = fixture_path / ".existing-series.patch"
+        for entry in parse_series(series_path):
+            candidate = series_path.parent / entry
+            if candidate.resolve() == patch_path.resolve():
+                break
+            selected = _write_filtered_patch(candidate, target_paths, temporary_patch)
+            if not selected:
+                continue
+            print(f"existing {entry}: {selected} touched file section(s)")
+            _run_patch(temporary_patch, fixture_path, dry_run=True)
+            _run_patch(temporary_patch, fixture_path, dry_run=False)
+            applied_existing += 1
 
     print(f"existing patches applied: {applied_existing}")
     _run_patch(patch_path, fixture_path, dry_run=True)
@@ -164,6 +168,11 @@ def main() -> int:
         help="offline Chromium source snapshot root",
     )
     parser.add_argument(
+        "--source-is-series-tip",
+        action="store_true",
+        help="treat --source-dir as the state after every preceding series patch",
+    )
+    parser.add_argument(
         "--fixture",
         type=Path,
         help="keep or use this sparse fixture directory",
@@ -175,7 +184,7 @@ def main() -> int:
     parser.add_argument(
         "--patch",
         type=Path,
-        default=root / "patches/helium/core/mru-tab-switcher-overlay.patch",
+        default=root / "patches/personal/mru-tab-switcher-visualizer.patch",
     )
     parser.add_argument(
         "--series",
@@ -183,10 +192,13 @@ def main() -> int:
         default=root / "patches/series",
     )
     args = parser.parse_args()
+    if args.source_is_series_tip and not args.source_dir:
+        parser.error("--source-is-series-tip requires --source-dir")
 
     try:
         verify(
             args.source_dir.resolve() if args.source_dir else None,
+            args.source_is_series_tip,
             args.fixture.resolve() if args.fixture else None,
             args.version,
             args.patch.resolve(),
