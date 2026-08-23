@@ -1,0 +1,1485 @@
+--- a/chrome/browser/importer/helium_arc_sidebar_import.cc
++++ b/chrome/browser/importer/helium_arc_sidebar_import.cc
+@@ -4,8 +4,16 @@
+ 
+ #include "chrome/browser/importer/helium_arc_sidebar_import.h"
+ 
++#include <iterator>
++#include <string_view>
+ #include <utility>
++#include <vector>
+ 
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
++#include "chrome/browser/ui/helium/helium_space.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/browser/ui/startup/startup_tab.h"
+ #include "chrome/browser/ui/tabs/pin_tab_codec.h"
+ #include "chrome/browser/ui/tabs/pinned_tab_codec.h"
+@@ -15,6 +23,24 @@ namespace helium {
+ 
+ namespace {
+ 
++constexpr std::u16string_view kSpaceMarkerPrefix = u"\u2063helium-space:";
++
++bool ParseSpaceMarker(const std::u16string& marker,
++                      std::string* id,
++                      std::u16string* name) {
++  if (!marker.starts_with(kSpaceMarkerPrefix)) {
++    return false;
++  }
++  const size_t separator = marker.find(u'\u001f', kSpaceMarkerPrefix.size());
++  if (separator == std::u16string::npos) {
++    return false;
++  }
++  *id = base::UTF16ToUTF8(marker.substr(kSpaceMarkerPrefix.size(),
++                                        separator - kSpaceMarkerPrefix.size()));
++  *name = marker.substr(separator + 1);
++  return !id->empty();
++}
++
+ StartupTabs ConvertToolbarEntriesToFavorites(
+     const std::vector<user_data_importer::ImportedBookmarkEntry>& entries) {
+   StartupTabs favorites;
+@@ -31,8 +57,7 @@ StartupTabs ConvertToolbarEntriesToFavor
+ }
+ 
+ StartupTabs ConvertEntriesToPins(
+-    const std::vector<user_data_importer::ImportedBookmarkEntry>& entries,
+-    const std::u16string& top_level_folder_name) {
++    const std::vector<user_data_importer::ImportedBookmarkEntry>& entries) {
+   StartupTabs pins;
+   for (const auto& entry : entries) {
+     if (entry.in_toolbar || entry.is_folder || !entry.url.is_valid()) {
+@@ -41,10 +66,6 @@ StartupTabs ConvertEntriesToPins(
+     StartupTab tab(entry.url, StartupTab::Type::kPin);
+     tab.helium_has_home = true;
+     tab.helium_home_title = entry.title;
+-    tab.helium_folder_path.push_back(StartupTab::FolderPathSegment{
+-        .title = top_level_folder_name,
+-        .collapsed = false,
+-    });
+     for (const auto& segment : entry.path) {
+       tab.helium_folder_path.push_back(StartupTab::FolderPathSegment{
+           .title = segment,
+@@ -56,15 +77,73 @@ StartupTabs ConvertEntriesToPins(
+   return pins;
+ }
+ 
++struct ImportedSpace {
++  std::string id;
++  std::u16string name;
++  StartupTabs pins;
++};
++
++std::vector<ImportedSpace> ConvertEntriesToSpaces(
++    const std::vector<user_data_importer::ImportedBookmarkEntry>& entries) {
++  std::vector<ImportedSpace> spaces;
++  for (const auto& entry : entries) {
++    std::string space_id;
++    std::u16string space_name;
++    if (entry.in_toolbar || entry.path.empty() ||
++        !ParseSpaceMarker(entry.path.front(), &space_id, &space_name)) {
++      continue;
++    }
++    ImportedSpace* target = nullptr;
++    for (auto& space : spaces) {
++      if (space.id == space_id) {
++        target = &space;
++        break;
++      }
++    }
++    if (!target) {
++      spaces.push_back(ImportedSpace{
++          .id = space_id,
++          .name = space_name.empty() ? u"Space" : space_name,
++      });
++      target = &spaces.back();
++    }
++
++    if (entry.is_folder || !entry.url.is_valid()) {
++      continue;
++    }
++
++    StartupTab tab(entry.url, StartupTab::Type::kPin);
++    tab.helium_has_home = true;
++    tab.helium_home_title = entry.title;
++    for (auto segment = std::next(entry.path.begin());
++         segment != entry.path.end(); ++segment) {
++      tab.helium_folder_path.push_back(StartupTab::FolderPathSegment{
++          .title = *segment,
++          .collapsed = false,
++      });
++    }
++    target->pins.push_back(std::move(tab));
++  }
++  return spaces;
++}
++
+ }  // namespace
+ 
+ void ImportArcSidebarEntriesAsPinsAndFavorites(
+     Profile* profile,
+-    const std::vector<user_data_importer::ImportedBookmarkEntry>& entries,
+-    const std::u16string& top_level_folder_name) {
++    const std::vector<user_data_importer::ImportedBookmarkEntry>& entries) {
++  HeliumSpace* space = nullptr;
++  if (IsHeliumFavoritesAndPinsEnabled()) {
++    if (auto* space_service =
++            HeliumSpaceServiceFactory::GetForProfile(profile)) {
++      space = space_service->GetDefaultSpace();
++    }
++  }
++
+   StartupTabs imported_favorites = ConvertToolbarEntriesToFavorites(entries);
+   if (!imported_favorites.empty()) {
+-    StartupTabs merged = PinnedTabCodec::ReadPinnedTabs(profile);
++    StartupTabs merged =
++        space ? space->ReadFavorites() : PinnedTabCodec::ReadPinnedTabs(profile);
+     // Drop any legacy pin-typed rows that may have landed in the favorites
+     // pref; keep only Chromium favorites.
+     StartupTabs favorites_only;
+@@ -75,15 +154,39 @@ void ImportArcSidebarEntriesAsPinsAndFav
+     }
+     favorites_only.insert(favorites_only.end(), imported_favorites.begin(),
+                           imported_favorites.end());
+-    PinnedTabCodec::WritePinnedTabs(profile, favorites_only);
++    if (space) {
++      space->WriteFavorites(favorites_only);
++    } else {
++      PinnedTabCodec::WritePinnedTabs(profile, favorites_only);
++    }
+   }
+ 
+-  StartupTabs imported_pins =
+-      ConvertEntriesToPins(entries, top_level_folder_name);
+-  if (!imported_pins.empty()) {
+-    StartupTabs merged = PinTabCodec::ReadPins(profile);
++  std::vector<ImportedSpace> imported_spaces = ConvertEntriesToSpaces(entries);
++  if (space && !imported_spaces.empty()) {
++    auto* space_service =
++        HeliumSpaceServiceFactory::GetForProfile(profile);
++    space_service->PrepareForArcImport();
++    for (auto& imported_space : imported_spaces) {
++      HeliumSpace* target = space_service->GetOrCreateSpace(
++          imported_space.id, imported_space.name);
++      StartupTabs merged = target->ReadPins();
++      merged.insert(merged.end(), imported_space.pins.begin(),
++                    imported_space.pins.end());
++      target->WritePins(merged);
++    }
++  } else {
++    StartupTabs imported_pins = ConvertEntriesToPins(entries);
++    if (imported_pins.empty()) {
++      return;
++    }
++    StartupTabs merged =
++        space ? space->ReadPins() : PinTabCodec::ReadPins(profile);
+     merged.insert(merged.end(), imported_pins.begin(), imported_pins.end());
+-    PinTabCodec::WritePins(profile, merged);
++    if (space) {
++      space->WritePins(merged);
++    } else {
++      PinTabCodec::WritePins(profile, merged);
++    }
+   }
+ }
+ 
+--- a/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
++++ b/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+@@ -264,6 +264,7 @@
+ #include "chrome/browser/ui/safety_hub/revoked_permissions_service_factory.h"
+ #include "chrome/browser/ui/signin/dice_migration_service_factory.h"
+ #include "chrome/browser/ui/tabs/pinned_tab_service_factory.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/browser/ui/toolbar/pinned_toolbar/pinned_toolbar_actions_model_factory.h"
+ #include "chrome/browser/ui/toolbar/toolbar_actions_model_factory.h"
+ #include "chrome/browser/ui/ui_features.h"
+@@ -649,6 +650,7 @@
+ #if defined(TOOLKIT_VIEWS)
+ #include "chrome/browser/bookmarks/bookmark_expanded_state_tracker_factory.h"
+ #include "chrome/browser/bookmarks/bookmark_merged_surface_service_factory.h"
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_service_factory.h"
+ #endif
+ 
+ #if BUILDFLAG(USE_NSS_CERTS)
+@@ -841,6 +843,9 @@ void ChromeBrowserMainExtraPartsProfiles
+   browser_switcher::BrowserSwitcherServiceFactory::GetInstance();
+ #endif
+   browser_sync::UserEventServiceFactory::GetInstance();
++#if defined(TOOLKIT_VIEWS)
++  browser_shortcuts::BrowserShortcutServiceFactory::GetInstance();
++#endif
+ #if !BUILDFLAG(IS_ANDROID)
+   BrowserManagerServiceFactory::GetInstance();
+ #endif
+@@ -966,7 +971,6 @@ void ChromeBrowserMainExtraPartsProfiles
+ #endif
+ #if BUILDFLAG(ENTERPRISE_CLOUD_CONTENT_ANALYSIS) || BUILDFLAG(IS_ANDROID) || \
+     BUILDFLAG(FULL_SAFE_BROWSING)
+-  enterprise_connectors::BrowserCrashEventRouterFactory::GetInstance();
+ #endif
+   enterprise_connectors::ConnectorsServiceFactory::GetInstance();
+ #if BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_MAC) || \
+@@ -986,7 +990,6 @@ void ChromeBrowserMainExtraPartsProfiles
+ #endif
+ #if BUILDFLAG(ENTERPRISE_CLOUD_CONTENT_ANALYSIS) || BUILDFLAG(IS_ANDROID) || \
+     BUILDFLAG(FULL_SAFE_BROWSING)
+-  enterprise_connectors::ReportingEventRouterFactory::GetInstance();
+ #endif
+ #if BUILDFLAG(ENTERPRISE_TELOMERE_REPORTING)
+   if (base::FeatureList::IsEnabled(enterprise_connectors::kTelomereReporting)) {
+@@ -1300,6 +1303,7 @@ void ChromeBrowserMainExtraPartsProfiles
+   PersonalContextServiceFactory::GetInstance();
+ #if !BUILDFLAG(IS_ANDROID)
+   PinnedTabServiceFactory::GetInstance();
++  helium::HeliumSpaceServiceFactory::GetInstance();
+   PinnedToolbarActionsModelFactory::GetInstance();
+ #endif
+   PlatformNotificationServiceFactory::GetInstance();
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -48,6 +48,10 @@
+ #include "chrome/browser/search/search.h"
+ #include "chrome/browser/search_engines/template_url_service_factory.h"
+ #include "chrome/browser/send_tab_to_self/send_tab_to_self_util.h"
++#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
++#include "chrome/browser/ui/helium/helium_space.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/browser/sessions/session_service.h"
+ #include "chrome/browser/sessions/session_service_base.h"
+ #include "chrome/browser/sessions/session_service_factory.h"
+@@ -870,6 +874,22 @@ BrowserWindowInterface* OpenEmptyWindow(
+     return nullptr;
+   }
+ 
++  // One primary tabbed window per HeliumSpace: reuse instead of cloning.
++  if (helium::IsHeliumFavoritesAndPinsEnabled() && !profile->IsOffTheRecord()) {
++    if (auto* space_service =
++            helium::HeliumSpaceServiceFactory::GetForProfile(profile)) {
++        if (helium::HeliumSpace* space = space_service->GetDefaultSpace()) {
++          if (BrowserWindowInterface* existing = space->GetPrimaryBrowser()) {
++            if (Browser* browser = existing->GetBrowserForMigrationOnly()) {
++              AddTabAt(browser, GURL(), -1, true);
++              browser->window()->Show();
++              return existing;
++            }
++          }
++        }
++    }
++  }
++
+   Browser::CreateParams params =
+       Browser::CreateParams(Browser::TYPE_NORMAL, profile, true);
+   params.should_trigger_session_restore = should_trigger_session_restore;
+--- /dev/null
++++ b/chrome/browser/ui/helium/helium_space.cc
+@@ -0,0 +1,193 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium/helium_space.h"
++
++#include "base/command_line.h"
++#include "base/files/file_path.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_tabstrip.h"
++#include "chrome/browser/ui/browser_window.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
++#include "chrome/browser/ui/startup/startup_browser_creator_impl.h"
++#include "chrome/browser/ui/startup/startup_types.h"
++#include "chrome/browser/ui/tabs/pin_tab_codec.h"
++#include "chrome/browser/ui/tabs/pinned_tab_codec.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/common/pref_names.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
++
++namespace helium {
++
++namespace {
++
++constexpr char kIdKey[] = "id";
++constexpr char kNameKey[] = "name";
++constexpr char kPinsKey[] = "pins";
++
++base::DictValue* FindSpaceRecord(base::ListValue& records,
++                                 const std::string& id) {
++  for (base::Value& value : records) {
++    base::DictValue* record = value.GetIfDict();
++    const std::string* record_id = record ? record->FindString(kIdKey) : nullptr;
++    if (record_id && *record_id == id) {
++      return record;
++    }
++  }
++  return nullptr;
++}
++
++const base::DictValue* FindSpaceRecord(const base::ListValue& records,
++                                       const std::string& id) {
++  for (const base::Value& value : records) {
++    const base::DictValue* record = value.GetIfDict();
++    const std::string* record_id = record ? record->FindString(kIdKey) : nullptr;
++    if (record_id && *record_id == id) {
++      return record;
++    }
++  }
++  return nullptr;
++}
++
++}  // namespace
++
++HeliumSpace::HeliumSpace(Profile* profile,
++                         std::string id,
++                         std::u16string name)
++    : profile_(profile), id_(std::move(id)), name_(std::move(name)) {}
++
++HeliumSpace::~HeliumSpace() = default;
++
++void HeliumSpace::SetName(std::u16string name) {
++  name_ = name.empty() ? u"Space" : std::move(name);
++  ScopedListPrefUpdate update(profile_->GetPrefs(), kHeliumSpacesPref);
++  if (base::DictValue* record = FindSpaceRecord(update.Get(), id_)) {
++    record->Set(kNameKey, base::UTF16ToUTF8(name_));
++  }
++}
++
++StartupTabs HeliumSpace::ReadPins() const {
++  const base::DictValue* record =
++      FindSpaceRecord(profile_->GetPrefs()->GetList(kHeliumSpacesPref), id_);
++  const base::ListValue* pins = record ? record->FindList(kPinsKey) : nullptr;
++  return pins ? PinTabCodec::DecodePins(*pins) : StartupTabs();
++}
++
++void HeliumSpace::WritePins(const StartupTabs& tabs) {
++  ScopedListPrefUpdate update(profile_->GetPrefs(), kHeliumSpacesPref);
++  if (base::DictValue* record = FindSpaceRecord(update.Get(), id_)) {
++    record->Set(kPinsKey, PinTabCodec::EncodePins(tabs));
++  }
++}
++
++void HeliumSpace::WritePinsFromBrowser(BrowserWindowInterface* browser) {
++  ScopedListPrefUpdate update(profile_->GetPrefs(), kHeliumSpacesPref);
++  if (base::DictValue* record = FindSpaceRecord(update.Get(), id_)) {
++    record->Set(kPinsKey, PinTabCodec::CapturePins(browser));
++  }
++}
++
++StartupTabs HeliumSpace::ReadFavorites() const {
++  return PinnedTabCodec::ReadPinnedTabs(profile_);
++}
++
++void HeliumSpace::WriteFavorites(const StartupTabs& tabs) {
++  PinnedTabCodec::WritePinnedTabs(profile_, tabs);
++}
++
++void HeliumSpace::WriteFavoritesFromBrowsers() {
++  BrowserWindowInterface* match = nullptr;
++  auto* space_service = HeliumSpaceServiceFactory::GetForProfile(profile_);
++  if (!space_service) {
++    return;
++  }
++  ProfileBrowserCollection::GetForProfile(profile_)->ForEach(
++      [space_service, &match](BrowserWindowInterface* window) {
++        Browser* browser = window->GetBrowserForMigrationOnly();
++        if (window->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
++            browser &&
++            !space_service->GetSpaceIdForBrowser(browser).empty()) {
++          match = window;
++          return false;
++        }
++        return true;
++      },
++      BrowserCollection::Order::kActivation);
++  if (match) {
++    PinnedTabCodec::WritePinnedTabs(profile_, match);
++  }
++}
++
++BrowserWindowInterface* HeliumSpace::GetPrimaryBrowser() const {
++  BrowserWindowInterface* match = nullptr;
++  auto* space_service = HeliumSpaceServiceFactory::GetForProfile(profile_);
++  if (!space_service) {
++    return nullptr;
++  }
++  ProfileBrowserCollection::GetForProfile(profile_)->ForEach(
++      [this, space_service, &match](BrowserWindowInterface* window) {
++        if (window->GetType() != BrowserWindowInterface::TYPE_NORMAL) {
++          return true;
++        }
++        Browser* browser = window->GetBrowserForMigrationOnly();
++        const std::string_view browser_space_id =
++            space_service->GetSpaceIdForBrowser(browser);
++        if (browser && browser_space_id == id_) {
++          match = window;
++          return false;
++        }
++        return true;
++      },
++      BrowserCollection::Order::kActivation);
++  return match;
++}
++
++BrowserWindowInterface* HeliumSpace::ActivateOrCreatePrimaryWindow() {
++  auto* space_service = HeliumSpaceServiceFactory::GetForProfile(profile_);
++  if (!space_service) {
++    return nullptr;
++  }
++  space_service->SetActiveSpace(id_);
++  if (BrowserWindowInterface* existing = GetPrimaryBrowser()) {
++    if (Browser* browser = existing->GetBrowserForMigrationOnly()) {
++      browser->window()->Show();
++      return existing;
++    }
++  }
++
++  if (Browser::GetCreationStatusForProfile(profile_) !=
++      Browser::CreationStatus::kOk) {
++    return nullptr;
++  }
++  if (profile_->ShutdownStarted()) {
++    return nullptr;
++  }
++
++  Browser::CreateParams params(Browser::TYPE_NORMAL, profile_, true);
++  params.should_trigger_session_restore = false;
++  Browser* browser = Browser::Create(params);
++  space_service->SetSpaceForBrowser(browser, id_);
++
++  StartupTabs startup_tabs = ReadFavorites();
++  StartupTabs pins = ReadPins();
++  startup_tabs.insert(startup_tabs.end(), pins.begin(), pins.end());
++  if (!startup_tabs.empty()) {
++    StartupBrowserCreatorImpl creator(
++        base::FilePath(), *base::CommandLine::ForCurrentProcess(),
++        chrome::startup::IsFirstRun::kNo);
++    creator.OpenTabsInBrowserForSpace(browser, startup_tabs);
++  } else if (browser->tab_strip_model()->empty()) {
++    chrome::AddTabAt(browser, GURL(), -1, true);
++  }
++  browser->window()->Show();
++  return browser;
++}
++
++}  // namespace helium
+--- /dev/null
++++ b/chrome/browser/ui/helium/helium_space.h
+@@ -0,0 +1,56 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_H_
++#define CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_H_
++
++#include <string>
++
++#include "base/memory/raw_ptr.h"
++#include "chrome/browser/ui/startup/startup_tab.h"
++
++class BrowserWindowInterface;
++class Profile;
++
++namespace helium {
++
++// User-facing Space within a private Chromium Profile. A Space owns its Pins;
++// Favorites remain shared by the backing profile.
++class HeliumSpace {
++ public:
++  HeliumSpace(Profile* profile, std::string id, std::u16string name);
++  HeliumSpace(const HeliumSpace&) = delete;
++  HeliumSpace& operator=(const HeliumSpace&) = delete;
++  ~HeliumSpace();
++
++  Profile* profile() const { return profile_; }
++
++  const std::string& id() const { return id_; }
++  const std::u16string& name() const { return name_; }
++
++  void SetName(std::u16string name);
++
++  StartupTabs ReadPins() const;
++  void WritePins(const StartupTabs& tabs);
++  void WritePinsFromBrowser(BrowserWindowInterface* browser);
++
++  StartupTabs ReadFavorites() const;
++  void WriteFavorites(const StartupTabs& tabs);
++  void WriteFavoritesFromBrowsers();
++
++  // Primary TYPE_NORMAL tabbed window for this Space, if any.
++  BrowserWindowInterface* GetPrimaryBrowser() const;
++
++  // Activate the primary window, or create one when missing.
++  BrowserWindowInterface* ActivateOrCreatePrimaryWindow();
++
++ private:
++  raw_ptr<Profile> profile_;
++  std::string id_;
++  std::u16string name_;
++};
++
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_H_
+--- /dev/null
++++ b/chrome/browser/ui/helium/helium_space_service.cc
+@@ -0,0 +1,190 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium/helium_space_service.h"
++
++#include <set>
++
++#include "base/strings/utf_string_conversions.h"
++#include "base/uuid.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/helium/helium_space.h"
++#include "chrome/browser/ui/tabs/pin_tab_codec.h"
++#include "chrome/common/pref_names.h"
++#include "components/prefs/pref_service.h"
++
++namespace helium {
++
++HeliumSpaceService::HeliumSpaceService(Profile* profile) : profile_(profile) {
++  browser_collection_observation_.Observe(
++      ProfileBrowserCollection::GetForProfile(profile_));
++  LoadSpaces();
++  EnsureDefaultSpace();
++}
++
++HeliumSpaceService::~HeliumSpaceService() = default;
++
++void HeliumSpaceService::LoadSpaces() {
++  constexpr char kIdKey[] = "id";
++  constexpr char kNameKey[] = "name";
++  for (const base::Value& value :
++       profile_->GetPrefs()->GetList(kHeliumSpacesPref)) {
++    const base::DictValue* record = value.GetIfDict();
++    if (!record) {
++      continue;
++    }
++    const std::string* id = record->FindString(kIdKey);
++    const std::string* name = record->FindString(kNameKey);
++    if (!id || id->empty()) {
++      continue;
++    }
++    spaces_.push_back(std::make_unique<HeliumSpace>(
++        profile_, *id, name ? base::UTF8ToUTF16(*name) : u"Space"));
++  }
++}
++
++void HeliumSpaceService::EnsureDefaultSpace() {
++  if (!spaces_.empty()) {
++    if (profile_->GetPrefs()->GetString(kHeliumActiveSpaceIdPref).empty()) {
++      SetActiveSpace(spaces_.front()->id());
++    }
++    return;
++  }
++
++  PrefService* prefs = profile_->GetPrefs();
++  std::string id = prefs->GetString(prefs::kHeliumSpaceId);
++  if (id.empty()) {
++    id = base::Uuid::GenerateRandomV4().AsLowercaseString();
++  }
++  StartupTabs legacy_pins = PinTabCodec::ReadPins(profile_);
++  GetOrCreateSpace(std::move(id), u"Space", legacy_pins);
++}
++
++HeliumSpace* HeliumSpaceService::GetDefaultSpace() {
++  EnsureDefaultSpace();
++  return spaces_.front().get();
++}
++
++const HeliumSpace* HeliumSpaceService::GetDefaultSpace() const {
++  return spaces_.empty() ? nullptr : spaces_.front().get();
++}
++
++HeliumSpace* HeliumSpaceService::GetActiveSpace() {
++  EnsureDefaultSpace();
++  const std::string& active_id =
++      profile_->GetPrefs()->GetString(kHeliumActiveSpaceIdPref);
++  if (HeliumSpace* active = GetSpaceById(active_id)) {
++    return active;
++  }
++  return spaces_.front().get();
++}
++
++HeliumSpace* HeliumSpaceService::GetSpaceById(std::string_view id) {
++  for (const auto& space : spaces_) {
++    if (space->id() == id) {
++      return space.get();
++    }
++  }
++  return nullptr;
++}
++
++HeliumSpace* HeliumSpaceService::GetOrCreateSpace(std::string id,
++                                                  std::u16string name,
++                                                  const StartupTabs& pins) {
++  if (HeliumSpace* existing = GetSpaceById(id)) {
++    existing->SetName(std::move(name));
++    existing->WritePins(pins);
++    return existing;
++  }
++
++  base::DictValue record;
++  record.Set("id", id);
++  record.Set("name", base::UTF16ToUTF8(name.empty() ? u"Space" : name));
++  record.Set("pins", PinTabCodec::EncodePins(pins));
++  base::ListValue records =
++      profile_->GetPrefs()->GetList(kHeliumSpacesPref).Clone();
++  records.Append(std::move(record));
++  profile_->GetPrefs()->SetList(kHeliumSpacesPref, std::move(records));
++
++  spaces_.push_back(std::make_unique<HeliumSpace>(
++      profile_, std::move(id), name.empty() ? u"Space" : std::move(name)));
++  if (spaces_.size() == 1u) {
++    SetActiveSpace(spaces_.front()->id());
++  }
++  return spaces_.back().get();
++}
++
++void HeliumSpaceService::PrepareForArcImport() {
++  // The settings/import window is not a Space window. Detach any existing
++  // browser association before replacing imported data so it cannot write its
++  // current tabs back over a freshly imported Space during shutdown.
++  browser_space_ids_.clear();
++
++  if (spaces_.size() != 1u || spaces_.front()->name() != u"Space" ||
++      !spaces_.front()->ReadPins().empty()) {
++    return;
++  }
++  spaces_.clear();
++  profile_->GetPrefs()->SetList(kHeliumSpacesPref, base::ListValue());
++  profile_->GetPrefs()->SetString(kHeliumActiveSpaceIdPref, std::string());
++}
++
++void HeliumSpaceService::SetActiveSpace(std::string_view id) {
++  if (GetSpaceById(id)) {
++    profile_->GetPrefs()->SetString(kHeliumActiveSpaceIdPref,
++                                    std::string(id));
++  }
++}
++
++void HeliumSpaceService::SetSpaceForBrowser(Browser* browser,
++                                            std::string_view id) {
++  if (browser && GetSpaceById(id)) {
++    browser_space_ids_[browser] = std::string(id);
++  }
++}
++
++std::string_view HeliumSpaceService::GetSpaceIdForBrowser(
++    Browser* browser) const {
++  auto found = browser_space_ids_.find(browser);
++  return found == browser_space_ids_.end() ? std::string_view()
++                                            : std::string_view(found->second);
++}
++
++std::vector<HeliumSpace*> HeliumSpaceService::GetSpaces() {
++  EnsureDefaultSpace();
++  std::vector<HeliumSpace*> result;
++  result.reserve(spaces_.size());
++  for (const auto& space : spaces_) {
++    result.push_back(space.get());
++  }
++  return result;
++}
++
++void HeliumSpaceService::WriteSpacesFromBrowsers() {
++  std::set<std::string> written_space_ids;
++  ProfileBrowserCollection::GetForProfile(profile_)->ForEach(
++      [this, &written_space_ids](BrowserWindowInterface* window) {
++        if (window->GetType() != BrowserWindowInterface::TYPE_NORMAL) {
++          return true;
++        }
++        Browser* browser = window->GetBrowserForMigrationOnly();
++        const std::string_view space_id = GetSpaceIdForBrowser(browser);
++        HeliumSpace* space = GetSpaceById(space_id);
++        if (space && written_space_ids.insert(space->id()).second) {
++          space->WritePinsFromBrowser(window);
++        }
++        return true;
++      },
++      BrowserCollection::Order::kActivation);
++}
++
++void HeliumSpaceService::OnBrowserClosed(BrowserWindowInterface* window) {
++  if (Browser* browser = window->GetBrowserForMigrationOnly()) {
++    browser_space_ids_.erase(browser);
++  }
++}
++
++}  // namespace helium
+--- /dev/null
++++ b/chrome/browser/ui/helium/helium_space_service.h
+@@ -0,0 +1,75 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_SERVICE_H_
++#define CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_SERVICE_H_
++
++#include <memory>
++#include <map>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
++#include "chrome/browser/ui/startup/startup_tab.h"
++#include "components/keyed_service/core/keyed_service.h"
++
++class Profile;
++class Browser;
++class BrowserWindowInterface;
++class ProfileBrowserCollection;
++
++namespace helium {
++
++inline constexpr char kHeliumSpacesPref[] = "helium.spaces";
++inline constexpr char kHeliumActiveSpaceIdPref[] = "helium.active_space_id";
++
++class HeliumSpace;
++
++// Profile-scoped owner of ordered Helium Spaces. Profile identity stays an
++// implementation detail; Spaces are the user-facing browsing contexts.
++class HeliumSpaceService : public KeyedService,
++                           public BrowserCollectionObserver {
++ public:
++  explicit HeliumSpaceService(Profile* profile);
++  HeliumSpaceService(const HeliumSpaceService&) = delete;
++  HeliumSpaceService& operator=(const HeliumSpaceService&) = delete;
++  ~HeliumSpaceService() override;
++
++  // Always non-null after construction.
++  HeliumSpace* GetDefaultSpace();
++  const HeliumSpace* GetDefaultSpace() const;
++  HeliumSpace* GetActiveSpace();
++  HeliumSpace* GetSpaceById(std::string_view id);
++  HeliumSpace* GetOrCreateSpace(std::string id,
++                                std::u16string name,
++                                const StartupTabs& pins = {});
++  // Removes the untouched bootstrap Space before the first Arc Space import.
++  void PrepareForArcImport();
++  void SetActiveSpace(std::string_view id);
++  void SetSpaceForBrowser(Browser* browser, std::string_view id);
++  std::string_view GetSpaceIdForBrowser(Browser* browser) const;
++
++  std::vector<HeliumSpace*> GetSpaces();
++  void WriteSpacesFromBrowsers();
++
++  // BrowserCollectionObserver:
++  void OnBrowserClosed(BrowserWindowInterface* browser) override;
++
++ private:
++  void LoadSpaces();
++  void EnsureDefaultSpace();
++
++  raw_ptr<Profile> profile_;
++  std::vector<std::unique_ptr<HeliumSpace>> spaces_;
++  std::map<Browser*, std::string> browser_space_ids_;
++  base::ScopedObservation<ProfileBrowserCollection, BrowserCollectionObserver>
++      browser_collection_observation_{this};
++};
++
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_SERVICE_H_
+--- /dev/null
++++ b/chrome/browser/ui/helium/helium_space_service_factory.cc
+@@ -0,0 +1,60 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
++
++#include "base/no_destructor.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/common/pref_names.h"
++#include "components/pref_registry/pref_registry_syncable.h"
++
++namespace helium {
++
++// static
++HeliumSpaceService* HeliumSpaceServiceFactory::GetForProfile(Profile* profile) {
++  return static_cast<HeliumSpaceService*>(
++      GetInstance()->GetServiceForBrowserContext(profile, true));
++}
++
++// static
++HeliumSpaceServiceFactory* HeliumSpaceServiceFactory::GetInstance() {
++  static base::NoDestructor<HeliumSpaceServiceFactory> instance;
++  return instance.get();
++}
++
++HeliumSpaceServiceFactory::HeliumSpaceServiceFactory()
++    : ProfileKeyedServiceFactory(
++          "HeliumSpaceService",
++          ProfileSelections::Builder()
++              .WithRegular(ProfileSelection::kOriginalOnly)
++              .WithGuest(ProfileSelection::kOriginalOnly)
++              .WithAshInternals(ProfileSelection::kOriginalOnly)
++              .Build()) {}
++
++HeliumSpaceServiceFactory::~HeliumSpaceServiceFactory() = default;
++
++std::unique_ptr<KeyedService>
++HeliumSpaceServiceFactory::BuildServiceInstanceForBrowserContext(
++    content::BrowserContext* context) const {
++  return std::make_unique<HeliumSpaceService>(static_cast<Profile*>(context));
++}
++
++bool HeliumSpaceServiceFactory::ServiceIsCreatedWithBrowserContext() const {
++  return true;
++}
++
++bool HeliumSpaceServiceFactory::ServiceIsNULLWhileTesting() const {
++  return true;
++}
++
++void HeliumSpaceServiceFactory::RegisterProfilePrefs(
++    user_prefs::PrefRegistrySyncable* registry) {
++  registry->RegisterStringPref(prefs::kHeliumSpaceId, std::string());
++  registry->RegisterStringPref(prefs::kHeliumSpaceName, std::string());
++  registry->RegisterListPref(kHeliumSpacesPref);
++  registry->RegisterStringPref(kHeliumActiveSpaceIdPref, std::string());
++}
++
++}  // namespace helium
+--- /dev/null
++++ b/chrome/browser/ui/helium/helium_space_service_factory.h
+@@ -0,0 +1,49 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_SERVICE_FACTORY_H_
++#define CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_SERVICE_FACTORY_H_
++
++#include "chrome/browser/profiles/profile_keyed_service_factory.h"
++
++namespace base {
++template <typename T>
++class NoDestructor;
++}  // namespace base
++
++namespace user_prefs {
++class PrefRegistrySyncable;
++}
++
++namespace helium {
++
++class HeliumSpaceService;
++
++class HeliumSpaceServiceFactory : public ProfileKeyedServiceFactory {
++ public:
++  static HeliumSpaceService* GetForProfile(Profile* profile);
++  static HeliumSpaceServiceFactory* GetInstance();
++
++  HeliumSpaceServiceFactory(const HeliumSpaceServiceFactory&) = delete;
++  HeliumSpaceServiceFactory& operator=(const HeliumSpaceServiceFactory&) =
++      delete;
++
++ private:
++  friend base::NoDestructor<HeliumSpaceServiceFactory>;
++
++  HeliumSpaceServiceFactory();
++  ~HeliumSpaceServiceFactory() override;
++
++  // BrowserContextKeyedServiceFactory:
++  std::unique_ptr<KeyedService> BuildServiceInstanceForBrowserContext(
++      content::BrowserContext* context) const override;
++  bool ServiceIsCreatedWithBrowserContext() const override;
++  bool ServiceIsNULLWhileTesting() const override;
++  void RegisterProfilePrefs(
++      user_prefs::PrefRegistrySyncable* registry) override;
++};
++
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_SERVICE_FACTORY_H_
+--- a/chrome/browser/ui/startup/startup_tab_provider.cc
++++ b/chrome/browser/ui/startup/startup_tab_provider.cc
+@@ -36,6 +36,11 @@
+ #include "chrome/browser/ui/startup/startup_types.h"
+ #include "chrome/browser/ui/startup/url_util.h"
+ #include "chrome/browser/ui/tabs/pinned_tab_codec.h"
++#include "chrome/browser/ui/tabs/pin_tab_codec.h"
++#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
++#include "chrome/browser/ui/helium/helium_space.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/webui/settings/reset_settings_handler.h"
+ #include "chrome/common/pref_names.h"
+@@ -127,10 +132,28 @@ StartupTabs StartupTabProviderImpl::GetR
+ StartupTabs StartupTabProviderImpl::GetPinnedTabs(
+     const base::CommandLine& command_line,
+     Profile* profile) const {
+-  return GetPinnedTabsForState(
++  const bool has_other_tabbed_browser = ProfileHasOtherTabbedBrowser(profile);
++
++  StartupTabs favorites = PinnedTabCodec::ReadPinnedTabs(profile);
++  StartupTabs pins = PinTabCodec::ReadPins(profile);
++  if (helium::IsHeliumFavoritesAndPinsEnabled()) {
++    if (auto* space_service =
++            helium::HeliumSpaceServiceFactory::GetForProfile(profile)) {
++      if (helium::HeliumSpace* space = space_service->GetActiveSpace()) {
++        favorites = space->ReadFavorites();
++        pins = space->ReadPins();
++      }
++    }
++  }
++
++  StartupTabs tabs = GetPinnedTabsForState(
+       StartupBrowserCreator::GetSessionStartupPref(command_line, profile),
+-      PinnedTabCodec::ReadPinnedTabs(profile),
+-      ProfileHasOtherTabbedBrowser(profile));
++      favorites, has_other_tabbed_browser);
++  // Only materialize Space pins on the primary window.
++  if (!has_other_tabbed_browser) {
++    tabs.insert(tabs.end(), pins.begin(), pins.end());
++  }
++  return tabs;
+ }
+ 
+ StartupTabs StartupTabProviderImpl::GetPreferencesTabs(
+--- a/chrome/browser/ui/tabs/pinned_tab_service.cc
++++ b/chrome/browser/ui/tabs/pinned_tab_service.cc
+@@ -12,6 +12,11 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/tabs/pinned_tab_codec.h"
++#include "chrome/browser/ui/tabs/pin_tab_codec.h"
++#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
++#include "chrome/browser/ui/helium/helium_space.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ 
+ PinnedTabService::PinnedTabService(Profile* profile) : profile_(profile) {
+@@ -73,6 +78,31 @@ void PinnedTabService::OnTabStripModelCh
+ }
+ 
+ void PinnedTabService::WillCloseAllTabs(TabStripModel* tab_strip_model) {
++  if (helium::IsHeliumFavoritesAndPinsEnabled()) {
++    if (auto* space_service =
++            helium::HeliumSpaceServiceFactory::GetForProfile(profile_)) {
++      // A Space can close while other browser windows remain open. Capture
++      // that exact window before its tabs are detached; the legacy
++      // last-window-only policy would otherwise lose Space-local pin edits.
++      ForEachCurrentBrowserWindowInterfaceOrderedByActivation(
++          [this, space_service,
++           tab_strip_model](BrowserWindowInterface* window) {
++            if (window->GetProfile() != profile_ ||
++                window->GetType() != BrowserWindowInterface::TYPE_NORMAL ||
++                window->GetTabStripModel() != tab_strip_model) {
++              return true;
++            }
++            Browser* browser = window->GetBrowserForMigrationOnly();
++            if (helium::HeliumSpace* space = space_service->GetSpaceById(
++                    space_service->GetSpaceIdForBrowser(browser))) {
++              space->WritePinsFromBrowser(window);
++              PinnedTabCodec::WritePinnedTabs(profile_, window);
++            }
++            return false;
++          });
++    }
++  }
++
+   if (TabStripModelObserver::CountObservedModels(this) == 1) {
+     WritePinnedTabsIfNecessary();
+   }
+@@ -80,7 +110,21 @@ void PinnedTabService::WillCloseAllTabs(
+ 
+ void PinnedTabService::WritePinnedTabsIfNecessary() {
+   if (need_to_write_pinned_tabs_) {
++    if (helium::IsHeliumFavoritesAndPinsEnabled()) {
++      if (auto* space_service =
++              helium::HeliumSpaceServiceFactory::GetForProfile(profile_)) {
++        // Favorites are profile-scoped. Pins are captured independently for
++        // each Space window so one window can never overwrite another.
++        if (helium::HeliumSpace* space = space_service->GetDefaultSpace()) {
++          space->WriteFavoritesFromBrowsers();
++        }
++        space_service->WriteSpacesFromBrowsers();
++        need_to_write_pinned_tabs_ = false;
++        return;
++      }
++    }
+     PinnedTabCodec::WritePinnedTabs(profile_);
++    PinTabCodec::WritePins(profile_);
+   }
+   need_to_write_pinned_tabs_ = false;
+ }
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -378,6 +378,12 @@ static_library("ui") {
+     "helium/helium_favorites_and_pins.h",
+     "helium/helium_little_arc.cc",
+     "helium/helium_little_arc.h",
++    "helium/helium_space.cc",
++    "helium/helium_space.h",
++    "helium/helium_space_service.cc",
++    "helium/helium_space_service.h",
++    "helium/helium_space_service_factory.cc",
++    "helium/helium_space_service_factory.h",
+     "idle_bubble.h",
+     "managed_ui.cc",
+     "managed_ui.h",
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -984,6 +984,9 @@ inline constexpr char kPartitionPerHostZ
+ #if !BUILDFLAG(IS_ANDROID)
+ inline constexpr char kPinnedTabs[] = "pinned_tabs";
+ inline constexpr char kHeliumPins[] = "helium.pins";
++// HeliumSpace identity (legacy: one Space per Profile).
++inline constexpr char kHeliumSpaceId[] = "helium.space.id";
++inline constexpr char kHeliumSpaceName[] = "helium.space.name";
+ #endif  // !BUILDFLAG(IS_ANDROID)
+ 
+ // Preference to disable 3D APIs (WebGL).
+--- a/chrome/utility/importer/arc_sidebar_importer.cc
++++ b/chrome/utility/importer/arc_sidebar_importer.cc
+@@ -7,6 +7,7 @@
+ #include <map>
+ #include <optional>
+ #include <string>
++#include <string_view>
+ #include <unordered_set>
+ #include <vector>
+ 
+@@ -28,6 +29,13 @@ namespace {
+ // macOS CFAbsoluteTime epoch: 2001-01-01 00:00:00 UTC
+ // Unix epoch offset: 978307200 seconds between 1970-01-01 and 2001-01-01.
+ constexpr double kCFAbsoluteTimeToUnixOffset = 978307200.0;
++constexpr std::u16string_view kSpaceMarkerPrefix = u"\u2063helium-space:";
++
++std::u16string MakeSpaceMarker(const std::string& id,
++                               const std::u16string& name) {
++  return std::u16string(kSpaceMarkerPrefix) + base::UTF8ToUTF16(id) +
++         u"\u001f" + name;
++}
+ 
+ base::Time CFAbsoluteTimeToBaseTime(double cf_time) {
+   return base::Time::FromSecondsSinceUnixEpoch(cf_time +
+@@ -36,13 +44,15 @@ base::Time CFAbsoluteTimeToBaseTime(doub
+ 
+ // Represents a parsed sidebar item from StorableSidebar.json.
+ struct ArcSidebarItem {
++  enum class Kind { kUnknown, kContainer, kFolder, kSplitView, kTab };
++
+   std::string id;
+   std::string title;
+   std::string saved_url;
+   std::string saved_title;
+   double created_at = 0;
+   std::vector<std::string> children_ids;
+-  bool is_container = false;
++  Kind kind = Kind::kUnknown;
+ };
+ 
+ // Parse the flat item list from the sidebar JSON into a map of id -> item.
+@@ -82,8 +92,12 @@ std::map<std::string, ArcSidebarItem> Pa
+     const auto* data = dict->FindDict("data");
+     const auto* tab = data ? data->FindDict("tab") : nullptr;
+     const auto* container = data ? data->FindDict("itemContainer") : nullptr;
++    const auto* list = data ? data->Find("list") : nullptr;
++    const auto* split_view = data ? data->FindDict("splitView") : nullptr;
++    const auto* tab_group = data ? data->FindDict("tabGroup") : nullptr;
+ 
+     if (tab) {
++      item.kind = ArcSidebarItem::Kind::kTab;
+       if (const auto* url = tab->FindString("savedURL")) {
+         item.saved_url = *url;
+       }
+@@ -92,7 +106,16 @@ std::map<std::string, ArcSidebarItem> Pa
+         item.saved_title = *title;
+       }
+     } else if (container) {
+-      item.is_container = true;
++      item.kind = ArcSidebarItem::Kind::kContainer;
++    } else if (list) {
++      item.kind = ArcSidebarItem::Kind::kFolder;
++    } else if (tab_group) {
++      item.kind = ArcSidebarItem::Kind::kFolder;
++      if (const auto* title = tab_group->FindString("title")) {
++        item.title = *title;
++      }
++    } else if (split_view) {
++      item.kind = ArcSidebarItem::Kind::kSplitView;
+     }
+ 
+     items[item.id] = std::move(item);
+@@ -104,6 +127,8 @@ void WalkItem(const std::string& item_id
+               const std::map<std::string, ArcSidebarItem>& items,
+               const std::vector<std::u16string>& path,
+               bool in_toolbar,
++              const std::string& arc_space_id,
++              const std::u16string& arc_space_name,
+               std::vector<user_data_importer::ImportedBookmarkEntry>* bookmarks,
+               std::unordered_set<std::string>& visited) {
+   if (!visited.insert(item_id).second) {
+@@ -120,22 +145,23 @@ void WalkItem(const std::string& item_id
+     return;
+   }
+ 
+-  bool is_folder = item.saved_url.empty() && !item.children_ids.empty() &&
+-                   !item.is_container;
+-
+-  if (!item.saved_url.empty()) {
++  if (item.kind == ArcSidebarItem::Kind::kTab && !item.saved_url.empty()) {
+     user_data_importer::ImportedBookmarkEntry entry;
+     entry.in_toolbar = in_toolbar;
+     entry.is_folder = false;
+     entry.url = GURL(item.saved_url);
+     entry.path = path;
++    if (!arc_space_id.empty()) {
++      entry.path.insert(entry.path.begin(),
++                        MakeSpaceMarker(arc_space_id, arc_space_name));
++    }
+     entry.title =
+         base::UTF8ToUTF16(!item.title.empty() ? item.title : item.saved_title);
+     if (item.created_at > 0) {
+       entry.creation_time = CFAbsoluteTimeToBaseTime(item.created_at);
+     }
+     bookmarks->push_back(std::move(entry));
+-  } else if (is_folder) {
++  } else if (item.kind == ArcSidebarItem::Kind::kFolder) {
+     std::string folder_name = item.title;
+     if (folder_name.empty()) {
+       folder_name = item.saved_title;
+@@ -147,24 +173,43 @@ void WalkItem(const std::string& item_id
+     std::vector<std::u16string> child_path = path;
+     child_path.push_back(base::UTF8ToUTF16(folder_name));
+     for (const auto& child_id : item.children_ids) {
+-      WalkItem(child_id, items, child_path, in_toolbar, bookmarks, visited);
++      WalkItem(child_id, items, child_path, in_toolbar, arc_space_id,
++               arc_space_name, bookmarks, visited);
+     }
+     return;
+   }
+ 
+-  // For containers, just recurse into children.
+-  if (item.is_container) {
++  // Containers and split views are structural, not visible folders.
++  if (item.kind == ArcSidebarItem::Kind::kContainer ||
++      item.kind == ArcSidebarItem::Kind::kSplitView) {
+     for (const auto& child_id : item.children_ids) {
+-      WalkItem(child_id, items, path, in_toolbar, bookmarks, visited);
++      WalkItem(child_id, items, path, in_toolbar, arc_space_id, arc_space_name,
++               bookmarks, visited);
+     }
+   }
+ }
+ 
+ struct SpaceInfo {
+   std::string id;
++  std::string title;
++  std::string profile_directory;
+   std::string pinned_container_id;
+ };
+ 
++std::string ParseProfileDirectory(const base::DictValue* profile) {
++  if (!profile) {
++    return {};
++  }
++  if (profile->FindBool("default").value_or(false)) {
++    return "Default";
++  }
++  const auto* custom = profile->FindDict("custom");
++  const auto* payload = custom ? custom->FindDict("_0") : nullptr;
++  const auto* directory = payload ? payload->FindString("directoryBasename")
++                                  : nullptr;
++  return directory ? *directory : std::string();
++}
++
+ // Parse the spaces list from the sidebar data container.
+ // Spaces alternate: ["spaceId", {spaceObj}, ...] and each space has
+ // containerIDs: ["pinned", "<id>", "unpinned", "<id>"].
+@@ -183,6 +228,11 @@ std::vector<SpaceInfo> ParseSpaces(const
+ 
+     SpaceInfo space;
+     space.id = *space_id;
++    if (const auto* title = space_dict->FindString("title")) {
++      space.title = *title;
++    }
++    space.profile_directory =
++        ParseProfileDirectory(space_dict->FindDict("profile"));
+ 
+     const auto* container_ids = space_dict->FindList("containerIDs");
+     if (container_ids) {
+@@ -283,48 +333,54 @@ void ArcSidebarImporter::ImportBookmarks
+   }
+ 
+   auto spaces = ParseSpaces(data_container->FindList("spaces"));
+-  std::unordered_set<std::string> visited_ids;
+   std::vector<user_data_importer::ImportedBookmarkEntry> bookmarks;
+   const auto* top_apps_ids = data_container->FindList("topAppsContainerIDs");
+   if (top_apps_ids) {
+     for (size_t i = 0; i + 1 < top_apps_ids->size(); i += 2) {
++      const auto* profile = (*top_apps_ids)[i].GetIfDict();
+       const auto* id = (*top_apps_ids)[i + 1].GetIfString();
+-      if (!id) {
++      if (!id || ParseProfileDirectory(profile) !=
++                     source_path_.BaseName().AsUTF8Unsafe()) {
+         continue;
+       }
+       auto it = items.find(*id);
+       if (it != items.end()) {
++        std::unordered_set<std::string> visited_ids;
+         std::vector<std::u16string> path_parts;
+         for (const auto& child_id : it->second.children_ids) {
+-          WalkItem(child_id, items, path_parts, /*in_toolbar=*/true, &bookmarks,
++          WalkItem(child_id, items, path_parts, /*in_toolbar=*/true,
++                   /*arc_space_id=*/std::string(),
++                   /*arc_space_name=*/std::u16string(), &bookmarks,
+                    visited_ids);
+         }
+       }
+-      break;
+     }
+   }
+ 
+   for (const auto& space : spaces) {
+-    if (space.pinned_container_id.empty()) {
++    if (space.profile_directory != source_path_.BaseName().AsUTF8Unsafe()) {
+       continue;
+     }
+ 
++    std::string space_name = space.title.empty() ? "Space" : space.title;
++    user_data_importer::ImportedBookmarkEntry space_marker;
++    space_marker.in_toolbar = false;
++    space_marker.is_folder = true;
++    space_marker.title = base::UTF8ToUTF16(space_name);
++    space_marker.path.push_back(MakeSpaceMarker(space.id, space_marker.title));
++    bookmarks.push_back(std::move(space_marker));
++
+     auto it = items.find(space.pinned_container_id);
+-    if (it == items.end() || it->second.children_ids.empty()) {
++    if (space.pinned_container_id.empty() || it == items.end()) {
+       continue;
+     }
+ 
+     std::vector<std::u16string> path_parts;
+-    if (spaces.size() > 1) {
+-      std::string space_name = space.id;
+-      if (space_name.contains("defaultPersonalSpaceID")) {
+-        space_name = "Personal";
+-      }
+-      path_parts.push_back(base::UTF8ToUTF16(space_name));
+-    }
++
++    std::unordered_set<std::string> visited_ids;
+     for (const auto& child_id : it->second.children_ids) {
+-      WalkItem(child_id, items, path_parts, /*in_toolbar=*/false, &bookmarks,
+-               visited_ids);
++      WalkItem(child_id, items, path_parts, /*in_toolbar=*/false, space.id,
++               base::UTF8ToUTF16(space_name), &bookmarks, visited_ids);
+     }
+   }
+ 
+--- a/chrome/browser/ui/startup/startup_browser_creator_impl.cc
++++ b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
+@@ -42,6 +42,9 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
++#include "chrome/browser/ui/helium/helium_space.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+ #include "chrome/browser/ui/startup/infobar_utils.h"
+@@ -298,6 +301,16 @@ Browser* StartupBrowserCreatorImpl::Open
+   return OpenTabsInBrowser(browser, process_startup, tabs, TabOverWrite::kNo);
+ }
+ 
++Browser* StartupBrowserCreatorImpl::OpenTabsInBrowserForSpace(
++    Browser* browser,
++    const StartupTabs& tabs) {
++  if (tabs.empty()) {
++    return browser;
++  }
++  return OpenTabsInBrowser(browser, chrome::startup::IsProcessStartup::kNo,
++                           tabs, TabOverWrite::kNo);
++}
++
+ Browser* StartupBrowserCreatorImpl::OpenTabsInBrowser(
+     Browser* browser,
+     chrome::startup::IsProcessStartup process_startup,
+@@ -588,6 +601,25 @@ void StartupBrowserCreatorImpl::Determin
+   Browser* browser = RestoreOrCreateBrowser(
+       tabs, behavior, restore_options, process_startup, is_post_crash_launch);
+ 
++  // Only a normal startup window that was eligible to restore the active
++  // Space owns that Space. Setup, crash-recovery, settings, and ordinary new
++  // windows remain unassigned until opened explicitly for a Space.
++  const bool skipped_first_run =
++      base::CommandLine::ForCurrentProcess()->HasSwitch(
++          switches::kNoFirstRun);
++  if (browser && helium::IsHeliumFavoritesAndPinsEnabled() &&
++      !is_incognito_or_guest && !is_post_crash_launch &&
++      (skipped_first_run ||
++       profile_->GetPrefs()->GetBoolean(prefs::kHeliumDidOnboarding))) {
++    if (auto* space_service =
++            helium::HeliumSpaceServiceFactory::GetForProfile(profile_)) {
++      if (helium::HeliumSpace* active_space =
++              space_service->GetActiveSpace()) {
++        space_service->SetSpaceForBrowser(browser, active_space->id());
++      }
++    }
++  }
++
+   tab_groups::MaybeShowSharedTabGroupVersionOutOfDateModal(browser);
+   tab_groups::MaybeShowSharedTabGroupVersionUpToDateToast(browser);
+ 
+--- a/chrome/browser/ui/startup/startup_browser_creator_impl.h
++++ b/chrome/browser/ui/startup/startup_browser_creator_impl.h
+@@ -73,6 +73,11 @@ class StartupBrowserCreatorImpl {
+                              chrome::startup::IsProcessStartup process_startup,
+                              const std::vector<GURL>& urls);
+ 
++  // Materializes Helium Favorites/Pins with their startup metadata into an
++  // already-created Space window.
++  Browser* OpenTabsInBrowserForSpace(Browser* browser,
++                                     const StartupTabs& tabs);
++
+   void SetCurrentChromeVersionStringForTesting(
+       const std::optional<std::string>& version) {
+     current_chrome_version_string_for_testing_ = version;
+--- a/chrome/browser/ui/tabs/pin_tab_codec.cc
++++ b/chrome/browser/ui/tabs/pin_tab_codec.cc
+@@ -196,6 +196,11 @@ void PinTabCodec::WritePins(Profile* pro
+   if (!prefs) {
+     return;
+   }
++  prefs->SetList(prefs::kHeliumPins, EncodePins(tabs));
++}
++
++// static
++base::ListValue PinTabCodec::EncodePins(const StartupTabs& tabs) {
+   // Rebuild a tree from flat tabs that carry folder paths.
+   base::ListValue root;
+   for (const auto& tab : tabs) {
+@@ -231,7 +236,23 @@ void PinTabCodec::WritePins(Profile* pro
+         EncodeTabNode(tab.url, tab.helium_home_title));
+   }
+ 
+-  prefs->SetList(prefs::kHeliumPins, std::move(root));
++  return root;
++}
++
++// static
++base::ListValue PinTabCodec::CapturePins(BrowserWindowInterface* browser) {
++  base::ListValue values;
++  if (browser && browser->GetType() == BrowserWindowInterface::TYPE_NORMAL) {
++    EncodePinTree(browser, values);
++  }
++  return values;
++}
++
++// static
++StartupTabs PinTabCodec::DecodePins(const base::ListValue& values) {
++  StartupTabs results;
++  DecodeTreeList(values, {}, &results);
++  return results;
+ }
+ 
+ // static
+@@ -240,7 +261,5 @@ StartupTabs PinTabCodec::ReadPins(Profil
+   if (!prefs) {
+     return {};
+   }
+-  StartupTabs results;
+-  DecodeTreeList(prefs->GetList(prefs::kHeliumPins), {}, &results);
+-  return results;
++  return DecodePins(prefs->GetList(prefs::kHeliumPins));
+ }
+--- a/chrome/browser/ui/tabs/pin_tab_codec.h
++++ b/chrome/browser/ui/tabs/pin_tab_codec.h
+@@ -5,8 +5,10 @@
+ #ifndef CHROME_BROWSER_UI_TABS_PIN_TAB_CODEC_H_
+ #define CHROME_BROWSER_UI_TABS_PIN_TAB_CODEC_H_
+ 
++#include "base/values.h"
+ #include "chrome/browser/ui/startup/startup_tab.h"
+ 
++class BrowserWindowInterface;
+ class Profile;
+ 
+ namespace user_prefs {
+@@ -26,6 +28,12 @@ class PinTabCodec {
+   // Depth-first flatten of the tree; folder ancestry is on each StartupTab.
+   static StartupTabs ReadPins(Profile* profile);
+ 
++  // Value-level helpers used by Helium Spaces. Keeping the codec here makes
++  // the on-disk shape identical for legacy and multi-Space pin trees.
++  static base::ListValue EncodePins(const StartupTabs& tabs);
++  static base::ListValue CapturePins(BrowserWindowInterface* browser);
++  static StartupTabs DecodePins(const base::ListValue& values);
++
+  private:
+   PinTabCodec();
+   ~PinTabCodec();
+--- a/chrome/browser/ui/tabs/pinned_tab_codec.cc
++++ b/chrome/browser/ui/tabs/pinned_tab_codec.cc
+@@ -127,6 +127,21 @@ void PinnedTabCodec::WritePinnedTabs(Pro
+ 
+ // static
+ void PinnedTabCodec::WritePinnedTabs(Profile* profile,
++                                     BrowserWindowInterface* browser) {
++  PrefService* prefs = profile->GetPrefs();
++  if (!prefs || !browser ||
++      browser->GetType() != BrowserWindowInterface::TYPE_NORMAL ||
++      browser->GetProfile() != profile) {
++    return;
++  }
++
++  base::ListValue values;
++  EncodePinnedTabs(browser, values);
++  prefs->SetList(prefs::kPinnedTabs, std::move(values));
++}
++
++// static
++void PinnedTabCodec::WritePinnedTabs(Profile* profile,
+                                      const StartupTabs& tabs) {
+   PrefService* prefs = profile->GetPrefs();
+   if (!prefs) {
+--- a/chrome/browser/ui/tabs/pinned_tab_codec.h
++++ b/chrome/browser/ui/tabs/pinned_tab_codec.h
+@@ -8,6 +8,7 @@
+ #include "chrome/browser/ui/startup/startup_tab.h"
+ 
+ class Profile;
++class BrowserWindowInterface;
+ 
+ namespace user_prefs {
+ class PrefRegistrySyncable;
+@@ -31,4 +32,9 @@ class PinnedTabCodec {
+   // Resets the preferences state.
+   static void WritePinnedTabs(Profile* profile);
++  // Writes Favorites from one Space window. Every Space shows the same
++  // Favorites, so serializing all windows would duplicate them.
++  static void WritePinnedTabs(Profile* profile,
++                              BrowserWindowInterface* browser);
++
+   // Sets the preferences state from the specified tab list.
+   static void WritePinnedTabs(Profile* profile, const StartupTabs& tabs);
