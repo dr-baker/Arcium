@@ -18,12 +18,10 @@ import tempfile
 from pathlib import Path
 from urllib.request import urlopen
 
-REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
-
-sys.path.insert(0, str(REPOSITORY_ROOT / "devutils" / "third_party"))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "third_party"))
 from unidiff import PatchSet # pylint: disable=wrong-import-position
 
-sys.path.insert(0, str(REPOSITORY_ROOT / "utils"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "utils"))
 from _common import parse_series # pylint: disable=wrong-import-position
 
 
@@ -133,7 +131,7 @@ def verify(
     for entry in parse_series(series_path):
         candidate = series_path.parent / entry
         if candidate.resolve() == patch_path.resolve():
-            break
+            continue
         selected = _write_filtered_patch(candidate, target_paths, temporary_patch)
         if not selected:
             continue
@@ -158,6 +156,7 @@ def verify(
 
 def main() -> int:
     """Run the command-line verifier."""
+    root = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--source-dir",
@@ -171,19 +170,17 @@ def main() -> int:
     )
     parser.add_argument(
         "--version",
-        default=(REPOSITORY_ROOT / "chromium_version.txt").read_text(
-            encoding="utf-8"
-        ).strip(),
+        default=(root / "chromium_version.txt").read_text(encoding="utf-8").strip(),
     )
     parser.add_argument(
         "--patch",
         type=Path,
-        default=REPOSITORY_ROOT / "patches/personal/mru-tab-switcher-overlay.patch",
+        default=root / "patches/helium/core/mru-tab-switcher-overlay.patch",
     )
     parser.add_argument(
         "--series",
         type=Path,
-        default=REPOSITORY_ROOT / "patches/series",
+        default=root / "patches/series",
     )
     args = parser.parse_args()
 
