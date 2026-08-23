@@ -2216,14 +2216,14 @@
 +}
 +
 +bool PinTabContainerView::ShouldAnimateOpacityForAddAndRemove(
-+    const views::View& child_view) const {
-+  // Only animate opacity for tab views.
-+  return views::IsViewClass<TabView>(&child_view);
++    const views::View&) const {
++  // Persistent rows can be materialized in bulk before the window is shown.
++  return false;
 +}
 +
 +bool PinTabContainerView::ShouldSnapToTarget(
-+    const views::View& child_view) const {
-+  return views::IsViewClass<SplitTabView>(&child_view);
++    const views::View&) const {
++  return true;
 +}
 +
 +void PinTabContainerView::ResetCollectionNode() {
@@ -3385,3 +3385,272 @@
            Unpin
          </message>
          <message name="IDS_TAB_CXMENU_SOUND_MUTE_SITE" desc="In Title Case: The label of the tab context menu item for muting one or more sites. NOTE: If having no explicit # makes the phrasing awkward, feel free to add a # as necessary. [ICU Syntax]">
+--- a/chrome/browser/ui/views/tabs/common/tab_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view.cc
+@@ -1031,15 +1031,21 @@ void TabView::OnCollapseStateChanged(
+ }
+ 
+ void TabView::OnTabStateChanged() {
+-  CHECK(collection_node_);
++  if (!collection_node_) {
++    return;
++  }
+ 
+   tabs::TabInterface* tab = const_cast<tabs::TabInterface*>(GetTabInterface());
+-  CHECK(tab);
++  if (!tab || !tab->GetBrowserWindowInterface()) {
++    return;
++  }
+ 
+   const TabStripModel* tab_strip_model =
+       tab->GetBrowserWindowInterface()->GetTabStripModel();
+   int index = tab_strip_model->GetIndexOfTab(tab);
+-  CHECK(index != TabStripModel::kNoTab);
++  if (index == TabStripModel::kNoTab) {
++    return;
++  }
+ 
+   active_ = tab_strip_model->IsTabInForeground(index);
+   split_ = tab->IsSplit();
+@@ -1183,11 +1189,16 @@ void TabView::UpdateThemeColors() {
+     return;
+   }
+ 
++  const BrowserWindowInterface* const browser_window =
++      tab_interface->GetBrowserWindowInterface();
++  BrowserView* const browser_view =
++      browser_window ? BrowserView::GetBrowserViewForBrowser(browser_window)
++                     : nullptr;
++  // A tab can be temporarily reparented while its macOS window is closing,
++  // after the BrowserView association has already been torn down. Theme
++  // propagation still runs on that reparent, so tolerate the detached state.
+   BrowserFrameView* const browser_frame_view =
+-      BrowserView::GetBrowserViewForBrowser(
+-          tab_interface->GetBrowserWindowInterface())
+-          ->browser_widget()
+-          ->GetFrameView();
++      browser_view ? browser_view->browser_widget()->GetFrameView() : nullptr;
+   const std::optional<int> inactive_tab_fill_id =
+       browser_frame_view ? browser_frame_view->GetCustomBackgroundId(
+                                BrowserFrameActiveState::kUseCurrent)
+--- a/components/tabs/impl/tab_strip_collection.cc
++++ b/components/tabs/impl/tab_strip_collection.cc
+@@ -434,8 +434,14 @@ std::unique_ptr<TabInterface> TabStripCo
+       parent_collection != pinned_collection_ &&
+       parent_collection != pin_collection_ &&
+       parent_collection->TabCountRecursive() == 1) {
+-    RemoveTabCollectionImpl(parent_collection);
+-    return parent_collection->MaybeRemoveTab(tab_to_be_removed);
++    // Folder collections are returned and destroyed by removal, while group
++    // collections move to detached storage. Keep the returned folder alive
++    // until its final tab has been extracted.
++    std::unique_ptr<TabCollection> removed_collection =
++        RemoveTabCollectionImpl(parent_collection);
++    return removed_collection
++               ? removed_collection->MaybeRemoveTab(tab_to_be_removed)
++               : parent_collection->MaybeRemoveTab(tab_to_be_removed);
+   } else {
+     return RemoveTabImpl(tab_to_be_removed);
+   }
+--- a/chrome/browser/ui/views/tabs/common/root_tab_collection_node.cc
++++ b/chrome/browser/ui/views/tabs/common/root_tab_collection_node.cc
+@@ -124,7 +124,9 @@ void RootTabCollectionNode::OnChildMoved
+       GetNodeForHandle(to_position.parent_handle);
+ 
+   TabCollectionNode* pinned_node = GetChildNodeOfType(Type::PINNED);
++  TabCollectionNode* pins_node = GetChildNodeOfType(Type::PIN);
+   CHECK(pinned_node);
++  CHECK(pins_node);
+   const bool pinned_container_changed =
+       (pinned_node->GetNodeForHandle(src_parent_node->GetHandle()) != nullptr) !=
+       (pinned_node->GetNodeForHandle(dst_parent_node->GetHandle()) != nullptr);
+@@ -146,9 +148,13 @@ void RootTabCollectionNode::OnChildMoved
+   } else {
+     // Moves across different containers typically within the unpinned container
+     // e.g. unpinned to group, unpinned to split etc.
++    const bool pins_container_changed =
++        (pins_node->GetNodeForHandle(src_parent_node->GetHandle()) != nullptr) !=
++        (pins_node->GetNodeForHandle(dst_parent_node->GetHandle()) != nullptr);
+     TabCollectionNode::MoveChild(GetPassKey(), moved_node_handle,
+                                  to_position.index, src_parent_node,
+-                                 dst_parent_node);
++                                 dst_parent_node,
++                                 /*animate_reparent=*/!pins_container_changed);
+   }
+ 
+   TabCollectionNode* final_moved_node = GetNodeForHandle(moved_node_handle);
+--- a/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
+@@ -14,6 +14,7 @@
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_view.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/compositor/layer.h"
+ #include "ui/gfx/geometry/rect.h"
+ #include "ui/views/controls/scroll_view.h"
+ #include "ui/views/layout/delegating_layout_manager.h"
+@@ -184,6 +185,21 @@ gfx::Size PinTabContainerView::GetMinimu
+                    min_height);
+ }
+ 
++views::View* PinTabContainerView::AddChildWithoutAnimation(
++    std::unique_ptr<views::View> child) {
++  views::View* added_child = AddChildView(std::move(child));
++  if (added_child->layer()) {
++    // The source collection may have created a temporary translucent layer
++    // for its add/reparent animation. This path intentionally skips that
++    // animation, so remove the layer just as the animation manager does when
++    // an animation completes. Leaving it attached violates Label's opaque
++    // text-painting invariant once the Pins scroll view becomes visible.
++    added_child->DestroyLayer();
++  }
++  layout_manager_->ResetViewsToTargetLayout({added_child});
++  return added_child;
++}
++
+ std::optional<BrowserRootView::DropIndex>
+ PinTabContainerView::GetLinkDropIndex(const gfx::Point& loc_in_container) {
+   if (!collection_node_) {
+--- a/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
++++ b/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
+@@ -53,6 +53,8 @@ class PinTabContainerView
+   std::optional<BrowserRootView::DropIndex> GetLinkDropIndex(
+       const gfx::Point& point_in_local_coords);
+ 
++  views::View* AddChildWithoutAnimation(std::unique_ptr<views::View> child);
++
+  private:
+   // DraggedTabsContainer:
+   views::ScrollView* GetScrollViewForContainer() const override;
+--- a/chrome/browser/ui/views/tabs/common/tab_collection_node.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_collection_node.cc
+@@ -344,7 +344,8 @@ void TabCollectionNode::MoveChild(base::
+                                   const tabs::TabCollectionNodeHandle& handle,
+                                   int new_index,
+                                   TabCollectionNode* src_parent_node,
+-                                  TabCollectionNode* dst_parent_node) {
++                                  TabCollectionNode* dst_parent_node,
++                                  bool animate_reparent) {
+   for (auto it = src_parent_node->children_.begin();
+        it != src_parent_node->children_.end(); ++it) {
+     TabCollectionNode* child_node = it->get();
+@@ -366,11 +367,24 @@ void TabCollectionNode::MoveChild(base::
+     src_parent_node->children_.erase(it);
+ 
+     dst_parent_node->AddChildNode(std::move(removed_node), new_index);
+-    if (dst_parent_node->attach_child_to_node_) {
++    if (animate_reparent && dst_parent_node->attach_child_to_node_) {
+       dst_parent_node->attach_child_to_node_.Run(std::move(removed_view),
+                                                  previous_bounds_in_screen);
++    } else if (!animate_reparent &&
++               views::IsViewClass<PinTabContainerView>(
++                   dst_parent_node->node_view_)) {
++      views::AsViewClass<PinTabContainerView>(dst_parent_node->node_view_)
++          ->AddChildWithoutAnimation(std::move(removed_view));
+     } else {
+-      dst_parent_node->node_view_->AddChildView(std::move(removed_view));
++      views::View* added_view =
++          dst_parent_node->node_view_->AddChildView(std::move(removed_view));
++      if (!animate_reparent && added_view->layer()) {
++        // A source collection may have attached a temporary translucent layer
++        // for animation. The non-animated reparent path must clear it for
++        // destinations such as nested pin folders, matching animation-end
++        // cleanup and preserving text-painting invariants.
++        added_view->DestroyLayer();
++      }
+     }
+     dst_parent_node->EnsureFocusOrder(new_index);
+     if (was_focused) {
+--- a/chrome/browser/ui/views/tabs/common/tab_collection_node.h
++++ b/chrome/browser/ui/views/tabs/common/tab_collection_node.h
+@@ -110,7 +110,8 @@ class TabCollectionNode {
+                         const tabs::TabCollectionNodeHandle& handle,
+                         int new_index,
+                         TabCollectionNode* src_parent_node,
+-                        TabCollectionNode* dst_parent_node);
++                        TabCollectionNode* dst_parent_node,
++                        bool animate_reparent = true);
+ 
+   tabs::ConstChildPtr GetNodeData() const { return node_data_; }
+   tabs::TabCollectionNodeHandle GetHandle() const;
+--- a/chrome/browser/ui/views/tabs/common/folder_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/folder_tab_container_view.cc
+@@ -48,6 +48,10 @@ FolderTabContainerView::FolderTabContain
+                           base::Unretained(this)),
+       folder->title());
+   header->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++  // Folder headers are painted inside the transparent, layer-scrolling Pins
++  // viewport. Match tab titles by suppressing subpixel rendering, which cannot
++  // safely sample a transparent backing layer.
++  header->SetTextSubpixelRenderingEnabled(false);
+   header_ = AddChildView(std::move(header));
+ 
+   collection_node_->set_add_child_to_node(base::BindRepeating(
+--- a/chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.cc
+@@ -345,7 +345,12 @@ void TabCollectionAnimatingLayoutManager
+     }
+     auto* starting_child_layout = starting_layout_.GetLayoutFor(view);
+     if (starting_child_layout) {
+-      starting_child_layout->bounds = target_child_layout->bounds;
++      *starting_child_layout = *target_child_layout;
++    } else {
++      // Newly added views do not have an entry in the starting layout. Add
++      // one at the target bounds so the interpolation path treats them as
++      // already placed instead of animating them from an empty rectangle.
++      starting_layout_.child_layouts.push_back(*target_child_layout);
+     }
+   }
+   SetStartingLayout(starting_layout_);
+--- a/chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager_unittest.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager_unittest.cc
+@@ -174,6 +174,20 @@ TEST_P(TabCollectionAnimatingLayoutManag
+ }
+ 
+ TEST_P(TabCollectionAnimatingLayoutManagerTest,
++       ResetNewChildSnapsDirectlyToTargetLayout) {
++  widget()->SetBounds(gfx::Rect(0, 0, 100, 100));
++  widget()->LayoutRootViewIfNecessary();
++
++  auto* const child =
++      host_view()->AddChildView(std::make_unique<views::View>());
++  layout_manager()->ResetViewsToTargetLayout({child});
++  widget()->LayoutRootViewIfNecessary();
++
++  EXPECT_EQ(child->bounds(), gfx::Rect(0, 0, 100, 20));
++  EXPECT_EQ(layout_manager()->GetPreferredSize(host_view()).height(), 20);
++}
++
++TEST_P(TabCollectionAnimatingLayoutManagerTest,
+        PreferredSizeDuringSwapAnimation) {
+   // Use standard duration for frame-by-frame observation.
+   gfx::ScopedAnimationDurationScaleMode normal_duration_mode(
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
+@@ -217,7 +217,7 @@ views::ProposedLayout TabStripView::Calc
+       pinned_tab_container_size_bounds.width().value(),
+       pinned_container_height);
+   layouts.child_layouts.emplace_back(pinned_tabs_scroll_view_.get(),
+-                                     pinned_tabs_scroll_view_->GetVisible(),
++                                     pinned_container_height > 0,
+                                      pinned_container_bounds);
+   if (pinned_container_bounds.height()) {
+     y += pinned_container_bounds.height();
+@@ -240,7 +240,7 @@ views::ProposedLayout TabStripView::Calc
+                                         pins_container_height);
+   if (pins_scroll_view_) {
+     layouts.child_layouts.emplace_back(pins_scroll_view_.get(),
+-                                       pins_scroll_view_->GetVisible(),
++                                       pins_container_height > 0,
+                                        pins_container_bounds);
+   }
+   if (pins_container_bounds.height()) {
+@@ -278,7 +278,7 @@ views::ProposedLayout TabStripView::Calc
+                  unpinned_tabs_container_view_->GetMinimumSize().height()));
+   }
+   layouts.child_layouts.emplace_back(unpinned_tabs_scroll_view_.get(),
+-                                     unpinned_tabs_scroll_view_->GetVisible(),
++                                     unpinned_container_bounds.height() > 0,
+                                      unpinned_container_bounds);
+ 
+   layouts.host_size = gfx::Size(size_bounds.width().value(),

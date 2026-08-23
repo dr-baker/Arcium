@@ -1,17 +1,18 @@
 --- a/chrome/browser/importer/helium_arc_sidebar_import.cc
 +++ b/chrome/browser/importer/helium_arc_sidebar_import.cc
-@@ -6,6 +6,10 @@
+@@ -6,6 +6,11 @@
  
  #include <utility>
  
 +#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
++#include "chrome/browser/ui/helium/helium_startup_tab_materializer.h"
 +#include "chrome/browser/ui/helium/helium_space.h"
 +#include "chrome/browser/ui/helium/helium_space_service.h"
 +#include "chrome/browser/ui/helium/helium_space_service_factory.h"
  #include "chrome/browser/ui/startup/startup_tab.h"
  #include "chrome/browser/ui/tabs/pin_tab_codec.h"
  #include "chrome/browser/ui/tabs/pinned_tab_codec.h"
-@@ -62,9 +66,18 @@
+@@ -62,9 +67,18 @@
      Profile* profile,
      const std::vector<user_data_importer::ImportedBookmarkEntry>& entries,
      const std::u16string& top_level_folder_name) {
@@ -19,7 +20,7 @@
 +  if (IsHeliumFavoritesAndPinsEnabled()) {
 +    if (auto* space_service =
 +            HeliumSpaceServiceFactory::GetForProfile(profile)) {
-+      space = space_service->GetDefaultSpace();
++      space = space_service->GetActiveSpace();
 +    }
 +  }
 +
@@ -31,7 +32,7 @@
      // Drop any legacy pin-typed rows that may have landed in the favorites
      // pref; keep only Chromium favorites.
      StartupTabs favorites_only;
-@@ -75,15 +88,24 @@
+@@ -75,15 +89,24 @@
      }
      favorites_only.insert(favorites_only.end(), imported_favorites.begin(),
                            imported_favorites.end());
@@ -81,22 +82,24 @@
 
 --- a/chrome/browser/ui/BUILD.gn
 +++ b/chrome/browser/ui/BUILD.gn
-@@ -376,6 +376,14 @@
+@@ -375,6 +375,16 @@
      "helium/helium_layout_state_controller.h",
      "helium/helium_favorites_and_pins.cc",
      "helium/helium_favorites_and_pins.h",
 +    "helium/helium_space.cc",
 +    "helium/helium_space.h",
++    "helium/helium_space_prefs.h",
 +    "helium/helium_space_model.cc",
 +    "helium/helium_space_model.h",
 +    "helium/helium_space_service.cc",
 +    "helium/helium_space_service.h",
 +    "helium/helium_space_service_factory.cc",
 +    "helium/helium_space_service_factory.h",
++    "helium/helium_startup_tab_materializer.h",
      "idle_bubble.h",
      "managed_ui.cc",
      "managed_ui.h",
-@@ -5940,6 +5948,20 @@
+@@ -5945,6 +5955,20 @@
    public_deps = [ "//ui/base/interaction" ]
  }
  
@@ -139,7 +142,7 @@
 +  if (helium::IsHeliumFavoritesAndPinsEnabled() && !profile->IsOffTheRecord()) {
 +    if (auto* space_service =
 +            helium::HeliumSpaceServiceFactory::GetForProfile(profile)) {
-+        if (helium::HeliumSpace* space = space_service->GetDefaultSpace()) {
++        if (helium::HeliumSpace* space = space_service->GetActiveSpace()) {
 +          if (BrowserWindowInterface* existing = space->GetPrimaryBrowser()) {
 +            if (Browser* browser = existing->GetBrowserForMigrationOnly()) {
 +              AddTabAt(browser, GURL(), -1, true);
@@ -157,7 +160,7 @@
 
 --- /dev/null
 +++ b/chrome/browser/ui/helium/helium_space.cc
-@@ -0,0 +1,345 @@
+@@ -0,0 +1,416 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -167,6 +170,7 @@
 +#include <algorithm>
 +#include <string_view>
 +#include <utility>
++#include <vector>
 +
 +#include "base/strings/utf_string_conversions.h"
 +#include "base/uuid.h"
@@ -177,8 +181,12 @@
 +#include "chrome/browser/ui/browser_window.h"
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 +#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
 +#include "chrome/browser/ui/helium/helium_space_service.h"
 +#include "chrome/browser/ui/helium/helium_space_service_factory.h"
++#include "chrome/browser/ui/helium/helium_space_model.h"
++#include "chrome/browser/ui/helium/helium_space_prefs.h"
++#include "chrome/browser/ui/helium/helium_startup_tab_materializer.h"
 +#include "chrome/browser/ui/tabs/pin_tab_codec.h"
 +#include "chrome/browser/ui/tabs/pinned_tab_codec.h"
 +#include "chrome/common/pref_names.h"
@@ -188,14 +196,8 @@
 +namespace helium {
 +namespace {
 +
-+constexpr char kType[] = "type";
-+constexpr char kTab[] = "tab";
-+constexpr char kFolder[] = "folder";
 +constexpr char kURL[] = "url";
-+constexpr char kTitle[] = "title";
 +constexpr char kSourceId[] = "source_id";
-+constexpr char kCollapsed[] = "collapsed";
-+constexpr char kChildren[] = "children";
 +constexpr char kID[] = "id";
 +constexpr char kName[] = "name";
 +constexpr char kSourceProfile[] = "source_profile";
@@ -204,109 +206,134 @@
 +constexpr char kHeliumHasHome[] = "helium_has_home";
 +constexpr char kHeliumHomeTitle[] = "helium_home_title";
 +
-+base::DictValue EncodeTab(const StartupTab& tab) {
-+  base::DictValue value;
-+  value.Set(kType, kTab);
-+  value.Set(kURL, tab.url.spec());
-+  if (!tab.helium_source_id.empty()) {
-+    value.Set(kSourceId, tab.helium_source_id);
++std::string ReadStoredSourceId(const base::DictValue& value) {
++  if (const std::string* source_id = value.FindString(kSourceId);
++      source_id && !source_id->empty()) {
++    return *source_id;
 +  }
-+  if (!tab.helium_home_title.empty()) {
-+    value.Set(kTitle, base::UTF16ToUTF8(tab.helium_home_title));
++  if (const std::string* source_id = value.FindString(kHeliumSourceId);
++      source_id && !source_id->empty()) {
++    return *source_id;
 +  }
-+  return value;
++  return {};
 +}
 +
-+void AppendPinNode(const StartupTab& tab, base::ListValue* target) {
-+  base::ListValue* current = target;
-+  for (const auto& segment : tab.helium_folder_path) {
-+    base::DictValue* folder = nullptr;
-+    for (base::Value& value : *current) {
-+      base::DictValue* candidate = value.GetIfDict();
-+      if (candidate && candidate->FindString(kType) &&
-+          *candidate->FindString(kType) == kFolder &&
-+          candidate->FindString(kTitle) &&
-+          base::UTF8ToUTF16(*candidate->FindString(kTitle)) == segment.title) {
-+        folder = candidate;
-+        break;
-+      }
-+    }
-+    if (!folder) {
-+      base::DictValue new_folder;
-+      new_folder.Set(kType, kFolder);
-+      new_folder.Set(kTitle, base::UTF16ToUTF8(segment.title));
-+      new_folder.Set(kCollapsed, segment.collapsed);
-+      new_folder.Set(kChildren, base::ListValue());
-+      current->Append(std::move(new_folder));
-+      folder = current->back().GetIfDict();
-+    }
-+    current = folder->FindList(kChildren);
-+  }
-+  current->Append(EncodeTab(tab));
-+}
-+
-+base::ListValue EncodePins(const StartupTabs& tabs) {
-+  base::ListValue result;
++HeliumSpaceStoredTabs MakeStoredTabs(const StartupTabs& tabs) {
++  HeliumSpaceStoredTabs result;
++  result.reserve(tabs.size());
 +  for (const StartupTab& tab : tabs) {
-+    AppendPinNode(tab, &result);
++    result.push_back({.tab = tab});
 +  }
 +  return result;
 +}
 +
-+void DecodePinList(const base::ListValue& list,
-+                   const std::vector<StartupTab::FolderPathSegment>& parents,
-+                   StartupTabs* result) {
-+  for (const base::Value& value : list) {
-+    const base::DictValue* dict = value.GetIfDict();
-+    if (!dict) {
-+      continue;
-+    }
-+    const std::string* type = dict->FindString(kType);
-+    if (type && *type == kFolder) {
-+      const std::string* title = dict->FindString(kTitle);
-+      const base::ListValue* children = dict->FindList(kChildren);
-+      if (!title || !children) {
-+        continue;
++HeliumSpaceNodes MakePinNodesInternal(const StartupTabs& tabs) {
++  HeliumSpaceNodes result;
++  for (const StartupTab& tab : tabs) {
++    HeliumSpaceNodes* current = &result;
++    for (const auto& segment : tab.helium_folder_path) {
++      HeliumSpaceFolder* folder = nullptr;
++      for (HeliumSpaceNode& node : *current) {
++        auto* candidate = std::get_if<HeliumSpaceFolder>(&node.data);
++        if (candidate && candidate->title ==
++                             base::UTF16ToUTF8(segment.title)) {
++          folder = candidate;
++          break;
++        }
 +      }
-+      std::vector<StartupTab::FolderPathSegment> nested = parents;
-+      nested.push_back(
-+          {.title = base::UTF8ToUTF16(*title),
-+           .collapsed = dict->FindBool(kCollapsed).value_or(false)});
-+      DecodePinList(*children, nested, result);
-+      continue;
++      if (!folder) {
++        current->push_back(HeliumSpaceNode{.data = HeliumSpaceFolder{
++            .source_id = base::Uuid::GenerateRandomV4().AsLowercaseString(),
++            .title = base::UTF16ToUTF8(segment.title),
++            .collapsed = segment.collapsed}});
++        folder = std::get_if<HeliumSpaceFolder>(&current->back().data);
++      }
++      current = &folder->children;
 +    }
-+    const std::string* url_string = dict->FindString(kURL);
-+    if (!url_string) {
-+      continue;
-+    }
-+    GURL url(*url_string);
-+    if (!url.is_valid() || url.is_empty() || url.spec() == "about:blank") {
-+      continue;
-+    }
-+    StartupTab tab(url, StartupTab::Type::kPin);
-+    if (const std::string* source_id = dict->FindString(kSourceId)) {
-+      tab.helium_source_id = *source_id;
-+    }
-+    if (const std::string* title = dict->FindString(kTitle)) {
-+      tab.helium_home_title = base::UTF8ToUTF16(*title);
-+      tab.helium_has_home = true;
-+    }
-+    tab.helium_folder_path = parents;
-+    result->push_back(std::move(tab));
++    current->push_back(HeliumSpaceNode{.data = HeliumSpaceTab{
++        .source_id = base::Uuid::GenerateRandomV4().AsLowercaseString(),
++        .title = base::UTF16ToUTF8(tab.helium_home_title), .url = tab.url}});
 +  }
-+}
-+
-+StartupTabs DecodePins(const base::ListValue& list) {
-+  StartupTabs result;
-+  DecodePinList(list, {}, &result);
 +  return result;
 +}
 +
-+base::DictValue EncodeFavorite(const StartupTab& tab) {
++void FlattenPinNodes(
++    const HeliumSpaceNodes& nodes,
++    const std::vector<StartupTab::FolderPathSegment>& parents,
++    StartupTabs* result) {
++  for (const HeliumSpaceNode& node : nodes) {
++    if (const auto* tab = std::get_if<HeliumSpaceTab>(&node.data)) {
++      StartupTab startup(tab->url, StartupTab::Type::kPin);
++      startup.helium_has_home = true;
++      startup.helium_home_title = base::UTF8ToUTF16(tab->title);
++      startup.helium_folder_path = parents;
++      result->push_back(std::move(startup));
++      continue;
++    }
++    const auto& folder = std::get<HeliumSpaceFolder>(node.data);
++    auto nested = parents;
++    nested.push_back({.title = base::UTF8ToUTF16(folder.title),
++                      .collapsed = folder.collapsed});
++    FlattenPinNodes(folder.children, nested, result);
++  }
++}
++
++HeliumSpaceNodes ReadLegacyPinsInternal(Profile* profile) {
++  PrefService* prefs = profile->GetPrefs();
++  if (prefs->HasPrefPath(prefs::kHeliumPins) &&
++      !prefs->GetList(prefs::kHeliumPins).empty()) {
++    if (auto decoded = DecodeSpaceNodes(prefs->GetList(prefs::kHeliumPins))) {
++      return std::move(*decoded);
++    }
++  }
++  return MakePinNodesInternal(PinTabCodec::ReadPins(profile));
++}
++
++StartupTabs PublicTabs(const HeliumSpaceNodes& stored) {
++  StartupTabs result;
++  FlattenPinNodes(stored, {}, &result);
++  return result;
++}
++
++StartupTabs PublicFavorites(const HeliumSpaceStoredTabs& stored) {
++  StartupTabs result;
++  result.reserve(stored.size());
++  for (const HeliumSpaceStoredTab& item : stored) {
++    result.push_back(item.tab);
++  }
++  return result;
++}
++
++HeliumSpaceStoredTabs MergeFavoriteIdentity(
++    const HeliumSpaceStoredTabs& stored,
++    const StartupTabs& captured) {
++  HeliumSpaceStoredTabs result;
++  result.reserve(captured.size());
++  for (const StartupTab& tab : captured) {
++    size_t match = 0;
++    size_t matches = 0;
++    for (size_t i = 0; i < stored.size(); ++i) {
++      if (stored[i].tab.url == tab.url &&
++          stored[i].tab.helium_home_title == tab.helium_home_title) {
++        match = i;
++        ++matches;
++      }
++    }
++    HeliumSpaceStoredTab item{.tab = tab};
++    if (matches == 1u) {
++      item.source_id = stored[match].source_id;
++    }
++    result.push_back(std::move(item));
++  }
++  return result;
++}
++
++base::DictValue EncodeFavorite(const HeliumSpaceStoredTab& stored) {
++  const StartupTab& tab = stored.tab;
 +  base::DictValue value;
 +  value.Set(kURL, tab.url.spec());
-+  if (!tab.helium_source_id.empty()) {
-+    value.Set(kHeliumSourceId, tab.helium_source_id);
++  if (!stored.source_id.empty()) {
++    value.Set(kSourceId, stored.source_id);
 +  }
 +  if (tab.helium_has_home) {
 +    value.Set(kHeliumHasHome, true);
@@ -315,16 +342,16 @@
 +  return value;
 +}
 +
-+base::ListValue EncodeFavorites(const StartupTabs& tabs) {
++base::ListValue EncodeFavorites(const HeliumSpaceStoredTabs& tabs) {
 +  base::ListValue result;
-+  for (const StartupTab& tab : tabs) {
-+    result.Append(EncodeFavorite(tab));
++  for (const HeliumSpaceStoredTab& stored : tabs) {
++    result.Append(EncodeFavorite(stored));
 +  }
 +  return result;
 +}
 +
-+StartupTabs DecodeFavorites(const base::ListValue& list) {
-+  StartupTabs result;
++HeliumSpaceStoredTabs DecodeFavorites(const base::ListValue& list) {
++  HeliumSpaceStoredTabs result;
 +  for (const base::Value& value : list) {
 +    const base::DictValue* dict = value.GetIfDict();
 +    const std::string* url_string = dict ? dict->FindString(kURL) : nullptr;
@@ -336,14 +363,12 @@
 +      continue;
 +    }
 +    StartupTab tab(url, StartupTab::Type::kPinned);
-+    if (const std::string* source_id = dict->FindString(kHeliumSourceId)) {
-+      tab.helium_source_id = *source_id;
-+    }
 +    tab.helium_has_home = dict->FindBool(kHeliumHasHome).value_or(false);
 +    if (const std::string* title = dict->FindString(kHeliumHomeTitle)) {
 +      tab.helium_home_title = base::UTF8ToUTF16(*title);
 +    }
-+    result.push_back(std::move(tab));
++    result.push_back({.tab = std::move(tab),
++                      .source_id = ReadStoredSourceId(*dict)});
 +  }
 +  return result;
 +}
@@ -360,12 +385,23 @@
 +
 +}  // namespace
 +
-+base::ListValue EncodeSpacePins(const StartupTabs& tabs) {
-+  return EncodePins(tabs);
++base::ListValue EncodeSpacePins(const HeliumSpaceNodes& nodes) {
++  return EncodeSpaceNodes(nodes);
 +}
 +
-+StartupTabs DecodeSpacePins(const base::ListValue& list) {
-+  return DecodePins(list);
++HeliumSpaceNodes DecodeSpacePins(const base::ListValue& list) {
++  if (auto nodes = DecodeSpaceNodes(list)) {
++    return std::move(*nodes);
++  }
++  return {};
++}
++
++HeliumSpaceNodes HeliumSpace::MakePinNodes(const StartupTabs& tabs) {
++  return MakePinNodesInternal(tabs);
++}
++
++HeliumSpaceNodes HeliumSpace::ReadLegacyPins(Profile* profile) {
++  return ReadLegacyPinsInternal(profile);
 +}
 +
 +HeliumSpace::HeliumSpace(Profile* profile) : profile_(profile) {
@@ -385,7 +421,7 @@
 +                         std::string id,
 +                         std::u16string name,
 +                         std::string source_profile,
-+                         StartupTabs pins)
++                         HeliumSpaceNodes pins)
 +    : profile_(profile),
 +      id_(std::move(id)),
 +      name_(name.empty() ? u"Space" : std::move(name)),
@@ -405,51 +441,76 @@
 +}
 +
 +StartupTabs HeliumSpace::ReadPins() const {
++  return PublicTabs(pins_);
++}
++
++const HeliumSpaceNodes& HeliumSpace::ReadStoredPins() const {
 +  return pins_;
 +}
 +
 +void HeliumSpace::WritePins(const StartupTabs& tabs) {
-+  pins_ = tabs;
++  WriteStoredPins(MergeSpaceNodeIdentity(pins_, MakePinNodes(tabs)));
++}
++
++void HeliumSpace::WriteStoredPins(const HeliumSpaceNodes& nodes) {
++  pins_ = nodes;
 +  PersistRecord();
 +}
 +
 +void HeliumSpace::WritePinsFromBrowsers() {
-+  PinTabCodec::WritePins(profile_);
-+  pins_ = PinTabCodec::ReadPins(profile_);
-+  PersistRecord();
++  BrowserWindowInterface* window = GetPrimaryBrowser();
++  if (!window) {
++    return;
++  }
++  base::ListValue encoded = PinTabCodec::CapturePins(window);
++  if (auto nodes = DecodeSpaceNodes(encoded)) {
++    WriteStoredPins(MergeSpaceNodeIdentity(pins_, std::move(*nodes)));
++  }
++}
++
++HeliumSpaceStoredTabs HeliumSpace::ReadStoredFavorites() const {
++  PrefService* prefs = profile_->GetPrefs();
++  if (prefs->HasPrefPath(space_prefs::kHeliumFavorites)) {
++    return DecodeFavorites(prefs->GetList(space_prefs::kHeliumFavorites));
++  }
++  if (prefs->HasPrefPath(prefs::kPinnedTabs) &&
++      !prefs->GetList(prefs::kPinnedTabs).empty()) {
++    return DecodeFavorites(prefs->GetList(prefs::kPinnedTabs));
++  }
++  return MakeStoredTabs(PinnedTabCodec::ReadPinnedTabs(profile_));
 +}
 +
 +StartupTabs HeliumSpace::ReadFavorites() const {
-+  PrefService* prefs = profile_->GetPrefs();
-+  const base::ListValue& stored = prefs->GetList(prefs::kHeliumFavorites);
-+  if (prefs->HasPrefPath(prefs::kHeliumFavorites)) {
-+    return DecodeFavorites(stored);
-+  }
-+  return PinnedTabCodec::ReadPinnedTabs(profile_);
++  return PublicFavorites(ReadStoredFavorites());
++}
++
++void HeliumSpace::WriteStoredFavorites(
++    const HeliumSpaceStoredTabs& tabs) {
++  profile_->GetPrefs()->SetList(space_prefs::kHeliumFavorites,
++                                EncodeFavorites(tabs));
 +}
 +
 +void HeliumSpace::WriteFavorites(const StartupTabs& tabs) {
-+  profile_->GetPrefs()->SetList(prefs::kHeliumFavorites, EncodeFavorites(tabs));
++  WriteStoredFavorites(MergeFavoriteIdentity(ReadStoredFavorites(), tabs));
 +}
 +
 +void HeliumSpace::WriteFavoritesFromBrowsers() {
-+  PinnedTabCodec::WritePinnedTabs(profile_);
-+  StartupTabs favorites = PinnedTabCodec::ReadPinnedTabs(profile_);
-+  std::erase_if(favorites, [](const StartupTab& tab) {
-+    return tab.type != StartupTab::Type::kPinned;
-+  });
-+  WriteFavorites(favorites);
++  BrowserWindowInterface* window = GetPrimaryBrowser();
++  if (!window) {
++    return;
++  }
++  WriteFavorites(PinnedTabCodec::CapturePinnedTabs(window));
 +}
 +
 +void HeliumSpace::PersistRecord() const {
-+  ScopedListPrefUpdate update(profile_->GetPrefs(), prefs::kHeliumSpaces);
++  ScopedListPrefUpdate update(profile_->GetPrefs(), space_prefs::kHeliumSpaces);
 +  base::DictValue* record = FindRecord(update.Get(), id_);
 +  if (!record) {
 +    return;
 +  }
 +  record->Set(kName, base::UTF16ToUTF8(name()));
 +  record->Set(kSourceProfile, source_profile_);
-+  record->Set(kPins, EncodePins(pins_));
++  record->Set(kPins, EncodeSpacePins(pins_));
 +}
 +
 +BrowserWindowInterface* HeliumSpace::GetPrimaryBrowser() const {
@@ -479,6 +540,13 @@
 +  if (!service) {
 +    return nullptr;
 +  }
++  if (HeliumSpace* old_active = service->GetActiveSpace()) {
++    if (BrowserWindowInterface* old_window = old_active->GetPrimaryBrowser()) {
++      if (Browser* old_browser = old_window->GetBrowserForMigrationOnly()) {
++        service->SetSpaceForBrowser(old_browser, old_active->id());
++      }
++    }
++  }
 +  service->SetActiveSpace(id_);
 +  if (BrowserWindowInterface* existing = GetPrimaryBrowser()) {
 +    if (Browser* browser = existing->GetBrowserForMigrationOnly()) {
@@ -495,6 +563,12 @@
 +  params.should_trigger_session_restore = false;
 +  Browser* browser = Browser::Create(params);
 +  service->SetSpaceForBrowser(browser, id_);
++  StartupTabs tabs = ReadFavorites();
++  StartupTabs pins = ReadPins();
++  tabs.insert(tabs.end(), pins.begin(), pins.end());
++  for (const StartupTab& tab : tabs) {
++    MaterializeStartupTab(browser, tab, browser->tab_strip_model()->empty());
++  }
 +  if (browser->tab_strip_model()->empty()) {
 +    chrome::AddTabAt(browser, GURL(), -1, true);
 +  }
@@ -506,7 +580,7 @@
 
 --- /dev/null
 +++ b/chrome/browser/ui/helium/helium_space.h
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,82 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -515,9 +589,11 @@
 +#define CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_H_
 +
 +#include <string>
++#include <vector>
 +
 +#include "base/memory/raw_ptr.h"
 +#include "base/values.h"
++#include "chrome/browser/ui/helium/helium_space_model.h"
 +#include "chrome/browser/ui/startup/startup_tab.h"
 +
 +class BrowserWindowInterface;
@@ -525,8 +601,16 @@
 +
 +namespace helium {
 +
-+base::ListValue EncodeSpacePins(const StartupTabs& tabs);
-+StartupTabs DecodeSpacePins(const base::ListValue& list);
++// A Space-owned sidecar keeps source identity out of public StartupTab APIs.
++// The browser-facing view is always the ordinary StartupTab value.
++struct HeliumSpaceStoredTab {
++  StartupTab tab;
++  std::string source_id;
++};
++using HeliumSpaceStoredTabs = std::vector<HeliumSpaceStoredTab>;
++
++base::ListValue EncodeSpacePins(const HeliumSpaceNodes& nodes);
++HeliumSpaceNodes DecodeSpacePins(const base::ListValue& list);
 +
 +// A durable Space identity. Pins are Space-scoped; Favorites are profile-
 +// scoped and are therefore stored by the owning HeliumSpaceService.
@@ -537,7 +621,7 @@
 +              std::string id,
 +              std::u16string name,
 +              std::string source_profile,
-+              StartupTabs pins);
++              HeliumSpaceNodes pins);
 +  HeliumSpace(const HeliumSpace&) = delete;
 +  HeliumSpace& operator=(const HeliumSpace&) = delete;
 +  ~HeliumSpace();
@@ -548,12 +632,19 @@
 +  std::u16string name() const;
 +  void SyncNameFromProfile();
 +
++  static HeliumSpaceNodes MakePinNodes(const StartupTabs& tabs);
++  static HeliumSpaceNodes ReadLegacyPins(Profile* profile);
++
 +  StartupTabs ReadPins() const;
++  const HeliumSpaceNodes& ReadStoredPins() const;
 +  void WritePins(const StartupTabs& tabs);
++  void WriteStoredPins(const HeliumSpaceNodes& nodes);
 +  void WritePinsFromBrowsers();
 +
 +  StartupTabs ReadFavorites() const;
++  HeliumSpaceStoredTabs ReadStoredFavorites() const;
 +  void WriteFavorites(const StartupTabs& tabs);
++  void WriteStoredFavorites(const HeliumSpaceStoredTabs& tabs);
 +  void WriteFavoritesFromBrowsers();
 +
 +  BrowserWindowInterface* GetPrimaryBrowser() const;
@@ -566,7 +657,7 @@
 +  std::string id_;
 +  std::u16string name_;
 +  std::string source_profile_;
-+  StartupTabs pins_;
++  HeliumSpaceNodes pins_;
 +};
 +
 +}  // namespace helium
@@ -574,15 +665,69 @@
 +#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_H_
 
 --- /dev/null
++++ b/chrome/browser/ui/helium/helium_space_prefs.h
+@@ -0,0 +1,18 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_PREFS_H_
++#define CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_PREFS_H_
++
++namespace helium {
++namespace space_prefs {
++
++inline constexpr char kHeliumFavorites[] = "helium.favorites";
++inline constexpr char kHeliumSpaces[] = "helium.spaces";
++inline constexpr char kHeliumActiveSpaceId[] = "helium.active_space_id";
++
++}  // namespace space_prefs
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_PREFS_H_
+
+--- /dev/null
++++ b/chrome/browser/ui/helium/helium_startup_tab_materializer.h
+@@ -0,0 +1,25 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_HELIUM_STARTUP_TAB_MATERIALIZER_H_
++#define CHROME_BROWSER_UI_HELIUM_HELIUM_STARTUP_TAB_MATERIALIZER_H_
++
++class Browser;
++struct StartupTab;
++
++namespace tabs {
++class TabInterface;
++}  // namespace tabs
++
++namespace helium {
++
++void RestoreStartupTabPinState(tabs::TabInterface* tab,
++                               const StartupTab& startup_tab);
++void MaterializeStartupTab(Browser* browser,
++                           const StartupTab& startup_tab,
++                           bool foreground);
++
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_STARTUP_TAB_MATERIALIZER_H_
+
+--- /dev/null
 +++ b/chrome/browser/ui/helium/helium_space_model.cc
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,394 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#include "chrome/browser/ui/helium/helium_space_model.h"
 +
++#include "base/uuid.h"
++
 +#include <set>
++#include <string_view>
 +#include <utility>
 +
 +namespace helium {
@@ -597,6 +742,7 @@
 +constexpr char kPins[] = "pins";
 +constexpr char kType[] = "type";
 +constexpr char kTab[] = "tab";
++constexpr char kLink[] = "link";
 +constexpr char kFolder[] = "folder";
 +constexpr char kSourceId[] = "source_id";
 +constexpr char kTitle[] = "title";
@@ -638,15 +784,15 @@
 +}
 +
 +std::optional<HeliumSpaceTab> DecodeTab(const base::DictValue& value) {
-+  if (value.size() != 4u) {
-+    return std::nullopt;
-+  }
 +  const std::string* type = value.FindString(kType);
 +  const std::string* source_id = value.FindString(kSourceId);
++  const std::string* legacy_id = value.FindString(kId);
 +  const std::string* title = value.FindString(kTitle);
 +  const std::string* url_string = value.FindString(kURL);
-+  if (!type || *type != kTab || !source_id || source_id->empty() || !title ||
-+      !url_string || url_string->empty()) {
++  if ((value.Find(kType) && !type) || (value.Find(kSourceId) && !source_id) ||
++      (value.Find(kId) && !legacy_id) || (value.Find(kTitle) && !title) ||
++      (type && *type != kTab && *type != kLink) ||
++      value.FindList(kChildren) || !url_string || url_string->empty()) {
 +    return std::nullopt;
 +  }
 +  GURL url(*url_string);
@@ -654,7 +800,14 @@
 +    return std::nullopt;
 +  }
 +  return HeliumSpaceTab{
-+      .source_id = *source_id, .title = *title, .url = std::move(url)};
++      .source_id = source_id && !source_id->empty()
++                       ? *source_id
++                       : legacy_id && !legacy_id->empty()
++                             ? *legacy_id
++                             : base::Uuid::GenerateRandomV4()
++                                   .AsLowercaseString(),
++      .title = title ? *title : std::string(),
++      .url = std::move(url)};
 +}
 +
 +std::optional<HeliumSpaceNode> DecodeNode(const base::Value& value) {
@@ -663,24 +816,27 @@
 +    return std::nullopt;
 +  }
 +  const std::string* type = dict->FindString(kType);
-+  if (!type) {
++  const std::string* legacy_id = dict->FindString(kId);
++  if ((dict->Find(kType) && !type) ||
++      (dict->Find(kSourceId) && !dict->FindString(kSourceId)) ||
++      (dict->Find(kId) && !legacy_id)) {
 +    return std::nullopt;
 +  }
-+  if (*type == kTab) {
++  if ((type && (*type == kTab || *type == kLink)) ||
++      (!type && dict->FindString(kURL) && !dict->FindList(kChildren))) {
 +    std::optional<HeliumSpaceTab> tab = DecodeTab(*dict);
 +    return tab ? std::optional<HeliumSpaceNode>(
 +                     HeliumSpaceNode{.data = std::move(*tab)})
 +               : std::nullopt;
 +  }
-+  if (*type != kFolder || dict->size() != 5u) {
++  if ((type && *type != kFolder) || !dict->FindList(kChildren)) {
 +    return std::nullopt;
 +  }
 +  const std::string* source_id = dict->FindString(kSourceId);
 +  const std::string* title = dict->FindString(kTitle);
 +  std::optional<bool> collapsed = dict->FindBool(kCollapsed);
 +  const base::ListValue* encoded_children = dict->FindList(kChildren);
-+  if (!source_id || source_id->empty() || !title || !collapsed ||
-+      !encoded_children) {
++  if (!title || !collapsed || !encoded_children) {
 +    return std::nullopt;
 +  }
 +  std::vector<HeliumSpaceNode> children;
@@ -693,7 +849,13 @@
 +    children.push_back(std::move(*child));
 +  }
 +  return HeliumSpaceNode{
-+      .data = HeliumSpaceFolder{.source_id = *source_id,
++      .data = HeliumSpaceFolder{
++          .source_id = source_id && !source_id->empty()
++                           ? *source_id
++                           : legacy_id && !legacy_id->empty()
++                                 ? *legacy_id
++                                 : base::Uuid::GenerateRandomV4()
++                                       .AsLowercaseString(),
 +                                .title = *title,
 +                                .collapsed = *collapsed,
 +                                .children = std::move(children)}};
@@ -763,7 +925,133 @@
 +  return value;
 +}
 +
++bool SameNodeIdentity(const HeliumSpaceNode& stored,
++                      const HeliumSpaceNode& captured) {
++  const auto* stored_tab = std::get_if<HeliumSpaceTab>(&stored.data);
++  const auto* captured_tab = std::get_if<HeliumSpaceTab>(&captured.data);
++  if (stored_tab || captured_tab) {
++    return stored_tab && captured_tab &&
++           stored_tab->title == captured_tab->title &&
++           stored_tab->url == captured_tab->url;
++  }
++  const auto& stored_folder = std::get<HeliumSpaceFolder>(stored.data);
++  const auto& captured_folder = std::get<HeliumSpaceFolder>(captured.data);
++  return stored_folder.title == captured_folder.title;
++}
++
++void MergeNodeIdentity(const HeliumSpaceNodes& stored,
++                       HeliumSpaceNode* captured) {
++  std::vector<size_t> matches;
++  for (size_t i = 0; i < stored.size(); ++i) {
++    if (SameNodeIdentity(stored[i], *captured)) {
++      matches.push_back(i);
++    }
++  }
++  // A URL/title duplicate in the same folder, or sibling folders with the
++  // same title, has no safe identity match. Leave every source_id alone.
++  if (matches.size() != 1u) {
++    return;
++  }
++
++  const HeliumSpaceNode& stored_node = stored[matches.front()];
++  if (auto* captured_tab = std::get_if<HeliumSpaceTab>(&captured->data)) {
++    const auto& stored_tab = std::get<HeliumSpaceTab>(stored_node.data);
++    captured_tab->source_id = stored_tab.source_id;
++    return;
++  }
++
++  auto& captured_folder = std::get<HeliumSpaceFolder>(captured->data);
++  const auto& stored_folder = std::get<HeliumSpaceFolder>(stored_node.data);
++  captured_folder.source_id = stored_folder.source_id;
++  HeliumSpaceNodes merged_children =
++      MergeSpaceNodeIdentity(stored_folder.children,
++                             std::move(captured_folder.children));
++  captured_folder.children = std::move(merged_children);
++}
++
++size_t CountEmptyFoldersWithTitle(const HeliumSpaceNodes& nodes,
++                                  std::string_view title) {
++  size_t count = 0;
++  for (const HeliumSpaceNode& node : nodes) {
++    const auto* folder = std::get_if<HeliumSpaceFolder>(&node.data);
++    if (folder && folder->title == title && folder->children.empty()) {
++      ++count;
++    }
++  }
++  return count;
++}
++
++void PreserveMissingEmptyFolders(const HeliumSpaceNodes& stored,
++                                 HeliumSpaceNodes* captured) {
++  for (size_t stored_index = 0; stored_index < stored.size();
++       ++stored_index) {
++    const HeliumSpaceNode& node = stored[stored_index];
++    const auto* folder = std::get_if<HeliumSpaceFolder>(&node.data);
++    if (!folder || !folder->children.empty()) {
++      continue;
++    }
++    size_t stored_empty_before = 0;
++    for (size_t i = 0; i < stored_index; ++i) {
++      const auto* prior = std::get_if<HeliumSpaceFolder>(&stored[i].data);
++      if (prior && prior->children.empty() && prior->title == folder->title) {
++        ++stored_empty_before;
++      }
++    }
++    if (CountEmptyFoldersWithTitle(*captured, folder->title) <=
++        stored_empty_before) {
++      size_t insertion = captured->size();
++      for (size_t next = stored_index + 1; next < stored.size(); ++next) {
++        for (size_t captured_index = 0; captured_index < captured->size();
++             ++captured_index) {
++          if (SameNodeIdentity(stored[next], (*captured)[captured_index])) {
++            insertion = captured_index;
++            next = stored.size();
++            break;
++          }
++        }
++      }
++      captured->insert(captured->begin() + insertion, node);
++    }
++  }
++}
++
 +}  // namespace
++
++base::ListValue EncodeSpaceNodes(const HeliumSpaceNodes& nodes) {
++  base::ListValue encoded;
++  encoded.reserve(nodes.size());
++  for (const HeliumSpaceNode& node : nodes) {
++    encoded.Append(EncodeNode(node));
++  }
++  return encoded;
++}
++
++std::optional<HeliumSpaceNodes> DecodeSpaceNodes(
++    const base::ListValue& encoded_nodes) {
++  HeliumSpaceNodes nodes;
++  nodes.reserve(encoded_nodes.size());
++  for (const base::Value& encoded_node : encoded_nodes) {
++    std::optional<HeliumSpaceNode> node = DecodeNode(encoded_node);
++    if (!node) {
++      return std::nullopt;
++    }
++    nodes.push_back(std::move(*node));
++  }
++  std::set<std::string> ids;
++  if (!CollectIDs(nodes, &ids)) {
++    return std::nullopt;
++  }
++  return nodes;
++}
++
++HeliumSpaceNodes MergeSpaceNodeIdentity(const HeliumSpaceNodes& stored,
++                                         HeliumSpaceNodes captured) {
++  for (HeliumSpaceNode& node : captured) {
++    MergeNodeIdentity(stored, &node);
++  }
++  PreserveMissingEmptyFolders(stored, &captured);
++  return captured;
++}
 +
 +base::Value HeliumSpaceModel::ToValue() const {
 +  base::ListValue favorites;
@@ -794,7 +1082,7 @@
 +  const base::ListValue* encoded_favorites = root->FindList(kFavorites);
 +  const base::ListValue* encoded_spaces = root->FindList(kSpaces);
 +  if (!source_profile || source_profile->empty() || !encoded_favorites ||
-+      !encoded_spaces) {
++      !encoded_spaces || encoded_spaces->empty()) {
 +    return std::nullopt;
 +  }
 +  std::vector<HeliumSpaceTab> favorites;
@@ -812,7 +1100,8 @@
 +  std::set<std::string> space_ids;
 +  for (const base::Value& encoded_space : *encoded_spaces) {
 +    std::optional<HeliumSpaceRecord> space = DecodeSpace(encoded_space);
-+    if (!space || !space_ids.insert(space->id).second) {
++    if (!space || space->source_profile != *source_profile ||
++        !space_ids.insert(space->id).second) {
 +      return std::nullopt;
 +    }
 +    spaces.push_back(std::move(*space));
@@ -826,7 +1115,7 @@
 
 --- /dev/null
 +++ b/chrome/browser/ui/helium/helium_space_model.h
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,84 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -871,6 +1160,19 @@
 +  bool operator==(const HeliumSpaceNode&) const = default;
 +};
 +
++using HeliumSpaceNodes = std::vector<HeliumSpaceNode>;
++
++// These helpers keep the durable Space representation as the normalized
++// ordered item tree. StartupTabs is only a browser/startup boundary view.
++base::ListValue EncodeSpaceNodes(const HeliumSpaceNodes& nodes);
++std::optional<HeliumSpaceNodes> DecodeSpaceNodes(
++    const base::ListValue& encoded_nodes);
++
++// Reattach durable identities after a browser recaptures ordinary tabs.
++// Matching is intentionally unique-only; ambiguity never reuses a stored ID.
++HeliumSpaceNodes MergeSpaceNodeIdentity(const HeliumSpaceNodes& stored,
++                                         HeliumSpaceNodes captured);
++
 +struct HeliumSpaceRecord {
 +  std::string id;
 +  std::string name;
@@ -901,7 +1203,7 @@
 
 --- /dev/null
 +++ b/chrome/browser/ui/helium/helium_space_model_unittest.cc
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,170 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -958,13 +1260,27 @@
 +  EXPECT_EQ(MakeModel(), *decoded);
 +}
 +
++TEST(HeliumSpaceModelTest, PreservesSourceIdentityAcrossReimport) {
++  HeliumSpaceModel imported = MakeModel();
++  imported.favorites[0].title = "Renamed favorite";
++
++  std::optional<HeliumSpaceModel> decoded =
++      HeliumSpaceModel::FromValue(imported.ToValue());
++  ASSERT_TRUE(decoded);
++  EXPECT_EQ("fav-1", decoded->favorites[0].source_id);
++  const auto& folder =
++      std::get<HeliumSpaceFolder>(decoded->spaces[0].pins[0].data);
++  EXPECT_EQ("pin-1",
++            std::get<HeliumSpaceTab>(folder.children[0].data).source_id);
++}
++
 +TEST(HeliumSpaceModelTest, RejectsDuplicateOrMalformedIdentity) {
 +  base::Value malformed = MakeModel().ToValue();
 +  malformed.GetDict()
 +      .FindList("favorites")
 +      ->front()
 +      .GetDict()
-+      .Remove("source_id");
++      .Remove("url");
 +  EXPECT_FALSE(HeliumSpaceModel::FromValue(malformed));
 +
 +  base::Value duplicate = MakeModel().ToValue();
@@ -973,12 +1289,95 @@
 +  EXPECT_FALSE(HeliumSpaceModel::FromValue(duplicate));
 +}
 +
++TEST(HeliumSpaceModelTest, PreservesDuplicateAndEmptyFolders) {
++  HeliumSpaceNodes nodes;
++  nodes.push_back(HeliumSpaceNode{.data = HeliumSpaceTab{
++      .source_id = "tab-1", .title = "One", .url = GURL("https://one/")}});
++  nodes.push_back(HeliumSpaceNode{.data = HeliumSpaceFolder{
++      .source_id = "folder-1", .title = "Same", .collapsed = true}});
++  nodes.push_back(HeliumSpaceNode{.data = HeliumSpaceFolder{
++      .source_id = "folder-2",
++      .title = "Same",
++      .children = {HeliumSpaceNode{.data = HeliumSpaceTab{
++          .source_id = "tab-2", .title = "Two", .url = GURL("https://two/")}}}}});
++
++  std::optional<HeliumSpaceNodes> decoded =
++      DecodeSpaceNodes(EncodeSpaceNodes(nodes));
++  ASSERT_TRUE(decoded);
++  EXPECT_EQ(nodes, *decoded);
++}
++
++TEST(HeliumSpaceModelTest, AssignsLegacyNodeIdentity) {
++  base::ListValue legacy;
++  base::DictValue empty_folder;
++  empty_folder.Set("title", "Empty");
++  empty_folder.Set("collapsed", false);
++  empty_folder.Set("children", base::ListValue());
++  legacy.Append(std::move(empty_folder));
++  base::DictValue legacy_tab;
++  legacy_tab.Set("url", "https://legacy/");
++  legacy.Append(std::move(legacy_tab));
++
++  std::optional<HeliumSpaceNodes> decoded = DecodeSpaceNodes(legacy);
++  ASSERT_TRUE(decoded);
++  ASSERT_EQ(2u, decoded->size());
++  EXPECT_FALSE(std::get<HeliumSpaceFolder>((*decoded)[0].data).source_id.empty());
++  EXPECT_FALSE(std::get<HeliumSpaceTab>((*decoded)[1].data).source_id.empty());
++}
++
++TEST(HeliumSpaceModelTest, DecodesLegacyNormalizedLinkAndIdSchema) {
++  base::DictValue link;
++  link.Set("type", "link");
++  link.Set("id", "link-1");
++  link.Set("title", "Legacy link");
++  link.Set("url", "https://legacy-link.example/");
++  base::ListValue children;
++  children.Append(std::move(link));
++
++  base::DictValue folder;
++  folder.Set("type", "folder");
++  folder.Set("id", "folder-1");
++  folder.Set("title", "Legacy folder");
++  folder.Set("collapsed", true);
++  folder.Set("children", std::move(children));
++  base::ListValue encoded;
++  encoded.Append(std::move(folder));
++
++  std::optional<HeliumSpaceNodes> decoded = DecodeSpaceNodes(encoded);
++  ASSERT_TRUE(decoded);
++  ASSERT_EQ(1u, decoded->size());
++  const auto& decoded_folder =
++      std::get<HeliumSpaceFolder>((*decoded)[0].data);
++  EXPECT_EQ("folder-1", decoded_folder.source_id);
++  ASSERT_EQ(1u, decoded_folder.children.size());
++  const auto& decoded_link =
++      std::get<HeliumSpaceTab>(decoded_folder.children[0].data);
++  EXPECT_EQ("link-1", decoded_link.source_id);
++  EXPECT_EQ(GURL("https://legacy-link.example/"), decoded_link.url);
++}
++
++TEST(HeliumSpaceModelTest, MergesUniqueIdentityButLeavesAmbiguousMatch) {
++  const HeliumSpaceNode stored{.data = HeliumSpaceTab{
++      .source_id = "old", .title = "Same", .url = GURL("https://same/")}};
++  HeliumSpaceNodes captured = {HeliumSpaceNode{.data = HeliumSpaceTab{
++      .source_id = "new", .title = "Same", .url = GURL("https://same/")}}};
++  HeliumSpaceNodes merged = MergeSpaceNodeIdentity({stored}, std::move(captured));
++  EXPECT_EQ("old", std::get<HeliumSpaceTab>(merged[0].data).source_id);
++
++  const HeliumSpaceNode duplicate{.data = HeliumSpaceTab{
++      .source_id = "other", .title = "Same", .url = GURL("https://same/")}};
++  captured = {HeliumSpaceNode{.data = HeliumSpaceTab{
++      .source_id = "new", .title = "Same", .url = GURL("https://same/")}}};
++  merged = MergeSpaceNodeIdentity({stored, duplicate}, std::move(captured));
++  EXPECT_EQ("new", std::get<HeliumSpaceTab>(merged[0].data).source_id);
++}
++
 +}  // namespace
 +}  // namespace helium
 
 --- /dev/null
 +++ b/chrome/browser/ui/helium/helium_space_service.cc
-@@ -0,0 +1,324 @@
+@@ -0,0 +1,299 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -996,6 +1395,7 @@
 +#include "chrome/browser/ui/browser.h"
 +#include "chrome/browser/ui/helium/helium_space.h"
 +#include "chrome/browser/ui/helium/helium_space_model.h"
++#include "chrome/browser/ui/helium/helium_space_prefs.h"
 +#include "chrome/browser/ui/tabs/pin_tab_codec.h"
 +#include "chrome/browser/ui/tabs/pinned_tab_codec.h"
 +#include "chrome/common/pref_names.h"
@@ -1019,49 +1419,18 @@
 +  return base::StrCat({"arc:", profile, ":", scope, ":", source_id});
 +}
 +
-+StartupTabs ConvertNodes(const std::vector<HeliumSpaceNode>& nodes,
-+                         std::string_view source_profile,
-+                         std::string_view space_id) {
-+  StartupTabs result;
-+
-+  auto append_nodes =
-+      [&](const auto& self, const std::vector<HeliumSpaceNode>& current,
-+          std::vector<StartupTab::FolderPathSegment> parents) -> void {
-+    for (const HeliumSpaceNode& node : current) {
-+      if (const auto* tab = std::get_if<HeliumSpaceTab>(&node.data)) {
-+        StartupTab startup(tab->url, StartupTab::Type::kPin);
-+        startup.helium_has_home = true;
-+        startup.helium_home_title = base::UTF8ToUTF16(tab->title);
-+        startup.helium_source_id =
-+            ImportedID(source_profile, space_id.empty() ? "space" : space_id,
-+                       tab->source_id);
-+        startup.helium_folder_path = parents;
-+        result.push_back(std::move(startup));
-+        continue;
-+      }
-+      const auto& folder = std::get<HeliumSpaceFolder>(node.data);
-+      std::vector<StartupTab::FolderPathSegment> nested = parents;
-+      nested.push_back({.title = base::UTF8ToUTF16(folder.title),
-+                        .collapsed = folder.collapsed});
-+      self(self, folder.children, std::move(nested));
-+    }
-+  };
-+
-+  append_nodes(append_nodes, nodes, {});
-+  return result;
-+}
-+
-+StartupTabs ConvertFavorites(const std::vector<HeliumSpaceTab>& tabs,
-+                             std::string_view source_profile) {
-+  StartupTabs result;
++HeliumSpaceStoredTabs ConvertFavorites(
++    const std::vector<HeliumSpaceTab>& tabs,
++    std::string_view source_profile) {
++  HeliumSpaceStoredTabs result;
 +  result.reserve(tabs.size());
 +  for (const HeliumSpaceTab& tab : tabs) {
 +    StartupTab favorite(tab.url, StartupTab::Type::kPinned);
 +    favorite.helium_has_home = true;
 +    favorite.helium_home_title = base::UTF8ToUTF16(tab.title);
-+    favorite.helium_source_id =
-+        ImportedID(source_profile, "favorite", tab.source_id);
-+    result.push_back(std::move(favorite));
++    result.push_back(
++        {.tab = std::move(favorite),
++         .source_id = ImportedID(source_profile, "favorite", tab.source_id)});
 +  }
 +  return result;
 +}
@@ -1078,7 +1447,8 @@
 +void HeliumSpaceService::LoadSpaces() {
 +  spaces_.clear();
 +  PrefService* prefs = profile_->GetPrefs();
-+  for (const base::Value& value : prefs->GetList(prefs::kHeliumSpaces)) {
++  for (const base::Value& value :
++       prefs->GetList(space_prefs::kHeliumSpaces)) {
 +    const base::DictValue* record = value.GetIfDict();
 +    const std::string* id = record ? record->FindString(kID) : nullptr;
 +    const std::string* name = record ? record->FindString(kName) : nullptr;
@@ -1100,22 +1470,22 @@
 +
 +void HeliumSpaceService::MigrateLegacySingleSpace() {
 +  PrefService* prefs = profile_->GetPrefs();
-+  std::string id = prefs->GetString(prefs::kHeliumSpaceId);
++  std::string id = prefs->GetString(::prefs::kHeliumSpaceId);
 +  if (id.empty()) {
 +    id = NewSpaceID();
-+    prefs->SetString(prefs::kHeliumSpaceId, id);
++    prefs->SetString(::prefs::kHeliumSpaceId, id);
 +  }
-+  std::string name = prefs->GetString(prefs::kHeliumSpaceName);
++  std::string name = prefs->GetString(::prefs::kHeliumSpaceName);
 +  if (name.empty()) {
 +    name = "Space";
 +  }
 +
-+  StartupTabs pins = PinTabCodec::ReadPins(profile_);
++  HeliumSpaceNodes pins = HeliumSpace::ReadLegacyPins(profile_);
 +  spaces_.push_back(std::make_unique<HeliumSpace>(
 +      profile_, std::move(id), base::UTF8ToUTF16(name), std::string(),
 +      std::move(pins)));
 +
-+  if (prefs->GetList(prefs::kHeliumFavorites).empty()) {
++  if (prefs->GetList(space_prefs::kHeliumFavorites).empty()) {
 +    spaces_.front()->WriteFavorites(PinnedTabCodec::ReadPinnedTabs(profile_));
 +  }
 +  PersistSpaces();
@@ -1127,13 +1497,14 @@
 +  }
 +  if (spaces_.empty()) {
 +    spaces_.push_back(std::make_unique<HeliumSpace>(
-+        profile_, NewSpaceID(), u"Space", std::string(), StartupTabs()));
++        profile_, NewSpaceID(), u"Space", std::string(),
++        HeliumSpaceNodes()));
 +    PersistSpaces();
 +  }
 +  const std::string active =
-+      profile_->GetPrefs()->GetString(prefs::kHeliumActiveSpaceId);
++      profile_->GetPrefs()->GetString(space_prefs::kHeliumActiveSpaceId);
 +  if (!GetSpaceById(active)) {
-+    profile_->GetPrefs()->SetString(prefs::kHeliumActiveSpaceId,
++    profile_->GetPrefs()->SetString(space_prefs::kHeliumActiveSpaceId,
 +                                    spaces_.front()->id());
 +  }
 +}
@@ -1150,7 +1521,7 @@
 +HeliumSpace* HeliumSpaceService::GetActiveSpace() {
 +  EnsureDefaultSpace();
 +  const std::string active =
-+      profile_->GetPrefs()->GetString(prefs::kHeliumActiveSpaceId);
++      profile_->GetPrefs()->GetString(space_prefs::kHeliumActiveSpaceId);
 +  return GetSpaceById(active) ? GetSpaceById(active) : spaces_.front().get();
 +}
 +
@@ -1197,7 +1568,7 @@
 +  }
 +  spaces_.push_back(std::make_unique<HeliumSpace>(
 +      profile_, std::move(id), std::move(name), std::move(source_profile),
-+      std::move(pins)));
++      HeliumSpace::MakePinNodes(pins)));
 +  PersistSpaces();
 +  if (spaces_.size() == 1u) {
 +    SetActiveSpace(spaces_.front()->id());
@@ -1219,29 +1590,29 @@
 +  for (const HeliumSpaceRecord& record : model.spaces) {
 +    spaces_.push_back(std::make_unique<HeliumSpace>(
 +        profile_, record.id, base::UTF8ToUTF16(record.name),
-+        model.source_profile,
-+        ConvertNodes(record.pins, model.source_profile, record.id)));
++        model.source_profile, record.pins));
 +  }
 +  if (spaces_.empty()) {
 +    spaces_.push_back(std::make_unique<HeliumSpace>(
-+        profile_, NewSpaceID(), u"Space", std::string(), StartupTabs()));
++        profile_, NewSpaceID(), u"Space", std::string(),
++        HeliumSpaceNodes()));
 +  }
 +
 +  HeliumSpace* active = GetActiveSpace();
-+  StartupTabs favorites = active->ReadFavorites();
++  HeliumSpaceStoredTabs favorites = active->ReadStoredFavorites();
 +  const std::string prefix = base::StrCat({"arc:", model.source_profile, ":"});
-+  std::erase_if(favorites, [&prefix](const StartupTab& tab) {
-+    return tab.helium_source_id.starts_with(prefix);
++  std::erase_if(favorites, [&prefix](const HeliumSpaceStoredTab& item) {
++    return item.source_id.starts_with(prefix);
 +  });
-+  StartupTabs imported_favorites =
++  HeliumSpaceStoredTabs imported_favorites =
 +      ConvertFavorites(model.favorites, model.source_profile);
 +  favorites.insert(favorites.end(), imported_favorites.begin(),
 +                   imported_favorites.end());
-+  active->WriteFavorites(favorites);
++  active->WriteStoredFavorites(favorites);
 +
 +  PersistSpaces();
 +  if (!GetSpaceById(
-+          profile_->GetPrefs()->GetString(prefs::kHeliumActiveSpaceId))) {
++          profile_->GetPrefs()->GetString(space_prefs::kHeliumActiveSpaceId))) {
 +    SetActiveSpace(spaces_.front()->id());
 +  }
 +  browser_space_ids_.clear();
@@ -1252,14 +1623,16 @@
 +      spaces_.front()->name() == u"Space" &&
 +      spaces_.front()->ReadPins().empty()) {
 +    spaces_.clear();
-+    profile_->GetPrefs()->SetList(prefs::kHeliumSpaces, base::ListValue());
-+    profile_->GetPrefs()->SetString(prefs::kHeliumActiveSpaceId, std::string());
++    profile_->GetPrefs()->SetList(space_prefs::kHeliumSpaces,
++                                  base::ListValue());
++    profile_->GetPrefs()->SetString(space_prefs::kHeliumActiveSpaceId,
++                                    std::string());
 +  }
 +}
 +
 +void HeliumSpaceService::SetActiveSpace(std::string_view id) {
 +  if (GetSpaceById(id)) {
-+    profile_->GetPrefs()->SetString(prefs::kHeliumActiveSpaceId,
++    profile_->GetPrefs()->SetString(space_prefs::kHeliumActiveSpaceId,
 +                                    std::string(id));
 +  }
 +}
@@ -1282,7 +1655,7 @@
 +    return it->second;
 +  }
 +  const std::string active =
-+      profile_->GetPrefs()->GetString(prefs::kHeliumActiveSpaceId);
++      profile_->GetPrefs()->GetString(space_prefs::kHeliumActiveSpaceId);
 +  if (GetSpaceById(active)) {
 +    return active;
 +  }
@@ -1296,10 +1669,11 @@
 +    record.Set(kID, space->id());
 +    record.Set(kName, base::UTF16ToUTF8(space->name()));
 +    record.Set(kSourceProfile, space->source_profile());
-+    record.Set(kPins, EncodeSpacePins(space->ReadPins()));
++    record.Set(kPins, EncodeSpacePins(space->ReadStoredPins()));
 +    records.Append(std::move(record));
 +  }
-+  profile_->GetPrefs()->SetList(prefs::kHeliumSpaces, std::move(records));
++  profile_->GetPrefs()->SetList(space_prefs::kHeliumSpaces,
++                                std::move(records));
 +}
 +
 +}  // namespace helium
@@ -1378,7 +1752,7 @@
 
 --- /dev/null
 +++ b/chrome/browser/ui/helium/helium_space_service_factory.cc
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,63 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1388,6 +1762,7 @@
 +#include "base/no_destructor.h"
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_prefs.h"
 +#include "chrome/common/pref_names.h"
 +#include "components/pref_registry/pref_registry_syncable.h"
 +
@@ -1432,9 +1807,10 @@
 +
 +void HeliumSpaceServiceFactory::RegisterProfilePrefs(
 +    user_prefs::PrefRegistrySyncable* registry) {
-+  registry->RegisterListPref(prefs::kHeliumSpaces);
-+  registry->RegisterListPref(prefs::kHeliumFavorites);
-+  registry->RegisterStringPref(prefs::kHeliumActiveSpaceId, std::string());
++  registry->RegisterListPref(space_prefs::kHeliumSpaces);
++  registry->RegisterListPref(space_prefs::kHeliumFavorites);
++  registry->RegisterStringPref(space_prefs::kHeliumActiveSpaceId,
++                               std::string());
 +  registry->RegisterStringPref(prefs::kHeliumSpaceId, std::string());
 +  registry->RegisterStringPref(prefs::kHeliumSpaceName, std::string());
 +}
@@ -1518,7 +1894,7 @@
 +  if (helium::IsHeliumFavoritesAndPinsEnabled()) {
 +    if (auto* space_service =
 +            helium::HeliumSpaceServiceFactory::GetForProfile(profile)) {
-+      if (helium::HeliumSpace* space = space_service->GetDefaultSpace()) {
++      if (helium::HeliumSpace* space = space_service->GetActiveSpace()) {
 +        favorites = space->ReadFavorites();
 +        pins = space->ReadPins();
 +      }
@@ -1540,14 +1916,79 @@
    return tabs;
  }
 
---- a/chrome/browser/ui/startup/startup_tab.h
-+++ b/chrome/browser/ui/startup/startup_tab.h
-@@ -46,2 +46,5 @@ struct StartupTab {
-   bool is_untrusted_launch = false;
+--- a/chrome/browser/ui/tabs/pin_tab_codec.cc
++++ b/chrome/browser/ui/tabs/pin_tab_codec.cc
+@@ -238,8 +238,20 @@ StartupTabs PinTabCodec::ReadPins(Profile* profile) {
+   PrefService* prefs = profile->GetPrefs();
+   if (!prefs) {
+     return {};
+   }
+   StartupTabs results;
+   DecodeTreeList(prefs->GetList(prefs::kHeliumPins), {}, &results);
+   return results;
+ }
 +
-+  // Stable source identity used by Arc import and Space reconciliation.
-+  std::string helium_source_id;
- };
++// Captures only the pin tree owned by this browser window. The returned
++// transport remains independent of StartupTab identity fields.
++// static
++base::ListValue PinTabCodec::CapturePins(BrowserWindowInterface* browser) {
++  base::ListValue result;
++  if (!browser || browser->GetType() != BrowserWindowInterface::TYPE_NORMAL) {
++    return result;
++  }
++  EncodePinTree(browser, result);
++  return result;
++}
+
+--- a/chrome/browser/ui/tabs/pin_tab_codec.h
++++ b/chrome/browser/ui/tabs/pin_tab_codec.h
+@@ -8,1 +8,2 @@
++#include "base/values.h"
+ #include "chrome/browser/ui/startup/startup_tab.h"
+@@ -10,1 +11,2 @@
++class BrowserWindowInterface;
+ class Profile;
+@@ -27,1 +29,3 @@ class PinTabCodec {
++  // Captures one browser's pin tree without mutating profile preferences.
++  static base::ListValue CapturePins(BrowserWindowInterface* browser);
+   static StartupTabs ReadPins(Profile* profile);
+
+--- a/chrome/browser/ui/tabs/pinned_tab_codec.cc
++++ b/chrome/browser/ui/tabs/pinned_tab_codec.cc
+@@ -173,2 +173,23 @@
+   return results;
+ }
++
++// Captures Favorites from one normal browser without writing profile prefs.
++// static
++StartupTabs PinnedTabCodec::CapturePinnedTabs(
++    BrowserWindowInterface* browser) {
++  if (!browser || browser->GetType() != BrowserWindowInterface::TYPE_NORMAL) {
++    return {};
++  }
++  base::ListValue values;
++  EncodePinnedTabs(browser, values);
++  StartupTabs result;
++  for (const base::Value& value : values) {
++    const base::DictValue* dict = value.GetIfDict();
++    if (dict) {
++      if (std::optional<StartupTab> tab = DecodeTab(*dict)) {
++        result.push_back(std::move(*tab));
++      }
++    }
++  }
++  return result;
++}
+
+--- a/chrome/browser/ui/tabs/pinned_tab_codec.h
++++ b/chrome/browser/ui/tabs/pinned_tab_codec.h
+@@ -10,1 +10,2 @@
++class BrowserWindowInterface;
+ class Profile;
+@@ -38,1 +39,3 @@ class PinnedTabCodec {
++  // Captures Favorites from one normal browser without writing prefs.
++  static StartupTabs CapturePinnedTabs(BrowserWindowInterface* browser);
+   static StartupTabs ReadPinnedTabs(Profile* profile);
 
 --- a/chrome/browser/ui/tabs/pinned_tab_service.cc
 +++ b/chrome/browser/ui/tabs/pinned_tab_service.cc
@@ -1562,16 +2003,23 @@
  #include "chrome/browser/ui/tabs/pinned_tab_codec.h"
  #include "chrome/browser/ui/tabs/pin_tab_codec.h"
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
-@@ -81,6 +85,17 @@
+@@ -81,6 +85,24 @@
  
  void PinnedTabService::WritePinnedTabsIfNecessary() {
    if (need_to_write_pinned_tabs_) {
 +    if (helium::IsHeliumFavoritesAndPinsEnabled()) {
 +      if (auto* space_service =
 +              helium::HeliumSpaceServiceFactory::GetForProfile(profile_)) {
-+        if (helium::HeliumSpace* space = space_service->GetDefaultSpace()) {
++        bool captured = false;
++        for (helium::HeliumSpace* space : space_service->GetSpaces()) {
++          if (!space->GetPrimaryBrowser()) {
++            continue;
++          }
 +          space->WriteFavoritesFromBrowsers();
 +          space->WritePinsFromBrowsers();
++          captured = true;
++        }
++        if (captured) {
 +          need_to_write_pinned_tabs_ = false;
 +          return;
 +        }
@@ -1648,7 +2096,7 @@
  }
  
  void VerticalTabStripBottomContainer::ShowContextMenuForViewImpl(
-@@ -104,6 +138,47 @@
+@@ -104,6 +138,46 @@
    expand_on_hover_lock_.reset();
  }
  
@@ -1688,7 +2136,6 @@
 +    return;
 +  }
 +  if (helium::HeliumSpace* space = service->GetSpaceById(space_id)) {
-+    service->SetActiveSpace(space_id);
 +    space->ActivateOrCreatePrimaryWindow();
 +  }
 +}
@@ -1736,18 +2183,701 @@
    base::CallbackListSubscription collapsed_state_change_subscription_;
    base::CallbackListSubscription new_tab_button_pressed_subscription_;
 
+--- a/chrome/browser/ui/helium/helium_favorites_and_pins.cc
++++ b/chrome/browser/ui/helium/helium_favorites_and_pins.cc
+@@ -12,12 +12,18 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/sessions/session_service.h"
+ #include "chrome/browser/sessions/session_service_factory.h"
++#include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium/helium_startup_tab_materializer.h"
++#include "chrome/browser/ui/navigator/browser_navigator.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "chrome/browser/ui/startup/startup_tab.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "components/sessions/content/session_tab_helper.h"
++#include "components/tabs/public/folder_tab_collection.h"
++#include "components/tabs/public/pin_tab_collection.h"
+ #include "components/tabs/public/tab_collection.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "components/tabs/public/tab_strip_collection.h"
+ #include "content/public/browser/navigation_controller.h"
+@@ -218,6 +224,68 @@
+   helper->SetAnchoredPinnedTabHome(std::move(home_url), std::move(home_title));
+ }
+-
++
++void RestoreStartupTabPinState(tabs::TabInterface* tab,
++                               const StartupTab& startup_tab) {
++  if (!tab ||
++      (startup_tab.type != StartupTab::Type::kPin &&
++       !startup_tab.helium_has_home)) {
++    return;
++  }
++
++  RestoreAnchoredPinnedTabHome(tab, startup_tab.url,
++                               startup_tab.helium_home_title);
++  if (tab->IsPinned()) {
++    return;
++  }
++
++  tabs::TabStripCollection* const strip = GetTabStripCollection(tab);
++  if (!strip) {
++    return;
++  }
++  tabs::TabCollection* parent =
++      static_cast<tabs::TabCollection*>(strip->pin_collection());
++  for (const auto& segment : startup_tab.helium_folder_path) {
++    parent = static_cast<tabs::TabCollection*>(strip->FindOrCreateFolder(
++        parent, segment.title, segment.collapsed));
++  }
++  if (parent ==
++      static_cast<tabs::TabCollection*>(strip->pin_collection())) {
++    if (!strip->IsPinTab(tab)) {
++      strip->MoveTabToPin(tab);
++    }
++    return;
++  }
++  strip->MoveTabToCollection(tab, parent);
++}
++
++void MaterializeStartupTab(Browser* browser,
++                           const StartupTab& startup_tab,
++                           bool foreground) {
++  if (!browser) {
++    return;
++  }
++  int add_types = foreground ? AddTabTypes::ADD_ACTIVE
++                             : AddTabTypes::ADD_NONE;
++  add_types |= AddTabTypes::ADD_FORCE_INDEX;
++  if (startup_tab.type == StartupTab::Type::kPinned) {
++    add_types |= AddTabTypes::ADD_PINNED;
++  }
++  NavigateParams params(browser, startup_tab.url,
++                        ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
++  params.disposition = foreground
++                           ? WindowOpenDisposition::NEW_FOREGROUND_TAB
++                           : WindowOpenDisposition::NEW_BACKGROUND_TAB;
++  params.tabstrip_add_types = add_types;
++  Navigate(&params);
++  if (!params.navigated_or_inserted_contents) {
++    return;
++  }
++  RestoreStartupTabPinState(
++      tabs::TabInterface::MaybeGetFromContents(
++          params.navigated_or_inserted_contents),
++      startup_tab);
++}
++
+ void ResetAnchoredPinnedTab(tabs::TabInterface* tab) {
+   if (!IsAnchoredTab(tab)) {
+     return;
+
+--- a/chrome/browser/ui/startup/startup_browser_creator_impl.cc
++++ b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
+@@ -41,7 +41,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+-#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
++#include "chrome/browser/ui/helium/helium_startup_tab_materializer.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+ #include "chrome/browser/ui/startup/infobar_utils.h"
+@@ -439,29 +439,7 @@
+     Navigate(&params);
+-    if ((tab.type == StartupTab::Type::kPin || tab.helium_has_home) &&
+-        params.navigated_or_inserted_contents) {
+-      tabs::TabInterface* const tab_interface =
+-          tabs::TabInterface::MaybeGetFromContents(
+-              params.navigated_or_inserted_contents);
+-      helium::RestoreAnchoredPinnedTabHome(
+-          tab_interface, tab.url, tab.helium_home_title);
+-      if (tab_interface && !tab_interface->IsPinned()) {
+-        if (auto* strip = static_cast<tabs::TabStripCollection*>(
+-                const_cast<tabs::TabCollection*>(
+-                    browser->tab_strip_model()->Root()))) {
+-          tabs::TabCollection* parent = static_cast<tabs::TabCollection*>(
+-              strip->pin_collection());
+-          for (const auto& segment : tab.helium_folder_path) {
+-            parent = static_cast<tabs::TabCollection*>(strip->FindOrCreateFolder(
+-                parent, segment.title, segment.collapsed));
+-          }
+-          if (parent == static_cast<tabs::TabCollection*>(
+-                            strip->pin_collection())) {
+-            if (!strip->IsPinTab(tab_interface)) {
+-              strip->MoveTabToPin(tab_interface);
+-            }
+-          } else {
+-            strip->MoveTabToCollection(tab_interface, parent);
+-          }
+-        }
+-      }
++    if (params.navigated_or_inserted_contents) {
++      helium::RestoreStartupTabPinState(
++          tabs::TabInterface::MaybeGetFromContents(
++              params.navigated_or_inserted_contents),
++          tab);
+     }
+     first_tab = false;
+
 --- a/chrome/common/pref_names.h
 +++ b/chrome/common/pref_names.h
-@@ -984,6 +984,12 @@
+@@ -984,6 +984,9 @@
  #if !BUILDFLAG(IS_ANDROID)
  inline constexpr char kPinnedTabs[] = "pinned_tabs";
  inline constexpr char kHeliumPins[] = "helium.pins";
-+inline constexpr char kHeliumFavorites[] = "helium.favorites";
-+inline constexpr char kHeliumSpaces[] = "helium.spaces";
-+inline constexpr char kHeliumActiveSpaceId[] = "helium.active_space_id";
-+// Legacy HeliumSpace identity retained for one-time migration.
++// HeliumSpace identity (v1: one Space per Profile).
 +inline constexpr char kHeliumSpaceId[] = "helium.space.id";
 +inline constexpr char kHeliumSpaceName[] = "helium.space.name";
  #endif  // !BUILDFLAG(IS_ANDROID)
  
  // Preference to disable 3D APIs (WebGL).
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
+@@ -4,36 +4,42 @@
+ 
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h"
+ 
++#include "base/functional/bind.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
++#include "chrome/browser/ui/helium/helium_space.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+-#include "chrome/browser/ui/ui_features.h"
+-#include "chrome/browser/ui/views/frame/browser_view.h"
+-#include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
+-#include "chrome/browser/ui/views/tabs/new_tab_button.h"
+-#include "chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.h"
+-#include "ui/actions/actions.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+-#include "ui/views/controls/menu/menu_runner.h"
+-#include "ui/views/view_class_properties.h"
++#include "ui/views/controls/button/label_button.h"
+ 
+ VerticalTabStripBottomContainer::VerticalTabStripBottomContainer(
+     tabs::VerticalTabStripStateController* state_controller,
+-    actions::ActionItem*,
+-    BrowserWindowInterface* browser,
+-    base::RepeatingClosure record_new_tab_button_pressed)
++    BrowserWindowInterface* browser)
+     : browser_(browser) {
+   SetProperty(views::kElementIdentifierKey,
+               kVerticalTabStripBottomContainerElementId);
+ 
+-  auto new_tab_button = std::make_unique<VerticalNewTabButton>(browser_);
+-  new_tab_button->set_context_menu_controller(this);
+-
+-  new_tab_button_pressed_subscription_ =
+-      new_tab_button->RegisterWillInvokeActionCallback(
+-          record_new_tab_button_pressed);
+-
+-  new_tab_button_ = AddChildView(std::move(new_tab_button));
++  if (helium::IsHeliumFavoritesAndPinsEnabled()) {
++    spaces_list_ = AddChildView(std::make_unique<views::FlexLayoutView>());
++    spaces_list_->SetOrientation(views::LayoutOrientation::kVertical);
++    spaces_list_->SetCrossAxisAlignment(views::LayoutAlignment::kStretch);
++    spaces_list_->SetVisible(false);
++
++    spaces_disclosure_button_ = AddChildView(
++        std::make_unique<views::LabelButton>(
++            base::BindRepeating(
++                &VerticalTabStripBottomContainer::ToggleSpacesList,
++                base::Unretained(this)),
++            u"Spaces"));
++    spaces_disclosure_button_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++    spaces_disclosure_button_->SetTooltipText(
++        u"Show Spaces. Each Space opens in its own window.");
++  }
+ 
+   OnCollapseStateChanged(state_controller->GetCollapseState());
+   collapsed_state_change_subscription_ =
+@@ -44,7 +50,6 @@ VerticalTabStripBottomContainer::Vertica
+ 
+ VerticalTabStripBottomContainer::~VerticalTabStripBottomContainer() = default;
+ 
+-
+ bool VerticalTabStripBottomContainer::IsPositionInWindowCaption(
+     const gfx::Point& point) {
+   for (views::View* child : children()) {
+@@ -64,64 +69,66 @@ void VerticalTabStripBottomContainer::On
+     tabs::VerticalTabStripCollapseState state) {
+   // Updating the styles immediately at start of the animation by including
+   // collapsing state.
+-  UpdateButtonStyles(state != tabs::VerticalTabStripCollapseState::kExpanded);
++  tab_strip_collapsed_ =
++      state != tabs::VerticalTabStripCollapseState::kExpanded;
++  UpdateButtonStyles(tab_strip_collapsed_);
+ }
+ 
+-void VerticalTabStripBottomContainer::ShowContextMenuForViewImpl(
+-    View* source,
+-    const gfx::Point& point,
+-    ui::mojom::MenuSourceType source_type) {
+-  if (features::IsTabGroupMenuMoreEntryPointsEnabled()) {
+-    context_menu_model_ = std::make_unique<NewTabButtonMenuModel>(browser_);
+-
+-    int32_t menu_runner_flags =
+-        views::MenuRunner::HAS_MNEMONICS | views::MenuRunner::CONTEXT_MENU;
+-
+-    BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(browser_);
+-    CHECK(browser_view);
+-    CHECK(browser_view->tab_strip_view());
+-    expand_on_hover_lock_ =
+-        browser_view->tab_strip_view()->GetExpandOnHoverLock(
+-            ExpandOnHoverLockType::kKeepCurrentState);
+-
+-    // `base::Unretained(this)` is safe because `context_menu_runner_` is owned
+-    // by `this`, ensuring the callback cannot outlive `this`.
+-    auto on_menu_closed = base::BindRepeating(
+-        &VerticalTabStripBottomContainer::OnNewTabButtonContextMenuClosed,
+-        base::Unretained(this));
+-
+-    context_menu_runner_ = std::make_unique<views::MenuRunner>(
+-        context_menu_model_.get(), menu_runner_flags,
+-        std::move(on_menu_closed));
++void VerticalTabStripBottomContainer::ToggleSpacesList() {
++  spaces_expanded_ = !spaces_expanded_;
++  if (spaces_expanded_) {
++    RebuildSpacesList();
++  }
++  spaces_list_->SetVisible(spaces_expanded_);
++  spaces_disclosure_button_->SetText(spaces_expanded_ ? u"Hide Spaces"
++                                                      : u"Spaces");
++  InvalidateLayout();
++}
+ 
+-    context_menu_runner_->RunMenuAt(
+-        source->GetWidget(), nullptr, gfx::Rect(point, gfx::Size()),
+-        views::MenuAnchorPosition::kTopLeft, source_type);
++void VerticalTabStripBottomContainer::RebuildSpacesList() {
++  spaces_list_->RemoveAllChildViews();
++  auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(
++      browser_->GetProfile());
++  if (!service) {
++    return;
++  }
++  for (helium::HeliumSpace* space : service->GetSpaces()) {
++    auto row = std::make_unique<views::LabelButton>(
++        base::BindRepeating(&VerticalTabStripBottomContainer::ActivateSpace,
++                            base::Unretained(this), space->id()),
++        space->name());
++    row->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++    row->SetTooltipText(u"Open this Space window");
++    spaces_list_->AddChildView(std::move(row));
+   }
+ }
+ 
+-void VerticalTabStripBottomContainer::OnNewTabButtonContextMenuClosed() {
+-  expand_on_hover_lock_.reset();
++void VerticalTabStripBottomContainer::ActivateSpace(std::string space_id) {
++  auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(
++      browser_->GetProfile());
++  if (!service) {
++    return;
++  }
++  if (helium::HeliumSpace* space = service->GetSpaceById(space_id)) {
++    service->SetActiveSpace(space_id);
++    space->ActivateOrCreatePrimaryWindow();
++  }
+ }
+ 
+ void VerticalTabStripBottomContainer::UpdateButtonStyles(bool collapsed) {
+-  auto orientation = collapsed ? views::LayoutOrientation::kVertical
+-                               : views::LayoutOrientation::kHorizontal;
+-
+-  // Setting button's layout based on collapsed state
+-  SetOrientation(orientation);
+-  SetCrossAxisAlignment(collapsed ? views::LayoutAlignment::kStretch
+-                                  : views::LayoutAlignment::kStart);
+-
+-  new_tab_button_->SetProperty(
+-      views::kFlexBehaviorKey,
+-      views::FlexSpecification(
+-          orientation,
+-          collapsed ? views::MinimumFlexSizeRule::kPreferred
+-                    : views::MinimumFlexSizeRule::kScaleToMinimum,
+-          collapsed ? views::MaximumFlexSizeRule::kPreferred
+-                    : views::MaximumFlexSizeRule::kUnbounded,
+-          false, views::MinimumFlexSizeRule::kPreferred));
++  // This stack contains only the bottom-anchored Space selector. Tab content
++  // and the New Tab control remain together at the top of the sidebar.
++  SetOrientation(views::LayoutOrientation::kVertical);
++  SetCrossAxisAlignment(views::LayoutAlignment::kStretch);
++
++  if (spaces_disclosure_button_) {
++    spaces_disclosure_button_->SetVisible(!collapsed);
++    if (collapsed && spaces_expanded_) {
++      spaces_expanded_ = false;
++      spaces_list_->SetVisible(false);
++      spaces_disclosure_button_->SetText(u"Spaces");
++    }
++  }
+ }
+ 
+ BEGIN_METADATA(VerticalTabStripBottomContainer)
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h
+@@ -5,14 +5,11 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_STRIP_BOTTOM_CONTAINER_H_
+ #define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_STRIP_BOTTOM_CONTAINER_H_
+ 
+-#include "ui/views/context_menu_controller.h"
++#include <string>
++
+ #include "ui/views/layout/flex_layout_view.h"
+ 
+ class BrowserWindowInterface;
+-class ExpandOnHoverLock;
+-class NewTabButtonMenuModel;
+-class VerticalNewTabButton;
+-
+ namespace actions {
+ class ActionItem;
+ }  // namespace actions
+@@ -23,44 +20,36 @@ enum class VerticalTabStripCollapseState
+ }  // namespace tabs
+ 
+ namespace views {
+-class MenuRunner;
++class LabelButton;
++class View;
+ }  // namespace views
+ 
+-// Bottom container of the vertical tab strip which includes the new tab button.
+-class VerticalTabStripBottomContainer : public views::FlexLayoutView,
+-                                        public views::ContextMenuController {
++// Bottom-anchored Space selector for the vertical tab strip.
++class VerticalTabStripBottomContainer : public views::FlexLayoutView {
+   METADATA_HEADER(VerticalTabStripBottomContainer, views::FlexLayoutView)
+  public:
+   VerticalTabStripBottomContainer(
+       tabs::VerticalTabStripStateController* state_controller,
+-      actions::ActionItem* root_action_item,
+-      BrowserWindowInterface* browser,
+-      base::RepeatingClosure record_new_tab_button_pressed);
++      BrowserWindowInterface* browser);
+   ~VerticalTabStripBottomContainer() override;
+ 
+   bool IsPositionInWindowCaption(const gfx::Point& point);
+ 
+   void OnCollapseStateChanged(tabs::VerticalTabStripCollapseState state);
+ 
+-  // views::ContextMenuController:
+-  void ShowContextMenuForViewImpl(
+-      View* source,
+-      const gfx::Point& point,
+-      ui::mojom::MenuSourceType source_type) override;
+-
+  private:
+-  void OnNewTabButtonContextMenuClosed();
++  void ToggleSpacesList();
++  void RebuildSpacesList();
++  void ActivateSpace(std::string space_id);
+ 
+   void UpdateButtonStyles(bool collapsed);
+ 
+   raw_ptr<BrowserWindowInterface> browser_ = nullptr;
+-  raw_ptr<VerticalNewTabButton> new_tab_button_ = nullptr;
++  raw_ptr<views::FlexLayoutView> spaces_list_ = nullptr;
++  raw_ptr<views::LabelButton> spaces_disclosure_button_ = nullptr;
++  bool spaces_expanded_ = false;
++  bool tab_strip_collapsed_ = false;
+   base::CallbackListSubscription collapsed_state_change_subscription_;
+-  base::CallbackListSubscription new_tab_button_pressed_subscription_;
+-
+-  std::unique_ptr<NewTabButtonMenuModel> context_menu_model_;
+-  std::unique_ptr<views::MenuRunner> context_menu_runner_;
+-  std::unique_ptr<ExpandOnHoverLock> expand_on_hover_lock_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_STRIP_BOTTOM_CONTAINER_H_
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -34,6 +34,7 @@
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/animations/tab_strip_animations.h"
+ #include "chrome/browser/ui/views/frame/base_tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -50,7 +51,9 @@
+ #include "chrome/browser/ui/views/tabs/common/tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
+ #include "chrome/browser/ui/views/tabs/shared/drop_arrow.h"
++#include "chrome/browser/ui/views/tabs/new_tab_button.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h"
++#include "chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.h"
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/tabs/public/tab_group.h"
+@@ -68,6 +71,7 @@
+ #include "ui/views/background.h"
+ #include "ui/views/controls/button/label_button.h"
+ #include "ui/views/controls/focus_ring.h"
++#include "ui/views/controls/menu/menu_runner.h"
+ #include "ui/views/controls/resize_area.h"
+ #include "ui/views/controls/scroll_view.h"
+ #include "ui/views/controls/separator.h"
+@@ -88,6 +92,17 @@ constexpr int kSnapDistance = 15;
+ constexpr int kBottomContainerGap = 2;
+ constexpr int kDefaultWidthSnapDistance = 6;
+ 
++gfx::Size GetTopAnchoredTabStripSize(const views::View* view,
++                                     const views::SizeBounds& size_bounds) {
++  gfx::Size preferred_size = view->GetPreferredSize(views::SizeBounds(
++      size_bounds.width(), views::SizeBound()));
++  if (size_bounds.height().is_bounded()) {
++    preferred_size.set_height(
++        std::min(preferred_size.height(), size_bounds.height().value()));
++  }
++  return preferred_size;
++}
++
+ // Shadow is used in expand-on-hover mode. Shadow radius and opacity are dynamic
+ // and set by the layout.
+ constexpr int kExpandOnHoverShadowElevation = 4;
+@@ -127,16 +142,36 @@ VerticalTabStripRegionView::VerticalTabS
+                                    views::MinimumFlexSizeRule::kPreferred,
+                                    views::MaximumFlexSizeRule::kPreferred));
+ 
++  auto new_tab_button =
++      std::make_unique<VerticalNewTabButton>(browser_view->browser());
++  new_tab_button->set_context_menu_controller(this);
++  new_tab_button_pressed_subscription_ =
++      new_tab_button->RegisterWillInvokeActionCallback(base::BindRepeating(
++          &VerticalTabStripRegionView::RecordNewTabButtonPressed,
++          base::Unretained(this)));
++  new_tab_button_ = AddChildView(std::move(new_tab_button));
++  new_tab_button_->SetProperty(
++      views::kMarginsKey,
++      gfx::Insets::TLBR(kBottomContainerGap, region_horizontal_padding,
++                        kBottomContainerGap, region_horizontal_padding));
++
++  tab_area_spacer_ = AddChildView(std::make_unique<views::View>());
++  tab_area_spacer_->SetProperty(
++      views::kFlexBehaviorKey,
++      views::FlexSpecification(
++          views::LayoutOrientation::kVertical,
++          views::MinimumFlexSizeRule::kPreferred,
++          views::MaximumFlexSizeRule::kUnbounded)
++          .WithWeight(1));
++
+   bottom_button_container_ =
+       AddChildView(std::make_unique<VerticalTabStripBottomContainer>(
+-          state_controller_, root_action_item, browser_view->browser(),
+-          base::BindRepeating(
+-              &VerticalTabStripRegionView::RecordNewTabButtonPressed,
+-              base::Unretained(this))));
++          state_controller_, browser_view->browser()));
+   bottom_button_container_->SetProperty(
+       views::kFlexBehaviorKey,
+-      views::FlexSpecification(views::MinimumFlexSizeRule::kPreferred,
+-                               views::MaximumFlexSizeRule::kUnbounded));
++      views::FlexSpecification(views::LayoutOrientation::kVertical,
++                               views::MinimumFlexSizeRule::kPreferred,
++                               views::MaximumFlexSizeRule::kPreferred));
+   bottom_button_container_->SetProperty(
+       views::kMarginsKey,
+       gfx::Insets::TLBR(kBottomContainerGap, region_horizontal_padding,
+@@ -666,6 +701,42 @@ void VerticalTabStripRegionView::OnResiz
+   }
+ }
+ 
++void VerticalTabStripRegionView::ShowContextMenuForViewImpl(
++    views::View* source,
++    const gfx::Point& point,
++    ui::mojom::MenuSourceType source_type) {
++  if (!features::IsTabGroupMenuMoreEntryPointsEnabled()) {
++    return;
++  }
++
++  context_menu_model_ =
++      std::make_unique<NewTabButtonMenuModel>(browser_view_->browser());
++  new_tab_context_menu_hover_lock_ = GetExpandOnHoverLock(
++      ExpandOnHoverLockType::kKeepCurrentState);
++
++  constexpr int32_t kMenuRunnerFlags =
++      views::MenuRunner::HAS_MNEMONICS | views::MenuRunner::CONTEXT_MENU;
++  context_menu_runner_ = std::make_unique<views::MenuRunner>(
++      context_menu_model_.get(), kMenuRunnerFlags,
++      base::BindRepeating(
++          &VerticalTabStripRegionView::OnNewTabButtonContextMenuClosed,
++          base::Unretained(this)));
++  context_menu_runner_->RunMenuAt(
++      source->GetWidget(), nullptr, gfx::Rect(point, gfx::Size()),
++      views::MenuAnchorPosition::kTopLeft, source_type);
++}
++
++void VerticalTabStripRegionView::OnNewTabButtonContextMenuClosed() {
++  new_tab_context_menu_hover_lock_.reset();
++}
++
++void VerticalTabStripRegionView::OnTabCollectionChanged() {
++  // The tab strip uses content-sized flex behavior so that short tab lists
++  // stay at the top. Its nested scroll views do not propagate preferred-size
++  // changes, so explicitly remeasure the region as tabs are restored or moved.
++  InvalidateLayout();
++}
++
+ void VerticalTabStripRegionView::SetCollapsedStateUpdatedCallback(
+     base::RepeatingCallback<void(bool)> callback) {
+   update_state_controller_collapsed_callback_ = std::move(callback);
+@@ -729,8 +800,8 @@ views::View* VerticalTabStripRegionView:
+   tab_strip_view_ = static_cast<TabStripView*>(AddChildView(std::move(view)));
+   tab_strip_view_->SetProperty(
+       views::kFlexBehaviorKey,
+-      views::FlexSpecification(views::MinimumFlexSizeRule::kScaleToMinimum,
+-                               views::MaximumFlexSizeRule::kPreferred));
++      views::FlexSpecification(
++          base::BindRepeating(&GetTopAnchoredTabStripSize)));
+   tab_strip_view_->SetProperty(views::kMarginsKey,
+                                gfx::Insets::TLBR(0, 0, kBottomContainerGap, 0));
+ 
+@@ -738,6 +809,20 @@ views::View* VerticalTabStripRegionView:
+       root_node_->RegisterOnActiveTabChangedCallback(
+           base::BindRepeating(&VerticalTabStripRegionView::OnActiveTabChanged,
+                               base::Unretained(this)));
++  tab_children_added_subscription_ =
++      root_node_->RegisterOnChildrenAddedCallback(base::BindRepeating(
++          &VerticalTabStripRegionView::OnTabCollectionChanged,
++          base::Unretained(this)));
++  tab_child_removed_subscription_ =
++      root_node_->RegisterOnChildRemovedCallback(base::BindRepeating(
++          &VerticalTabStripRegionView::OnTabCollectionChanged,
++          base::Unretained(this)));
++  tab_child_moved_subscription_ = root_node_->RegisterOnChildMovedCallback(
++      base::BindRepeating(
++          [](VerticalTabStripRegionView* region, TabCollectionNode*) {
++            region->OnTabCollectionChanged();
++          },
++          base::Unretained(this)));
+ 
+   // Pre-set the animation values to the appropriate state.
+   auto* const animation_controller =
+@@ -758,10 +843,9 @@ views::View* VerticalTabStripRegionView:
+               &VerticalTabStripRegionView::OnExpandOnHoverEnabledChanged,
+               base::Unretained(this)));
+ 
+-  std::optional<size_t> bottom_container_index =
+-      GetIndexOf(bottom_button_container_);
+-  CHECK(bottom_container_index.has_value());
+-  ReorderChildView(tab_strip_view_, bottom_container_index.value());
++  std::optional<size_t> new_tab_button_index = GetIndexOf(new_tab_button_);
++  CHECK(new_tab_button_index.has_value());
++  ReorderChildView(tab_strip_view_, new_tab_button_index.value());
+ 
+   OnCollapseStateChanged(state_controller_->GetCollapseState());
+ 
+@@ -771,6 +855,9 @@ views::View* VerticalTabStripRegionView:
+ void VerticalTabStripRegionView::ClearTabStripView(views::View* view) {
+   on_animation_update_subscription_.reset();
+   on_active_tab_changed_subscription_.reset();
++  tab_children_added_subscription_ = {};
++  tab_child_removed_subscription_ = {};
++  tab_child_moved_subscription_ = {};
+   expand_on_hover_enabled_changed_subscription_.reset();
+   omnibox_tab_helper_observation_.Reset();
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_FRAME_VERTICAL_TAB_STRIP_REGION_VIEW_H_
+ #define CHROME_BROWSER_UI_VIEWS_FRAME_VERTICAL_TAB_STRIP_REGION_VIEW_H_
+ 
++#include <memory>
+ #include <optional>
+ 
+ #include "base/callback_list.h"
+@@ -27,12 +28,16 @@
+ #include "ui/base/interaction/element_tracker.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/events/event_handler.h"
++#include "ui/views/context_menu_controller.h"
+ #include "ui/gfx/geometry/point.h"
+ #include "ui/views/accessible_pane_view.h"
+ #include "ui/views/controls/resize_area_delegate.h"
+ #include "ui/views/focus/focus_manager.h"
+ 
+ class BrowserView;
++class ExpandOnHoverLock;
++class NewTabButtonMenuModel;
++class VerticalNewTabButton;
+ class VerticalTabStripBottomContainer;
+ class ShadowFrameView;
+ 
+@@ -41,6 +46,7 @@ class VerticalTabStripStateController;
+ }  // namespace tabs
+ 
+ namespace views {
++class MenuRunner;
+ class ResizeArea;
+ class Separator;
+ class View;
+@@ -54,6 +60,7 @@ class VerticalTabStripRegionView final
+       public views::ResizeAreaDelegate,
+       public OmniboxTabHelper::Observer,
+       public tabs::VerticalTabStripStateController::Delegate,
++      public views::ContextMenuController,
+       public views::WidgetObserver {
+   METADATA_HEADER(VerticalTabStripRegionView, BaseTabStripRegionView)
+ 
+@@ -121,6 +128,12 @@ class VerticalTabStripRegionView final
+   // views::ResizeAreaDelegate:
+   void OnResize(int resize_amount, bool done_resizing) override;
+ 
++  // views::ContextMenuController:
++  void ShowContextMenuForViewImpl(
++      views::View* source,
++      const gfx::Point& point,
++      ui::mojom::MenuSourceType source_type) override;
++
+   // tabs::VerticalTabStripStateController::Delegate
+   void SetCollapsedStateUpdatedCallback(
+       base::RepeatingCallback<void(bool)> callback) override;
+@@ -229,12 +242,16 @@ class VerticalTabStripRegionView final
+   void OnOmniboxPopupVisibilityChanged(bool is_open) override;
+ 
+   void OnActiveTabChanged(const tabs::TabInterface* active_tab);
++  void OnTabCollectionChanged();
++  void OnNewTabButtonContextMenuClosed();
+ 
+   // Whether a leading exclusion exists due to window controls.
+   bool has_leading_exclusion_ = false;
+   bool zen_mode_floating_style_ = false;
+ 
+   raw_ptr<VerticalTabStripBottomContainer> bottom_button_container_ = nullptr;
++  raw_ptr<VerticalNewTabButton> new_tab_button_ = nullptr;
++  raw_ptr<views::View> tab_area_spacer_ = nullptr;
+   raw_ptr<views::View> gemini_button_ = nullptr;
+   raw_ptr<views::ResizeArea> resize_area_ = nullptr;
+   raw_ptr<ShadowFrameView> shadow_frame_ = nullptr;
+@@ -263,6 +280,10 @@ class VerticalTabStripRegionView final
+   tabs::VerticalTabStripState target_collapse_state_;
+ 
+   base::CallbackListSubscription collapsed_state_changed_subscription_;
++  base::CallbackListSubscription new_tab_button_pressed_subscription_;
++  base::CallbackListSubscription tab_children_added_subscription_;
++  base::CallbackListSubscription tab_child_removed_subscription_;
++  base::CallbackListSubscription tab_child_moved_subscription_;
+   base::RepeatingCallback<void(bool)>
+       update_state_controller_collapsed_callback_;
+ 
+@@ -274,6 +295,10 @@ class VerticalTabStripRegionView final
+   std::optional<base::TimeTicks> time_at_expand_on_hover_timer_start_;
+   int expand_on_hover_heuristic_samples_ = 0;
+ 
++  std::unique_ptr<NewTabButtonMenuModel> context_menu_model_;
++  std::unique_ptr<views::MenuRunner> context_menu_runner_;
++  std::unique_ptr<ExpandOnHoverLock> new_tab_context_menu_hover_lock_;
++
+   // Given that both lock counters are non-zero, force_collapse_lock_count_ will
+   // always take precedence.
+   int force_collapse_lock_count_ = 0;
