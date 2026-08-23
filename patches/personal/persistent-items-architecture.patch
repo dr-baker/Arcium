@@ -4510,7 +4510,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
    SetSpaceForBrowser(browser, found->second);
    return true;
  }
-@@ -223,24 +1726,32 @@ void HeliumSpaceService::AddSpaceToSessi
+@@ -223,20 +1726,19 @@ void HeliumSpaceService::AddSpaceToSessi
    if (!extra_data) {
      return;
    }
@@ -4537,23 +4537,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    return {};
    }
    const auto found = session_space_ids_.find(browser->session_id());
--  return found == session_space_ids_.end() ? std::string_view()
--                                            : std::string_view(found->second);
-+  if (found != session_space_ids_.end()) {
-+    return found->second;
-+  }
-+  const std::string& active_id =
-+      profile_->GetPrefs()->GetString(kHeliumActiveSpaceIdPref);
-+  for (const auto& space : spaces_) {
-+    if (space->id() == active_id) {
-+      return space->id();
-+    }
-+  }
-+  return spaces_.empty() ? std::string_view() : spaces_.front()->id();
- }
- 
- std::vector<HeliumSpace*> HeliumSpaceService::GetSpaces() {
-@@ -253,22 +1764,22 @@ std::vector<HeliumSpace*> HeliumSpaceSer
+   return found == session_space_ids_.end() ? std::string_view()
+@@ -253,22 +1755,34 @@ std::vector<HeliumSpace*> HeliumSpaceSer
    return result;
  }
  
@@ -4580,7 +4565,9 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +      !GetSpaceIdForBrowser(browser).empty()) {
 +    return;
 +  }
-+  SetSpaceForBrowser(browser, GetActiveSpace()->id());
++  if (HeliumSpace* active_space = GetActiveSpace()) {
++    SetSpaceForBrowser(browser, active_space->id());
++  }
 +}
 +
 +void HeliumSpaceService::OnBrowserActivated(BrowserWindowInterface* window) {
@@ -4589,6 +4576,16 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  // through ProfileBrowserCollection. Activation is the final deterministic
 +  // boundary at which that window must have a Space.
 +  OnBrowserCreated(window);
++
++  Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
++  if (!browser || browser->profile() != profile_ ||
++      browser->type() != Browser::TYPE_NORMAL) {
++    return;
++  }
++  const std::string_view space_id = GetSpaceIdForBrowser(browser);
++  if (!space_id.empty()) {
++    SetActiveSpace(space_id);
++  }
  }
  
  void HeliumSpaceService::OnBrowserClosed(BrowserWindowInterface* window) {
@@ -10574,3 +10571,173 @@ Index: src/components/omnibox/browser/autocomplete_result.cc
  }
  
  void AutocompleteResult::LimitNumberOfUrlsShown(
+Index: src/chrome/browser/ui/tabs/pinned_tab_codec_browsertest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/tabs/pinned_tab_codec_browsertest.cc
++++ src/chrome/browser/ui/tabs/pinned_tab_codec_browsertest.cc
+@@ -5,12 +5,20 @@
+ #include "chrome/browser/ui/tabs/pinned_tab_codec.h"
+ 
+ #include <map>
++#include <memory>
+ #include <string>
+ #include <vector>
+ 
++#include "base/functional/bind.h"
++#include "base/test/scoped_feature_list.h"
+ #include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_tabstrip.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
+ #include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/browser/ui/startup/startup_tab.h"
+ #include "chrome/browser/ui/tabs/pinned_tab_test_utils.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -23,6 +31,31 @@
+ 
+ using PinnedTabCodecBrowserTest = InProcessBrowserTest;
+ 
++class PinnedTabCodecHeliumSpacesBrowserTest : public InProcessBrowserTest {
++ public:
++  PinnedTabCodecHeliumSpacesBrowserTest() {
++    feature_list_.InitAndEnableFeature(helium::kHeliumFavoritesAndPins);
++  }
++
++ protected:
++  void SetUpOnMainThread() override {
++    InProcessBrowserTest::SetUpOnMainThread();
++
++    ASSERT_TRUE(helium::IsHeliumFavoritesAndPinsEnabled());
++    helium::HeliumSpaceServiceFactory::GetInstance()
++        ->SetTestingSubclassFactoryAndUse<helium::HeliumSpaceService>(
++            browser()->profile(),
++            base::BindOnce([](content::BrowserContext* context)
++                               -> std::unique_ptr<helium::HeliumSpaceService> {
++              return std::make_unique<helium::HeliumSpaceService>(
++                  static_cast<Profile*>(context));
++            }));
++  }
++
++ private:
++  base::test::ScopedFeatureList feature_list_;
++};
++
+ // Make sure nothing is restored when the browser has no pinned tabs.
+ IN_PROC_BROWSER_TEST_F(PinnedTabCodecBrowserTest, NoPinnedTabs) {
+   GURL url1("https://www.google.com");
+@@ -96,34 +129,95 @@ IN_PROC_BROWSER_TEST_F(PinnedTabCodecBro
+   EXPECT_EQ(favorite.helium_home_title, restored[0].helium_home_title);
+ }
+ 
+-IN_PROC_BROWSER_TEST_F(PinnedTabCodecBrowserTest,
++IN_PROC_BROWSER_TEST_F(PinnedTabCodecHeliumSpacesBrowserTest,
+                        SpaceAssociationRoundTripsThroughSessionExtraData) {
+-  helium::HeliumSpaceService service(browser()->profile());
++  helium::HeliumSpaceService* service =
++      helium::HeliumSpaceServiceFactory::GetForProfile(browser()->profile());
++  ASSERT_TRUE(service);
+   constexpr char kSpaceId[] = "test-space";
+-  service.GetOrCreateSpace(kSpaceId, u"Test Space");
+-  service.SetSpaceForBrowser(browser(), kSpaceId);
++  service->GetOrCreateSpace(kSpaceId, u"Test Space");
++  service->SetSpaceForBrowser(browser(), kSpaceId);
+ 
+   std::map<std::string, std::string> extra_data;
+-  service.AddSpaceToSessionExtraData(browser(), &extra_data);
++  service->AddSpaceToSessionExtraData(browser(), &extra_data);
+   ASSERT_EQ(1u, extra_data.size());
+-  EXPECT_EQ(kSpaceId,
+-            extra_data[helium::kHeliumSpaceIdWindowExtraDataKey]);
++  EXPECT_EQ(kSpaceId, extra_data[helium::kHeliumSpaceIdWindowExtraDataKey]);
+ 
+-  service.OnBrowserClosed(browser());
+-  EXPECT_TRUE(service.GetSpaceIdForBrowser(browser()).empty());
++  service->OnBrowserClosed(browser());
++  EXPECT_TRUE(service->GetSpaceIdForBrowser(browser()).empty());
+   EXPECT_TRUE(
+-      service.RestoreSpaceForBrowserFromSession(browser(), extra_data));
+-  EXPECT_EQ(kSpaceId, service.GetSpaceIdForBrowser(browser()));
++      service->RestoreSpaceForBrowserFromSession(browser(), extra_data));
++  EXPECT_EQ(kSpaceId, service->GetSpaceIdForBrowser(browser()));
+ }
+ 
+-IN_PROC_BROWSER_TEST_F(PinnedTabCodecBrowserTest,
++IN_PROC_BROWSER_TEST_F(PinnedTabCodecHeliumSpacesBrowserTest,
+                        ArcImportKeepsValidBrowserSpaceAssociation) {
+-  helium::HeliumSpaceService service(browser()->profile());
++  helium::HeliumSpaceService* service =
++      helium::HeliumSpaceServiceFactory::GetForProfile(browser()->profile());
++  ASSERT_TRUE(service);
+   constexpr char kSpaceId[] = "existing-imported-space";
+-  service.GetOrCreateSpace(kSpaceId, u"Existing Space");
+-  service.SetSpaceForBrowser(browser(), kSpaceId);
++  service->GetOrCreateSpace(kSpaceId, u"Existing Space");
++  service->SetSpaceForBrowser(browser(), kSpaceId);
++
++  service->PrepareForArcImport();
++
++  EXPECT_EQ(kSpaceId, service->GetSpaceIdForBrowser(browser()));
++}
+ 
+-  service.PrepareForArcImport();
++IN_PROC_BROWSER_TEST_F(PinnedTabCodecHeliumSpacesBrowserTest,
++                       BrowserCreationGetsExplicitActiveSpace) {
++  helium::HeliumSpaceService* service =
++      helium::HeliumSpaceServiceFactory::GetForProfile(browser()->profile());
++  ASSERT_TRUE(service);
++  constexpr char kSpaceId[] = "created-browser-space";
++  service->GetOrCreateSpace(kSpaceId, u"Created Browser Space");
++  service->SetActiveSpace(kSpaceId);
++
++  Browser* new_browser = Browser::Create(
++      Browser::CreateParams(Browser::TYPE_NORMAL, browser()->profile(), true));
++  ASSERT_NE(nullptr, new_browser);
++  EXPECT_EQ(Browser::TYPE_NORMAL, new_browser->type());
++  EXPECT_EQ(kSpaceId, service->GetSpaceIdForBrowser(new_browser));
++
++  new_browser->GetWindow()->Close();
++}
++
++IN_PROC_BROWSER_TEST_F(PinnedTabCodecHeliumSpacesBrowserTest,
++                       BrowserActivationUpdatesActiveSpace) {
++  helium::HeliumSpaceService* service =
++      helium::HeliumSpaceServiceFactory::GetForProfile(browser()->profile());
++  ASSERT_TRUE(service);
++  constexpr char kSpaceId[] = "activated-browser-space";
++  constexpr char kOtherSpaceId[] = "other-browser-space";
++  service->GetOrCreateSpace(kSpaceId, u"Activated Browser Space");
++  service->GetOrCreateSpace(kOtherSpaceId, u"Other Browser Space");
++  service->SetSpaceForBrowser(browser(), kSpaceId);
++  service->SetActiveSpace(kOtherSpaceId);
++
++  service->OnBrowserActivated(browser());
++
++  EXPECT_EQ(kSpaceId, service->GetActiveSpace()->id());
++}
+ 
+-  EXPECT_EQ(kSpaceId, service.GetSpaceIdForBrowser(browser()));
++IN_PROC_BROWSER_TEST_F(PinnedTabCodecHeliumSpacesBrowserTest,
++                       NewWindowCreatesBrowserInsteadOfTab) {
++  ProfileBrowserCollection* collection =
++      ProfileBrowserCollection::GetForProfile(browser()->profile());
++  const size_t initial_browser_count = collection->GetSize();
++  const int initial_tab_count = browser()->tab_strip_model()->count();
++
++  BrowserWindowInterface* new_window =
++      chrome::OpenEmptyWindow(browser()->profile());
++  Browser* new_browser =
++      new_window ? new_window->GetBrowserForMigrationOnly() : nullptr;
++  ASSERT_NE(nullptr, new_browser);
++
++  EXPECT_EQ(initial_browser_count + 1, collection->GetSize());
++  EXPECT_EQ(initial_tab_count, browser()->tab_strip_model()->count());
++  EXPECT_NE(browser(), new_browser);
++  EXPECT_EQ(Browser::TYPE_NORMAL, new_browser->type());
++
++  if (new_browser != browser()) {
++    new_browser->GetWindow()->Close();
++  }
+ }
