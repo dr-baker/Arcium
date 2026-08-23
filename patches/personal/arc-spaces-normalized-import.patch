@@ -5,7 +5,7 @@ Index: src/chrome/browser/importer/BUILD.gn
 @@ -118,6 +118,24 @@ source_set("browser_tests") {
    }
  }
-
+ 
 +executable("helium_arc_sidebar_import_tests") {
 +  testonly = true
 +  sources = [ "helium_arc_sidebar_import_unittest.cc" ]
@@ -34,7 +34,7 @@ Index: src/chrome/browser/importer/external_process_importer_client.cc
 @@ -186,10 +186,19 @@ void ExternalProcessImporterClient::OnBo
      bridge_->AddBookmarks(bookmarks_, bookmarks_first_folder_name_);
  }
-
+ 
 +void ExternalProcessImporterClient::OnArcSidebarSnapshotReady(
 +    const std::string& snapshot_json) {
 +  if (cancelled_) {
@@ -49,7 +49,7 @@ Index: src/chrome/browser/importer/external_process_importer_client.cc
 +  if (cancelled_) {
      return;
 +  }
-
+ 
    total_favicons_count_ = total_favicons_count;
    favicons_.reserve(total_favicons_count);
 Index: src/chrome/browser/importer/external_process_importer_client.h
@@ -69,9 +69,9 @@ Index: src/chrome/browser/importer/helium_arc_sidebar_import.cc
 --- src.orig/chrome/browser/importer/helium_arc_sidebar_import.cc
 +++ src/chrome/browser/importer/helium_arc_sidebar_import.cc
 @@ -4,190 +4,84 @@
-
+ 
  #include "chrome/browser/importer/helium_arc_sidebar_import.h"
-
+ 
 -#include <iterator>
 +#include <algorithm>
 +#include <optional>
@@ -79,7 +79,7 @@ Index: src/chrome/browser/importer/helium_arc_sidebar_import.cc
  #include <string_view>
  #include <utility>
 -#include <vector>
-
+ 
 +#include "base/json/json_reader.h"
 +#include "base/strings/strcat.h"
  #include "base/strings/utf_string_conversions.h"
@@ -95,11 +95,11 @@ Index: src/chrome/browser/importer/helium_arc_sidebar_import.cc
 -#include "components/user_data_importer/common/imported_bookmark_entry.h"
 +#include "components/prefs/pref_service.h"
 +#include "components/prefs/scoped_user_pref_update.h"
-
+ 
  namespace helium {
-
+ 
  namespace {
-
+ 
 -constexpr std::u16string_view kSpaceMarkerPrefix = u"\u2063helium-space:";
 -
 -bool ParseSpaceMarker(const std::u16string& marker,
@@ -120,7 +120,7 @@ Index: src/chrome/browser/importer/helium_arc_sidebar_import.cc
 +                          std::string_view source_id) {
 +  return base::StrCat({"arc:", profile, ":", source_id});
  }
-
+ 
 -StartupTabs ConvertToolbarEntriesToFavorites(
 -    const std::vector<user_data_importer::ImportedBookmarkEntry>& entries) {
 -  StartupTabs favorites;
@@ -136,7 +136,7 @@ Index: src/chrome/browser/importer/helium_arc_sidebar_import.cc
 -  return favorites;
 -}
 +}  // namespace
-
+ 
 -StartupTabs ConvertEntriesToPins(
 -    const std::vector<user_data_importer::ImportedBookmarkEntry>& entries) {
 -  StartupTabs pins;
@@ -185,7 +185,7 @@ Index: src/chrome/browser/importer/helium_arc_sidebar_import.cc
 +                              kHeliumArcFavoritesByProfilePref);
 +  update->Set(model.source_profile,
 +              PinnedTabCodec::EncodeTabs(imported_favorites));
-
+ 
 -struct ImportedSpace {
 -  std::string id;
 -  std::u16string name;
@@ -236,7 +236,7 @@ Index: src/chrome/browser/importer/helium_arc_sidebar_import.cc
 -  return spaces;
 +  service->ReconcileImportedSpaces(model);
  }
-
+ 
 -}  // namespace
 -
 -void ImportArcSidebarEntriesAsPinsAndFavorites(
@@ -274,7 +274,7 @@ Index: src/chrome/browser/importer/helium_arc_sidebar_import.cc
 +  if (!profile) {
 +    return false;
    }
-
+ 
 -  std::vector<ImportedSpace> imported_spaces = ConvertEntriesToSpaces(entries);
 -  if (space && !imported_spaces.empty()) {
 -    auto* space_service =
@@ -313,7 +313,7 @@ Index: src/chrome/browser/importer/helium_arc_sidebar_import.cc
 +  ApplyArcSidebarModel(profile, service, *model);
 +  return true;
  }
-
+ 
  }  // namespace helium
 Index: src/chrome/browser/importer/helium_arc_sidebar_import.h
 ===================================================================
@@ -322,19 +322,19 @@ Index: src/chrome/browser/importer/helium_arc_sidebar_import.h
 @@ -5,22 +5,24 @@
  #ifndef CHROME_BROWSER_IMPORTER_HELIUM_ARC_SIDEBAR_IMPORT_H_
  #define CHROME_BROWSER_IMPORTER_HELIUM_ARC_SIDEBAR_IMPORT_H_
-
+ 
 -#include <string>
 -#include <vector>
 +#include <string_view>
-
+ 
  class Profile;
-
+ 
 -namespace user_data_importer {
 -struct ImportedBookmarkEntry;
 -}  // namespace user_data_importer
 -
  namespace helium {
-
+ 
 -// Routes Arc sidebar bookmark entries into Helium favorites (toolbar) and pins
 -// (non-toolbar), merging with any existing stored entries.
 -void ImportArcSidebarEntriesAsPinsAndFavorites(
@@ -352,17 +352,17 @@ Index: src/chrome/browser/importer/helium_arc_sidebar_import.h
 +void ApplyArcSidebarModel(Profile* profile,
 +                          HeliumSpaceService* service,
 +                          const HeliumSpaceModel& model);
-
+ 
  }  // namespace helium
-
+ 
 Index: src/chrome/browser/importer/helium_arc_sidebar_import_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/importer/helium_arc_sidebar_import_unittest.cc
 +++ src/chrome/browser/importer/helium_arc_sidebar_import_unittest.cc
 @@ -4,79 +4,150 @@
-
+ 
  #include "chrome/browser/importer/helium_arc_sidebar_import.h"
-
+ 
 +#include <string>
 +#include <variant>
 +
@@ -378,10 +378,10 @@ Index: src/chrome/browser/importer/helium_arc_sidebar_import_unittest.cc
  #include "content/public/test/browser_task_environment.h"
  #include "testing/gtest/include/gtest/gtest.h"
  #include "url/gurl.h"
-
+ 
 +namespace helium {
  namespace {
-
+ 
 -user_data_importer::ImportedBookmarkEntry MakeEntry(
 -    const GURL& url,
 -    const std::u16string& title,
@@ -428,7 +428,7 @@ Index: src/chrome/browser/importer/helium_arc_sidebar_import_unittest.cc
 +  });
 +  return model;
  }
-
+ 
 -}  // namespace
 -
  class HeliumArcSidebarImportTest : public testing::Test {
@@ -436,7 +436,7 @@ Index: src/chrome/browser/importer/helium_arc_sidebar_import_unittest.cc
    content::BrowserTaskEnvironment task_environment_;
    TestingProfile profile_;
  };
-
+ 
 -TEST_F(HeliumArcSidebarImportTest, RoutesToolbarToFavoritesAndRestToPins) {
 -  std::vector<user_data_importer::ImportedBookmarkEntry> entries;
 -  entries.push_back(
@@ -457,7 +457,7 @@ Index: src/chrome/browser/importer/helium_arc_sidebar_import_unittest.cc
 +      MakeModel("Profile 1", "favorite-old", "space-one", "pin-old");
 +  ApplyArcSidebarModel(&profile_, &service, first);
 +  ApplyArcSidebarModel(&profile_, &service, first);
-
+ 
    StartupTabs favorites = PinnedTabCodec::ReadPinnedTabs(&profile_);
    ASSERT_EQ(1u, favorites.size());
 -  EXPECT_EQ(StartupTab::Type::kPinned, favorites[0].type);
@@ -537,7 +537,7 @@ Index: src/chrome/browser/importer/helium_arc_sidebar_import_unittest.cc
 +  EXPECT_EQ("arc:Profile 1:profile-fav",
 +            profile_favorites[0].helium_source_id);
  }
-
+ 
 -TEST_F(HeliumArcSidebarImportTest, MergesWithExistingPins) {
 -  StartupTabs existing;
 -  existing.emplace_back(GURL("https://existing.example/"),
@@ -570,7 +570,7 @@ Index: src/chrome/browser/importer/in_process_importer_bridge.cc
 @@ -115,6 +115,11 @@ void InProcessImporterBridge::AddBookmar
    writer_->AddBookmarks(bookmarks, first_folder_name);
  }
-
+ 
 +void InProcessImporterBridge::AddArcSidebarSnapshot(
 +    const std::string& snapshot_json) {
 +  writer_->AddArcSidebarSnapshot(snapshot_json);
@@ -586,11 +586,11 @@ Index: src/chrome/browser/importer/in_process_importer_bridge.h
 @@ -34,6 +34,8 @@ class InProcessImporterBridge : public I
        const std::vector<user_data_importer::ImportedBookmarkEntry>& bookmarks,
        const std::u16string& first_folder_name) override;
-
+ 
 +  void AddArcSidebarSnapshot(const std::string& snapshot_json) override;
 +
    void AddHomePage(const GURL& home_page) override;
-
+ 
    void SetFavicons(const favicon_base::FaviconUsageDataList& favicons) override;
 Index: src/chrome/browser/importer/profile_writer.cc
 ===================================================================
@@ -609,11 +609,11 @@ Index: src/chrome/browser/importer/profile_writer.cc
 +  if (bookmarks.empty()) {
      return;
    }
-
+ 
 @@ -238,6 +233,14 @@ void ProfileWriter::AddBookmarks(
      ShowBookmarkBar(profile_);
  }
-
+ 
 +void ProfileWriter::AddArcSidebarSnapshot(const std::string& snapshot_json) {
 +  if (importer_type_ != user_data_importer::TYPE_ARC ||
 +      !profile_->GetPrefs()->GetBoolean(prefs::kImportArcSidebarToPins)) {
@@ -632,11 +632,11 @@ Index: src/chrome/browser/importer/profile_writer.h
 @@ -77,6 +77,8 @@ class ProfileWriter : public base::RefCo
        const std::vector<user_data_importer::ImportedBookmarkEntry>& bookmarks,
        const std::u16string& top_level_folder_name);
-
+ 
 +  virtual void AddArcSidebarSnapshot(const std::string& snapshot_json);
 +
    virtual void AddFavicons(const favicon_base::FaviconUsageDataList& favicons);
-
+ 
    // Adds the TemplateURLs in |template_urls| to the local store.
 Index: src/chrome/browser/sessions/session_restore.cc
 ===================================================================
@@ -654,7 +654,7 @@ Index: src/chrome/browser/sessions/session_restore.cc
 @@ -834,6 +836,12 @@ class SessionRestoreImpl : public Browse
  #endif
        }
-
+ 
 +      if (helium::HeliumSpaceService* space_service =
 +              helium::HeliumSpaceServiceFactory::GetForProfile(profile_)) {
 +        space_service->RestoreSpaceForBrowserFromSession(browser,
@@ -674,7 +674,7 @@ Index: src/chrome/browser/sessions/session_restore.cc
      Browser::CreateParams params(type, profile_, false);
      params.initial_bounds = bounds;
 @@ -1244,6 +1252,10 @@ class SessionRestoreImpl : public Browse
-
+ 
      base::TimeTicks now = base::TimeTicks::Now();
      Browser* browser = Browser::Create(params);
 +    if (helium::HeliumSpaceService* space_service =
@@ -700,7 +700,7 @@ Index: src/chrome/browser/sessions/session_service_base.cc
 @@ -709,6 +711,18 @@ void SessionServiceBase::BuildCommandsFo
            browser->session_id(),
            BrowserWindow::FromBrowser(browser)->IsVisibleOnAllWorkspaces()));
-
+ 
 +  if (auto* space_service = helium::HeliumSpaceServiceFactory::GetForProfile(
 +          browser->profile())) {
 +    const std::string_view space_id =
@@ -723,7 +723,7 @@ Index: src/chrome/browser/ui/BUILD.gn
 @@ -361,6 +361,20 @@ if (!is_android) {
    }
  }
-
+ 
 +executable("helium_space_model_tests") {
 +  testonly = true
 +  sources = [
@@ -768,7 +768,7 @@ Index: src/chrome/browser/ui/browser_live_tab_context.cc
  #include "chrome/browser/ui/tabs/tab_group_model.h"
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
 @@ -165,7 +167,13 @@ std::map<std::string, std::string> Brows
-
+ 
  std::map<std::string, std::string>
  BrowserLiveTabContext::GetExtraDataForWindow() const {
 -  return std::map<std::string, std::string>();
@@ -780,7 +780,7 @@ Index: src/chrome/browser/ui/browser_live_tab_context.cc
 +  }
 +  return extra_data;
  }
-
+ 
  std::optional<tab_groups::TabGroupId> BrowserLiveTabContext::GetTabGroupForTab(
 @@ -419,7 +427,7 @@ sessions::LiveTabContext* BrowserLiveTab
      ui::mojom::WindowShowState show_state,
@@ -793,13 +793,13 @@ Index: src/chrome/browser/ui/browser_live_tab_context.cc
      // Only trusted app popup windows should ever be restored.
 @@ -445,6 +453,10 @@ sessions::LiveTabContext* BrowserLiveTab
    create_params->user_title = user_title;
-
+ 
    Browser* browser = Browser::Create(*create_params.get());
 +  if (auto* service =
 +          helium::HeliumSpaceServiceFactory::GetForProfile(profile)) {
 +    service->RestoreSpaceForBrowserFromSession(browser, extra_data);
 +  }
-
+ 
    return browser->GetFeatures().live_tab_context();
  }
 Index: src/chrome/browser/ui/helium/helium_space.cc
@@ -807,9 +807,9 @@ Index: src/chrome/browser/ui/helium/helium_space.cc
 --- src.orig/chrome/browser/ui/helium/helium_space.cc
 +++ src/chrome/browser/ui/helium/helium_space.cc
 @@ -4,8 +4,11 @@
-
+ 
  #include "chrome/browser/ui/helium/helium_space.h"
-
+ 
 +#include <vector>
 +
  #include "base/command_line.h"
@@ -829,13 +829,13 @@ Index: src/chrome/browser/ui/helium/helium_space.cc
 +constexpr char kTitleKey[] = "title";
 +constexpr char kUrlKey[] = "url";
 +constexpr char kChildrenKey[] = "children";
-
+ 
  base::DictValue* FindSpaceRecord(base::ListValue& records,
                                   const std::string& id) {
 @@ -56,11 +66,90 @@ const base::DictValue* FindSpaceRecord(c
    return nullptr;
  }
-
+ 
 +const std::string* FindSourceProfile(Profile* profile,
 +                                     const std::string& space_id) {
 +  const base::DictValue* record =
@@ -918,13 +918,13 @@ Index: src/chrome/browser/ui/helium/helium_space.cc
 +}
 +
  }  // namespace
-
+ 
 -HeliumSpace::HeliumSpace(Profile* profile,
 -                         std::string id,
 -                         std::u16string name)
 +HeliumSpace::HeliumSpace(Profile* profile, std::string id, std::u16string name)
      : profile_(profile), id_(std::move(id)), name_(std::move(name)) {}
-
+ 
  HeliumSpace::~HeliumSpace() = default;
 @@ -90,16 +179,65 @@ void HeliumSpace::WritePins(const Startu
  void HeliumSpace::WritePinsFromBrowser(BrowserWindowInterface* browser) {
@@ -940,7 +940,7 @@ Index: src/chrome/browser/ui/helium/helium_space.cc
 +    record->Set(kPinsKey, std::move(captured));
    }
  }
-
+ 
  StartupTabs HeliumSpace::ReadFavorites() const {
 -  return PinnedTabCodec::ReadPinnedTabs(profile_);
 +  StartupTabs favorites = PinnedTabCodec::ReadPinnedTabs(profile_);
@@ -981,7 +981,7 @@ Index: src/chrome/browser/ui/helium/helium_space.cc
 +  }
 +  return favorites;
  }
-
+ 
  void HeliumSpace::WriteFavorites(const StartupTabs& tabs) {
 -  PinnedTabCodec::WritePinnedTabs(profile_, tabs);
 +  const std::string* source_profile = FindSourceProfile(profile_, id_);
@@ -993,7 +993,7 @@ Index: src/chrome/browser/ui/helium/helium_space.cc
 +                              kHeliumArcFavoritesByProfilePref);
 +  update->Set(*source_profile, PinnedTabCodec::EncodeTabs(tabs));
  }
-
+ 
  void HeliumSpace::WriteFavoritesFromBrowsers() {
 @@ -109,11 +247,11 @@ void HeliumSpace::WriteFavoritesFromBrow
      return;
@@ -1017,7 +1017,7 @@ Index: src/chrome/browser/ui/helium/helium_space.cc
 +    WriteFavorites(PinnedTabCodec::CapturePinnedTabs(match));
    }
  }
-
+ 
 @@ -178,13 +316,16 @@ BrowserWindowInterface* HeliumSpace::Act
    StartupTabs startup_tabs = ReadFavorites();
    StartupTabs pins = ReadPins();
@@ -1675,7 +1675,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 @@ -119,6 +120,50 @@ HeliumSpace* HeliumSpaceService::GetOrCr
    return spaces_.back().get();
  }
-
+ 
 +void HeliumSpaceService::ReconcileImportedSpaces(
 +    const HeliumSpaceModel& model) {
 +  PrepareForArcImport();
@@ -1728,16 +1728,16 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 --- src.orig/chrome/browser/ui/helium/helium_space_service.h
 +++ src/chrome/browser/ui/helium/helium_space_service.h
 @@ -27,9 +27,12 @@ namespace helium {
-
+ 
  inline constexpr char kHeliumSpacesPref[] = "helium.spaces";
  inline constexpr char kHeliumActiveSpaceIdPref[] = "helium.active_space_id";
 +inline constexpr char kHeliumArcFavoritesByProfilePref[] =
 +    "helium.arc_favorites_by_profile";
  inline constexpr char kHeliumSpaceIdWindowExtraDataKey[] = "helium_space_id";
-
+ 
  class HeliumSpace;
 +struct HeliumSpaceModel;
-
+ 
  // Profile-scoped owner of ordered Helium Spaces. Profile identity stays an
  // implementation detail; Spaces are the user-facing browsing contexts.
 @@ -49,6 +52,9 @@ class HeliumSpaceService : public KeyedS
@@ -1754,7 +1754,7 @@ Index: src/chrome/browser/ui/startup/startup_browser_creator_impl.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/startup/startup_browser_creator_impl.cc
 +++ src/chrome/browser/ui/startup/startup_browser_creator_impl.cc
-@@ -308,14 +308,16 @@ Browser* StartupBrowserCreatorImpl::Open
+@@ -308,14 +308,16 @@
      return browser;
    }
    return OpenTabsInBrowser(browser, chrome::startup::IsProcessStartup::kNo,
@@ -1762,7 +1762,7 @@ Index: src/chrome/browser/ui/startup/startup_browser_creator_impl.cc
 +                           tabs, TabOverWrite::kNo,
 +                           /*keep_existing_tab_active=*/true);
  }
-
+ 
  Browser* StartupBrowserCreatorImpl::OpenTabsInBrowser(
      Browser* browser,
      chrome::startup::IsProcessStartup process_startup,
@@ -1771,18 +1771,39 @@ Index: src/chrome/browser/ui/startup/startup_browser_creator_impl.cc
 +    TabOverWrite is_active_tab_overwrite,
 +    bool keep_existing_tab_active) {
    DCHECK(!tabs.empty());
-
+ 
    // If we don't yet have a profile, try to use the one we're given from
-@@ -355,7 +357,7 @@ Browser* StartupBrowserCreatorImpl::Open
+@@ -355,7 +357,7 @@
    }
    CHECK(profile_);
-
+ 
 -  bool first_tab = true;
 +  bool first_tab = !keep_existing_tab_active;
    bool process_headless_commands = headless::ShouldProcessHeadlessCommands();
    custom_handlers::ProtocolHandlerRegistry* registry =
        ProtocolHandlerRegistryFactory::GetForBrowserContext(profile_);
-@@ -479,6 +481,12 @@ Browser* StartupBrowserCreatorImpl::Open
+@@ -460,9 +462,10 @@
+       helium::RestoreAnchoredPinnedTabHome(
+           tab_interface, tab.url, tab.helium_home_title);
+       if (tab_interface && !tab_interface->IsPinned()) {
++        TabStripModel* const model = browser->tab_strip_model();
+         if (auto* strip = static_cast<tabs::TabStripCollection*>(
+                 const_cast<tabs::TabCollection*>(
+-                    browser->tab_strip_model()->Root()))) {
++                    model->Root()))) {
+           tabs::TabCollection* parent = static_cast<tabs::TabCollection*>(
+               strip->pin_collection());
+           for (const auto& segment : tab.helium_folder_path) {
+@@ -472,13 +475,19 @@
+           if (parent == static_cast<tabs::TabCollection*>(
+                             strip->pin_collection())) {
+             if (!strip->IsPinTab(tab_interface)) {
+-              strip->MoveTabToPin(tab_interface);
++              model->MoveTabToPin(tab_interface);
+             }
+           } else {
+-            strip->MoveTabToCollection(tab_interface, parent);
++            model->MoveTabToPinCollection(tab_interface, parent);
            }
          }
        }
@@ -1795,7 +1816,7 @@ Index: src/chrome/browser/ui/startup/startup_browser_creator_impl.cc
      }
      first_tab = false;
    }
-@@ -613,9 +621,11 @@ void StartupBrowserCreatorImpl::Determin
+@@ -613,9 +622,11 @@
         profile_->GetPrefs()->GetBoolean(prefs::kHeliumDidOnboarding))) {
      if (auto* space_service =
              helium::HeliumSpaceServiceFactory::GetForProfile(profile_)) {
@@ -1821,7 +1842,7 @@ Index: src/chrome/browser/ui/startup/startup_tab.h
 +  // Stable identity supplied by an external sidebar source. Empty for local
 +  // tabs. Codecs persist it so re-import can replace source-owned rows.
 +  std::string helium_source_id;
-
+ 
    // When restoring a pin into nested folders, each segment is an
    // ancestor folder title (outermost first) plus that folder's collapsed state.
    struct FolderPathSegment {
@@ -1830,7 +1851,7 @@ Index: src/chrome/browser/ui/startup/startup_tab.h
 +    std::string source_id;
    };
    std::vector<FolderPathSegment> helium_folder_path;
-
+ 
 Index: src/chrome/browser/ui/tabs/pin_tab_codec.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/tabs/pin_tab_codec.cc
@@ -1840,7 +1861,7 @@ Index: src/chrome/browser/ui/tabs/pin_tab_codec.cc
  constexpr char kCollapsed[] = "collapsed";
  constexpr char kChildren[] = "children";
 +constexpr char kSourceId[] = "source_id";
-
+ 
 -base::DictValue EncodeTabNode(const GURL& url, const std::u16string& title) {
 +base::DictValue EncodeTabNode(const GURL& url,
 +                              const std::u16string& title,
@@ -1856,7 +1877,7 @@ Index: src/chrome/browser/ui/tabs/pin_tab_codec.cc
 +  }
    return dict;
  }
-
+ 
 @@ -129,6 +135,8 @@ void DecodeNode(const base::DictValue& v
      nested.push_back(StartupTab::FolderPathSegment{
          .title = base::UTF8ToUTF16(*title),
@@ -1875,7 +1896,7 @@ Index: src/chrome/browser/ui/tabs/pin_tab_codec.cc
 +  }
    results->push_back(std::move(tab));
  }
-
+ 
 @@ -225,6 +236,9 @@ base::ListValue PinTabCodec::EncodePins(
          dict.Set(kType, kTypeFolder);
          dict.Set(kTitle, base::UTF16ToUTF8(segment.title));
@@ -1893,7 +1914,7 @@ Index: src/chrome/browser/ui/tabs/pin_tab_codec.cc
 -        EncodeTabNode(tab.url, tab.helium_home_title));
 +        EncodeTabNode(tab.url, tab.helium_home_title, tab.helium_source_id));
    }
-
+ 
    return root;
 Index: src/chrome/browser/ui/tabs/pinned_tab_codec.cc
 ===================================================================
@@ -1907,7 +1928,7 @@ Index: src/chrome/browser/ui/tabs/pinned_tab_codec.cc
 -    "helium_home_title";
 +const char kHeliumHomeTitle[] = "helium_home_title";
 +const char kHeliumSourceId[] = "helium_source_id";
-
+ 
  // Returns a base::DictValue representing the supplied StartupTab.
  base::DictValue EncodeTab(const GURL& url,
                            bool helium_has_home,
@@ -1930,7 +1951,7 @@ Index: src/chrome/browser/ui/tabs/pinned_tab_codec.cc
 @@ -83,13 +86,17 @@ std::optional<StartupTab> DecodeTab(cons
      return std::nullopt;
    }
-
+ 
 +  // This preference is the Favorites collection. Anchored-home metadata is
 +  // orthogonal to collection membership and must never turn a Favorite into a
 +  // Space-local Pin.
@@ -1948,11 +1969,11 @@ Index: src/chrome/browser/ui/tabs/pinned_tab_codec.cc
 +  }
    return tab;
  }
-
+ 
 @@ -143,13 +150,7 @@ void PinnedTabCodec::WritePinnedTabs(Pro
      return;
    }
-
+ 
 -  ScopedListPrefUpdate update(prefs, prefs::kPinnedTabs);
 -  base::ListValue& values = update.Get();
 -  values.clear();
@@ -1962,16 +1983,16 @@ Index: src/chrome/browser/ui/tabs/pinned_tab_codec.cc
 -  }
 +  prefs->SetList(prefs::kPinnedTabs, EncodeTabs(tabs));
  }
-
+ 
  // static
 @@ -159,9 +160,23 @@ StartupTabs PinnedTabCodec::ReadPinnedTa
      return {};
    }
-
+ 
 -  StartupTabs results;
 +  return DecodeTabs(prefs->GetList(prefs::kPinnedTabs));
 +}
-
+ 
 -  for (const auto& serialized_tab : prefs->GetList(prefs::kPinnedTabs)) {
 +// static
 +base::ListValue PinnedTabCodec::EncodeTabs(const StartupTabs& tabs) {
@@ -1991,7 +2012,7 @@ Index: src/chrome/browser/ui/tabs/pinned_tab_codec.cc
        continue;
      }
 @@ -173,3 +188,14 @@ StartupTabs PinnedTabCodec::ReadPinnedTa
-
+ 
    return results;
  }
 +
@@ -2010,20 +2031,20 @@ Index: src/chrome/browser/ui/tabs/pinned_tab_codec_browsertest.cc
 --- src.orig/chrome/browser/ui/tabs/pinned_tab_codec_browsertest.cc
 +++ src/chrome/browser/ui/tabs/pinned_tab_codec_browsertest.cc
 @@ -4,6 +4,7 @@
-
+ 
  #include "chrome/browser/ui/tabs/pinned_tab_codec.h"
-
+ 
 +#include <map>
  #include <string>
  #include <vector>
-
+ 
 Index: src/chrome/common/importer/importer_bridge.cc
 ===================================================================
 --- src.orig/chrome/common/importer/importer_bridge.cc
 +++ src/chrome/common/importer/importer_bridge.cc
 @@ -7,3 +7,5 @@
  ImporterBridge::ImporterBridge() = default;
-
+ 
  ImporterBridge::~ImporterBridge() = default;
 +
 +void ImporterBridge::AddArcSidebarSnapshot(const std::string& snapshot_json) {}
@@ -2034,14 +2055,14 @@ Index: src/chrome/common/importer/importer_bridge.h
 @@ -32,6 +32,11 @@ class ImporterBridge : public base::RefC
        const std::vector<user_data_importer::ImportedBookmarkEntry>& bookmarks,
        const std::u16string& first_folder_name) = 0;
-
+ 
 +  // Delivers Arc's sidebar as one typed, lossless JSON snapshot. This avoids
 +  // flattening Spaces, stable item IDs, and empty folders into bookmark rows.
 +  // Importers other than Arc may ignore this hook.
 +  virtual void AddArcSidebarSnapshot(const std::string& snapshot_json);
 +
    virtual void AddHomePage(const GURL& home_page) = 0;
-
+ 
    virtual void SetFavicons(
 Index: src/chrome/common/importer/profile_import.mojom
 ===================================================================
@@ -2071,18 +2092,28 @@ Index: src/chrome/utility/BUILD.gn
 ===================================================================
 --- src.orig/chrome/utility/BUILD.gn
 +++ src/chrome/utility/BUILD.gn
-@@ -100,6 +100,8 @@ static_library("utility") {
-       "importer/brave_profile_import_impl.h",
-       "importer/arc_sidebar_importer.cc",
-       "importer/arc_sidebar_importer.h",
+@@ -92,14 +92,16 @@
+ 
+   if (!is_android) {
+     sources += [
++      "importer/arc_sidebar_importer.cc",
++      "importer/arc_sidebar_importer.h",
 +      "importer/arc_sidebar_snapshot.cc",
 +      "importer/arc_sidebar_snapshot.h",
+       "importer/bookmarks_file_importer.cc",
+       "importer/bookmarks_file_importer.h",
+       "importer/brave_external_process_importer_bridge.cc",
+       "importer/brave_external_process_importer_bridge.h",
+       "importer/brave_profile_import_impl.cc",
+       "importer/brave_profile_import_impl.h",
+-      "importer/arc_sidebar_importer.cc",
+-      "importer/arc_sidebar_importer.h",
        "importer/chrome_importer.cc",
        "importer/chrome_importer.h",
        "importer/external_process_importer_bridge.cc",
-@@ -268,10 +270,27 @@ static_library("utility") {
+@@ -268,10 +270,27 @@
  }
-
+ 
  if (!is_android) {
 +  executable("arc_sidebar_snapshot_tests") {
 +    testonly = true
@@ -2100,7 +2131,7 @@ Index: src/chrome/utility/BUILD.gn
 +
    source_set("unit_tests") {
      testonly = true
-
+ 
 -    sources = [ "importer/bookmarks_file_importer_unittest.cc" ]
 +    sources = [
 +      "importer/arc_sidebar_snapshot_unittest.cc",
@@ -2114,9 +2145,9 @@ Index: src/chrome/utility/importer/arc_sidebar_importer.cc
 --- src.orig/chrome/utility/importer/arc_sidebar_importer.cc
 +++ src/chrome/utility/importer/arc_sidebar_importer.cc
 @@ -4,256 +4,16 @@
-
+ 
  #include "chrome/utility/importer/arc_sidebar_importer.h"
-
+ 
 -#include <map>
 +#include <array>
  #include <optional>
@@ -2124,7 +2155,7 @@ Index: src/chrome/utility/importer/arc_sidebar_importer.cc
 -#include <string_view>
 -#include <unordered_set>
 -#include <vector>
-
+ 
  #include "base/files/file_util.h"
  #include "base/json/json_reader.h"
 +#include "base/json/json_writer.h"
@@ -2370,9 +2401,9 @@ Index: src/chrome/utility/importer/arc_sidebar_importer.cc
 -
 -}  // namespace
 +#include "chrome/utility/importer/arc_sidebar_snapshot.h"
-
+ 
  ArcSidebarImporter::ArcSidebarImporter() = default;
-
+ 
 @@ -274,7 +34,6 @@ base::FilePath ArcSidebarImporter::GetSt
        return path;
      }
@@ -2380,7 +2411,7 @@ Index: src/chrome/utility/importer/arc_sidebar_importer.cc
 -
    return {};
  }
-
+ 
 @@ -282,119 +41,50 @@ std::optional<base::DictValue> ArcSideba
      base::FilePath path) const {
    std::string sidebar_content;
@@ -2389,7 +2420,7 @@ Index: src/chrome/utility/importer/arc_sidebar_importer.cc
 +    LOG(WARNING) << "failed to read Arc sidebar data";
      return std::nullopt;
    }
-
+ 
    std::optional<base::DictValue> root = base::JSONReader::ReadDict(
        sidebar_content, base::JSON_PARSE_CHROMIUM_EXTENSIONS);
 -  if (!root) {
@@ -2405,14 +2436,14 @@ Index: src/chrome/utility/importer/arc_sidebar_importer.cc
 -
    return root;
  }
-
+ 
  void ArcSidebarImporter::ImportBookmarksImpl() {
 -  base::FilePath path = GetStorableSidebarPath();
 +  const base::FilePath path = GetStorableSidebarPath();
    if (path.empty()) {
      return;
    }
-
+ 
 -  auto root = LoadSidebarData(path);
 -  if (!root) {
 -    return;
@@ -2430,7 +2461,7 @@ Index: src/chrome/utility/importer/arc_sidebar_importer.cc
 +  if (!root || cancelled()) {
      return;
    }
-
+ 
 -  const auto* items_list = data_container->FindList("items");
 -  if (!items_list) {
 +  std::optional<helium::ArcSidebarSnapshot> snapshot =
@@ -2439,7 +2470,7 @@ Index: src/chrome/utility/importer/arc_sidebar_importer.cc
 +  if (!snapshot) {
      return;
    }
-
+ 
 -  auto items = ParseItems(*items_list);
 -  if (items.empty()) {
 +  std::string snapshot_json;
@@ -2506,7 +2537,7 @@ Index: src/chrome/utility/importer/arc_sidebar_importer.cc
 -  }
 +  bridge_->AddArcSidebarSnapshot(snapshot_json);
  }
-
+ 
  void ArcSidebarImporter::ImportBookmarks() {
 -  // Only call the base class if the Chromium Bookmarks file exists — Arc
 -  // typically doesn't have one, and ScopedCopyFile DCHECKs on missing files.
@@ -3310,7 +3341,7 @@ Index: src/chrome/utility/importer/external_process_importer_bridge.cc
 @@ -57,6 +57,11 @@ void ExternalProcessImporterBridge::AddB
    DCHECK_EQ(0, bookmarks_left);
  }
-
+ 
 +void ExternalProcessImporterBridge::AddArcSidebarSnapshot(
 +    const std::string& snapshot_json) {
 +  observer_->OnArcSidebarSnapshotReady(snapshot_json);
@@ -3326,11 +3357,11 @@ Index: src/chrome/utility/importer/external_process_importer_bridge.h
 @@ -47,6 +47,8 @@ class ExternalProcessImporterBridge : pu
        const std::vector<user_data_importer::ImportedBookmarkEntry>& bookmarks,
        const std::u16string& first_folder_name) override;
-
+ 
 +  void AddArcSidebarSnapshot(const std::string& snapshot_json) override;
 +
    void AddHomePage(const GURL& home_page) override;
-
+ 
    void SetFavicons(const favicon_base::FaviconUsageDataList& favicons) override;
 Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 ===================================================================
@@ -3338,7 +3369,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +++ src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 @@ -8,19 +8,28 @@
  #include <utility>
-
+ 
  #include "base/feature_list.h"
 +#include "base/functional/bind.h"
 +#include "base/location.h"
@@ -3368,7 +3399,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 @@ -37,6 +46,49 @@ namespace {
  constexpr char kAnchorURLKey[] = "helium.favorites_and_pins.anchor_url";
  constexpr char kAnchorTitleKey[] = "helium.favorites_and_pins.anchor_title";
-
+ 
 +// Owns itself until the pending primary navigation has committed. Discarding
 +// earlier preserves only the initial about:blank entry in the replacement
 +// WebContents, corrupting the URL that should be restored on activation.
@@ -3418,7 +3449,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 @@ -85,6 +137,19 @@ bool HasHomeMetadata(const tabs::TabInte
    return helper && helper->HasAnchoredPinnedTabHome();
  }
-
+ 
 +bool IsInsideCollapsedFolder(const tabs::TabInterface* tab) {
 +  const tabs::TabCollection* ancestor =
 +      tab ? tab->GetParentCollection() : nullptr;
@@ -3438,7 +3469,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 @@ -218,6 +283,13 @@ void RestoreAnchoredPinnedTabHome(tabs::
    helper->SetAnchoredPinnedTabHome(std::move(home_url), std::move(home_title));
  }
-
+ 
 +void DiscardAnchoredTabAfterNextNavigation(tabs::TabInterface* tab) {
 +  if (!IsAnchoredTab(tab) || !tab->GetContents()) {
 +    return;
@@ -3467,7 +3498,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +    }
 +  }
  }
-
+ 
  void ReplaceAnchoredPinnedTabHome(tabs::TabInterface* tab) {
 Index: src/chrome/browser/ui/helium/helium_space_service_factory.cc
 ===================================================================
@@ -3479,7 +3510,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service_factory.cc
    registry->RegisterStringPref(kHeliumActiveSpaceIdPref, std::string());
 +  registry->RegisterDictionaryPref(kHeliumArcFavoritesByProfilePref);
  }
-
+ 
  }  // namespace helium
 Index: src/chrome/browser/ui/startup/startup_browser_creator_impl.h
 ===================================================================
@@ -3492,7 +3523,7 @@ Index: src/chrome/browser/ui/startup/startup_browser_creator_impl.h
 -                             TabOverWrite is_active_tab_overwrite);
 +                             TabOverWrite is_active_tab_overwrite,
 +                             bool keep_existing_tab_active = false);
-
+ 
    // Determines the URLs to be shown at startup by way of various policies
    // (welcome, pinned tabs, etc.), determines whether a session restore
 Index: src/chrome/browser/ui/tabs/pinned_tab_codec.h
@@ -3502,15 +3533,15 @@ Index: src/chrome/browser/ui/tabs/pinned_tab_codec.h
 @@ -5,6 +5,7 @@
  #ifndef CHROME_BROWSER_UI_TABS_PINNED_TAB_CODEC_H_
  #define CHROME_BROWSER_UI_TABS_PINNED_TAB_CODEC_H_
-
+ 
 +#include "base/values.h"
  #include "chrome/browser/ui/startup/startup_tab.h"
-
+ 
  class Profile;
 @@ -43,6 +44,14 @@ class PinnedTabCodec {
    // Reads and returns the set of pinned tabs to restore from preferences.
    static StartupTabs ReadPinnedTabs(Profile* profile);
-
+ 
 +  // Converts Favorites to and from their preference representation. These are
 +  // also used by Helium's per-Arc-profile Favorites store.
 +  static base::ListValue EncodeTabs(const StartupTabs& tabs);
@@ -3554,9 +3585,9 @@ Index: src/chrome/browser/ui/views/tabs/common/folder_tab_container_view.cc
 --- src.orig/chrome/browser/ui/views/tabs/common/folder_tab_container_view.cc
 +++ src/chrome/browser/ui/views/tabs/common/folder_tab_container_view.cc
 @@ -4,11 +4,16 @@
-
+ 
  #include "chrome/browser/ui/views/tabs/common/folder_tab_container_view.h"
-
+ 
 +#include <algorithm>
 +
  #include "base/functional/bind.h"
@@ -3576,7 +3607,7 @@ Index: src/chrome/browser/ui/views/tabs/common/folder_tab_container_view.cc
  constexpr int kTabVerticalPadding = 2;
 +constexpr int kChildIndent = 20;
 +constexpr int kFolderIconSize = 18;
-
+ 
  // True if `node` is the active tab, or a folder that contains the active tab.
  bool NodeContainsActivatedTab(const TabCollectionNode* node) {
 @@ -105,6 +112,13 @@ void FolderTabContainerView::UpdateChild
@@ -3590,7 +3621,7 @@ Index: src/chrome/browser/ui/views/tabs/common/folder_tab_container_view.cc
 +                    : vector_icons::kFolderOpenIcon,
 +          ui::kColorIcon, kFolderIconSize));
 +  header_->SetImageLabelSpacing(8);
-
+ 
    const auto& nodes = collection_node_->children();
    size_t node_index = 0;
 @@ -172,8 +186,9 @@ views::ProposedLayout FolderTabContainer
@@ -3604,13 +3635,13 @@ Index: src/chrome/browser/ui/views/tabs/common/folder_tab_container_view.cc
 +        gfx::Rect(kChildIndent, y, std::max(0, width - kChildIndent), height));
      y += height + kTabVerticalPadding;
    }
-
+ 
 Index: src/chrome/browser/ui/helium/helium_persistent_item_metrics.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/helium_persistent_item_metrics.cc
 +++ src/chrome/browser/ui/helium/helium_persistent_item_metrics.cc
 @@ -8,6 +8,7 @@
-
+ 
  #include "base/functional/bind.h"
  #include "base/metrics/histogram_functions.h"
 +#include "base/strings/strcat.h"
@@ -3618,14 +3649,14 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_metrics.cc
  #include "components/tabs/public/tab_interface.h"
  #include "content/public/browser/navigation_handle.h"
 @@ -37,12 +38,18 @@ std::string HistogramName(PersistentItem
-
+ 
  }  // namespace
-
+ 
 +BASE_FEATURE(kHeliumPersistentItemMetrics,
 +             base::FEATURE_ENABLED_BY_DEFAULT);
 +
  DEFINE_USER_DATA(HeliumPersistentItemMetrics);
-
+ 
  HeliumPersistentItemMetrics::HeliumPersistentItemMetrics(
      tabs::TabInterface& tab)
      : tabs::ContentsObservingTabFeature(tab),
@@ -3639,7 +3670,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_metrics.cc
 @@ -120,6 +127,14 @@ void HeliumPersistentItemMetrics::DidSto
    pending_open_->recorded_load_stop = true;
  }
-
+ 
 +void HeliumPersistentItemMetrics::OnDidActivate(tabs::TabInterface* tab) {
 +  if (!pending_open_) {
 +    BeginInferredOpen(PersistentItemOpenState::kWarm,
@@ -3654,7 +3685,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_metrics.cc
 @@ -134,6 +149,34 @@ void HeliumPersistentItemMetrics::OnWill
    Finish(PersistentItemOpenOutcome::kDeactivated);
  }
-
+ 
 +void HeliumPersistentItemMetrics::OnDiscardContents(
 +    tabs::TabInterface* tab,
 +    content::WebContents* old_contents,
@@ -3704,9 +3735,9 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_metrics_unittest.cc
 --- src.orig/chrome/browser/ui/helium/helium_persistent_item_metrics_unittest.cc
 +++ src/chrome/browser/ui/helium/helium_persistent_item_metrics_unittest.cc
 @@ -6,11 +6,10 @@
-
+ 
  #include <memory>
-
+ 
 -#include "base/metrics/histogram_tester.h"
 +#include "base/test/metrics/histogram_tester.h"
  #include "chrome/test/base/chrome_render_view_host_test_harness.h"
@@ -3747,9 +3778,9 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_metrics_unittest.cc
 +            });
      metrics_ = std::make_unique<HeliumPersistentItemMetrics>(*mock_tab_);
    }
-
+ 
 @@ -41,7 +59,10 @@ class HeliumPersistentItemMetricsTest
-
+ 
   protected:
    ui::UnownedUserDataHost unowned_user_data_host_;
 -  std::unique_ptr<testing::NiceMock<tabs::MockTabInterface>> mock_tab_;
@@ -3759,11 +3790,11 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_metrics_unittest.cc
 +  std::unique_ptr<tabs::MockTabInterface> mock_tab_;
    std::unique_ptr<HeliumPersistentItemMetrics> metrics_;
  };
-
+ 
 @@ -62,6 +83,18 @@ TEST_F(HeliumPersistentItemMetricsTest,
        PersistentItemOpenOutcome::kWarmActivated, 1);
  }
-
+ 
 +TEST_F(HeliumPersistentItemMetricsTest, ActivationAutomaticallyMeasuresWarmItem) {
 +  base::HistogramTester histograms;
 +
@@ -3778,29 +3809,29 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_metrics_unittest.cc
 +
  TEST_F(HeliumPersistentItemMetricsTest, NewOpenSupersedesPendingOpen) {
    base::HistogramTester histograms;
-
+ 
 @@ -71,7 +104,7 @@ TEST_F(HeliumPersistentItemMetricsTest,
    metrics_->BeginOpen(PersistentItemKind::kPin,
                        PersistentItemOpenState::kDiscarded,
                        base::TimeTicks::Now());
 -  metrics_->OnWillDeactivate(mock_tab_.get());
 +  will_deactivate_.Run(mock_tab_.get());
-
+ 
    histograms.ExpectBucketCount("Helium.PersistentItem.Open.Outcome",
                                 PersistentItemOpenOutcome::kSuperseded, 1);
 @@ -81,11 +114,10 @@ TEST_F(HeliumPersistentItemMetricsTest,
-
+ 
  TEST_F(HeliumPersistentItemMetricsTest, FollowsDiscardedWebContents) {
    std::unique_ptr<content::WebContents> replacement =
 -      content::TestWebContentsFactory().CreateWebContents(
 -          profile(), content::SiteInstance::Create(profile()));
 +      CreateTestWebContents();
-
+ 
 -  metrics_->OnDiscardContents(mock_tab_.get(), web_contents(),
 -                              replacement.get());
 +  will_discard_contents_.Run(mock_tab_.get(), web_contents(),
 +                             replacement.get());
-
+ 
    EXPECT_EQ(metrics_->web_contents(), replacement.get());
  }
 Index: src/chrome/browser/ui/tabs/BUILD.gn
@@ -3830,7 +3861,7 @@ Index: src/chrome/browser/ui/tabs/tab_features.cc
 @@ -630,6 +631,13 @@ void TabFeatures::Init(TabInterface& tab
        GetUserDataFactory().CreateInstance<tabs::PageContextEligibilityHelper>(
            tab, tab);
-
+ 
 +  if (base::FeatureList::IsEnabled(helium::kHeliumPersistentItemMetrics)) {
 +    helium_persistent_item_metrics_ = GetUserDataFactory()
 +                                          .CreateInstance<
@@ -3848,7 +3879,7 @@ Index: src/tools/metrics/histograms/enums.xml
 @@ -4951,6 +4951,26 @@ shown properly on the user-facing crash
    <int value="4" label="Ready, other status (not success, not empty index)"/>
  </enum>
-
+ 
 +<enum name="HeliumPersistentItemKind">
 +  <int value="0" label="Favorite"/>
 +  <int value="1" label="Pin"/>
@@ -3890,16 +3921,16 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_metrics.h
 +++ src/chrome/browser/ui/helium/helium_persistent_item_metrics.h
 @@ -9,6 +9,7 @@
  #include <vector>
-
+ 
  #include "base/callback_list.h"
 +#include "base/feature_list.h"
  #include "base/memory/weak_ptr.h"
  #include "base/time/time.h"
  #include "base/timer/timer.h"
 @@ -26,6 +27,8 @@ class TabInterface;
-
+ 
  namespace helium {
-
+ 
 +BASE_DECLARE_FEATURE(kHeliumPersistentItemMetrics);
 +
  // These values are persisted to UMA. Do not renumber or reuse them.
@@ -3908,7 +3939,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_metrics.h
 @@ -94,8 +97,14 @@ class HeliumPersistentItemMetrics
      bool recorded_load_stop = false;
    };
-
+ 
 +  void OnDidActivate(tabs::TabInterface* tab);
    void OnDidBecomeVisible(tabs::TabInterface* tab);
    void OnWillDeactivate(tabs::TabInterface* tab);
@@ -3919,7 +3950,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_metrics.h
 +                         base::TimeTicks request_time);
    void RecordMilestone(const char* milestone, base::TimeTicks now);
    void Finish(PersistentItemOpenOutcome outcome);
-
+ 
 Index: src/chrome/browser/ui/tabs/public/tab_features.h
 ===================================================================
 --- src.orig/chrome/browser/ui/tabs/public/tab_features.h
@@ -3927,7 +3958,7 @@ Index: src/chrome/browser/ui/tabs/public/tab_features.h
 @@ -117,6 +117,10 @@ namespace memory_saver {
  class MemorySaverChipController;
  }  // namespace memory_saver
-
+ 
 +namespace helium {
 +class HeliumPersistentItemMetrics;
 +}  // namespace helium
@@ -3938,7 +3969,7 @@ Index: src/chrome/browser/ui/tabs/public/tab_features.h
 @@ -567,6 +571,9 @@ class TabFeatures {
    std::unique_ptr<tabs::PageContextEligibilityHelper>
        page_context_eligibility_helper_;
-
+ 
 +  std::unique_ptr<helium::HeliumPersistentItemMetrics>
 +      helium_persistent_item_metrics_;
 +
