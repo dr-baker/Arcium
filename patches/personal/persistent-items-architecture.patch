@@ -264,7 +264,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.cc
 +    bool is_anchored_live_item,
 +    const GURL& home_url,
 +    const GURL& target_url) {
-+  if (disposition != PersistentNavigationDisposition::kCurrentTab ||
++  if (disposition == PersistentNavigationDisposition::kExplicitNewTarget ||
 +      !is_link_transition || !is_anchored_live_item || !target_url.is_valid() ||
 +      !home_url.is_valid()) {
 +    return false;
@@ -488,7 +488,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_persistent_item_model.h
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,149 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -517,9 +517,14 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.h
 +
 +PersistentLiveCollection LiveCollectionForKind(PersistentRecordKind kind);
 +
-+// CURRENT_TAB link navigations away from a live item's stored home open in
-+// Little Arc. Explicit new-tab/window dispositions are left unchanged.
-+enum class PersistentNavigationDisposition { kCurrentTab, kExplicitNewTarget };
++// Current-tab links and page-requested foreground targets away from a live
++// item's stored home open in Little Arc. Explicit new-tab/window commands are
++// left unchanged.
++enum class PersistentNavigationDisposition {
++  kCurrentTab,
++  kPageRequestedNewTarget,
++  kExplicitNewTarget
++};
 +
 +bool ShouldOpenAnchoredNavigationInLittleArc(
 +    PersistentNavigationDisposition disposition,
@@ -638,7 +643,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,190 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -772,7 +777,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
 +            LiveCollectionForKind(PersistentRecordKind::kPin));
 +}
 +
-+TEST(AnchoredNavigationPolicyTest, OnlyCurrentTabLinksAwayFromHomeDivert) {
++TEST(AnchoredNavigationPolicyTest, OrdinaryLinksAwayFromHomeDivert) {
 +  const GURL home("https://home.test/");
 +  const GURL away("https://away.test/");
 +  EXPECT_TRUE(ShouldOpenAnchoredNavigationInLittleArc(
@@ -782,6 +787,9 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
 +  EXPECT_FALSE(ShouldOpenAnchoredNavigationInLittleArc(
 +      PersistentNavigationDisposition::kCurrentTab, true, true, home,
 +      GURL("https://home.test/#section")));
++  EXPECT_TRUE(ShouldOpenAnchoredNavigationInLittleArc(
++      PersistentNavigationDisposition::kPageRequestedNewTarget, true, true,
++      home, away));
 +  EXPECT_FALSE(ShouldOpenAnchoredNavigationInLittleArc(
 +      PersistentNavigationDisposition::kExplicitNewTarget, true, true, home,
 +      away));
@@ -2189,7 +2197,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
      return;
    }
  
-@@ -396,17 +455,40 @@ void RestoreAnchoredPinnedTabExtraData(
+@@ -396,17 +455,49 @@ void RestoreAnchoredPinnedTabExtraData(
  
    // Place restored anchored tabs that are not favorites into the pins section.
    if (tab && !tab->IsPinned()) {
@@ -2217,10 +2225,19 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +  std::u16string home_title;
 +  const bool is_link_transition = ui::PageTransitionCoreTypeIs(
 +      params->transition, ui::PAGE_TRANSITION_LINK);
-+  const PersistentNavigationDisposition disposition =
-+      params->disposition == WindowOpenDisposition::CURRENT_TAB
-+          ? PersistentNavigationDisposition::kCurrentTab
-+          : PersistentNavigationDisposition::kExplicitNewTarget;
++  PersistentNavigationDisposition disposition =
++      PersistentNavigationDisposition::kExplicitNewTarget;
++  if (params->disposition == WindowOpenDisposition::CURRENT_TAB) {
++    disposition = PersistentNavigationDisposition::kCurrentTab;
++  } else if (params->disposition ==
++                 WindowOpenDisposition::NEW_FOREGROUND_TAB &&
++             params->is_renderer_initiated && params->user_gesture &&
++             !params->started_from_context_menu) {
++    // A plain click on a page-authored target=_blank link arrives as a
++    // renderer-requested foreground tab. Treat it like an ordinary link while
++    // preserving Command-click, context-menu, and explicit browser commands.
++    disposition = PersistentNavigationDisposition::kPageRequestedNewTarget;
++  }
 +  if (!ShouldOpenAnchoredNavigationInLittleArc(
 +          disposition, is_link_transition,
 +          GetAnchoredPinnedTabHome(tab, &home_url, &home_title), home_url,
