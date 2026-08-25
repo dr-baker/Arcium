@@ -1,5 +1,7 @@
---- a/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
-+++ b/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+Index: src/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+===================================================================
+--- src.orig/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
++++ src/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
 @@ -257,6 +257,7 @@
  #include "chrome/browser/ui/autofill/autofill_client_provider_factory.h"
  #include "chrome/browser/ui/find_bar/find_bar_state_factory.h"
@@ -16,8 +18,10 @@
    PinnedToolbarActionsModelFactory::GetInstance();
  #endif
    PlatformNotificationServiceFactory::GetInstance();
---- a/chrome/browser/sessions/session_restore.cc
-+++ b/chrome/browser/sessions/session_restore.cc
+Index: src/chrome/browser/sessions/session_restore.cc
+===================================================================
+--- src.orig/chrome/browser/sessions/session_restore.cc
++++ src/chrome/browser/sessions/session_restore.cc
 @@ -64,6 +64,8 @@
  #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
  #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
@@ -60,9 +64,15 @@
      if (auto* manager = InitialWebUIWindowMetricsManager::From(browser)) {
        manager->SetWindowCreationInfo(
            waap::NewWindowCreationSource::kSessionRestore, now);
---- a/chrome/browser/sessions/session_service_base.cc
-+++ b/chrome/browser/sessions/session_service_base.cc
-@@ -29,6 +29,8 @@
+Index: src/chrome/browser/sessions/session_service_base.cc
+===================================================================
+--- src.orig/chrome/browser/sessions/session_service_base.cc
++++ src/chrome/browser/sessions/session_service_base.cc
+@@ -26,9 +26,12 @@
+ #include "chrome/browser/sessions/session_service_utils.h"
+ #include "chrome/browser/sessions/tab_restore_service_factory.h"
+ #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
++#include "chrome/browser/ui/arcium/tab_provenance.h"
  #include "chrome/browser/ui/browser_window.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
  #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
@@ -71,7 +81,21 @@
  #include "chrome/browser/ui/startup/startup_browser_creator.h"
  #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
  #include "chrome/browser/ui/tabs/tab_group_model.h"
-@@ -709,6 +711,18 @@ void SessionServiceBase::BuildCommandsFo
+@@ -662,6 +665,13 @@ void SessionServiceBase::BuildCommandsFo
+         sessions::CreatePinnedStateCommand(session_id, true));
+   }
+ 
++  std::map<std::string, std::string> extra_data;
++  arcium::TabProvenance::PopulateExtraData(tab, &extra_data);
++  for (const auto& [key, value] : extra_data) {
++    command_storage_manager()->AppendRebuildCommand(
++        sessions::CreateAddTabExtraDataCommand(session_id, key, value));
++  }
++
+   // Record the association between the sessionStorage namespace and the tab.
+   content::SessionStorageNamespace* session_storage_namespace =
+       tab->GetController().GetDefaultSessionStorageNamespace();
+@@ -709,6 +719,18 @@ void SessionServiceBase::BuildCommandsFo
            browser->session_id(),
            BrowserWindow::FromBrowser(browser)->IsVisibleOnAllWorkspaces()));
  
@@ -90,9 +114,18 @@
    command_storage_manager()->AppendRebuildCommand(
        sessions::CreateSetSelectedTabInWindowCommand(
            browser->session_id(), browser->tab_strip_model()->active_index()));
---- a/chrome/browser/ui/BUILD.gn
-+++ b/chrome/browser/ui/BUILD.gn
-@@ -373,6 +373,12 @@ static_library("ui") {
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn
++++ src/chrome/browser/ui/BUILD.gn
+@@ -368,11 +368,19 @@ if (!is_android) {
+ # circular includes from each other.
+ static_library("ui") {
+   sources = [
++    "arcium/tab_provenance.cc",
++    "arcium/tab_provenance.h",
+     "confirm_bubble.h",
+     "crypto_module_password_dialog.h",
      "enterprise_startup_dialog.h",
      "helium/helium_layout_state_controller.cc",
      "helium/helium_layout_state_controller.h",
@@ -105,9 +138,19 @@
      "idle_bubble.h",
      "managed_ui.cc",
      "managed_ui.h",
---- a/chrome/browser/ui/browser_live_tab_context.cc
-+++ b/chrome/browser/ui/browser_live_tab_context.cc
-@@ -29,6 +29,8 @@
+Index: src/chrome/browser/ui/browser_live_tab_context.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_live_tab_context.cc
++++ src/chrome/browser/ui/browser_live_tab_context.cc
+@@ -20,6 +20,7 @@
+ #include "chrome/browser/sessions/session_service_utils.h"
+ #include "chrome/browser/sessions/tab_restore_service_factory.h"
+ #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
++#include "chrome/browser/ui/arcium/tab_provenance.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_tab_strip_model_delegate.h"
+@@ -29,6 +30,8 @@
  #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
  #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
  #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
@@ -116,7 +159,15 @@
  #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
  #include "chrome/browser/ui/tabs/tab_group_model.h"
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
-@@ -162,7 +164,13 @@ std::map<std::string, std::string> Brows
+@@ -156,13 +159,21 @@ std::map<std::string, std::string> Brows
+ 
+   glic::PopulateGlicExtraData(tab_strip_model_->GetTabAtIndex(index),
+                               &extra_data);
++  arcium::TabProvenance::PopulateExtraData(
++      tab_strip_model_->GetWebContentsAt(index), &extra_data);
+ 
+   return extra_data;
+ }
  
  std::map<std::string, std::string>
  BrowserLiveTabContext::GetExtraDataForWindow() const {
@@ -131,7 +182,7 @@
  }
  
  std::optional<tab_groups::TabGroupId> BrowserLiveTabContext::GetTabGroupForTab(
-@@ -416,7 +424,7 @@ sessions::LiveTabContext* BrowserLiveTab
+@@ -416,7 +427,7 @@ sessions::LiveTabContext* BrowserLiveTab
      ui::mojom::WindowShowState show_state,
      const std::string& workspace,
      const std::string& user_title,
@@ -140,7 +191,7 @@
    std::unique_ptr<Browser::CreateParams> create_params;
    if (ShouldCreateAppWindowForAppName(profile, app_name)) {
      // Only trusted app popup windows should ever be restored.
-@@ -442,6 +450,10 @@ sessions::LiveTabContext* BrowserLiveTab
+@@ -442,6 +453,10 @@ sessions::LiveTabContext* BrowserLiveTab
    create_params->user_title = user_title;
  
    Browser* browser = Browser::Create(*create_params.get());
@@ -151,8 +202,10 @@
  
    return browser->GetFeatures().live_tab_context();
  }
+Index: src/chrome/browser/ui/helium/helium_space.cc
+===================================================================
 --- /dev/null
-+++ b/chrome/browser/ui/helium/helium_space.cc
++++ src/chrome/browser/ui/helium/helium_space.cc
 @@ -0,0 +1,111 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
@@ -265,8 +318,10 @@
 +}
 +
 +}  // namespace helium
+Index: src/chrome/browser/ui/helium/helium_space.h
+===================================================================
 --- /dev/null
-+++ b/chrome/browser/ui/helium/helium_space.h
++++ src/chrome/browser/ui/helium/helium_space.h
 @@ -0,0 +1,45 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
@@ -313,8 +368,10 @@
 +}  // namespace helium
 +
 +#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_H_
+Index: src/chrome/browser/ui/helium/helium_space_service.cc
+===================================================================
 --- /dev/null
-+++ b/chrome/browser/ui/helium/helium_space_service.cc
++++ src/chrome/browser/ui/helium/helium_space_service.cc
 @@ -0,0 +1,218 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
@@ -534,8 +591,10 @@
 +}
 +
 +}  // namespace helium
+Index: src/chrome/browser/ui/helium/helium_space_service.h
+===================================================================
 --- /dev/null
-+++ b/chrome/browser/ui/helium/helium_space_service.h
++++ src/chrome/browser/ui/helium/helium_space_service.h
 @@ -0,0 +1,78 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
@@ -615,8 +674,10 @@
 +}  // namespace helium
 +
 +#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_SERVICE_H_
+Index: src/chrome/browser/ui/helium/helium_space_service_factory.cc
+===================================================================
 --- /dev/null
-+++ b/chrome/browser/ui/helium/helium_space_service_factory.cc
++++ src/chrome/browser/ui/helium/helium_space_service_factory.cc
 @@ -0,0 +1,60 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
@@ -678,8 +739,10 @@
 +}
 +
 +}  // namespace helium
+Index: src/chrome/browser/ui/helium/helium_space_service_factory.h
+===================================================================
 --- /dev/null
-+++ b/chrome/browser/ui/helium/helium_space_service_factory.h
++++ src/chrome/browser/ui/helium/helium_space_service_factory.h
 @@ -0,0 +1,49 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
@@ -730,8 +793,10 @@
 +}  // namespace helium
 +
 +#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_SERVICE_FACTORY_H_
---- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
-+++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 @@ -34,6 +34,7 @@
  #include "chrome/browser/ui/tabs/tab_group_model.h"
  #include "chrome/browser/ui/tabs/vertical_tab_strip_state.h"
@@ -918,8 +983,10 @@
    expand_on_hover_enabled_changed_subscription_.reset();
    omnibox_tab_helper_observation_.Reset();
  
---- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
-+++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
++++ src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
 @@ -5,6 +5,7 @@
  #ifndef CHROME_BROWSER_UI_VIEWS_FRAME_VERTICAL_TAB_STRIP_REGION_VIEW_H_
  #define CHROME_BROWSER_UI_VIEWS_FRAME_VERTICAL_TAB_STRIP_REGION_VIEW_H_
@@ -1013,8 +1080,10 @@
    // Given that both lock counters are non-zero, force_collapse_lock_count_ will
    // always take precedence.
    int force_collapse_lock_count_ = 0;
---- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
-+++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
+Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
++++ src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
 @@ -4,36 +4,39 @@
  
  #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h"
@@ -1198,8 +1267,10 @@
  }
  
  BEGIN_METADATA(VerticalTabStripBottomContainer)
---- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h
-+++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h
+Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h
++++ src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h
 @@ -5,14 +5,11 @@
  #ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_STRIP_BOTTOM_CONTAINER_H_
  #define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_STRIP_BOTTOM_CONTAINER_H_
@@ -1274,8 +1345,10 @@
  };
  
  #endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_STRIP_BOTTOM_CONTAINER_H_
---- a/chrome/common/pref_names.h
-+++ b/chrome/common/pref_names.h
+Index: src/chrome/common/pref_names.h
+===================================================================
+--- src.orig/chrome/common/pref_names.h
++++ src/chrome/common/pref_names.h
 @@ -978,6 +978,9 @@ inline constexpr char kPartitionPerHostZ
  
  #if !BUILDFLAG(IS_ANDROID)
@@ -1286,3 +1359,200 @@
  #endif  // !BUILDFLAG(IS_ANDROID)
  
  // Preference to disable 3D APIs (WebGL).
+Index: src/chrome/browser/ui/arcium/tab_provenance.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/arcium/tab_provenance.cc
+@@ -0,0 +1,108 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/arcium/tab_provenance.h"
++
++#include <utility>
++
++#include "base/check.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/sessions/session_service.h"
++#include "chrome/browser/sessions/session_service_factory.h"
++#include "components/sessions/content/session_tab_helper.h"
++#include "content/public/browser/web_contents.h"
++
++namespace arcium {
++
++namespace {
++
++constexpr char kSourceKey[] = "arcium.provenance.source";
++constexpr char kCollectionIdKey[] = "arcium.provenance.collection_id";
++constexpr char kItemIdKey[] = "arcium.provenance.item_id";
++
++}  // namespace
++
++TabProvenance::TabProvenance(content::WebContents* web_contents,
++                             std::string source,
++                             std::string collection_id,
++                             std::string item_id)
++    : content::WebContentsUserData<TabProvenance>(*web_contents),
++      source_(std::move(source)),
++      collection_id_(std::move(collection_id)),
++      item_id_(std::move(item_id)) {
++  CHECK(!source_.empty());
++  CHECK(!collection_id_.empty());
++  CHECK(!item_id_.empty());
++}
++
++TabProvenance::~TabProvenance() = default;
++
++// static
++void TabProvenance::Set(content::WebContents* web_contents,
++                        std::string source,
++                        std::string collection_id,
++                        std::string item_id) {
++  CHECK(web_contents);
++  CreateForWebContents(web_contents, std::move(source),
++                       std::move(collection_id), std::move(item_id));
++  FromWebContents(web_contents)->Persist();
++}
++
++// static
++void TabProvenance::RestoreFromExtraData(
++    content::WebContents* web_contents,
++    const std::map<std::string, std::string>& extra_data) {
++  const auto source = extra_data.find(kSourceKey);
++  const auto collection_id = extra_data.find(kCollectionIdKey);
++  const auto item_id = extra_data.find(kItemIdKey);
++  if (source == extra_data.end() || collection_id == extra_data.end() ||
++      item_id == extra_data.end() || source->second.empty() ||
++      collection_id->second.empty() || item_id->second.empty()) {
++    return;
++  }
++  CreateForWebContents(web_contents, source->second, collection_id->second,
++                       item_id->second);
++}
++
++// static
++void TabProvenance::PopulateExtraData(
++    content::WebContents* web_contents,
++    std::map<std::string, std::string>* extra_data) {
++  CHECK(web_contents);
++  CHECK(extra_data);
++  const auto* provenance = FromWebContents(web_contents);
++  if (!provenance) {
++    return;
++  }
++  extra_data->insert_or_assign(kSourceKey, provenance->source());
++  extra_data->insert_or_assign(kCollectionIdKey, provenance->collection_id());
++  extra_data->insert_or_assign(kItemIdKey, provenance->item_id());
++}
++
++void TabProvenance::Persist() {
++  Profile* profile =
++      Profile::FromBrowserContext(GetWebContents().GetBrowserContext());
++  SessionService* session_service =
++      SessionServiceFactory::GetForProfile(profile);
++  if (!session_service) {
++    return;
++  }
++
++  const SessionID window_id =
++      sessions::SessionTabHelper::IdForWindowContainingTab(&GetWebContents());
++  const SessionID tab_id =
++      sessions::SessionTabHelper::IdForTab(&GetWebContents());
++  if (!window_id.is_valid() || !tab_id.is_valid()) {
++    return;
++  }
++
++  session_service->AddTabExtraData(window_id, tab_id, kSourceKey, source_);
++  session_service->AddTabExtraData(window_id, tab_id, kCollectionIdKey,
++                                   collection_id_);
++  session_service->AddTabExtraData(window_id, tab_id, kItemIdKey, item_id_);
++}
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(TabProvenance);
++
++}  // namespace arcium
+Index: src/chrome/browser/ui/arcium/tab_provenance.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/arcium/tab_provenance.h
+@@ -0,0 +1,59 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_ARCIUM_TAB_PROVENANCE_H_
++#define CHROME_BROWSER_UI_ARCIUM_TAB_PROVENANCE_H_
++
++#include <map>
++#include <string>
++
++#include "content/public/browser/web_contents_user_data.h"
++
++namespace content {
++class WebContents;
++}
++
++namespace arcium {
++
++// Identifies a tab owned by an external data source. Feature patches use this
++// identity to reconcile their own tabs without disturbing user-created tabs.
++class TabProvenance : public content::WebContentsUserData<TabProvenance> {
++ public:
++  TabProvenance(const TabProvenance&) = delete;
++  TabProvenance& operator=(const TabProvenance&) = delete;
++  ~TabProvenance() override;
++
++  static void Set(content::WebContents* web_contents,
++                  std::string source,
++                  std::string collection_id,
++                  std::string item_id);
++  static void RestoreFromExtraData(
++      content::WebContents* web_contents,
++      const std::map<std::string, std::string>& extra_data);
++  static void PopulateExtraData(content::WebContents* web_contents,
++                                std::map<std::string, std::string>* extra_data);
++
++  const std::string& source() const { return source_; }
++  const std::string& collection_id() const { return collection_id_; }
++  const std::string& item_id() const { return item_id_; }
++
++ private:
++  friend class content::WebContentsUserData<TabProvenance>;
++  TabProvenance(content::WebContents* web_contents,
++                std::string source,
++                std::string collection_id,
++                std::string item_id);
++
++  void Persist();
++
++  const std::string source_;
++  const std::string collection_id_;
++  const std::string item_id_;
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++}  // namespace arcium
++
++#endif  // CHROME_BROWSER_UI_ARCIUM_TAB_PROVENANCE_H_
+Index: src/chrome/browser/ui/browser_tabrestore.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_tabrestore.cc
++++ src/chrome/browser/ui/browser_tabrestore.cc
+@@ -17,6 +17,7 @@
+ #include "chrome/browser/sessions/session_service_base.h"
+ #include "chrome/browser/sessions/session_service_lookup.h"
+ #include "chrome/browser/tab_contents/tab_util.h"
++#include "chrome/browser/ui/arcium/tab_provenance.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_activation_tracker.h"
+@@ -88,6 +89,7 @@ std::unique_ptr<WebContents> CreateResto
+   glic::RestoreGlicStateFromExtraData(web_contents.get(), extra_data);
+   send_tab_to_self::SendTabToSelfActivationTracker::RestoreFromExtraData(
+       web_contents.get(), extra_data);
++  arcium::TabProvenance::RestoreFromExtraData(web_contents.get(), extra_data);
+ 
+   std::vector<std::unique_ptr<NavigationEntry>> entries =
+       ContentSerializedNavigationBuilder::ToNavigationEntries(
