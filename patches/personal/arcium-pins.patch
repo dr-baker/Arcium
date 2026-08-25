@@ -891,7 +891,15 @@ Index: src/chrome/browser/ui/startup/startup_browser_creator_impl.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/startup/startup_browser_creator_impl.cc
 +++ src/chrome/browser/ui/startup/startup_browser_creator_impl.cc
-@@ -41,6 +41,7 @@
+@@ -34,6 +34,7 @@
+ #include "chrome/browser/sessions/session_service_factory.h"
+ #include "chrome/browser/signin/account_consistency_mode_manager.h"
+ #include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/arcium/tab_provenance.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_tabstrip.h"
+ #include "chrome/browser/ui/browser_window.h"
+@@ -41,6 +42,7 @@
  #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
  #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
@@ -899,7 +907,7 @@ Index: src/chrome/browser/ui/startup/startup_browser_creator_impl.cc
  #include "chrome/browser/ui/navigator/browser_navigator.h"
  #include "chrome/browser/ui/navigator/browser_navigator_params.h"
  #include "chrome/browser/ui/startup/infobar_utils.h"
-@@ -62,6 +63,11 @@
+@@ -62,6 +64,11 @@
  #include "components/helium_services/pref_names.h"
  #include "components/prefs/pref_service.h"
  #include "components/signin/public/base/signin_switches.h"
@@ -911,7 +919,7 @@ Index: src/chrome/browser/ui/startup/startup_browser_creator_impl.cc
  #include "content/public/browser/child_process_security_policy.h"
  #include "content/public/browser/dom_storage_context.h"
  #include "content/public/browser/storage_partition.h"
-@@ -291,6 +297,13 @@ Browser* StartupBrowserCreatorImpl::Open
+@@ -291,6 +298,13 @@ Browser* StartupBrowserCreatorImpl::Open
    return OpenTabsInBrowser(browser, process_startup, tabs, TabOverWrite::kNo);
  }
  
@@ -925,7 +933,7 @@ Index: src/chrome/browser/ui/startup/startup_browser_creator_impl.cc
  Browser* StartupBrowserCreatorImpl::OpenTabsInBrowser(
      Browser* browser,
      chrome::startup::IsProcessStartup process_startup,
-@@ -340,6 +353,19 @@ Browser* StartupBrowserCreatorImpl::Open
+@@ -340,6 +354,28 @@ Browser* StartupBrowserCreatorImpl::Open
    custom_handlers::ProtocolHandlerRegistry* registry =
        ProtocolHandlerRegistryFactory::GetForBrowserContext(profile_);
    for (auto& tab : tabs) {
@@ -935,9 +943,18 @@ Index: src/chrome/browser/ui/startup/startup_browser_creator_impl.cc
 +              browser->tab_strip_model()->Root()));
 +      tabs::TabCollection* parent =
 +          static_cast<tabs::TabCollection*>(strip->pin_collection());
++      tabs::FolderTabCollection* folder = nullptr;
 +      for (const auto& segment : tab.helium_folder_path) {
-+        parent = static_cast<tabs::TabCollection*>(strip->FindOrCreateFolder(
-+            parent, segment.title, segment.collapsed));
++        folder = strip->FindOrCreateFolder(parent, segment.title,
++                                           segment.collapsed);
++        parent = static_cast<tabs::TabCollection*>(folder);
++      }
++      if (folder && !tab.arcium_provenance_source.empty() &&
++          !tab.arcium_provenance_collection_id.empty() &&
++          !tab.arcium_provenance_item_id.empty()) {
++        folder->SetProvenance(tab.arcium_provenance_source,
++                              tab.arcium_provenance_collection_id,
++                              tab.arcium_provenance_item_id);
 +      }
 +      continue;
 +    }
@@ -945,10 +962,19 @@ Index: src/chrome/browser/ui/startup/startup_browser_creator_impl.cc
      // We skip URLs that we'd have to launch an external protocol handler for.
      // This avoids us getting into an infinite loop asking ourselves to open
      // a URL, should the handler be (incorrectly) configured to be us. Anyone
-@@ -431,6 +457,34 @@ Browser* StartupBrowserCreatorImpl::Open
+@@ -431,6 +467,43 @@ Browser* StartupBrowserCreatorImpl::Open
  #endif  // BUILDFLAG(ENABLE_RLZ)
  
      Navigate(&params);
++    if (params.navigated_or_inserted_contents &&
++        !tab.arcium_provenance_source.empty() &&
++        !tab.arcium_provenance_collection_id.empty() &&
++        !tab.arcium_provenance_item_id.empty()) {
++      arcium::TabProvenance::Set(
++          params.navigated_or_inserted_contents, tab.arcium_provenance_source,
++          tab.arcium_provenance_collection_id,
++          tab.arcium_provenance_item_id);
++    }
 +    if ((tab.type == StartupTab::Type::kPin || tab.helium_has_home) &&
 +        params.navigated_or_inserted_contents) {
 +      tabs::TabInterface* const tab_interface =
@@ -1020,7 +1046,7 @@ Index: src/chrome/browser/ui/startup/startup_tab.h
      // The url is from the LAST_AND_URLS startup pref.
      kFromLastAndUrlsStartupPref,
    };
-@@ -28,6 +34,18 @@ struct StartupTab {
+@@ -28,6 +34,25 @@ struct StartupTab {
  
    Type type = Type::kNormal;
  
@@ -1035,6 +1061,13 @@ Index: src/chrome/browser/ui/startup/startup_tab.h
 +    bool collapsed = false;
 +  };
 +  std::vector<FolderPathSegment> helium_folder_path;
++
++  // Optional identity for externally owned tabs and Pin folders. Pin restore
++  // carries this through its own tree codec because Pin collections are not
++  // part of Chromium's normal tab-session topology.
++  std::string arcium_provenance_source;
++  std::string arcium_provenance_collection_id;
++  std::string arcium_provenance_item_id;
 +
    // True if this tab was launched from an untrusted external custom protocol
    // (e.g., google-chrome://) that was stripped on startup.
@@ -1185,7 +1218,7 @@ Index: src/chrome/browser/ui/tabs/pin_tab_codec.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/tabs/pin_tab_codec.cc
-@@ -0,0 +1,271 @@
+@@ -0,0 +1,323 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1198,6 +1231,7 @@ Index: src/chrome/browser/ui/tabs/pin_tab_codec.cc
 +#include "base/strings/utf_string_conversions.h"
 +#include "base/values.h"
 +#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/arcium/tab_provenance.h"
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
 +#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
@@ -1223,14 +1257,47 @@ Index: src/chrome/browser/ui/tabs/pin_tab_codec.cc
 +constexpr char kTitle[] = "title";
 +constexpr char kCollapsed[] = "collapsed";
 +constexpr char kChildren[] = "children";
++constexpr char kProvenanceSource[] = "provenance_source";
++constexpr char kProvenanceCollectionId[] = "provenance_collection_id";
++constexpr char kProvenanceItemId[] = "provenance_item_id";
 +
-+base::DictValue EncodeTabNode(const GURL& url, const std::u16string& title) {
++void EncodeProvenance(base::DictValue& dict,
++                      const std::string& source,
++                      const std::string& collection_id,
++                      const std::string& item_id) {
++  if (source.empty() || collection_id.empty() || item_id.empty()) {
++    return;
++  }
++  dict.Set(kProvenanceSource, source);
++  dict.Set(kProvenanceCollectionId, collection_id);
++  dict.Set(kProvenanceItemId, item_id);
++}
++
++void DecodeProvenance(const base::DictValue& dict, StartupTab& tab) {
++  const std::string* source = dict.FindString(kProvenanceSource);
++  const std::string* collection_id =
++      dict.FindString(kProvenanceCollectionId);
++  const std::string* item_id = dict.FindString(kProvenanceItemId);
++  if (!source || !collection_id || !item_id) {
++    return;
++  }
++  tab.arcium_provenance_source = *source;
++  tab.arcium_provenance_collection_id = *collection_id;
++  tab.arcium_provenance_item_id = *item_id;
++}
++
++base::DictValue EncodeTabNode(const GURL& url,
++                              const std::u16string& title,
++                              const std::string& source = {},
++                              const std::string& collection_id = {},
++                              const std::string& item_id = {}) {
 +  base::DictValue dict;
 +  dict.Set(kType, kTypeTab);
 +  dict.Set(kURL, url.spec());
 +  if (!title.empty()) {
 +    dict.Set(kTitle, base::UTF16ToUTF8(title));
 +  }
++  EncodeProvenance(dict, source, collection_id, item_id);
 +  return dict;
 +}
 +
@@ -1246,7 +1313,12 @@ Index: src/chrome/browser/ui/tabs/pin_tab_codec.cc
 +    url = entry->GetURL();
 +    title = entry->GetTitleForDisplay();
 +  }
-+  out.Append(EncodeTabNode(url, title));
++  const auto* provenance =
++      arcium::TabProvenance::FromWebContents(tab->GetContents());
++  out.Append(EncodeTabNode(
++      url, title, provenance ? provenance->source() : std::string(),
++      provenance ? provenance->collection_id() : std::string(),
++      provenance ? provenance->item_id() : std::string()));
 +}
 +
 +void EncodeCollectionChildren(const tabs::TabCollection* collection,
@@ -1258,6 +1330,9 @@ Index: src/chrome/browser/ui/tabs/pin_tab_codec.cc
 +  dict.Set(kType, kTypeFolder);
 +  dict.Set(kTitle, base::UTF16ToUTF8(folder->title()));
 +  dict.Set(kCollapsed, folder->collapsed());
++  EncodeProvenance(dict, folder->provenance_source(),
++                   folder->provenance_collection_id(),
++                   folder->provenance_item_id());
 +  base::ListValue children;
 +  EncodeCollectionChildren(folder, children);
 +  dict.Set(kChildren, std::move(children));
@@ -1320,6 +1395,7 @@ Index: src/chrome/browser/ui/tabs/pin_tab_codec.cc
 +    });
 +    StartupTab folder_marker(GURL(), StartupTab::Type::kPinFolder);
 +    folder_marker.helium_folder_path = nested;
++    DecodeProvenance(value, folder_marker);
 +    results->push_back(std::move(folder_marker));
 +    if (const base::ListValue* children = value.FindList(kChildren)) {
 +      DecodeTreeList(*children, nested, results);
@@ -1338,6 +1414,7 @@ Index: src/chrome/browser/ui/tabs/pin_tab_codec.cc
 +    tab.helium_home_title = base::UTF8ToUTF16(*title);
 +  }
 +  tab.helium_folder_path = ancestors;
++  DecodeProvenance(value, tab);
 +  results->push_back(std::move(tab));
 +}
 +
@@ -1396,6 +1473,7 @@ Index: src/chrome/browser/ui/tabs/pin_tab_codec.cc
 +  base::ListValue root;
 +  for (const auto& tab : tabs) {
 +    base::ListValue* target = &root;
++    base::DictValue* last_folder = nullptr;
 +    for (const auto& segment : tab.helium_folder_path) {
 +      base::DictValue* folder_dict = nullptr;
 +      for (auto& entry : *target) {
@@ -1420,14 +1498,21 @@ Index: src/chrome/browser/ui/tabs/pin_tab_codec.cc
 +        target->Append(std::move(dict));
 +        folder_dict = &target->back().GetDict();
 +      }
++      last_folder = folder_dict;
 +      target = folder_dict->FindList(kChildren);
 +      CHECK(target);
 +    }
 +    if (tab.type == StartupTab::Type::kPinFolder) {
++      if (last_folder) {
++        EncodeProvenance(*last_folder, tab.arcium_provenance_source,
++                         tab.arcium_provenance_collection_id,
++                         tab.arcium_provenance_item_id);
++      }
 +      continue;
 +    }
-+    target->Append(
-+        EncodeTabNode(tab.url, tab.helium_home_title));
++    target->Append(EncodeTabNode(
++        tab.url, tab.helium_home_title, tab.arcium_provenance_source,
++        tab.arcium_provenance_collection_id, tab.arcium_provenance_item_id));
 +  }
 +
 +  return root;
@@ -3841,7 +3926,7 @@ Index: src/components/tabs/public/folder_tab_collection.h
 ===================================================================
 --- /dev/null
 +++ src/components/tabs/public/folder_tab_collection.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,54 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -3870,9 +3955,27 @@ Index: src/components/tabs/public/folder_tab_collection.h
 +  bool collapsed() const { return collapsed_; }
 +  void SetCollapsed(bool collapsed) { collapsed_ = collapsed; }
 +
++  void SetProvenance(std::string source,
++                     std::string collection_id,
++                     std::string item_id) {
++    provenance_source_ = std::move(source);
++    provenance_collection_id_ = std::move(collection_id);
++    provenance_item_id_ = std::move(item_id);
++  }
++  const std::string& provenance_source() const { return provenance_source_; }
++  const std::string& provenance_collection_id() const {
++    return provenance_collection_id_;
++  }
++  const std::string& provenance_item_id() const {
++    return provenance_item_id_;
++  }
++
 + private:
 +  std::u16string title_;
 +  bool collapsed_ = false;
++  std::string provenance_source_;
++  std::string provenance_collection_id_;
++  std::string provenance_item_id_;
 +};
 +
 +}  // namespace tabs
