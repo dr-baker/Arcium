@@ -3753,7 +3753,7 @@ Index: src/components/tabs/impl/tab_strip_collection.cc
  }
  
  TabStripCollection::~TabStripCollection() = default;
-@@ -73,6 +80,109 @@ size_t TabStripCollection::IndexOfFirstN
+@@ -73,6 +80,123 @@ size_t TabStripCollection::IndexOfFirstN
    return pinned_collection_->TabCountRecursive();
  }
  
@@ -3802,13 +3802,27 @@ Index: src/components/tabs/impl/tab_strip_collection.cc
 +FolderTabCollection* TabStripCollection::CreatePinFolder(
 +    std::u16string title,
 +    size_t direct_index) {
-+  const size_t dst_direct =
-+      std::min(direct_index, pin_collection_->ChildCount());
++  return CreatePinFolder(pin_collection_, std::move(title), false,
++                         direct_index);
++}
++
++FolderTabCollection* TabStripCollection::CreatePinFolder(
++    TabCollection* parent,
++    std::u16string title,
++    bool collapsed,
++    size_t direct_index) {
++  CHECK(parent);
++  CHECK(parent == pin_collection_ ||
++        parent->type() == TabCollection::Type::FOLDER);
++  const size_t dst_direct = direct_index == SIZE_MAX
++                                ? parent->ChildCount()
++                                : std::min(direct_index, parent->ChildCount());
 +  auto folder = std::make_unique<FolderTabCollection>(std::move(title));
++  folder->SetCollapsed(collapsed);
 +  FolderTabCollection* folder_ptr = folder.get();
 +  AddTabCollectionImpl(
 +      std::move(folder),
-+      TabCollection::Position{pin_collection_->GetHandle(), dst_direct});
++      TabCollection::Position{parent->GetHandle(), dst_direct});
 +  return folder_ptr;
 +}
 +
@@ -3863,7 +3877,7 @@ Index: src/components/tabs/impl/tab_strip_collection.cc
  void TabStripCollection::AddTabRecursive(
      std::unique_ptr<TabInterface> tab,
      size_t index,
-@@ -165,6 +275,7 @@ void TabStripCollection::MoveTabsRecursi
+@@ -165,6 +289,7 @@ void TabStripCollection::MoveTabsRecursi
      // collection is removed.
      if (src_parent_collection != unpinned_collection_ &&
          src_parent_collection != pinned_collection_ &&
@@ -3871,7 +3885,7 @@ Index: src/components/tabs/impl/tab_strip_collection.cc
          src_parent_collection->TabCountRecursive() == 0) {
        RemoveTabCollectionImpl(src_parent_collection);
      }
-@@ -263,14 +374,16 @@ ChildrenPtrs TabStripCollection::GetTabs
+@@ -263,14 +388,16 @@ ChildrenPtrs TabStripCollection::GetTabs
    ChildrenPtrs move_datas;
  
    // Iterates through `tab_indices`. If the tab is a direct child of
@@ -3891,7 +3905,7 @@ Index: src/components/tabs/impl/tab_strip_collection.cc
          collection == unpinned_collection_) {
        TabInterface* move_data =
            GetTabAtIndexRecursive(tab_indices[array_index]);
-@@ -286,6 +399,7 @@ ChildrenPtrs TabStripCollection::GetTabs
+@@ -286,6 +413,7 @@ ChildrenPtrs TabStripCollection::GetTabs
        // `candidate_subtree_collection` is the next potential subcollection to
        // remove.
        while ((candidate_subtree_collection != pinned_collection_ &&
@@ -3899,7 +3913,7 @@ Index: src/components/tabs/impl/tab_strip_collection.cc
                candidate_subtree_collection != unpinned_collection_) &&
               selected_collections.contains(candidate_subtree_collection)) {
          subtree_to_remove = candidate_subtree_collection;
-@@ -318,6 +432,7 @@ std::unique_ptr<TabInterface> TabStripCo
+@@ -318,6 +446,7 @@ std::unique_ptr<TabInterface> TabStripCo
    // If it is the only tab in the group remove the collection.
    if (parent_collection != unpinned_collection_ &&
        parent_collection != pinned_collection_ &&
@@ -3907,7 +3921,7 @@ Index: src/components/tabs/impl/tab_strip_collection.cc
        parent_collection->TabCountRecursive() == 1) {
      RemoveTabCollectionImpl(parent_collection);
      return parent_collection->MaybeRemoveTab(tab_to_be_removed);
-@@ -764,7 +879,13 @@ TabCollection::Position TabStripCollecti
+@@ -764,7 +893,13 @@ TabCollection::Position TabStripCollecti
      }
      insert_collection = group_collection;
    } else {
@@ -4080,7 +4094,7 @@ Index: src/components/tabs/public/tab_strip_collection.h
  class TabStripCollection : public TabCollection {
   public:
    explicit TabStripCollection(bool send_notifications_immediately = true);
-@@ -37,9 +39,40 @@ class TabStripCollection : public TabCol
+@@ -37,9 +39,47 @@ class TabStripCollection : public TabCol
    TabStripCollection& operator=(const TabStripCollection&) = delete;
  
    PinnedTabCollection* pinned_collection() { return pinned_collection_; }
@@ -4106,7 +4120,14 @@ Index: src/components/tabs/public/tab_strip_collection.h
 +  size_t MoveTabFromPin(TabInterface* tab);
 +
 +  FolderTabCollection* CreatePinFolder(std::u16string title,
-+                                              size_t direct_index = 0);
++                                       size_t direct_index = 0);
++
++  // Creates a distinct folder under the Pin root or another folder. Unlike
++  // FindOrCreateFolder(), this never adopts a same-named existing folder.
++  FolderTabCollection* CreatePinFolder(TabCollection* parent,
++                                       std::u16string title,
++                                       bool collapsed = false,
++                                       size_t direct_index = SIZE_MAX);
 +
 +  // Finds a direct child folder titled `title` under `parent`, or creates one.
 +  // `parent` must be the persistent collection or a folder under it.
@@ -4121,7 +4142,7 @@ Index: src/components/tabs/public/tab_strip_collection.h
  
    void AddTabRecursive(std::unique_ptr<TabInterface> tab,
                         size_t index,
-@@ -200,6 +233,9 @@ class TabStripCollection : public TabCol
+@@ -200,6 +240,9 @@ class TabStripCollection : public TabCol
    // destruction.
    raw_ptr<PinnedTabCollection> pinned_collection_ = nullptr;
  
