@@ -196,40 +196,6 @@
  #include "chrome/browser/ui/toolbar/pinned_toolbar/pinned_toolbar_actions_model_factory.h"
  #include "chrome/browser/ui/toolbar/toolbar_actions_model_factory.h"
  #include "chrome/browser/ui/ui_features.h"
-@@ -649,6 +650,7 @@
- #if defined(TOOLKIT_VIEWS)
- #include "chrome/browser/bookmarks/bookmark_expanded_state_tracker_factory.h"
- #include "chrome/browser/bookmarks/bookmark_merged_surface_service_factory.h"
-+#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_service_factory.h"
- #endif
- 
- #if BUILDFLAG(USE_NSS_CERTS)
-@@ -841,6 +843,9 @@ void ChromeBrowserMainExtraPartsProfiles
-   browser_switcher::BrowserSwitcherServiceFactory::GetInstance();
- #endif
-   browser_sync::UserEventServiceFactory::GetInstance();
-+#if defined(TOOLKIT_VIEWS)
-+  browser_shortcuts::BrowserShortcutServiceFactory::GetInstance();
-+#endif
- #if !BUILDFLAG(IS_ANDROID)
-   BrowserManagerServiceFactory::GetInstance();
- #endif
-@@ -966,7 +971,6 @@ void ChromeBrowserMainExtraPartsProfiles
- #endif
- #if BUILDFLAG(ENTERPRISE_CLOUD_CONTENT_ANALYSIS) || BUILDFLAG(IS_ANDROID) || \
-     BUILDFLAG(FULL_SAFE_BROWSING)
--  enterprise_connectors::BrowserCrashEventRouterFactory::GetInstance();
- #endif
-   enterprise_connectors::ConnectorsServiceFactory::GetInstance();
- #if BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_MAC) || \
-@@ -986,7 +990,6 @@ void ChromeBrowserMainExtraPartsProfiles
- #endif
- #if BUILDFLAG(ENTERPRISE_CLOUD_CONTENT_ANALYSIS) || BUILDFLAG(IS_ANDROID) || \
-     BUILDFLAG(FULL_SAFE_BROWSING)
--  enterprise_connectors::ReportingEventRouterFactory::GetInstance();
- #endif
- #if BUILDFLAG(ENTERPRISE_TELOMERE_REPORTING)
-   if (base::FeatureList::IsEnabled(enterprise_connectors::kTelomereReporting)) {
 @@ -1300,6 +1303,7 @@ void ChromeBrowserMainExtraPartsProfiles
    PersonalContextServiceFactory::GetInstance();
  #if !BUILDFLAG(IS_ANDROID)
@@ -881,23 +847,18 @@
 +#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_SERVICE_FACTORY_H_
 --- a/chrome/browser/ui/startup/startup_tab_provider.cc
 +++ b/chrome/browser/ui/startup/startup_tab_provider.cc
-@@ -36,6 +36,11 @@
- #include "chrome/browser/ui/startup/startup_types.h"
- #include "chrome/browser/ui/startup/url_util.h"
- #include "chrome/browser/ui/tabs/pinned_tab_codec.h"
-+#include "chrome/browser/ui/tabs/pin_tab_codec.h"
+@@ -39,2 +39,6 @@
+ #include "chrome/browser/ui/tabs/pin_tab_codec.h"
 +#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
 +#include "chrome/browser/ui/helium/helium_space.h"
 +#include "chrome/browser/ui/helium/helium_space_service.h"
 +#include "chrome/browser/ui/helium/helium_space_service_factory.h"
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
- #include "chrome/browser/ui/webui/settings/reset_settings_handler.h"
- #include "chrome/common/pref_names.h"
-@@ -127,10 +132,28 @@ StartupTabs StartupTabProviderImpl::GetR
+@@ -127,14 +131,28 @@ StartupTabs StartupTabProviderImpl::GetR
  StartupTabs StartupTabProviderImpl::GetPinnedTabs(
      const base::CommandLine& command_line,
      Profile* profile) const {
--  return GetPinnedTabsForState(
+-  StartupTabs tabs = GetPinnedTabsForState(
 +  const bool has_other_tabbed_browser = ProfileHasOtherTabbedBrowser(profile);
 +
 +  StartupTabs favorites = PinnedTabCodec::ReadPinnedTabs(profile);
@@ -916,29 +877,27 @@
        StartupBrowserCreator::GetSessionStartupPref(command_line, profile),
 -      PinnedTabCodec::ReadPinnedTabs(profile),
 -      ProfileHasOtherTabbedBrowser(profile));
+-  // Append Helium pins (not native pins).
+-  StartupTabs persistent = PinTabCodec::ReadPins(profile);
+-  tabs.insert(tabs.end(), persistent.begin(), persistent.end());
 +      favorites, has_other_tabbed_browser);
 +  // Only materialize Space pins on the primary window.
 +  if (!has_other_tabbed_browser) {
 +    tabs.insert(tabs.end(), pins.begin(), pins.end());
 +  }
-+  return tabs;
+   return tabs;
  }
  
  StartupTabs StartupTabProviderImpl::GetPreferencesTabs(
 --- a/chrome/browser/ui/tabs/pinned_tab_service.cc
 +++ b/chrome/browser/ui/tabs/pinned_tab_service.cc
-@@ -12,6 +12,11 @@
- #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
- #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
- #include "chrome/browser/ui/tabs/pinned_tab_codec.h"
-+#include "chrome/browser/ui/tabs/pin_tab_codec.h"
+@@ -15,2 +15,6 @@
+ #include "chrome/browser/ui/tabs/pin_tab_codec.h"
 +#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
 +#include "chrome/browser/ui/helium/helium_space.h"
 +#include "chrome/browser/ui/helium/helium_space_service.h"
 +#include "chrome/browser/ui/helium/helium_space_service_factory.h"
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
- 
- PinnedTabService::PinnedTabService(Profile* profile) : profile_(profile) {
 @@ -73,6 +78,31 @@ void PinnedTabService::OnTabStripModelCh
  }
  
@@ -971,7 +930,7 @@
    if (TabStripModelObserver::CountObservedModels(this) == 1) {
      WritePinnedTabsIfNecessary();
    }
-@@ -80,7 +110,21 @@ void PinnedTabService::WillCloseAllTabs(
+@@ -80,8 +110,21 @@ void PinnedTabService::WillCloseAllTabs(
  
  void PinnedTabService::WritePinnedTabsIfNecessary() {
    if (need_to_write_pinned_tabs_) {
@@ -989,7 +948,7 @@
 +      }
 +    }
      PinnedTabCodec::WritePinnedTabs(profile_);
-+    PinTabCodec::WritePins(profile_);
+     PinTabCodec::WritePins(profile_);
    }
    need_to_write_pinned_tabs_ = false;
  }
@@ -1190,7 +1149,7 @@
  
      const auto* container_ids = space_dict->FindList("containerIDs");
      if (container_ids) {
-@@ -283,48 +333,54 @@ void ArcSidebarImporter::ImportBookmarks
+@@ -283,51 +333,54 @@ void ArcSidebarImporter::ImportBookmarks
    }
  
    auto spaces = ParseSpaces(data_container->FindList("spaces"));
@@ -1222,6 +1181,8 @@
      }
    }
  
+-  bool multiple_spaces = spaces.size() > 1;
+-
    for (const auto& space : spaces) {
 -    if (space.pinned_container_id.empty()) {
 +    if (space.profile_directory != source_path_.BaseName().AsUTF8Unsafe()) {
@@ -1243,14 +1204,14 @@
      }
  
      std::vector<std::u16string> path_parts;
--    if (spaces.size() > 1) {
+-    if (multiple_spaces) {
 -      std::string space_name = space.id;
 -      if (space_name.contains("defaultPersonalSpaceID")) {
 -        space_name = "Personal";
 -      }
 -      path_parts.push_back(base::UTF8ToUTF16(space_name));
 -    }
-+
+ 
 +    std::unordered_set<std::string> visited_ids;
      for (const auto& child_id : it->second.children_ids) {
 -      WalkItem(child_id, items, path_parts, /*in_toolbar=*/false, &bookmarks,
@@ -1437,9 +1398,10 @@
  
  namespace user_prefs {
  class PrefRegistrySyncable;
-@@ -31,4 +32,9 @@ class PinnedTabCodec {
+@@ -31,6 +32,11 @@ class PinnedTabCodec {
    // Resets the preferences state.
    static void WritePinnedTabs(Profile* profile);
+ 
 +  // Writes Favorites from one Space window. Every Space shows the same
 +  // Favorites, so serializing all windows would duplicate them.
 +  static void WritePinnedTabs(Profile* profile,
