@@ -306,7 +306,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,379 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -322,6 +322,8 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +#include "chrome/browser/sessions/session_service.h"
 +#include "chrome/browser/sessions/session_service_factory.h"
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
 +#include "chrome/browser/ui/navigator/browser_navigator_params.h"
 +#include "chrome/browser/ui/tab_ui_helper.h"
 +#include "chrome/browser/ui/tabs/tab_strip_model.h"
@@ -345,6 +347,11 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +
 +constexpr char kAnchorURLKey[] = "helium.favorites_and_pins.anchor_url";
 +constexpr char kAnchorTitleKey[] = "helium.favorites_and_pins.anchor_title";
++
++HeliumSpaceService* GetSpaceService(const tabs::TabInterface* tab) {
++  return tab ? HeliumSpaceServiceFactory::GetForProfile(tab->GetProfile())
++             : nullptr;
++}
 +
 +bool IsHTTPOrHTTPS(const GURL& url) {
 +  return url.is_valid() && url.SchemeIsHTTPOrHTTPS();
@@ -438,13 +445,20 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +  return strip && strip->IsPinTab(tab);
 +}
 +
++bool IsPersistentItemTab(const tabs::TabInterface* tab) {
++  HeliumSpaceService* service = GetSpaceService(tab);
++  return service && service->IsPersistentItemTab(tab);
++}
++
 +bool IsAnchoredTab(const tabs::TabInterface* tab) {
 +  if (!IsHeliumFavoritesAndPinsEnabled() || !IsEligibleTabContext(tab) ||
-+      !IsStandaloneTab(tab) || !HasHomeMetadata(tab)) {
++      !IsStandaloneTab(tab)) {
 +    return false;
 +  }
-+  // Native pinned tabs and pins-section tabs share anchored-home UX.
-+  return tab->IsPinned() || IsPinTab(tab);
++  if (IsPersistentItemTab(tab)) {
++    return true;
++  }
++  return HasHomeMetadata(tab) && (tab->IsPinned() || IsPinTab(tab));
 +}
 +
 +bool IsAnchoredTabAwayFromHome(const tabs::TabInterface* tab) {
@@ -471,30 +485,40 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +      !IsStandaloneTab(tab) || IsPinTab(tab) || tab->IsPinned()) {
 +    return false;
 +  }
-+  return IsHTTPOrHTTPS(tab->GetContents()->GetLastCommittedURL());
++  HeliumSpaceService* service = GetSpaceService(tab);
++  return (!service || !service->IsPersistentItemTab(tab)) &&
++         IsHTTPOrHTTPS(tab->GetContents()->GetLastCommittedURL());
++}
++
++bool CanMakeFavorite(const tabs::TabInterface* tab) {
++  if (!IsHeliumFavoritesAndPinsEnabled() || !IsEligibleTabContext(tab) ||
++      !IsStandaloneTab(tab)) {
++    return false;
++  }
++  HeliumSpaceService* service = GetSpaceService(tab);
++  return (!service || !service->IsPersistentItemTab(tab)) &&
++         IsHTTPOrHTTPS(tab->GetContents()->GetLastCommittedURL());
++}
++
++bool MakeFavorite(tabs::TabInterface* tab) {
++  if (!CanMakeFavorite(tab)) {
++    return false;
++  }
++  HeliumSpaceService* service = GetSpaceService(tab);
++  return service && service->AddFavoriteFromTab(tab);
 +}
 +
 +bool MakePin(tabs::TabInterface* tab) {
 +  if (!CanMakePin(tab)) {
 +    return false;
 +  }
++  HeliumSpaceService* service = GetSpaceService(tab);
++  return service && service->AddPinFromTab(tab);
++}
 +
-+  tabs::TabStripCollection* const strip = GetTabStripCollection(tab);
-+  TabUIHelper* const helper = GetTabUIHelper(tab);
-+  if (!strip || !helper) {
-+    return false;
-+  }
-+
-+  const GURL home_url = tab->GetContents()->GetLastCommittedURL();
-+  std::u16string title = helper->GetTitle();
-+  if (title.empty()) {
-+    title = base::UTF8ToUTF16(home_url.host());
-+  }
-+
-+  helper->SetAnchoredPinnedTabHome(home_url, std::move(title));
-+  strip->MoveTabToPin(tab);
-+  PersistAnchoredPinnedTabExtraData(tab);
-+  return true;
++bool CreatePinFolder(tabs::TabInterface* tab) {
++  HeliumSpaceService* service = GetSpaceService(tab);
++  return service && service->CreatePinFolderForTab(tab);
 +}
 +
 +bool GetAnchoredPinnedTabHome(const tabs::TabInterface* tab,
@@ -505,9 +529,13 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +  }
 +
 +  const TabUIHelper* const helper = GetTabUIHelper(tab);
-+  *home_url = helper->anchored_pinned_tab_home_url();
-+  *home_title = helper->anchored_pinned_tab_home_title();
-+  return true;
++  if (helper && helper->HasAnchoredPinnedTabHome()) {
++    *home_url = helper->anchored_pinned_tab_home_url();
++    *home_title = helper->anchored_pinned_tab_home_title();
++    return true;
++  }
++  HeliumSpaceService* service = GetSpaceService(tab);
++  return service && service->GetPersistentItemHome(tab, home_url, home_title);
 +}
 +
 +void RestoreAnchoredPinnedTabHome(tabs::TabInterface* tab,
@@ -559,6 +587,12 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +    return;
 +  }
 +
++  if (HeliumSpaceService* service = GetSpaceService(tab);
++      service && service->ReplacePersistentItemHome(tab)) {
++    PersistAnchoredPinnedTabExtraData(tab);
++    return;
++  }
++
 +  TabUIHelper* const helper = GetTabUIHelper(tab);
 +  std::u16string title = helper->GetTitle();
 +  if (title.empty()) {
@@ -570,6 +604,10 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +
 +void RemoveAnchoredPinnedTab(tabs::TabInterface* tab) {
 +  if (!tab) {
++    return;
++  }
++  if (HeliumSpaceService* service = GetSpaceService(tab);
++      service && service->RemovePersistentItem(tab)) {
 +    return;
 +  }
 +  if (TabUIHelper* const helper = GetTabUIHelper(tab)) {
@@ -606,10 +644,15 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +    helper->ClearAnchoredPinnedTabHome();
 +  }
 +
++  // The normalized model and its stable session key own restoration. Never
++  // reconstruct legacy native/fake pinned tabs from anchored metadata.
++  if (IsHeliumFavoritesAndPinsEnabled()) {
++    return;
++  }
++
 +  const Profile* const profile = tab ? tab->GetProfile() : nullptr;
-+  if (!helper || !IsHeliumFavoritesAndPinsEnabled() || !profile ||
-+      profile->IsOffTheRecord() || profile->IsGuestSession() ||
-+      !IsStandaloneTab(tab)) {
++  if (!helper || !profile || profile->IsOffTheRecord() ||
++      profile->IsGuestSession() || !IsStandaloneTab(tab)) {
 +    return;
 +  }
 +
@@ -647,7 +690,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_favorites_and_pins.h
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,63 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -674,7 +717,10 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.h
 +bool IsHeliumFavoritesAndPinsEnabled();
 +
 +bool CanMakePin(const tabs::TabInterface* tab);
++bool CanMakeFavorite(const tabs::TabInterface* tab);
++bool MakeFavorite(tabs::TabInterface* tab);
 +bool IsPinTab(const tabs::TabInterface* tab);
++bool IsPersistentItemTab(const tabs::TabInterface* tab);
 +bool IsAnchoredTab(const tabs::TabInterface* tab);
 +bool IsAnchoredTabAwayFromHome(const tabs::TabInterface* tab);
 +
@@ -683,6 +729,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.h
 +bool IsAnchoredPinnedTabAwayFromHome(const tabs::TabInterface* tab);
 +
 +bool MakePin(tabs::TabInterface* tab);
++bool CreatePinFolder(tabs::TabInterface* tab);
 +bool GetAnchoredPinnedTabHome(const tabs::TabInterface* tab,
 +                              GURL* home_url,
 +                              std::u16string* home_title);
@@ -701,7 +748,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.h
 +    tabs::TabInterface* tab,
 +    const std::map<std::string, std::string>& extra_data);
 +
-+// Pins navigate in place; this remains a no-op converter.
++// Optional features can replace this seam to divert anchored navigation.
 +bool MaybeConvertAnchoredFavoriteOrPinNavigation(NavigateParams* params);
 +
 +}  // namespace helium
@@ -950,7 +997,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/helium_space_service.cc
 +++ src/chrome/browser/ui/helium/helium_space_service.cc
-@@ -4,48 +4,343 @@
+@@ -4,48 +4,369 @@
  
  #include "chrome/browser/ui/helium/helium_space_service.h"
  
@@ -1055,6 +1102,32 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +
 +std::string NewId() {
 +  return base::Uuid::GenerateRandomV4().AsLowercaseString();
++}
++
++bool WrapLinkInFolder(PersistentNodes* nodes,
++                      std::string_view link_id,
++                      std::string folder_id,
++                      std::u16string folder_title) {
++  for (PersistentNode& node : *nodes) {
++    if (auto* link = std::get_if<PersistentLink>(&node.data)) {
++      if (link->id != link_id) {
++        continue;
++      }
++      PersistentNodes children;
++      children.push_back(std::move(node));
++      node.data = PersistentFolder{.id = std::move(folder_id),
++                                   .title = std::move(folder_title),
++                                   .collapsed = false,
++                                   .children = std::move(children)};
++      return true;
++    }
++    auto* folder = std::get_if<PersistentFolder>(&node.data);
++    if (folder && WrapLinkInFolder(&folder->children, link_id, folder_id,
++                                   folder_title)) {
++      return true;
++    }
++  }
++  return false;
 +}
 +
 +std::string ImportedId(std::string_view profile,
@@ -1307,7 +1380,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
    }
  }
  
-@@ -56,16 +351,8 @@ void HeliumSpaceService::EnsureDefaultSp
+@@ -56,16 +377,8 @@ void HeliumSpaceService::EnsureDefaultSp
      }
      return;
    }
@@ -1326,7 +1399,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
  }
  
  HeliumSpace* HeliumSpaceService::GetDefaultSpace() {
-@@ -79,9 +366,8 @@ const HeliumSpace* HeliumSpaceService::G
+@@ -79,9 +392,8 @@ const HeliumSpace* HeliumSpaceService::G
  
  HeliumSpace* HeliumSpaceService::GetActiveSpace() {
    EnsureDefaultSpace();
@@ -1338,7 +1411,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      return active;
    }
    return spaces_.front().get();
-@@ -97,55 +383,1314 @@ HeliumSpace* HeliumSpaceService::GetSpac
+@@ -97,55 +409,1338 @@ HeliumSpace* HeliumSpaceService::GetSpac
  }
  
  HeliumSpace* HeliumSpaceService::GetOrCreateSpace(std::string id,
@@ -1529,7 +1602,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +                     association->second->tab &&
 +                     association->second->tab->IsActivated();
 +    item.is_live = true;
-+  }
+   }
 +  return items;
 +}
 +
@@ -1760,6 +1833,30 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  return AddFromTab(tab, PersistentRecordKind::kPin);
 +}
 +
++bool HeliumSpaceService::CreatePinFolderForTab(tabs::TabInterface* tab) {
++  for (const auto& [token, association] : live_associations_) {
++    if (association->tab != tab ||
++        association->kind != PersistentRecordKind::kPin) {
++      continue;
++    }
++    BrowserWindowInterface* window = tab->GetBrowserWindowInterface();
++    Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
++    HeliumSpace* space =
++        browser ? GetSpaceById(GetSpaceIdForBrowser(browser)) : nullptr;
++    if (!space) {
++      return false;
++    }
++    PersistentNodes pins = space->pins();
++    if (!WrapLinkInFolder(&pins, association->item_id, NewId(), u"Folder")) {
++      return false;
++    }
++    space->SetPins(std::move(pins));
++    NotifyItemsChanged();
++    return true;
++  }
++  return false;
++}
++
 +bool HeliumSpaceService::AddFromTab(tabs::TabInterface* tab,
 +                                    PersistentRecordKind kind) {
 +  if (!tab || tab->GetProfile() != profile_ || profile_->IsOffTheRecord() ||
@@ -1919,7 +2016,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  std::u16string title = item.title;
 +  if (title.empty()) {
 +    title = base::UTF8ToUTF16(item.url.host());
-   }
++  }
 +  helper->SetAnchoredPinnedTabHome(item.url, std::move(title));
 +}
 +
@@ -2662,7 +2759,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      return false;
    }
    SetSpaceForBrowser(browser, found->second);
-@@ -158,20 +1703,32 @@ void HeliumSpaceService::AddSpaceToSessi
+@@ -158,20 +1753,32 @@ void HeliumSpaceService::AddSpaceToSessi
    if (!extra_data) {
      return;
    }
@@ -2703,7 +2800,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
  }
  
  std::vector<HeliumSpace*> HeliumSpaceService::GetSpaces() {
-@@ -191,27 +1748,20 @@ void HeliumSpaceService::OnBrowserCreate
+@@ -191,27 +1798,20 @@ void HeliumSpaceService::OnBrowserCreate
        !GetSpaceIdForBrowser(browser).empty()) {
      return;
    }
@@ -2822,7 +2919,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
  class HeliumSpaceService : public KeyedService,
                             public BrowserCollectionObserver {
   public:
-@@ -39,13 +83,82 @@ class HeliumSpaceService : public KeyedS
+@@ -39,13 +83,83 @@ class HeliumSpaceService : public KeyedS
    HeliumSpaceService& operator=(const HeliumSpaceService&) = delete;
    ~HeliumSpaceService() override;
  
@@ -2855,6 +2952,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +                              std::string_view id);
 +  bool AddFavoriteFromTab(tabs::TabInterface* tab);
 +  bool AddPinFromTab(tabs::TabInterface* tab);
++  bool CreatePinFolderForTab(tabs::TabInterface* tab);
 +  bool ReplacePersistentItemHome(tabs::TabInterface* tab);
 +  bool RemovePersistentItem(tabs::TabInterface* tab);
 +  bool RemovePersistentItem(Browser* browser,
@@ -2907,7 +3005,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
    void SetSpaceForBrowser(Browser* browser, std::string_view id);
    bool RestoreSpaceForBrowserFromSession(
        Browser* browser,
-@@ -57,20 +170,82 @@ class HeliumSpaceService : public KeyedS
+@@ -57,20 +171,82 @@ class HeliumSpaceService : public KeyedS
  
    std::vector<HeliumSpace*> GetSpaces();
  
@@ -4250,7 +4348,29 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  void TabStripModel::MoveSelectedTabsTo(
      int index,
      std::optional<tab_groups::TabGroupId> into_group) {
-@@ -1559,6 +1613,10 @@ int TabStripModel::IndexOfFirstNonPinned
+@@ -1467,9 +1521,20 @@ void TabStripModel::SetTabBlocked(int in
+ }
+ 
+ int TabStripModel::SetTabPinned(int index, bool pinned) {
+-  ReentrancyCheck reentrancy_check(&reentrancy_guard_);
+   CHECK(ContainsIndex(index));
+ 
++  // Product-level pin requests create a durable Space Pin. The service owns
++  // identity and moves the associated live tab into the Pin collection. Its
++  // internal native move re-enters here only for a persistent Favorite.
++  if (helium::IsHeliumFavoritesAndPinsEnabled() && pinned &&
++      !helium::IsPersistentItemTab(GetTabAtIndex(index))) {
++    tabs::TabInterface* tab = GetTabAtIndex(index);
++    helium::MakePin(tab);
++    return GetIndexOfTab(tab);
++  }
++
++  ReentrancyCheck reentrancy_check(&reentrancy_guard_);
++
+   if (IsTabPinned(index) == pinned) {
+     return index;
+   }
+@@ -1559,6 +1624,10 @@ int TabStripModel::IndexOfFirstNonPinned
    return contents_data_->IndexOfFirstNonPinnedTab();
  }
  
@@ -4261,7 +4381,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  void TabStripModel::ExtendSelectionTo(int index) {
    CHECK(ContainsIndex(index));
    tabs::TabStripModelSelectionState new_model = selection_model_;
-@@ -2474,6 +2532,15 @@ bool TabStripModel::IsContextMenuCommand
+@@ -2474,6 +2543,15 @@ bool TabStripModel::IsContextMenuCommand
      return false;
    }
  
@@ -4277,7 +4397,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
    switch (command_id) {
      case CommandNewTabToRight:
      case CommandCloseTab:
-@@ -2526,8 +2593,19 @@ bool TabStripModel::IsContextMenuCommand
+@@ -2526,8 +2604,19 @@ bool TabStripModel::IsContextMenuCommand
      case CommandTogglePinned:
        return true;
  
@@ -4298,7 +4418,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  
      case CommandSendTabToSelf:
        return true;
-@@ -2538,12 +2616,12 @@ bool TabStripModel::IsContextMenuCommand
+@@ -2538,12 +2627,12 @@ bool TabStripModel::IsContextMenuCommand
      case CommandAddToNewGroup:
      case CommandAddToNewGroupFromMenuItem:
      case CommandAddToExistingGroup:
@@ -4313,7 +4433,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  
      case CommandRemoveFromGroup:
        return SupportsTabGroups();
-@@ -2733,6 +2811,44 @@ void TabStripModel::ExecuteContextMenuCo
+@@ -2733,7 +2822,61 @@ void TabStripModel::ExecuteContextMenuCo
        break;
      }
  
@@ -4335,6 +4455,10 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
 +
 +    case CommandNewPinFolder: {
 +      tabs::TabInterface* tab = GetTabAtIndex(context_index);
++      if (helium::IsHeliumFavoritesAndPinsEnabled()) {
++        helium::CreatePinFolder(tab);
++        break;
++      }
 +      if (auto* strip = static_cast<tabs::TabStripCollection*>(
 +              const_cast<tabs::TabCollection*>(Root()))) {
 +        tabs::TabCollection* parent =
@@ -4356,9 +4480,22 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
 +    }
 +
      case CommandTogglePinned: {
++      if (helium::IsHeliumFavoritesAndPinsEnabled() &&
++          WillContextMenuPin(context_index)) {
++        std::vector<tabs::TabInterface*> tabs;
++        for (int index : GetIndicesForCommand(context_index)) {
++          tabs.push_back(GetTabAtIndex(index));
++        }
++        for (tabs::TabInterface* tab : tabs) {
++          helium::MakePin(tab);
++        }
++        break;
++      }
++
        base::UmaHistogramCounts1000(
            "Tab.ContextMenu.TogglePinned.SelectedTabsCount",
-@@ -3469,13 +3585,13 @@ bool TabStripModel::ShouldRunUnloadListe
+           selection_model_.size());
+@@ -3469,13 +3612,13 @@ bool TabStripModel::ShouldRunUnloadListe
  
  int TabStripModel::ConstrainInsertionIndex(int index, bool pinned_tab) const {
    return pinned_tab ? std::clamp(index, 0, IndexOfFirstNonPinnedTab())
@@ -4374,7 +4511,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  }
  
  std::vector<int> TabStripModel::GetIndicesForCommand(int index) const {
-@@ -3771,8 +3887,16 @@ tabs::TabInterface* TabStripModel::GetTa
+@@ -3771,8 +3914,16 @@ tabs::TabInterface* TabStripModel::GetTa
  void TabStripModel::CloseTabs(base::span<content::WebContents* const> items,
                                uint32_t close_types) {
    std::vector<content::WebContents*> filtered_items;
@@ -5903,7 +6040,15 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
 +++ src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
-@@ -124,9 +124,16 @@ gfx::Range GetContainerRange(const TabCo
+@@ -13,6 +13,7 @@
+ #include "base/notreached.h"
+ #include "base/types/to_address.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
++#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
+@@ -124,9 +125,16 @@ gfx::Range GetContainerRange(const TabCo
        return TabGroupDataFromNode(container_node).ListTabs();
      case TabCollectionNode::Type::PINNED:
        return gfx::Range(0, tab_strip_model.IndexOfFirstNonPinnedTab());
@@ -5921,6 +6066,39 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
      default:
        NOTREACHED();
    }
+@@ -917,6 +925,32 @@ bool TabDragHandlerImpl::HandleDraggedTa
+ 
+   const auto& drag_session_data = drag_controller_->GetSessionData();
+ 
++  // Crossing a persistent-region boundary is a product mutation, not a raw
++  // index move. Let the service create or remove the durable record and let
++  // its TabStripModel transaction move the associated live tab.
++  bool handled_persistent_transition = false;
++  for (const TabDragData& tab_drag_data : drag_session_data.tab_drag_data_) {
++    if (!tab_drag_data.contents) {
++      continue;
++    }
++    tabs::TabInterface* tab =
++        tabs::TabInterface::GetFromContents(tab_drag_data.contents);
++    if (container_node.type() == TabCollectionNode::Type::PIN &&
++        !helium::IsPersistentItemTab(tab)) {
++      handled_persistent_transition |= helium::MakePin(tab);
++    } else if (container_node.type() == TabCollectionNode::Type::PINNED &&
++               !helium::IsPersistentItemTab(tab)) {
++      handled_persistent_transition |= helium::MakeFavorite(tab);
++    } else if (container_node.type() == TabCollectionNode::Type::UNPINNED &&
++               helium::IsPersistentItemTab(tab)) {
++      helium::RemoveAnchoredPinnedTab(tab);
++      handled_persistent_transition = true;
++    }
++  }
++  if (handled_persistent_transition) {
++    return true;
++  }
++
+   auto container_range = GetContainerRange(container_node, *tab_strip_model_);
+   int container_start_index = container_range.start();
+   int container_end_index = container_range.end();
 Index: src/chrome/browser/ui/views/tabs/common/tab_link_drop_handler.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/common/tab_link_drop_handler.cc
@@ -5941,37 +6119,122 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
 +++ src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
-@@ -15,6 +15,7 @@
+@@ -7,6 +7,7 @@
+ #include "base/callback_list.h"
+ #include "base/functional/bind.h"
+ #include "base/metrics/histogram_macros.h"
++#include "base/scoped_multi_source_observation.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+@@ -14,6 +15,7 @@
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
  #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
- #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
 +#include "chrome/browser/ui/views/tabs/common/pin_tab_container_view.h"
+ #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
  #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
  #include "chrome/browser/ui/views/tabs/common/tab_group_view.h"
- #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
-@@ -114,6 +115,15 @@ TabStripView::TabStripView(TabCollection
+@@ -28,13 +30,80 @@
+ #include "ui/views/background.h"
+ #include "ui/views/controls/scroll_view.h"
+ #include "ui/views/controls/separator.h"
++#include "ui/views/layout/box_layout.h"
+ #include "ui/views/layout/delegating_layout_manager.h"
+ #include "ui/views/layout/layout_types.h"
+ #include "ui/views/layout/proposed_layout.h"
+ #include "ui/views/view.h"
+ #include "ui/views/view_class_properties.h"
++#include "ui/views/view_observer.h"
+ #include "ui/views/view_utils.h"
+ 
++namespace {
++
++class MainTabsContentsView : public views::View, public views::ViewObserver {
++ public:
++  MainTabsContentsView() {
++    SetLayoutManager(std::make_unique<views::BoxLayout>(
++        views::BoxLayout::Orientation::kVertical));
++    separator_ = AddChildView(std::make_unique<views::Separator>());
++    separator_->SetOrientation(views::Separator::Orientation::kHorizontal);
++    separator_->SetProperty(
++        views::kMarginsKey,
++        gfx::Insets::VH(
++            4, GetLayoutConstant(
++                   LayoutConstant::kVerticalTabStripHorizontalPadding)));
++    separator_->SetVisible(false);
++  }
++
++  views::View* AddPersistent(std::unique_ptr<views::View> view) {
++    persistent_ = AddChildViewAt(std::move(view), 0);
++    observations_.AddObservation(persistent_);
++    UpdateSeparator();
++    return persistent_;
++  }
++
++  views::View* AddTabs(std::unique_ptr<views::View> view) {
++    tabs_ = AddChildView(std::move(view));
++    observations_.AddObservation(tabs_);
++    UpdateSeparator();
++    return tabs_;
++  }
++
++  void RemoveCollection(views::View* view) {
++    observations_.RemoveObservation(view);
++    if (view == persistent_) {
++      persistent_ = nullptr;
++    } else if (view == tabs_) {
++      tabs_ = nullptr;
++    }
++    RemoveChildViewT(view);
++    UpdateSeparator();
++  }
++
++  views::Separator* separator() { return separator_; }
++
++  void OnViewPreferredSizeChanged(views::View* observed_view) override {
++    UpdateSeparator();
++  }
++
++ private:
++  void UpdateSeparator() {
++    const bool visible = persistent_ && tabs_ &&
++                         persistent_->GetPreferredSize().height() > 0 &&
++                         tabs_->GetPreferredSize().height() > 0;
++    separator_->SetVisible(visible);
++  }
++
++  raw_ptr<views::View> persistent_ = nullptr;
++  raw_ptr<views::View> tabs_ = nullptr;
++  raw_ptr<views::Separator> separator_ = nullptr;
++  base::ScopedMultiSourceObservation<views::View, views::ViewObserver>
++      observations_{this};
++};
++
++}  // namespace
++
+ class TabStripView::ActivatedViewTracker : public views::ViewObserver {
+  public:
+   ActivatedViewTracker() = default;
+@@ -114,9 +183,14 @@ TabStripView::TabStripView(TabCollection
        views::ScrollView::ScrollWithLayers::kEnabled));
    SetScrollViewProperties(pinned_tabs_scroll_view_);
  
-+  pins_scroll_view_ = AddChildView(
-+      std::make_unique<views::ScrollView>(
-+          views::ScrollView::ScrollWithLayers::kEnabled));
-+  SetScrollViewProperties(pins_scroll_view_);
-+
-+  tabs_separator_ = AddChildView(std::make_unique<views::Separator>());
-+  tabs_separator_->SetOrientation(views::Separator::Orientation::kHorizontal);
-+  tabs_separator_->SetVisible(false);
-+
-   unpinned_tabs_scroll_view_ = AddChildView(std::make_unique<views::ScrollView>(
+-  unpinned_tabs_scroll_view_ = AddChildView(std::make_unique<views::ScrollView>(
++  main_tabs_scroll_view_ = AddChildView(std::make_unique<views::ScrollView>(
        views::ScrollView::ScrollWithLayers::kEnabled));
-   SetScrollViewProperties(unpinned_tabs_scroll_view_);
-@@ -147,40 +157,58 @@ views::ProposedLayout TabStripView::Calc
-   const int region_vertical_padding = GetLayoutConstant(
-       LayoutConstant::kVerticalTabStripCollapsedVerticalPadding);
- 
-+  constexpr int kSeparatorHeight = 1;
-+  constexpr int kSeparatorVerticalPadding = 4;
+-  SetScrollViewProperties(unpinned_tabs_scroll_view_);
++  SetScrollViewProperties(main_tabs_scroll_view_);
 +
++  auto main_tabs_contents = std::make_unique<MainTabsContentsView>();
++  tabs_separator_ = main_tabs_contents->separator();
++  main_tabs_contents_ =
++      main_tabs_scroll_view_->SetContents(std::move(main_tabs_contents));
+ 
+   collection_node->set_add_child_to_node(base::BindRepeating(
+       &TabStripView::AddScrollViewContents, base::Unretained(this)));
+@@ -149,38 +223,39 @@ views::ProposedLayout TabStripView::Calc
+ 
    int y = 0;
  
 -  // Determine container preferred heights.
@@ -5981,18 +6244,13 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
        pinned_tabs_scroll_view_
            ->GetPreferredSize(pinned_tab_container_size_bounds)
            .height();
-+  const int pins_preferred_height =
-+      pins_scroll_view_
-+          ? pins_scroll_view_->GetPreferredSize(size_bounds).height()
-+          : 0;
-   const int unpinned_preferred_height =
-       unpinned_tabs_scroll_view_->GetPreferredSize(size_bounds).height();
+-  const int unpinned_preferred_height =
+-      unpinned_tabs_scroll_view_->GetPreferredSize(size_bounds).height();
++  const int main_tabs_preferred_height =
++      main_tabs_scroll_view_->GetPreferredSize(size_bounds).height();
  
 -  // If the height is bounded, calculate the available space for laying out the
 -  // pinned and unpinned containers.
-+  const bool show_separator =
-+      pins_preferred_height > 0 && unpinned_preferred_height > 0;
-+
    int remaining_height = 0;
    if (size_bounds.height().is_bounded()) {
      remaining_height = size_bounds.height().value();
@@ -6002,17 +6260,11 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
 +    if (pinned_preferred_height != 0) {
 +      ++sections_with_content;
 +    }
-+    if (pins_preferred_height != 0) {
-+      ++sections_with_content;
-+    }
-+    if (unpinned_preferred_height != 0) {
++    if (main_tabs_preferred_height != 0) {
 +      ++sections_with_content;
 +    }
 +    if (sections_with_content > 1) {
 +      remaining_height -= region_vertical_padding * (sections_with_content - 1);
-+    }
-+    if (show_separator) {
-+      remaining_height -= kSeparatorHeight + 2 * kSeparatorVerticalPadding;
      }
 -    // Clamp the remaining height to 0 if we have less space.
      remaining_height = std::max(remaining_height, 0);
@@ -6026,24 +6278,30 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
 -    // space unless the unpinned container will not fill that space. Also make
 -    // sure the height is at least the minimum.
 +  if (size_bounds.height().is_bounded() && pinned_tabs_container_view_) {
-+    const int other_preferred =
-+        pins_preferred_height + unpinned_preferred_height;
++    const int other_preferred = main_tabs_preferred_height;
      pinned_container_height = std::max(
-         std::min(pinned_preferred_height,
+-        std::min(pinned_preferred_height,
 -                 std::max(remaining_height / 2,
 -                          remaining_height - unpinned_preferred_height)),
-+                 std::max(remaining_height / 3,
-+                          remaining_height - other_preferred)),
++        std::min(
++            pinned_preferred_height,
++            std::max(remaining_height / 3, remaining_height - other_preferred)),
          pinned_tabs_container_view_->GetMinimumSize().height());
      remaining_height -= pinned_container_height;
    }
-@@ -194,19 +222,58 @@ views::ProposedLayout TabStripView::Calc
- 
+@@ -189,34 +264,36 @@ views::ProposedLayout TabStripView::Calc
+       pinned_tab_container_size_bounds.width().value(),
+       pinned_container_height);
+   layouts.child_layouts.emplace_back(pinned_tabs_scroll_view_.get(),
+-                                     pinned_tabs_scroll_view_->GetVisible(),
++                                     pinned_container_height > 0,
+                                      pinned_container_bounds);
+-
    if (pinned_container_bounds.height()) {
      y += pinned_container_bounds.height();
 -    // Add padding only if there are pinned and unpinned tabs.
 -    if (unpinned_preferred_height != 0) {
-+    if (pins_preferred_height != 0 || unpinned_preferred_height != 0) {
++    if (main_tabs_preferred_height != 0) {
        y += region_vertical_padding;
      }
    }
@@ -6052,58 +6310,42 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
 -  // inset the x value by |region_horizontal_padding| here because, when the tab
 -  // strip is collapsed, tab groups need to draw the group colored line in this
 -  // space.
-+  // Persistent
-+  int pins_container_height = pins_preferred_height;
-+  if (size_bounds.height().is_bounded() && pins_container_view_) {
-+    pins_container_height = std::max(
-+        std::min(pins_preferred_height,
-+                 std::max(remaining_height / 2,
-+                          remaining_height - unpinned_preferred_height)),
-+        pins_container_view_->GetMinimumSize().height());
-+    remaining_height -= pins_container_height;
+-  gfx::Rect unpinned_container_bounds(0, y, size_bounds.width().value(),
+-                                      unpinned_preferred_height);
++  // Persistent records and ordinary tabs form one ordered, scrolling list.
++  // The divider belongs to the list contents so neither section can crop the
++  // other into a separately constrained viewport.
++  int main_tabs_height = main_tabs_preferred_height;
+   if (size_bounds.height().is_bounded()) {
+-    unpinned_container_bounds.set_height(
+-        std::max(std::min(unpinned_container_bounds.height(), remaining_height),
+-                 unpinned_tabs_container_view_->GetMinimumSize().height()));
+-  }
+-  layouts.child_layouts.emplace_back(unpinned_tabs_scroll_view_.get(),
+-                                     unpinned_tabs_scroll_view_->GetVisible(),
+-                                     unpinned_container_bounds);
++    remaining_height = std::max(remaining_height, 0);
++    // The contents wrapper's BoxLayout minimum is the height of every
++    // persistent row, separator, and ordinary tab. Using that as the viewport
++    // minimum expands the ScrollView to its complete contents and leaves the
++    // parent to clip it, so there is never any overflow for the scrollbar to
++    // navigate. The viewport must remain bounded by the available region;
++    // SetUseContentsPreferredSize() keeps the inner list at its full height.
++    main_tabs_height = std::min(main_tabs_height, remaining_height);
 +  }
-+  gfx::Rect pins_container_bounds(0, y, size_bounds.width().value(),
-+                                  pins_container_height);
-+  if (pins_scroll_view_) {
-+    layouts.child_layouts.emplace_back(
-+        pins_scroll_view_.get(), pins_container_height > 0,
-+        pins_container_bounds);
-+  }
-+  if (pins_container_bounds.height()) {
-+    y += pins_container_bounds.height();
-+  }
-+
-+  // Divider between pins and ordinary unpinned tabs.
-+  if (tabs_separator_) {
-+    if (show_separator) {
-+      y += kSeparatorVerticalPadding;
-+      gfx::Rect separator_bounds(region_horizontal_padding, y,
-+                                 size_bounds.width().value() -
-+                                     2 * region_horizontal_padding,
-+                                 kSeparatorHeight);
-+      layouts.child_layouts.emplace_back(tabs_separator_.get(), true,
-+                                         separator_bounds);
-+      y += kSeparatorHeight + kSeparatorVerticalPadding;
-+    } else {
-+      layouts.child_layouts.emplace_back(tabs_separator_.get(), false,
-+                                         gfx::Rect());
-+    }
-+  }
-+
-+  if (pins_container_bounds.height() && unpinned_preferred_height != 0 &&
-+      !show_separator) {
-+    y += region_vertical_padding;
-+  }
-+
-+  // Unpinned
-   gfx::Rect unpinned_container_bounds(0, y, size_bounds.width().value(),
-                                       unpinned_preferred_height);
--  if (size_bounds.height().is_bounded()) {
-+  if (size_bounds.height().is_bounded() && unpinned_tabs_container_view_) {
-     unpinned_container_bounds.set_height(
-         std::max(std::min(unpinned_container_bounds.height(), remaining_height),
-                  unpinned_tabs_container_view_->GetMinimumSize().height()));
-@@ -300,7 +367,9 @@ void TabStripView::OnChildMoved(TabColle
++  gfx::Rect main_tabs_bounds(0, y, size_bounds.width().value(),
++                             main_tabs_height);
++  layouts.child_layouts.emplace_back(main_tabs_scroll_view_.get(),
++                                     main_tabs_height > 0, main_tabs_bounds);
+ 
+-  layouts.host_size = gfx::Size(size_bounds.width().value(),
+-                                unpinned_container_bounds.bottom());
++  layouts.host_size =
++      gfx::Size(size_bounds.width().value(), main_tabs_bounds.bottom());
+   return layouts;
+ }
+ 
+@@ -300,7 +377,9 @@ void TabStripView::OnChildMoved(TabColle
          break;
        case TabCollectionNode::Type::TABSTRIP:
        case TabCollectionNode::Type::PINNED:
@@ -6113,9 +6355,49 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
          break;
      }
    }
-@@ -340,19 +409,29 @@ void TabStripView::OnTabChanged(const ta
+@@ -339,20 +418,68 @@ void TabStripView::OnTabChanged(const ta
+   ScrollToView(activated_node->view());
  }
  
++void TabStripView::BeginPersistentRowReplacement(views::View* virtual_row) {
++  CancelPersistentRowReplacement();
++  if (!virtual_row || !main_tabs_scroll_view_ || !pins_container_view_ ||
++      !pins_container_view_->Contains(virtual_row)) {
++    return;
++  }
++
++  persistent_row_replacement_ = PersistentRowReplacement{
++      .old_view_bounds =
++          GetBoundsInScrollContents(virtual_row, main_tabs_scroll_view_),
++      .old_visible_rect = main_tabs_scroll_view_->GetVisibleRect(),
++  };
++  activated_view_tracker_->SetView(nullptr);
++  main_tabs_scroll_view_->RegisterPostLayoutCallback(base::DoNothing());
++}
++
++void TabStripView::CompletePersistentRowReplacement(views::View* native_row) {
++  if (!persistent_row_replacement_ || !native_row || !pins_container_view_ ||
++      !pins_container_view_->Contains(native_row)) {
++    CancelPersistentRowReplacement();
++    return;
++  }
++
++  activated_view_tracker_->SetView(native_row);
++  main_tabs_scroll_view_->RegisterPostLayoutCallback(base::BindRepeating(
++      &TabStripView::FinishPersistentRowReplacement, base::Unretained(this)));
++}
++
++void TabStripView::CancelPersistentRowReplacement() {
++  if (!persistent_row_replacement_) {
++    return;
++  }
++  persistent_row_replacement_.reset();
++  activated_view_tracker_->SetView(nullptr);
++  if (main_tabs_scroll_view_) {
++    EnableOverflowVisuals(main_tabs_scroll_view_);
++  }
++}
++
  void TabStripView::ScrollToView(views::View* view) {
 +  if (persistent_row_replacement_) {
 +    return;
@@ -6137,12 +6419,11 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
 +  if (pinned_tabs_container_view_ &&
 +      pinned_tabs_container_view_->Contains(view)) {
 +    target_scroll_view = pinned_tabs_scroll_view_;
-+  } else if (pins_container_view_ &&
-+             pins_container_view_->Contains(view)) {
-+    target_scroll_view = pins_scroll_view_;
++  } else if (pins_container_view_ && pins_container_view_->Contains(view)) {
++    target_scroll_view = main_tabs_scroll_view_;
 +  } else if (unpinned_tabs_container_view_ &&
 +             unpinned_tabs_container_view_->Contains(view)) {
-+    target_scroll_view = unpinned_tabs_scroll_view_;
++    target_scroll_view = main_tabs_scroll_view_;
 +  }
 +  if (!target_scroll_view) {
 +    return;
@@ -6150,56 +6431,17 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
  
    // Wait for the next successful layout before attempting to handle moving
    // the activated view into the scroll view viewport.
-@@ -361,6 +440,83 @@ void TabStripView::ScrollToView(views::V
+@@ -361,6 +488,44 @@ void TabStripView::ScrollToView(views::V
        base::Unretained(this)));
  }
  
-+void TabStripView::BeginPersistentRowReplacement(views::View* virtual_row) {
-+  CancelPersistentRowReplacement();
-+  if (!virtual_row || !pins_scroll_view_ || !pins_container_view_ ||
-+      !pins_container_view_->Contains(virtual_row)) {
-+    return;
-+  }
-+
-+  persistent_row_replacement_ = PersistentRowReplacement{
-+      .old_view_bounds =
-+          GetBoundsInScrollContents(virtual_row, pins_scroll_view_),
-+      .old_visible_rect = pins_scroll_view_->GetVisibleRect(),
-+  };
-+  activated_view_tracker_->SetView(nullptr);
-+  pins_scroll_view_->RegisterPostLayoutCallback(base::DoNothing());
-+}
-+
-+void TabStripView::CompletePersistentRowReplacement(views::View* native_row) {
-+  if (!persistent_row_replacement_ || !native_row || !pins_container_view_ ||
-+      !pins_container_view_->Contains(native_row)) {
-+    CancelPersistentRowReplacement();
-+    return;
-+  }
-+
-+  activated_view_tracker_->SetView(native_row);
-+  pins_scroll_view_->RegisterPostLayoutCallback(base::BindRepeating(
-+      &TabStripView::FinishPersistentRowReplacement, base::Unretained(this)));
-+}
-+
-+void TabStripView::CancelPersistentRowReplacement() {
-+  if (!persistent_row_replacement_) {
-+    return;
-+  }
-+  persistent_row_replacement_.reset();
-+  activated_view_tracker_->SetView(nullptr);
-+  if (pins_scroll_view_) {
-+    EnableOverflowVisuals(pins_scroll_view_);
-+  }
-+}
-+
 +void TabStripView::FinishPersistentRowReplacement(
 +    views::ScrollView* scroll_view) {
 +  scroll_view->RegisterPostLayoutCallback(base::DoNothing());
 +
 +  views::View* const native_row = activated_view_tracker_->view();
 +  if (!persistent_row_replacement_ || !native_row || !Contains(native_row) ||
-+      scroll_view != pins_scroll_view_) {
++      scroll_view != main_tabs_scroll_view_) {
 +    CancelPersistentRowReplacement();
 +    return;
 +  }
@@ -6234,7 +6476,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
  void TabStripView::RecordMousePressedInTab() {
    if (mouse_entered_tabstrip_time_.has_value() &&
        !has_reported_time_mouse_entered_to_switch_) {
-@@ -379,6 +535,10 @@ PinnedTabContainerView* TabStripView::Ge
+@@ -379,6 +544,10 @@ PinnedTabContainerView* TabStripView::Ge
    return pinned_tabs_container_view_;
  }
  
@@ -6245,47 +6487,55 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
  UnpinnedTabContainerView* TabStripView::GetUnpinnedTabsContainer() {
    return unpinned_tabs_container_view_;
  }
-@@ -392,7 +552,8 @@ void TabStripView::SetCollapsedState(boo
+@@ -392,7 +561,7 @@ void TabStripView::SetCollapsedState(boo
  
  void TabStripView::SetIsAnimatingSize(bool is_animating) {
    for (views::ScrollView* scroll_view :
 -       {pinned_tabs_scroll_view_, unpinned_tabs_scroll_view_}) {
-+       {pinned_tabs_scroll_view_, pins_scroll_view_,
-+        unpinned_tabs_scroll_view_}) {
++       {pinned_tabs_scroll_view_, main_tabs_scroll_view_}) {
      if (scroll_view) {
        static_cast<VerticalTabStripScrollBar*>(
            scroll_view->vertical_scroll_bar())
-@@ -444,12 +605,15 @@ bool TabStripView::IsPositionInWindowCap
+@@ -443,13 +612,17 @@ bool TabStripView::IsPositionInWindowCap
+ 
  views::View* TabStripView::AddScrollViewContents(
      std::unique_ptr<views::View> view) {
-   if (auto* container =
-+          views::AsViewClass<PinTabContainerView>(view.get())) {
++  if (auto* container = views::AsViewClass<PinTabContainerView>(view.get())) {
 +    pins_container_view_ = container;
-+    return pins_scroll_view_->SetContents(std::move(view));
++    return static_cast<MainTabsContentsView*>(main_tabs_contents_.get())
++        ->AddPersistent(std::move(view));
 +  }
-+  if (auto* container =
+   if (auto* container =
            views::AsViewClass<UnpinnedTabContainerView>(view.get())) {
      unpinned_tabs_container_view_ = container;
-     return unpinned_tabs_scroll_view_->SetContents(std::move(view));
+-    return unpinned_tabs_scroll_view_->SetContents(std::move(view));
++    return static_cast<MainTabsContentsView*>(main_tabs_contents_.get())
++        ->AddTabs(std::move(view));
    }
 -  // |view| should only ever be UnpinnedTabContainerView or
 -  // PinnedTabContainerView.
    auto* container = views::AsViewClass<PinnedTabContainerView>(view.get());
    CHECK(container);
    pinned_tabs_container_view_ = container;
-@@ -457,6 +621,11 @@ views::View* TabStripView::AddScrollView
+@@ -457,9 +630,16 @@ views::View* TabStripView::AddScrollView
  }
  
  void TabStripView::RemoveScrollViewContents(views::View* view) {
 +  if (views::IsViewClass<PinTabContainerView>(view)) {
 +    pins_container_view_ = nullptr;
-+    pins_scroll_view_->SetContents(nullptr);
++    static_cast<MainTabsContentsView*>(main_tabs_contents_.get())
++        ->RemoveCollection(view);
 +    return;
 +  }
    if (views::IsViewClass<UnpinnedTabContainerView>(view)) {
      unpinned_tabs_container_view_ = nullptr;
-     unpinned_tabs_scroll_view_->SetContents(nullptr);
-@@ -467,8 +636,6 @@ void TabStripView::RemoveScrollViewConte
+-    unpinned_tabs_scroll_view_->SetContents(nullptr);
++    static_cast<MainTabsContentsView*>(main_tabs_contents_.get())
++        ->RemoveCollection(view);
+     return;
+   }
+   if (views::IsViewClass<PinnedTabContainerView>(view)) {
+@@ -467,8 +647,6 @@ void TabStripView::RemoveScrollViewConte
      pinned_tabs_scroll_view_->SetContents(nullptr);
      return;
    }
@@ -6298,7 +6548,20 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/common/tab_strip_view.h
 +++ src/chrome/browser/ui/views/tabs/common/tab_strip_view.h
-@@ -15,6 +15,7 @@
+@@ -5,16 +5,20 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TABS_COMMON_TAB_STRIP_VIEW_H_
+ #define CHROME_BROWSER_UI_VIEWS_TABS_COMMON_TAB_STRIP_VIEW_H_
+ 
++#include <optional>
++
+ #include "base/memory/raw_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/gfx/geometry/rect.h"
+ #include "ui/views/layout/delegating_layout_manager.h"
+ #include "ui/views/view.h"
+ #include "ui/views/widget/widget_observer.h"
  
  class TabCollectionNode;
  class PinnedTabContainerView;
@@ -6306,7 +6569,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.h
  class UnpinnedTabContainerView;
  
  namespace views {
-@@ -22,9 +23,9 @@ class ScrollView;
+@@ -22,9 +26,9 @@ class ScrollView;
  class Separator;
  }  // namespace views
  
@@ -6319,7 +6582,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.h
  class TabStripView final : public views::View,
                             public views::LayoutDelegate,
                             public views::WidgetObserver {
-@@ -39,11 +40,15 @@ class TabStripView final : public views:
+@@ -39,13 +43,15 @@ class TabStripView final : public views:
    views::Separator* GetTabsSeparator() { return tabs_separator_; }
  
    PinnedTabContainerView* GetPinnedTabsContainer();
@@ -6329,18 +6592,20 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.h
    views::ScrollView* pinned_tabs_scroll_view() {
      return pinned_tabs_scroll_view_;
    }
-+  views::ScrollView* pins_scroll_view() {
-+    return pins_scroll_view_;
-+  }
++  views::ScrollView* pins_scroll_view() { return main_tabs_scroll_view_; }
    views::ScrollView* unpinned_tabs_scroll_view() {
-     return unpinned_tabs_scroll_view_;
+-    return unpinned_tabs_scroll_view_;
++    return main_tabs_scroll_view_;
    }
-@@ -69,6 +74,12 @@ class TabStripView final : public views:
+ 
+   void SetCollapsedState(bool is_collapsed);
+@@ -69,6 +75,13 @@ class TabStripView final : public views:
    void OnChildMoved(TabCollectionNode* moved_node);
    void OnTabChanged(const tabs::TabInterface* active_tab);
  
-+  // Coordinates a durable row being replaced by its one live TabView without
-+  // jumping the dedicated Pins viewport.
++  // Coordinates a virtual persistent row being replaced by its materialized
++  // native TabView. Active-tab notifications received between these calls are
++  // deliberately ignored because the native view has only transient geometry.
 +  void BeginPersistentRowReplacement(views::View* virtual_row);
 +  void CompletePersistentRowReplacement(views::View* native_row);
 +  void CancelPersistentRowReplacement();
@@ -6348,7 +6613,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.h
    void RecordMousePressedInTab();
    bool IsFocusInTabStrip();
  
-@@ -85,6 +96,9 @@ class TabStripView final : public views:
+@@ -85,6 +98,9 @@ class TabStripView final : public views:
    // ScrollView. Ensures that the activated view is visible in the viewport.
    void EnsureVisibleInViewportPostActivationAndLayout(
        views::ScrollView* scroll_view);
@@ -6358,16 +6623,19 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.h
  
    // Enables and disables overflow visuals on `scroll_view` respectively. Used
    // in combination to avoid visual artifacts caused by repeatedly scrolling-in
-@@ -101,6 +115,8 @@ class TabStripView final : public views:
+@@ -101,8 +117,10 @@ class TabStripView final : public views:
    raw_ptr<TabCollectionNode> collection_node_ = nullptr;
    raw_ptr<views::ScrollView> pinned_tabs_scroll_view_ = nullptr;
    raw_ptr<PinnedTabContainerView> pinned_tabs_container_view_ = nullptr;
-+  raw_ptr<views::ScrollView> pins_scroll_view_ = nullptr;
++  raw_ptr<views::ScrollView> main_tabs_scroll_view_ = nullptr;
++  raw_ptr<views::View> main_tabs_contents_ = nullptr;
 +  raw_ptr<PinTabContainerView> pins_container_view_ = nullptr;
    raw_ptr<views::Separator> tabs_separator_ = nullptr;
-   raw_ptr<views::ScrollView> unpinned_tabs_scroll_view_ = nullptr;
+-  raw_ptr<views::ScrollView> unpinned_tabs_scroll_view_ = nullptr;
    raw_ptr<UnpinnedTabContainerView> unpinned_tabs_container_view_ = nullptr;
-@@ -115,6 +131,12 @@ class TabStripView final : public views:
+   bool is_collapsed_ = false;
+ 
+@@ -115,6 +133,12 @@ class TabStripView final : public views:
    // `OnActiveTabChanged()`.
    std::unique_ptr<ActivatedViewTracker> activated_view_tracker_;
  
@@ -6793,15 +7061,21 @@ Index: src/components/tabs/impl/tab_strip_collection.cc
                candidate_subtree_collection != unpinned_collection_) &&
               selected_collections.contains(candidate_subtree_collection)) {
          subtree_to_remove = candidate_subtree_collection;
-@@ -318,6 +446,7 @@ std::unique_ptr<TabInterface> TabStripCo
+@@ -318,9 +446,11 @@ std::unique_ptr<TabInterface> TabStripCo
    // If it is the only tab in the group remove the collection.
    if (parent_collection != unpinned_collection_ &&
        parent_collection != pinned_collection_ &&
 +      parent_collection != pin_collection_ &&
        parent_collection->TabCountRecursive() == 1) {
-     RemoveTabCollectionImpl(parent_collection);
-     return parent_collection->MaybeRemoveTab(tab_to_be_removed);
-@@ -764,7 +893,13 @@ TabCollection::Position TabStripCollecti
+-    RemoveTabCollectionImpl(parent_collection);
+-    return parent_collection->MaybeRemoveTab(tab_to_be_removed);
++    std::unique_ptr<TabCollection> detached_parent =
++        RemoveTabCollectionImpl(parent_collection);
++    return detached_parent->MaybeRemoveTab(tab_to_be_removed);
+   } else {
+     return RemoveTabImpl(tab_to_be_removed);
+   }
+@@ -764,7 +894,13 @@ TabCollection::Position TabStripCollecti
      }
      insert_collection = group_collection;
    } else {

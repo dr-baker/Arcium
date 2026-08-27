@@ -26,7 +26,7 @@ Index: src/chrome/browser/autocomplete/chrome_autocomplete_provider_client.cc
  #include "components/translate/core/browser/translate_manager.h"
  #include "components/unified_consent/url_keyed_data_collection_consent_helper.h"
  #include "components/variations/service/variations_service.h"
-@@ -304,6 +313,107 @@ bookmarks::BookmarkModel* ChromeAutocomp
+@@ -304,6 +313,60 @@ bookmarks::BookmarkModel* ChromeAutocomp
    return BookmarkModelFactory::GetForBrowserContext(profile_);
  }
  
@@ -51,82 +51,35 @@ Index: src/chrome/browser/autocomplete/chrome_autocomplete_provider_client.cc
 +    return {};
 +  }
 +
-+  auto read_tab = [](tabs::TabInterface* tab, ArciumOmniboxItem* item) {
-+    GURL home_url;
-+    std::u16string home_title;
-+    if (helium::GetAnchoredPinnedTabHome(tab, &home_url, &home_title)) {
-+      item->url = std::move(home_url);
-+      item->title = std::move(home_title);
-+    } else {
-+      item->url = tab->GetContents()->GetVisibleURL();
-+      item->title = tab->GetTitle();
-+    }
-+    if (item->title.empty()) {
-+      item->title = base::UTF8ToUTF16(item->url.spec());
-+    }
-+  };
-+
 +  std::vector<ArciumOmniboxItem> result;
-+  TabStripModel* current_model = current_browser->tab_strip_model();
-+  size_t favorite_ordinal = 0;
-+  for (int index = 0; index < current_model->count(); ++index) {
-+    tabs::TabInterface* tab = current_model->GetTabAtIndex(index);
-+    if (!tab->IsPinned()) {
-+      continue;
-+    }
++  for (const helium::PersistentOmniboxItem& source :
++       spaces->GetOmniboxItemsForBrowser(current_browser)) {
 +    ArciumOmniboxItem item;
-+    item.kind = ArciumOmniboxItem::Kind::kFavorite;
-+    item.ordinal = favorite_ordinal++;
-+    item.is_live = true;
-+    item.is_active = current_model->GetActiveTab() == tab;
-+    read_tab(tab, &item);
-+    result.push_back(std::move(item));
-+  }
-+
-+  for (helium::HeliumSpace* space : spaces->GetSpaces()) {
-+    if (!space) {
-+      continue;
++    item.kind = source.kind == helium::PersistentRecordKind::kFavorite
++                    ? ArciumOmniboxItem::Kind::kFavorite
++                    : ArciumOmniboxItem::Kind::kPin;
++    item.id = source.id;
++    item.title = source.title;
++    item.url = source.url;
++    item.space_id = source.space_id;
++    item.space_name = source.space_name;
++    item.folder_path = source.folder_path;
++    switch (source.tier) {
++      case helium::PersistentOmniboxItem::Tier::kActiveSpacePin:
++        item.tier = ArciumOmniboxItem::Tier::kActiveSpacePin;
++        break;
++      case helium::PersistentOmniboxItem::Tier::kFavorite:
++        item.tier = ArciumOmniboxItem::Tier::kFavorite;
++        break;
++      case helium::PersistentOmniboxItem::Tier::kOtherSpacePin:
++        item.tier = ArciumOmniboxItem::Tier::kOtherSpacePin;
++        break;
 +    }
-+    BrowserWindowInterface* window = space->GetPrimaryBrowser();
-+    TabStripModel* model = window ? window->GetTabStripModel() : nullptr;
-+    Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
-+    size_t ordinal = 0;
-+    std::vector<std::u16string> folder_path;
-+    auto append_nodes = [&](auto&& self,
-+                            const helium::PersistentNodes& nodes) -> void {
-+      for (const helium::PersistentNode& node : nodes) {
-+        if (const auto* folder =
-+                std::get_if<helium::PersistentFolder>(&node.data)) {
-+          folder_path.push_back(folder->title);
-+          self(self, folder->children);
-+          folder_path.pop_back();
-+          continue;
-+        }
-+
-+        const auto& link = std::get<helium::PersistentLink>(node.data);
-+        tabs::TabInterface* tab =
-+            browser ? spaces->GetLiveTabForPersistentItem(
-+                          browser, helium::PersistentRecordKind::kPin, link.id)
-+                    : nullptr;
-+        ArciumOmniboxItem item;
-+        item.kind = ArciumOmniboxItem::Kind::kPin;
-+        item.space_id = space->id();
-+        item.space_name = space->name();
-+        item.ordinal = ordinal++;
-+        item.folder_path = folder_path;
-+        item.is_live = tab != nullptr;
-+        item.is_active = tab && model && model->GetActiveTab() == tab;
-+        if (tab) {
-+          read_tab(tab, &item);
-+        } else {
-+          item.title = link.title.empty() ? base::UTF8ToUTF16(link.url.spec())
-+                                          : link.title;
-+          item.url = link.url;
-+        }
-+        result.push_back(std::move(item));
-+      }
-+    };
-+    append_nodes(append_nodes, space->pins());
++    item.is_live = source.is_live;
++    item.is_active = source.is_active;
++    item.use_count = source.use_count;
++    item.last_used_internal_value = source.last_used_internal_value;
++    result.push_back(std::move(item));
 +  }
 +  return result;
 +}
@@ -169,52 +122,30 @@ Index: src/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
  #include "components/strings/grit/components_strings.h"
  #include "components/viz/common/frame_sinks/copy_output_result.h"
  #include "content/public/browser/devtools_agent_host.h"
-@@ -907,6 +912,50 @@ void ChromeOmniboxClient::OnAutocomplete
+@@ -907,6 +912,28 @@ void ChromeOmniboxClient::OnAutocomplete
                text, "match", match, "alternative_nav_match",
                alternative_nav_match);
  
 +  if (browser_ && disposition == WindowOpenDisposition::CURRENT_TAB &&
 +      match.arcium_item) {
 +    const ArciumOmniboxItem& item = *match.arcium_item;
-+    TabStripModel* model = nullptr;
-+    BrowserWindowInterface* target_window = nullptr;
-+    if (item.kind == ArciumOmniboxItem::Kind::kFavorite) {
-+      model = browser_->tab_strip_model();
-+      size_t ordinal = 0;
-+      for (int index = 0; index < model->count(); ++index) {
-+        tabs::TabInterface* tab = model->GetTabAtIndex(index);
-+        if (!tab->IsPinned()) {
-+          continue;
-+        }
-+        if (ordinal++ == item.ordinal) {
-+          model->ActivateTabAt(index);
-+          browser_->window()->Show();
-+          return;
-+        }
-+      }
-+    } else if (helium::HeliumSpaceService* spaces =
-+                   helium::HeliumSpaceServiceFactory::GetForProfile(profile_)) {
-+      helium::HeliumSpace* space = spaces->GetSpaceById(item.space_id);
-+      target_window = space ? space->ActivateOrCreatePrimaryWindow() : nullptr;
-+      model = target_window ? target_window->GetTabStripModel() : nullptr;
-+      const auto* root = model ? static_cast<const tabs::TabStripCollection*>(
-+                                     model->Root())
-+                               : nullptr;
-+      const tabs::PinTabCollection* pins =
-+          root ? root->pin_collection() : nullptr;
-+      const std::vector<tabs::TabInterface*> pin_tabs =
-+          pins ? pins->GetTabsRecursive() : std::vector<tabs::TabInterface*>();
-+      if (item.ordinal < pin_tabs.size()) {
-+        const int index = model->GetIndexOfTab(pin_tabs[item.ordinal]);
-+        if (index != TabStripModel::kNoTab) {
-+          model->ActivateTabAt(index);
-+          if (Browser* target = target_window->GetBrowserForMigrationOnly()) {
-+            target->window()->Show();
-+          }
-+          return;
-+        }
++    if (helium::HeliumSpaceService* spaces =
++            helium::HeliumSpaceServiceFactory::GetForProfile(profile_)) {
++      helium::PersistentOmniboxItem target;
++      target.kind = item.kind == ArciumOmniboxItem::Kind::kFavorite
++                        ? helium::PersistentRecordKind::kFavorite
++                        : helium::PersistentRecordKind::kPin;
++      target.id = item.id;
++      target.space_id = item.space_id;
++      if (spaces->ActivateOmniboxItem(browser_, target)) {
++        return;
 +      }
 +    }
++
++    // An explicit persistent-item match must never degrade into ordinary URL
++    // navigation. Failure means the snapshot went stale; leave the current tab
++    // untouched and let the next omnibox query reconcile it.
++    return;
 +  }
 +
    std::string extra_headers;
@@ -224,7 +155,7 @@ Index: src/components/omnibox/browser/arcium_omnibox_item.h
 ===================================================================
 --- /dev/null
 +++ src/components/omnibox/browser/arcium_omnibox_item.h
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,35 @@
 +// Copyright 2026 The Arcium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -232,7 +163,7 @@ Index: src/components/omnibox/browser/arcium_omnibox_item.h
 +#ifndef COMPONENTS_OMNIBOX_BROWSER_ARCIUM_OMNIBOX_ITEM_H_
 +#define COMPONENTS_OMNIBOX_BROWSER_ARCIUM_OMNIBOX_ITEM_H_
 +
-+#include <cstddef>
++#include <cstdint>
 +#include <string>
 +#include <vector>
 +
@@ -243,16 +174,20 @@ Index: src/components/omnibox/browser/arcium_omnibox_item.h
 +// of a parallel persistent-item database.
 +struct ArciumOmniboxItem {
 +  enum class Kind { kFavorite, kPin };
++  enum class Tier { kActiveSpacePin, kFavorite, kOtherSpacePin };
 +
 +  Kind kind = Kind::kPin;
++  std::string id;
 +  std::u16string title;
 +  GURL url;
 +  std::string space_id;
 +  std::u16string space_name;
 +  std::vector<std::u16string> folder_path;
-+  size_t ordinal = 0;
++  Tier tier = Tier::kOtherSpacePin;
 +  bool is_live = false;
 +  bool is_active = false;
++  int use_count = 0;
++  int64_t last_used_internal_value = 0;
 +};
 +
 +#endif  // COMPONENTS_OMNIBOX_BROWSER_ARCIUM_OMNIBOX_ITEM_H_
@@ -347,7 +282,7 @@ Index: src/components/omnibox/browser/bookmark_provider.cc
 ===================================================================
 --- src.orig/components/omnibox/browser/bookmark_provider.cc
 +++ src/components/omnibox/browser/bookmark_provider.cc
-@@ -11,7 +11,10 @@
+@@ -11,7 +11,11 @@
  #include <vector>
  
  #include "base/feature_list.h"
@@ -355,27 +290,58 @@ Index: src/components/omnibox/browser/bookmark_provider.cc
  #include "base/memory/raw_ptr.h"
 +#include "base/strings/string_number_conversions.h"
 +#include "base/strings/utf_string_conversions.h"
++#include "base/time/time.h"
  #include "base/trace_event/trace_event.h"
  #include "components/bookmarks/browser/bookmark_model.h"
  #include "components/omnibox/browser/autocomplete_match.h"
-@@ -35,6 +38,48 @@
+@@ -35,6 +39,102 @@
  using bookmarks::BookmarkNode;
  using bookmarks::TitledUrlMatch;
  
 +namespace {
 +
-+bool ArciumItemMatches(const ArciumOmniboxItem& item,
-+                       const std::u16string& query) {
++constexpr int kArciumMatchWeight = 3;
++constexpr int kMaxArciumUsageCount = 10;
++constexpr int kMaxArciumRecencyScore = 10;
++
++int MatchQuality(const std::u16string& query,
++                 const std::u16string& title,
++                 const std::u16string& url) {
++  const std::u16string folded_query = base::i18n::ToLower(query);
++  const std::u16string folded_title = base::i18n::ToLower(title);
++  const std::u16string folded_url = base::i18n::ToLower(url);
++  if (folded_query == folded_title) {
++    return 60;
++  }
++  if (folded_query == folded_url) {
++    return 55;
++  }
++  if (folded_title.starts_with(folded_query)) {
++    return 40;
++  }
++  if (folded_url.starts_with(folded_query)) {
++    return 35;
++  }
++  if (folded_title.find(folded_query) != std::u16string::npos) {
++    return 20;
++  }
++  if (folded_url.find(folded_query) != std::u16string::npos) {
++    return 15;
++  }
++  return 0;
++}
++
++int MetadataMatchQuality(const ArciumOmniboxItem& item,
++                         const std::u16string& query) {
 +  const std::u16string folded_query = base::i18n::ToLower(query);
 +  auto contains = [&folded_query](const std::u16string& value) {
 +    return base::i18n::ToLower(value).find(folded_query) !=
 +           std::u16string::npos;
 +  };
-+  if (contains(item.title) || contains(base::UTF8ToUTF16(item.url.spec())) ||
-+      contains(item.space_name)) {
-+    return true;
++  if (contains(item.space_name)) {
++    return 10;
 +  }
-+  return std::ranges::any_of(item.folder_path, contains);
++  return std::ranges::any_of(item.folder_path, contains) ? 10 : 0;
 +}
 +
 +std::u16string ArciumItemDescription(const ArciumOmniboxItem& item) {
@@ -395,11 +361,35 @@ Index: src/components/omnibox/browser/bookmark_provider.cc
 +  return description;
 +}
 +
-+int ArciumItemRelevance(const ArciumOmniboxItem& item) {
-+  if (item.kind == ArciumOmniboxItem::Kind::kFavorite) {
-+    return 1175;
++int ArciumRecencyScore(int64_t internal_value) {
++  if (internal_value == 0) {
++    return 0;
 +  }
-+  return item.is_active ? 1160 : item.is_live ? 1125 : 1100;
++  base::TimeDelta age =
++      base::Time::Now() - base::Time::FromInternalValue(internal_value);
++  if (age.is_negative()) {
++    age = base::TimeDelta();
++  }
++  return std::max(0, kMaxArciumRecencyScore -
++                         static_cast<int>(age.InDays()));
++}
++
++int ArciumItemRelevance(const ArciumOmniboxItem& item, int match_quality) {
++  int relevance = 970;
++  switch (item.tier) {
++    case ArciumOmniboxItem::Tier::kActiveSpacePin:
++      relevance = 1000;
++      break;
++    case ArciumOmniboxItem::Tier::kFavorite:
++      relevance = 990;
++      break;
++    case ArciumOmniboxItem::Tier::kOtherSpacePin:
++      break;
++  }
++  relevance += match_quality * kArciumMatchWeight;
++  relevance += std::clamp(item.use_count, 0, kMaxArciumUsageCount) * 2;
++  relevance += ArciumRecencyScore(item.last_used_internal_value);
++  return relevance;
 +}
 +
 +}  // namespace
@@ -407,7 +397,7 @@ Index: src/components/omnibox/browser/bookmark_provider.cc
  BookmarkProvider::BookmarkProvider(AutocompleteProviderClient* client)
      : AutocompleteProvider(AutocompleteProvider::TYPE_BOOKMARK),
        client_(client),
-@@ -55,8 +100,10 @@ void BookmarkProvider::Start(const Autoc
+@@ -55,8 +155,10 @@ void BookmarkProvider::Start(const Autoc
  BookmarkProvider::~BookmarkProvider() = default;
  
  void BookmarkProvider::DoAutocomplete(const AutocompleteInput& input) {
@@ -419,7 +409,7 @@ Index: src/components/omnibox/browser/bookmark_provider.cc
      return;
    }
  
-@@ -89,10 +136,37 @@ void BookmarkProvider::DoAutocomplete(co
+@@ -89,10 +191,44 @@ void BookmarkProvider::DoAutocomplete(co
    // Please refer to the code for TitledUrlIndex::GetResultsMatching for
    // complete details of how searches are performed against the user's
    // bookmarks.
@@ -433,13 +423,20 @@ Index: src/components/omnibox/browser/bookmark_provider.cc
 +
 +  size_t arcium_index = 0;
 +  for (const ArciumOmniboxItem& item : arcium_items) {
-+    if (!ArciumItemMatches(item, adjusted_input.text())) {
++    int match_quality =
++        MatchQuality(adjusted_input.text(), item.title,
++                     base::UTF8ToUTF16(item.url.spec()));
++    match_quality =
++        std::max(match_quality,
++                 MetadataMatchQuality(item, adjusted_input.text()));
++    if (match_quality == 0) {
 +      ++arcium_index;
 +      continue;
 +    }
-+    AutocompleteMatch match(this, ArciumItemRelevance(item), false,
++    AutocompleteMatch match(this,
++                            ArciumItemRelevance(item, match_quality), false,
 +                            AutocompleteMatchType::BOOKMARK_TITLE);
-+    match.allowed_to_be_default_match = true;
++    match.allowed_to_be_default_match = match_quality >= 35;
 +    match.destination_url = item.url;
 +    match.fill_into_edit = base::UTF8ToUTF16(item.url.spec());
 +    match.contents = ArciumItemDescription(item);
@@ -464,19 +461,20 @@ Index: src/components/omnibox/browser/bookmark_provider_unittest.cc
 ===================================================================
 --- src.orig/components/omnibox/browser/bookmark_provider_unittest.cc
 +++ src/components/omnibox/browser/bookmark_provider_unittest.cc
-@@ -322,6 +322,30 @@ TEST_F(BookmarkProviderTest, Positions)
+@@ -322,6 +322,31 @@ TEST_F(BookmarkProviderTest, Positions)
    }
  }
  
 +TEST_F(BookmarkProviderTest, ArciumItemsKeepTypedSpaceAndFolderMetadata) {
 +  ArciumOmniboxItem pin;
 +  pin.kind = ArciumOmniboxItem::Kind::kPin;
++  pin.id = "project-dashboard";
 +  pin.title = u"Project Dashboard";
 +  pin.url = GURL("https://arcium-pin.example/dashboard");
 +  pin.space_id = "work";
 +  pin.space_name = u"Work";
 +  pin.folder_path = {u"Projects", u"Q4"};
-+  pin.ordinal = 3;
++  pin.tier = ArciumOmniboxItem::Tier::kActiveSpacePin;
 +  pin.is_live = true;
 +  pin.is_active = true;
 +  ON_CALL(*provider_client_, GetArciumOmniboxItems())
@@ -487,7 +485,7 @@ Index: src/components/omnibox/browser/bookmark_provider_unittest.cc
 +  ASSERT_TRUE(match.arcium_item);
 +  EXPECT_EQ(pin.space_id, match.arcium_item->space_id);
 +  EXPECT_EQ(pin.folder_path, match.arcium_item->folder_path);
-+  EXPECT_EQ(pin.ordinal, match.arcium_item->ordinal);
++  EXPECT_EQ(pin.id, match.arcium_item->id);
 +  EXPECT_EQ(u"Pin · Active · Work › Projects › Q4", match.contents);
 +  EXPECT_EQ(pin.title, match.description);
 +}
