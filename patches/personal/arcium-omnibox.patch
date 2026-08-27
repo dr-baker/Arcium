@@ -26,7 +26,7 @@ Index: src/chrome/browser/autocomplete/chrome_autocomplete_provider_client.cc
  #include "components/translate/core/browser/translate_manager.h"
  #include "components/unified_consent/url_keyed_data_collection_consent_helper.h"
  #include "components/variations/service/variations_service.h"
-@@ -304,6 +313,117 @@ bookmarks::BookmarkModel* ChromeAutocomp
+@@ -304,6 +313,107 @@ bookmarks::BookmarkModel* ChromeAutocomp
    return BookmarkModelFactory::GetForBrowserContext(profile_);
  }
  
@@ -89,54 +89,44 @@ Index: src/chrome/browser/autocomplete/chrome_autocomplete_provider_client.cc
 +    }
 +    BrowserWindowInterface* window = space->GetPrimaryBrowser();
 +    TabStripModel* model = window ? window->GetTabStripModel() : nullptr;
-+    const auto* root = model ? static_cast<const tabs::TabStripCollection*>(
-+                                   model->Root())
-+                             : nullptr;
-+    const tabs::PinTabCollection* pins = root ? root->pin_collection() : nullptr;
-+    if (pins) {
-+      size_t ordinal = 0;
-+      for (tabs::TabInterface* tab : pins->GetTabsRecursive()) {
++    Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
++    size_t ordinal = 0;
++    std::vector<std::u16string> folder_path;
++    auto append_nodes = [&](auto&& self,
++                            const helium::PersistentNodes& nodes) -> void {
++      for (const helium::PersistentNode& node : nodes) {
++        if (const auto* folder =
++                std::get_if<helium::PersistentFolder>(&node.data)) {
++          folder_path.push_back(folder->title);
++          self(self, folder->children);
++          folder_path.pop_back();
++          continue;
++        }
++
++        const auto& link = std::get<helium::PersistentLink>(node.data);
++        tabs::TabInterface* tab =
++            browser ? spaces->GetLiveTabForPersistentItem(
++                          browser, helium::PersistentRecordKind::kPin, link.id)
++                    : nullptr;
 +        ArciumOmniboxItem item;
 +        item.kind = ArciumOmniboxItem::Kind::kPin;
 +        item.space_id = space->id();
 +        item.space_name = space->name();
 +        item.ordinal = ordinal++;
-+        item.is_live = true;
-+        item.is_active = model->GetActiveTab() == tab;
-+        read_tab(tab, &item);
-+        for (const tabs::TabCollection* parent = tab->GetParentCollection();
-+             parent && parent->type() != tabs::TabCollection::Type::PIN;
-+             parent = parent->GetParentCollection()) {
-+          if (parent->type() == tabs::TabCollection::Type::FOLDER) {
-+            item.folder_path.push_back(
-+                static_cast<const tabs::FolderTabCollection*>(parent)->title());
-+          }
++        item.folder_path = folder_path;
++        item.is_live = tab != nullptr;
++        item.is_active = tab && model && model->GetActiveTab() == tab;
++        if (tab) {
++          read_tab(tab, &item);
++        } else {
++          item.title = link.title.empty() ? base::UTF8ToUTF16(link.url.spec())
++                                          : link.title;
++          item.url = link.url;
 +        }
-+        std::ranges::reverse(item.folder_path);
 +        result.push_back(std::move(item));
 +      }
-+      continue;
-+    }
-+
-+    size_t ordinal = 0;
-+    for (const StartupTab& tab : space->ReadPins()) {
-+      if (tab.type != StartupTab::Type::kPin) {
-+        continue;
-+      }
-+      ArciumOmniboxItem item;
-+      item.kind = ArciumOmniboxItem::Kind::kPin;
-+      item.title = tab.helium_home_title.empty()
-+                       ? base::UTF8ToUTF16(tab.url.spec())
-+                       : tab.helium_home_title;
-+      item.url = tab.url;
-+      item.space_id = space->id();
-+      item.space_name = space->name();
-+      item.ordinal = ordinal++;
-+      for (const auto& segment : tab.helium_folder_path) {
-+        item.folder_path.push_back(segment.title);
-+      }
-+      result.push_back(std::move(item));
-+    }
++    };
++    append_nodes(append_nodes, space->pins());
 +  }
 +  return result;
 +}

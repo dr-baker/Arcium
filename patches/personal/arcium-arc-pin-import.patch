@@ -19,42 +19,7 @@ Index: src/chrome/browser/importer/arcium_arc_import.cc
 ===================================================================
 --- src.orig/chrome/browser/importer/arcium_arc_import.cc
 +++ src/chrome/browser/importer/arcium_arc_import.cc
-@@ -5,11 +5,14 @@
- #include "chrome/browser/importer/arcium_arc_import.h"
- 
- #include <map>
-+#include <memory>
- #include <optional>
- #include <string>
- #include <utility>
-+#include <variant>
- #include <vector>
- 
-+#include "base/check.h"
- #include "base/containers/span.h"
- #include "base/json/json_reader.h"
- #include "base/strings/strcat.h"
-@@ -19,6 +22,7 @@
- #include "chrome/browser/ui/browser.h"
- #include "chrome/browser/ui/browser_tabrestore.h"
- #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
-+#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
- #include "chrome/browser/ui/helium/helium_space.h"
- #include "chrome/browser/ui/helium/helium_space_service.h"
- #include "chrome/browser/ui/helium/helium_space_service_factory.h"
-@@ -27,6 +31,11 @@
- #include "components/sessions/core/session_types.h"
- #include "components/tab_groups/tab_group_color.h"
- #include "components/tab_groups/tab_group_visual_data.h"
-+#include "components/tabs/public/folder_tab_collection.h"
-+#include "components/tabs/public/pin_tab_collection.h"
-+#include "components/tabs/public/tab_collection.h"
-+#include "components/tabs/public/tab_interface.h"
-+#include "components/tabs/public/tab_strip_collection.h"
- #include "content/public/browser/web_contents.h"
- #include "url/gurl.h"
- 
-@@ -44,22 +53,35 @@ struct ImportedTab {
+@@ -44,22 +44,35 @@ struct ImportedTab {
    bool group_collapsed = false;
  };
  
@@ -96,7 +61,7 @@ Index: src/chrome/browser/importer/arcium_arc_import.cc
      const base::DictValue* node = value.GetIfDict();
      const std::string* type = node ? node->FindString("type") : nullptr;
      const std::string* source_id =
-@@ -74,11 +96,11 @@ bool AppendNodes(const base::ListValue&
+@@ -74,11 +87,11 @@ bool AppendNodes(const base::ListValue&
        if (!url.is_valid() || url.SchemeIs("arc")) {
          return false;
        }
@@ -110,7 +75,7 @@ Index: src/chrome/browser/importer/arcium_arc_import.cc
        });
        continue;
      }
-@@ -90,27 +112,48 @@ bool AppendNodes(const base::ListValue&
+@@ -90,27 +103,78 @@ bool AppendNodes(const base::ListValue&
      if (!children || !collapsed) {
        return false;
      }
@@ -162,6 +127,36 @@ Index: src/chrome/browser/importer/arcium_arc_import.cc
 +  }
 +}
 +
++helium::PersistentNodes ToPersistentNodes(
++    const std::vector<ImportedNode>& nodes,
++    std::string_view source_profile,
++    std::string_view scope) {
++  helium::PersistentNodes result;
++  result.reserve(nodes.size());
++  for (const ImportedNode& node : nodes) {
++    const std::string id = base::StrCat(
++        {"arc:", source_profile, ":", scope, ":", node.source_id});
++    if (node.type == ImportedNode::Type::kTab) {
++      result.push_back(helium::PersistentNode{
++          .data = helium::PersistentLink{
++              .id = id,
++              .title = base::UTF8ToUTF16(node.title),
++              .url = node.url,
++          }});
++      continue;
++    }
++    result.push_back(helium::PersistentNode{
++        .data = helium::PersistentFolder{
++            .id = id,
++            .title = base::UTF8ToUTF16(node.title),
++            .collapsed = node.collapsed,
++            .children =
++                ToPersistentNodes(node.children, source_profile, scope),
++        }});
++  }
++  return result;
++}
++
  std::optional<Snapshot> ParseSnapshot(std::string_view snapshot_json) {
 -  std::optional<base::Value> value =
 +  std::optional<base::Value> root_value =
@@ -172,7 +167,7 @@ Index: src/chrome/browser/importer/arcium_arc_import.cc
    const std::optional<int> version =
        root ? root->FindInt("version") : std::nullopt;
    const std::string* source_profile =
-@@ -124,11 +167,11 @@ std::optional<Snapshot> ParseSnapshot(st
+@@ -124,11 +188,11 @@ std::optional<Snapshot> ParseSnapshot(st
    }
  
    Snapshot snapshot{.source_profile = *source_profile};
@@ -187,7 +182,7 @@ Index: src/chrome/browser/importer/arcium_arc_import.cc
      const std::string* id = space ? space->FindString("id") : nullptr;
      const std::string* name = space ? space->FindString("name") : nullptr;
      const std::string* profile =
-@@ -139,7 +182,7 @@ std::optional<Snapshot> ParseSnapshot(st
+@@ -139,7 +203,7 @@ std::optional<Snapshot> ParseSnapshot(st
        return std::nullopt;
      }
      ImportedSpace imported_space{.id = *id, .name = *name};
@@ -196,95 +191,7 @@ Index: src/chrome/browser/importer/arcium_arc_import.cc
        return std::nullopt;
      }
      snapshot.spaces.push_back(std::move(imported_space));
-@@ -196,6 +239,47 @@ void AddTabs(Browser* browser,
-   }
- }
- 
-+void AddPinNodes(Browser* browser,
-+                 const std::string& source_profile,
-+                 const std::vector<ImportedNode>& nodes,
-+                 tabs::TabCollection* parent) {
-+  auto* strip = static_cast<tabs::TabStripCollection*>(
-+      const_cast<tabs::TabCollection*>(browser->tab_strip_model()->Root()));
-+  for (const ImportedNode& node : nodes) {
-+    if (node.type == ImportedNode::Type::kFolder) {
-+      tabs::FolderTabCollection* folder = strip->CreatePinFolder(
-+          parent, base::UTF8ToUTF16(node.title), node.collapsed);
-+      folder->SetProvenance(kArcSource, source_profile, node.source_id);
-+      AddPinNodes(browser, source_profile, node.children, folder);
-+      continue;
-+    }
-+
-+    sessions::SerializedNavigationEntry navigation;
-+    navigation.set_index(0);
-+    navigation.set_virtual_url(node.url);
-+    navigation.set_title(base::UTF8ToUTF16(node.title));
-+    content::WebContents* contents = chrome::AddRestoredTab(
-+        browser, base::span_from_ref(navigation),
-+        browser->tab_strip_model()->count(), 0, std::string(), std::nullopt,
-+        false, false, base::TimeTicks(), base::Time(), nullptr,
-+        sessions::SerializedUserAgentOverride(), {}, true, false);
-+    TabProvenance::Set(contents, kArcSource, source_profile, node.source_id);
-+    tabs::TabInterface* tab = tabs::TabInterface::MaybeGetFromContents(contents);
-+    CHECK(tab);
-+    helium::RestoreAnchoredPinnedTabHome(tab, node.url,
-+                                        base::UTF8ToUTF16(node.title));
-+    strip->MoveTabToCollection(tab, parent);
-+  }
-+}
-+
-+void AddPins(Browser* browser,
-+             const std::string& source_profile,
-+             const std::vector<ImportedNode>& nodes) {
-+  auto* strip = static_cast<tabs::TabStripCollection*>(
-+      const_cast<tabs::TabCollection*>(browser->tab_strip_model()->Root()));
-+  AddPinNodes(browser, source_profile, nodes, strip->pin_collection());
-+}
-+
- std::vector<content::WebContents*> ImportedContents(
-     Browser* browser,
-     const std::string& source_profile) {
-@@ -212,10 +296,48 @@ std::vector<content::WebContents*> Impor
-   return result;
- }
- 
-+bool IsImportedFolder(const tabs::FolderTabCollection* folder,
-+                      const std::string& source_profile) {
-+  return folder->provenance_source() == kArcSource &&
-+         folder->provenance_collection_id() == source_profile;
-+}
-+
-+void PruneEmptyImportedFolders(tabs::TabStripCollection* strip,
-+                               tabs::TabCollection* parent,
-+                               const std::string& source_profile) {
-+  std::vector<tabs::FolderTabCollection*> folders;
-+  for (const auto& child : parent->GetChildren()) {
-+    if (!std::holds_alternative<std::unique_ptr<tabs::TabCollection>>(child)) {
-+      continue;
-+    }
-+    tabs::TabCollection* collection =
-+        std::get<std::unique_ptr<tabs::TabCollection>>(child).get();
-+    if (collection->type() == tabs::TabCollection::Type::FOLDER) {
-+      folders.push_back(
-+          static_cast<tabs::FolderTabCollection*>(collection));
-+    }
-+  }
-+  for (tabs::FolderTabCollection* folder : folders) {
-+    PruneEmptyImportedFolders(strip, folder, source_profile);
-+    if (folder->ChildCount() == 0 &&
-+        IsImportedFolder(folder, source_profile)) {
-+      strip->RemoveTabCollection(folder);
-+    }
-+  }
-+}
-+
-+void PruneEmptyImportedFolders(Browser* browser,
-+                               const std::string& source_profile) {
-+  auto* strip = static_cast<tabs::TabStripCollection*>(
-+      const_cast<tabs::TabCollection*>(browser->tab_strip_model()->Root()));
-+  PruneEmptyImportedFolders(strip, strip->pin_collection(), source_profile);
-+}
-+
+@@ -215,7 +279,8 @@ std::vector<content::WebContents*> Impor
  }  // namespace
  
  bool ImportArcSidebarSnapshot(Profile* profile,
@@ -294,11 +201,30 @@ Index: src/chrome/browser/importer/arcium_arc_import.cc
    std::optional<Snapshot> snapshot = ParseSnapshot(snapshot_json);
    helium::HeliumSpaceService* service =
        profile ? helium::HeliumSpaceServiceFactory::GetForProfile(profile)
-@@ -224,18 +346,25 @@ bool ImportArcSidebarSnapshot(Profile* p
+@@ -224,18 +289,44 @@ bool ImportArcSidebarSnapshot(Profile* p
      return false;
    }
  
 -  std::map<std::string, std::vector<ImportedTab>> tabs_by_space;
++  if (destination == ArcSidebarDestination::kPins) {
++    std::vector<helium::ImportedPersistentSpace> imported_spaces;
++    imported_spaces.reserve(snapshot->spaces.size());
++    for (const ImportedSpace& imported : snapshot->spaces) {
++      imported_spaces.push_back(helium::ImportedPersistentSpace{
++          .id = imported.id,
++          .name = base::UTF8ToUTF16(imported.name),
++          .pins = ToPersistentNodes(imported.nodes, snapshot->source_profile,
++                                    imported.id),
++      });
++    }
++    service->ReconcileImportedPersistentItems(
++        snapshot->source_profile,
++        ToPersistentNodes(snapshot->favorites, snapshot->source_profile,
++                          "favorite"),
++        std::move(imported_spaces));
++    return true;
++  }
++
 +  std::map<std::string, std::vector<ImportedNode>> nodes_by_space;
    for (const ImportedSpace& imported : snapshot->spaces) {
 -    tabs_by_space[imported.id] = imported.tabs;
@@ -326,7 +252,7 @@ Index: src/chrome/browser/importer/arcium_arc_import.cc
  
    for (helium::HeliumSpace* space : service->GetSpaces()) {
      BrowserWindowInterface* existing_window = space->GetPrimaryBrowser();
-@@ -245,17 +374,37 @@ bool ImportArcSidebarSnapshot(Profile* p
+@@ -245,17 +336,27 @@ bool ImportArcSidebarSnapshot(Profile* p
      std::vector<content::WebContents*> old_tabs =
          browser ? ImportedContents(browser, snapshot->source_profile)
                  : std::vector<content::WebContents*>();
@@ -351,21 +277,11 @@ Index: src/chrome/browser/importer/arcium_arc_import.cc
 +        }
 +      }
 +    }
-+    if (browser) {
-+      PruneEmptyImportedFolders(browser, snapshot->source_profile);
-+    }
 +    if (browser && replacement != nodes_by_space.end() &&
 +        !replacement->second.empty()) {
-+      if (destination == ArcSidebarDestination::kPins) {
-+        AddPins(browser, snapshot->source_profile, replacement->second);
-+      } else {
-+        std::vector<ImportedTab> tabs;
-+        FlattenNodes(replacement->second, std::string(), false, &tabs);
-+        AddTabs(browser, snapshot->source_profile, tabs);
-+      }
-+    }
-+    if (browser) {
-+      space->WritePinsFromBrowser(browser);
++      std::vector<ImportedTab> tabs;
++      FlattenNodes(replacement->second, std::string(), false, &tabs);
++      AddTabs(browser, snapshot->source_profile, tabs);
      }
    }
    return true;
@@ -385,7 +301,7 @@ Index: src/chrome/browser/importer/arcium_arc_import.h
  // Validates and reconciles an Arc sidebar snapshot as unloaded normal tabs
 -// and native tab groups. Returns false without mutation for malformed input.
 -bool ImportArcSidebarSnapshot(Profile* profile, std::string_view snapshot_json);
-+// with native groups, or as live tab-backed Pins. Returns false without
++// with native groups, or as dormant lightweight Pins. Returns false without
 +// mutation for malformed input.
 +bool ImportArcSidebarSnapshot(
 +    Profile* profile,
