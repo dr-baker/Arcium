@@ -2,7 +2,7 @@ Index: src/chrome/browser/ui/BUILD.gn
 ===================================================================
 --- src.orig/chrome/browser/ui/BUILD.gn
 +++ src/chrome/browser/ui/BUILD.gn
-@@ -3517,6 +3517,7 @@ static_library("ui") {
+@@ -3535,6 +3535,7 @@ static_library("ui") {
        "views/frame/immersive_mode_controller_mac.mm",
        "views/frame/immersive_mode_overlay_views_mac.h",
        "views/frame/immersive_mode_overlay_views_mac.mm",
@@ -22,7 +22,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  #include "chrome/browser/ui/web_applications/web_app_dialog_utils.h"
  #include "chrome/browser/ui/web_applications/web_app_launch_utils.h"
  #include "chrome/browser/ui/web_applications/web_app_tabbed_utils.h"
-@@ -4140,14 +4141,13 @@ void TabStripModel::SelectRelativeTabCyc
+@@ -4218,14 +4219,13 @@ void TabStripModel::SelectRelativeTabCyc
  
  void TabStripModel::SelectMRUTab(TabRelativeDirection direction,
                                   TabStripUserGestureDetails detail) {
@@ -43,7 +43,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
      for (int i = 0; i < count(); ++i) {
        mru_cycle_list_.push_back(i);
      }
-@@ -4158,9 +4158,9 @@ void TabStripModel::SelectMRUTab(TabRela
+@@ -4236,9 +4236,9 @@ void TabStripModel::SelectMRUTab(TabRela
                         GetWebContentsAt(b)->GetLastActiveTimeTicks();
                });
  
@@ -56,7 +56,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
      }
    }
  
-@@ -4173,6 +4173,21 @@ void TabStripModel::SelectMRUTab(TabRela
+@@ -4251,6 +4251,21 @@ void TabStripModel::SelectMRUTab(TabRela
    }
  
    ActivateTabAt(mru_cycle_list_[0], detail);
@@ -162,7 +162,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  #include "ui/views/view.h"
  #include "ui/views/view_class_properties.h"
  #include "ui/views/view_utils.h"
-@@ -891,6 +905,263 @@ class BrowserView::PipExclusionObserverI
+@@ -891,6 +905,307 @@ class BrowserView::PipExclusionObserverI
  };
  #endif
  
@@ -199,11 +199,14 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +  class BubbleView : public views::View {
 +   public:
 +    explicit BubbleView(BrowserView* browser_view)
-+        : browser_view_(browser_view) {
++        : browser_view_(browser_view),
++          preview_size_(CalculatePreviewSize(browser_view)) {
 +      GetViewAccessibility().SetRole(ax::mojom::Role::kGroup);
 +      GetViewAccessibility().SetName(
 +          l10n_util::GetStringUTF16(IDS_RECENT_TABS_MENU));
-+      SetPreferredSize(kOverlaySize);
++      SetPreferredSize(
++          gfx::Size(preview_size_.width() + 2 * kHorizontalInset,
++                    preview_size_.height() + kOverlayChromeHeight));
 +
 +      SetLayoutManager(std::make_unique<views::BoxLayout>(
 +          views::BoxLayout::Orientation::kVertical,
@@ -213,16 +216,16 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +      title_label_->SetTextStyle(views::style::STYLE_EMPHASIZED);
 +      title_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
 +      title_label_->SetElideBehavior(gfx::ELIDE_TAIL);
-+      title_label_->SetMaximumWidthSingleLine(kPreviewSize.width());
++      title_label_->SetMaximumWidthSingleLine(preview_size_.width());
 +
 +      domain_label_ = AddChildView(std::make_unique<views::Label>());
 +      domain_label_->SetTextStyle(views::style::STYLE_SECONDARY);
 +      domain_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
 +      domain_label_->SetElideBehavior(gfx::ELIDE_TAIL);
-+      domain_label_->SetMaximumWidthSingleLine(kPreviewSize.width());
++      domain_label_->SetMaximumWidthSingleLine(preview_size_.width());
 +
 +      auto preview_container = std::make_unique<views::View>();
-+      preview_container->SetPreferredSize(kPreviewSize);
++      preview_container->SetPreferredSize(preview_size_);
 +      preview_container->SetBackground(views::CreateRoundedRectBackground(
 +          kColorTabHoverCardBackground, kPreviewCornerRadius));
 +      preview_container->SetLayoutManager(
@@ -230,7 +233,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +
 +      preview_image_ =
 +          preview_container->AddChildView(std::make_unique<views::ImageView>());
-+      preview_image_->SetImageSize(kPreviewSize);
++      preview_image_->SetImageSize(preview_size_);
 +      preview_image_->SetCornerRadius(kPreviewCornerRadius);
 +
 +      placeholder_icon_ =
@@ -241,7 +244,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +
 +      icon_strip_ = AddChildView(std::make_unique<views::View>());
 +      icon_strip_->SetPreferredSize(
-+          gfx::Size(kPreviewSize.width(), kIconChipSize));
++          gfx::Size(preview_size_.width(), kIconChipSize));
 +      auto* strip_layout =
 +          icon_strip_->SetLayoutManager(std::make_unique<views::BoxLayout>(
 +              views::BoxLayout::Orientation::kHorizontal, gfx::Insets(),
@@ -256,6 +259,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +      thumbnail_subscription_ =
 +          thumbnail_observer_.AddCallback(base::BindRepeating(
 +              &BubbleView::OnThumbnailAvailable, base::Unretained(this)));
++      thumbnail_observer_.SetSizeHint(preview_size_);
 +    }
 +
 +    BubbleView(const BubbleView&) = delete;
@@ -284,6 +288,18 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +
 +      ThumbnailTabHelper* thumbnail_helper =
 +          ThumbnailTabHelper::FromWebContents(selected);
++      selected_contents_ = selected;
++      high_resolution_requested_ = false;
++      float destination_scale = 1.0f;
++      if (views::Widget* widget = browser_view_->GetWidget();
++          widget && widget->GetNativeWindow()) {
++        destination_scale =
++            display::Screen::Get()
++                ->GetDisplayNearestWindow(widget->GetNativeWindow())
++                .device_scale_factor();
++      }
++      desired_capture_size_ = gfx::ScaleToCeiledSize(
++          preview_size_, std::max(1.0f, destination_scale) * 1.15f);
 +      thumbnail_observer_.Observe(
 +          thumbnail_helper ? thumbnail_helper->thumbnail() : nullptr);
 +
@@ -291,17 +307,30 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +    }
 +
 +   private:
-+    static constexpr gfx::Size kOverlaySize = gfx::Size(448, 390);
-+    static constexpr gfx::Size kPreviewSize = gfx::Size(408, 230);
 +    static constexpr gfx::Size kPlaceholderIconSize = gfx::Size(32, 32);
 +    static constexpr int kHorizontalInset = 20;
 +    static constexpr int kVerticalInset = 16;
 +    static constexpr int kElementSpacing = 8;
 +    static constexpr int kPreviewCornerRadius = 12;
++    static constexpr int kOverlayChromeHeight = 160;
 +    static constexpr int kIconChipSize = 36;
 +    static constexpr int kIconSize = 20;
 +    static constexpr int kIconSpacing = 8;
 +    static constexpr size_t kMaxVisibleIcons = 9;
++
++    static gfx::Size CalculatePreviewSize(BrowserView* browser_view) {
++      const int available_width = std::max(browser_view->width(), 640);
++      const int available_height = std::max(browser_view->height(), 480);
++      int width = std::clamp(available_width * 48 / 100, 408, 720);
++      int height = width * 9 / 16;
++      const int maximum_height =
++          std::clamp(available_height * 48 / 100, 230, 405);
++      if (height > maximum_height) {
++        height = maximum_height;
++        width = height * 16 / 9;
++      }
++      return gfx::Size(width, height);
++    }
 +
 +    TabUIHelper* GetTabUIHelper(content::WebContents* contents) const {
 +      TabStripModel* model = browser_view_->browser()->tab_strip_model();
@@ -355,9 +384,20 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +      if (thumbnail.isNull()) {
 +        return;
 +      }
++      const bool needs_higher_resolution =
++          thumbnail.width() < desired_capture_size_.width() ||
++          thumbnail.height() < desired_capture_size_.height();
 +      preview_image_->SetImage(
 +          ui::ImageModel::FromImageSkia(std::move(thumbnail)));
 +      placeholder_icon_->SetVisible(false);
++      if (!high_resolution_requested_ && selected_contents_ &&
++          needs_higher_resolution) {
++        high_resolution_requested_ = true;
++        if (ThumbnailTabHelper* helper =
++                ThumbnailTabHelper::FromWebContents(selected_contents_)) {
++          helper->CaptureThumbnailForSize(desired_capture_size_);
++        }
++      }
 +    }
 +
 +    const raw_ptr<BrowserView> browser_view_;
@@ -367,6 +407,10 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +    raw_ptr<views::ImageView> placeholder_icon_ = nullptr;
 +    raw_ptr<views::View> icon_strip_ = nullptr;
 +    raw_ptr<views::Label> position_label_ = nullptr;
++    raw_ptr<content::WebContents> selected_contents_ = nullptr;
++    const gfx::Size preview_size_;
++    gfx::Size desired_capture_size_;
++    bool high_resolution_requested_ = false;
 +    TabHoverCardThumbnailObserver thumbnail_observer_;
 +    base::CallbackListSubscription thumbnail_subscription_;
 +  };
@@ -426,7 +470,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  // Handles events during MRU tab cycling to start/stop tab cycling.
  class TabCyclingEventHandler : public ui::EventObserver,
                                 public views::WidgetObserver {
-@@ -900,7 +1171,7 @@ class TabCyclingEventHandler : public ui
+@@ -900,7 +1215,7 @@ class TabCyclingEventHandler : public ui
      Start();
    }
  
@@ -435,7 +479,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  
    TabCyclingEventHandler(const TabCyclingEventHandler&) = delete;
    TabCyclingEventHandler& operator=(const TabCyclingEventHandler&) = delete;
-@@ -908,15 +1179,21 @@ class TabCyclingEventHandler : public ui
+@@ -908,15 +1223,21 @@ class TabCyclingEventHandler : public ui
   private:
    // ui::EventObserver overrides:
    void OnEvent(const ui::Event& event) override {
@@ -459,7 +503,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
      }
    }
  
-@@ -924,12 +1201,12 @@ class TabCyclingEventHandler : public ui
+@@ -924,12 +1245,12 @@ class TabCyclingEventHandler : public ui
    void OnWidgetActivationChanged(views::Widget* widget, bool active) override {
      // We should stop cycling if other application gets active state.
      if (!active) {
@@ -474,7 +518,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  
    void Start() {
      // Add the event handler.
-@@ -937,33 +1214,68 @@ class TabCyclingEventHandler : public ui
+@@ -937,33 +1258,68 @@ class TabCyclingEventHandler : public ui
      if (widget->GetNativeWindow()) {
        monitor_ = views::EventMonitor::CreateWindowMonitor(
            this, widget->GetNativeWindow(),
@@ -546,7 +590,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    tab_cycling_event_handler_.reset();
    browser()->tab_strip_model()->StopMRUCycling();
  }
-@@ -1210,6 +1522,8 @@ BrowserView::BrowserView(Browser* browse
+@@ -1210,6 +1566,8 @@ BrowserView::BrowserView(Browser* browse
  }
  
  BrowserView::~BrowserView() {
@@ -730,3 +774,126 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model_unittest.cc
  TEST_F(TabStripModelTest, TestTabHandlesStaticTabstrip) {
    tabstrip()->AppendWebContents(CreateWebContentsWithID(1), true);
    const tabs::TabHandle handle1 = tabstrip()->GetTabAtIndex(0)->GetHandle();
+Index: src/chrome/browser/ui/thumbnails/thumbnail_tab_helper.h
+===================================================================
+--- src.orig/chrome/browser/ui/thumbnails/thumbnail_tab_helper.h
++++ src/chrome/browser/ui/thumbnails/thumbnail_tab_helper.h
+@@ -38,6 +38,10 @@ class ThumbnailTabHelper
+   // active tab.
+   void CaptureThumbnailOnTabBackgrounded();
+ 
++  // Captures a one-shot thumbnail large enough for a known destination. The
++  // requested size is in physical pixels and is capped by the source surface.
++  void CaptureThumbnailForSize(const gfx::Size& minimum_target_size);
++
+  private:
+   class TabStateTracker;
+   friend class content::WebContentsUserData<ThumbnailTabHelper>;
+Index: src/chrome/browser/ui/thumbnails/thumbnail_tab_helper.cc
+===================================================================
+--- src.orig/chrome/browser/ui/thumbnails/thumbnail_tab_helper.cc
++++ src/chrome/browser/ui/thumbnails/thumbnail_tab_helper.cc
+@@ -271,6 +271,46 @@ void ThumbnailTabHelper::CaptureThumbnai
+                      time_of_call));
+ }
+ 
++void ThumbnailTabHelper::CaptureThumbnailForSize(
++    const gfx::Size& minimum_target_size) {
++  if (!state_->is_ready() || minimum_target_size.IsEmpty()) {
++    return;
++  }
++
++  weak_factory_for_thumbnail_on_tab_hidden_.InvalidateWeakPtrs();
++  content::RenderWidgetHostView* const source_view = state_->GetView();
++  if (!source_view || !source_view->IsSurfaceAvailableForCopy()) {
++    return;
++  }
++  const gfx::Size source_size = source_view->GetViewBounds().size();
++  if (source_size.IsEmpty()) {
++    return;
++  }
++
++  ThumbnailCaptureInfo copy_info = GetInitialCaptureInfo(
++      source_size, source_view->GetDeviceScaleFactor(),
++      /*include_scrollbars_in_capture=*/false);
++  const float width_ratio =
++      static_cast<float>(copy_info.copy_rect.width()) /
++      minimum_target_size.width();
++  const float height_ratio =
++      static_cast<float>(copy_info.copy_rect.height()) /
++      minimum_target_size.height();
++  const float scale_ratio = std::min(width_ratio, height_ratio);
++  copy_info.target_size =
++      scale_ratio <= 1.0f
++          ? copy_info.copy_rect.size()
++          : gfx::ScaleToCeiledSize(copy_info.copy_rect.size(),
++                                   1.0f / scale_ratio);
++
++  const base::TimeTicks time_of_call = base::TimeTicks::Now();
++  source_view->CopyFromSurface(
++      copy_info.copy_rect, copy_info.target_size, base::TimeDelta(),
++      base::BindOnce(&ThumbnailTabHelper::StoreThumbnailForTabSwitch,
++                     weak_factory_for_thumbnail_on_tab_hidden_.GetWeakPtr(),
++                     time_of_call));
++}
++
+ ThumbnailTabHelper::ThumbnailTabHelper(content::WebContents* contents)
+     : content::WebContentsUserData<ThumbnailTabHelper>(*contents),
+       content::WebContentsObserver(contents),
+Index: src/chrome/browser/ui/views/tabs/hovercard/tab_hover_card_thumbnail_observer.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/hovercard/tab_hover_card_thumbnail_observer.h
++++ src/chrome/browser/ui/views/tabs/hovercard/tab_hover_card_thumbnail_observer.h
+@@ -6,6 +6,8 @@
+ #define CHROME_BROWSER_UI_VIEWS_TABS_HOVERCARD_TAB_HOVER_CARD_THUMBNAIL_OBSERVER_H_
+ 
+ #include <memory>
++#include <optional>
++
+ #include "base/callback_list.h"
+ #include "chrome/browser/ui/thumbnails/thumbnail_image.h"
+ 
+@@ -24,6 +26,9 @@ class TabHoverCardThumbnailObserver {
+   // trigger the associated WebContents to load (if not loaded already) and
+   // retrieve a valid thumbnail.
+   void Observe(scoped_refptr<ThumbnailImage> thumbnail_image);
++
++  void SetSizeHint(std::optional<gfx::Size> size_hint);
++
+   // Returns the current (most recent) thumbnail being watched.
+   const scoped_refptr<ThumbnailImage>& current_image() const {
+     return current_image_;
+@@ -37,6 +42,7 @@ class TabHoverCardThumbnailObserver {
+ 
+   scoped_refptr<ThumbnailImage> current_image_;
+   std::unique_ptr<ThumbnailImage::Subscription> subscription_;
++  std::optional<gfx::Size> size_hint_;
+   base::RepeatingCallbackList<CallbackSignature> callback_list_;
+ };
+ 
+Index: src/chrome/browser/ui/views/tabs/hovercard/tab_hover_card_thumbnail_observer.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/hovercard/tab_hover_card_thumbnail_observer.cc
++++ src/chrome/browser/ui/views/tabs/hovercard/tab_hover_card_thumbnail_observer.cc
+@@ -27,7 +27,8 @@ void TabHoverCardThumbnailObserver::Obse
+     return;
+   }
+ 
+-  subscription_->SetSizeHint(TabStyle::Get()->GetPreviewImageSize());
++  subscription_->SetSizeHint(
++      size_hint_.value_or(TabStyle::Get()->GetPreviewImageSize()));
+   subscription_->SetUncompressedImageCallback(base::BindRepeating(
+       &TabHoverCardThumbnailObserver::ThumbnailImageCallback,
+       base::Unretained(this), base::Unretained(current_image_.get())));
+@@ -35,6 +36,11 @@ void TabHoverCardThumbnailObserver::Obse
+   current_image_->RequestThumbnailImage();
+ }
+ 
++void TabHoverCardThumbnailObserver::SetSizeHint(
++    std::optional<gfx::Size> size_hint) {
++  size_hint_ = size_hint;
++}
++
+ base::CallbackListSubscription TabHoverCardThumbnailObserver::AddCallback(
+     Callback callback) {
+   return callback_list_.Add(callback);
