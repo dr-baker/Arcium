@@ -7434,3 +7434,393 @@ Index: src/chrome/browser/ui/helium/helium_space_service_factory.cc
  }
  
  }  // namespace helium
+Index: src/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
++++ src/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
+@@ -4,16 +4,35 @@
+ 
+ #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
+ 
++#include <algorithm>
++#include <map>
++#include <set>
++#include <string_view>
++#include <variant>
++
++#include "base/functional/bind.h"
+ #include "base/i18n/rtl.h"
++#include "base/memory/raw_ptr.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/helium/helium_persistent_item_model.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/features.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/tabs/common/dragged_tabs_container.h"
++#include "chrome/browser/ui/views/tabs/common/persistent_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_drag_handler.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
++#include "chrome/browser/ui/views/tabs/common/tab_strip_utils.h"
++#include "chrome/browser/ui/views/tabs/common/tab_strip_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_view.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/gfx/geometry/rect.h"
+ #include "ui/views/controls/scroll_view.h"
+@@ -26,8 +45,29 @@
+ 
+ namespace {
+ constexpr int kTabPadding = 4;
++
++void CollectFavoriteLinks(const std::vector<helium::PersistentNode>& nodes,
++                          std::vector<helium::PersistentLink>* links) {
++  for (const helium::PersistentNode& node : nodes) {
++    if (const auto* link = std::get_if<helium::PersistentLink>(&node.data)) {
++      links->push_back(*link);
++      continue;
++    }
++    CollectFavoriteLinks(std::get<helium::PersistentFolder>(node.data).children,
++                         links);
++  }
++}
++
+ }  // namespace
+ 
++struct PinnedTabContainerView::FavoriteTileSpec {
++  std::string id;
++  bool selected = false;
++  raw_ptr<tabs::TabInterface> live_tab = nullptr;
++  std::u16string title;
++  GURL url;
++};
++
+ PinnedTabContainerView::PinnedTabContainerView(
+     TabCollectionNode* collection_node)
+     : DraggedTabsContainer(static_cast<views::View&>(*this),
+@@ -44,12 +84,24 @@ PinnedTabContainerView::PinnedTabContain
+       &TabCollectionAnimatingLayoutManager::AnimateAndDestroyChildView,
+       base::Unretained(base::to_address(layout_manager_))));
+   collection_node->set_attach_child_to_node(base::BindRepeating(
+-      &TabCollectionAnimatingLayoutManager::AnimateAndReparentView,
+-      base::Unretained(&layout_manager_.get())));
++      &PinnedTabContainerView::AttachCollectionChild, base::Unretained(this)));
+ 
+   node_destroyed_subscription_ = collection_node_->RegisterWillDestroyCallback(
+       base::BindOnce(&PinnedTabContainerView::ResetCollectionNode,
+                      base::Unretained(this)));
++
++  if (BrowserView* browser_view =
++          collection_node_->GetController()->GetBrowserView()) {
++    space_service_ = helium::HeliumSpaceServiceFactory::GetForProfile(
++        browser_view->GetProfile());
++    if (space_service_) {
++      items_changed_subscription_ =
++          space_service_->RegisterItemsChanged(base::BindRepeating(
++              &PinnedTabContainerView::ScheduleReconcileFavorites,
++              base::Unretained(this)));
++      ReconcileFavorites();
++    }
++  }
+ }
+ 
+ PinnedTabContainerView::~PinnedTabContainerView() = default;
+@@ -60,9 +112,15 @@ views::ProposedLayout PinnedTabContainer
+   int total_width = 0;
+   int total_height = 0;
+ 
+-  const std::vector<views::View*> children =
+-      collection_node_ ? collection_node_->GetDirectChildren()
+-                       : std::vector<views::View*>();
++  const std::vector<views::View*> children = [&] {
++    std::vector<views::View*> visible;
++    for (views::View* child : this->children()) {
++      if (child->GetVisible()) {
++        visible.push_back(child);
++      }
++    }
++    return visible;
++  }();
+ 
+   int x = 0;
+   int y = 0;
+@@ -168,7 +226,8 @@ gfx::Size PinnedTabContainerView::GetMin
+ 
+   // The minimum size should be enough to show a row and a half, if needed.
+   auto collapse_state = GetTabStripCollapseState();
+-  const int num_children = collection_node_->GetDirectChildren().size();
++  const int num_children = std::ranges::count_if(
++      children(), [](const views::View* child) { return child->GetVisible(); });
+   const float min_rows = std::min(
+       (collapse_state != tabs::VerticalTabStripCollapseState::kExpanded ? 1.5f
+                                                                         : 1.0f),
+@@ -209,6 +268,13 @@ bool PinnedTabContainerView::ShouldSnapT
+ 
+ std::optional<BrowserRootView::DropIndex>
+ PinnedTabContainerView::GetLinkDropIndex(const gfx::Point& loc_in_container) {
++  for (views::View* child : children()) {
++    if (views::IsViewClass<PersistentTabView>(child) && child->GetVisible() &&
++        child->bounds().Contains(loc_in_container)) {
++      return std::nullopt;
++    }
++  }
++
+   if (!collection_node_ || collection_node_->children().size() == 0) {
+     return std::nullopt;
+   }
+@@ -320,7 +386,13 @@ PinnedTabContainerView::GetLinkDropIndex
+ }
+ 
+ void PinnedTabContainerView::ResetCollectionNode() {
++  if (TabStripView* tab_strip = GetTabStripView(this)) {
++    tab_strip->CancelPersistentRowReplacement();
++  }
++  pending_replacement_id_.reset();
++  items_changed_subscription_ = {};
+   collection_node_ = nullptr;
++  space_service_ = nullptr;
+ }
+ 
+ views::ScrollView* PinnedTabContainerView::GetScrollViewForContainer() const {
+@@ -347,5 +419,235 @@ const TabCollectionNode* PinnedTabContai
+   return nullptr;
+ }
+ 
++views::View* PinnedTabContainerView::AddChildWithoutAnimation(
++    std::unique_ptr<views::View> child) {
++  views::View* added_child = AddChildView(std::move(child));
++  HideIfPersistentFavorite(added_child);
++  if (added_child->layer()) {
++    added_child->DestroyLayer();
++  }
++  layout_manager_->ResetViewsToTargetLayout({added_child});
++  ScheduleReconcileFavorites();
++  return added_child;
++}
++
++void PinnedTabContainerView::AttachCollectionChild(
++    std::unique_ptr<views::View> child,
++    const gfx::Rect& previous_bounds_in_screen) {
++  views::View* added = child.get();
++  layout_manager_->AnimateAndReparentView(std::move(child),
++                                          previous_bounds_in_screen);
++  HideIfPersistentFavorite(added);
++  ScheduleReconcileFavorites();
++}
++
++void PinnedTabContainerView::HideIfPersistentFavorite(views::View* child) {
++  auto* tab_view = views::AsViewClass<TabView>(child);
++  if (!tab_view || !space_service_) {
++    return;
++  }
++  tabs::ConstChildPtr node_data = tab_view->collection_node()->GetNodeData();
++  const auto* tab = std::get_if<const tabs::TabInterface*>(&node_data);
++  if (tab && space_service_->GetPersistentItemKind(*tab) ==
++                 helium::PersistentRecordKind::kFavorite) {
++    child->SetVisible(false);
++  }
++}
++
++void PinnedTabContainerView::ScheduleReconcileFavorites() {
++  if (reconcile_scheduled_) {
++    return;
++  }
++  reconcile_scheduled_ = true;
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&PinnedTabContainerView::ReconcileFavorites,
++                                weak_ptr_factory_.GetWeakPtr()));
++}
++
++void PinnedTabContainerView::ReconcileFavorites() {
++  reconcile_scheduled_ = false;
++  if (!collection_node_ || !space_service_) {
++    return;
++  }
++  BrowserView* browser_view =
++      collection_node_->GetController()->GetBrowserView();
++  Browser* browser = browser_view ? browser_view->browser() : nullptr;
++  if (!browser) {
++    return;
++  }
++
++  for (const auto& child_node : collection_node_->children()) {
++    tabs::ConstChildPtr node_data = child_node->GetNodeData();
++    const auto* tab = std::get_if<const tabs::TabInterface*>(&node_data);
++    if (tab &&
++        space_service_->GetPersistentItemKind(*tab) ==
++            helium::PersistentRecordKind::kFavorite &&
++        child_node->view()) {
++      child_node->view()->SetVisible(false);
++    }
++  }
++
++  const std::vector<FavoriteTileSpec> tiles = BuildFavoriteTiles();
++  std::set<std::string, std::less<>> desired_ids;
++  std::vector<helium::PersistentGridSlot> slots;
++  std::map<std::string, raw_ptr<views::View>, std::less<>> live_views;
++  views::View* replacement_native_row = nullptr;
++  slots.reserve(tiles.size());
++  for (const FavoriteTileSpec& spec : tiles) {
++    desired_ids.insert(spec.id);
++    views::View* tile = nullptr;
++    const auto existing = favorite_tiles_.find(spec.id);
++    if (existing != favorite_tiles_.end()) {
++      tile = existing->second;
++    } else {
++      auto compact_tile = std::make_unique<PersistentTabView>(
++          browser_view->GetProfile(), spec.id, spec.title, spec.url,
++          PersistentTabView::PresentationMode::kCompactGrid,
++          base::BindRepeating(&PinnedTabContainerView::ActivateFavorite,
++                              weak_ptr_factory_.GetWeakPtr(), spec.id),
++          base::BindRepeating(&PinnedTabContainerView::RemoveFavorite,
++                              weak_ptr_factory_.GetWeakPtr(), spec.id));
++      tile = AddChildView(std::move(compact_tile));
++      favorite_tiles_.emplace(spec.id, tile);
++    }
++
++    auto* link_tile = views::AsViewClass<PersistentTabView>(tile);
++    CHECK(link_tile);
++    link_tile->Update(spec.title, spec.url, spec.selected);
++
++    TabView* live_tab_view = nullptr;
++    if (spec.live_tab) {
++      TabCollectionNode* live_node =
++          collection_node_->GetNodeForHandle(spec.live_tab->GetHandle());
++      live_tab_view =
++          live_node ? views::AsViewClass<TabView>(live_node->view()) : nullptr;
++      if (live_tab_view && live_tab_view->parent() != this) {
++        live_tab_view = nullptr;
++      }
++    }
++
++    tile->SetVisible(!live_tab_view);
++    if (live_tab_view) {
++      live_tab_view->SetVisible(true);
++      live_views.emplace(spec.id, live_tab_view);
++    }
++    slots.push_back({.id = spec.id, .live = live_tab_view != nullptr});
++    if (pending_replacement_id_ == spec.id && live_tab_view) {
++      replacement_native_row = live_tab_view;
++    }
++  }
++
++  size_t target_index = 0;
++  for (const helium::PersistentGridChild& child :
++       helium::PackPersistentGridChildren(slots)) {
++    views::View* view = nullptr;
++    if (child.kind == helium::PersistentGridChildKind::kLiveTab) {
++      const auto found = live_views.find(child.id);
++      view = found != live_views.end() ? found->second.get() : nullptr;
++    } else {
++      const auto found = favorite_tiles_.find(child.id);
++      view = found != favorite_tiles_.end() ? found->second.get() : nullptr;
++    }
++    CHECK(view);
++    ReorderChildView(view, target_index++);
++  }
++
++  for (auto it = favorite_tiles_.begin(); it != favorite_tiles_.end();) {
++    if (desired_ids.contains(it->first)) {
++      ++it;
++      continue;
++    }
++    RemoveChildViewT(it->second);
++    it = favorite_tiles_.erase(it);
++  }
++
++  std::vector<const views::View*> views_to_snap(children().begin(),
++                                                children().end());
++  layout_manager_->ResetViewsToTargetLayout(views_to_snap);
++  InvalidateLayout();
++  PreferredSizeChanged();
++
++  if (pending_replacement_id_) {
++    if (TabStripView* tab_strip = GetTabStripView(this)) {
++      if (replacement_native_row) {
++        tab_strip->CompletePersistentRowReplacement(replacement_native_row);
++      } else {
++        tab_strip->CancelPersistentRowReplacement();
++      }
++    }
++    pending_replacement_id_.reset();
++  }
++}
++
++std::vector<PinnedTabContainerView::FavoriteTileSpec>
++PinnedTabContainerView::BuildFavoriteTiles() const {
++  std::vector<FavoriteTileSpec> tiles;
++  if (!collection_node_ || !collection_node_->GetController() ||
++      !space_service_) {
++    return tiles;
++  }
++  BrowserView* browser_view =
++      collection_node_->GetController()->GetBrowserView();
++  Browser* browser = browser_view ? browser_view->browser() : nullptr;
++  if (!browser) {
++    return tiles;
++  }
++  std::vector<helium::PersistentLink> links;
++  CollectFavoriteLinks(space_service_->GetFavoritesForBrowser(browser), &links);
++  tiles.reserve(links.size());
++  for (const helium::PersistentLink& link : links) {
++    tiles.push_back(FavoriteTileSpec{
++        .id = link.id,
++        .selected = space_service_->IsPersistentItemActive(
++            browser, helium::PersistentRecordKind::kFavorite, link.id),
++        .live_tab = space_service_->GetLiveTabForPersistentItem(
++            browser, helium::PersistentRecordKind::kFavorite, link.id),
++        .title = link.title.empty() ? base::UTF8ToUTF16(link.url.host())
++                                    : link.title,
++        .url = link.url,
++    });
++  }
++  return tiles;
++}
++
++void PinnedTabContainerView::ActivateFavorite(std::string id) {
++  if (!collection_node_ || !collection_node_->GetController() ||
++      !space_service_) {
++    return;
++  }
++  BrowserView* browser_view =
++      collection_node_->GetController()->GetBrowserView();
++  if (!browser_view) {
++    return;
++  }
++  const auto tile = favorite_tiles_.find(id);
++  TabStripView* tab_strip = GetTabStripView(this);
++  if (tile != favorite_tiles_.end() && tab_strip) {
++    tab_strip->BeginPersistentRowReplacement(tile->second);
++    pending_replacement_id_ = id;
++  }
++  if (!space_service_->ActivatePersistentItem(
++          browser_view->browser(), helium::PersistentRecordKind::kFavorite,
++          id)) {
++    if (tab_strip) {
++      tab_strip->CancelPersistentRowReplacement();
++    }
++    pending_replacement_id_.reset();
++  }
++}
++
++void PinnedTabContainerView::RemoveFavorite(std::string id) {
++  if (!collection_node_ || !collection_node_->GetController() ||
++      !space_service_) {
++    return;
++  }
++  BrowserView* browser_view =
++      collection_node_->GetController()->GetBrowserView();
++  if (browser_view) {
++    space_service_->RemovePersistentItem(
++        browser_view->browser(), helium::PersistentRecordKind::kFavorite, id);
++  }
++}
++
+ BEGIN_METADATA(PinnedTabContainerView)
+ END_METADATA
