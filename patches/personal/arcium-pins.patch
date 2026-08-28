@@ -5048,7 +5048,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
-@@ -0,0 +1,774 @@
+@@ -0,0 +1,773 @@
 +// Copyright 2025 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -5792,8 +5792,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +}
 +
 +views::ScrollView* PinTabContainerView::GetScrollViewForContainer() const {
-+  return views::ScrollView::GetScrollViewForContents(
-+      const_cast<PinTabContainerView*>(this));
++  return GetAncestorScrollView(const_cast<PinTabContainerView*>(this));
 +}
 +
 +void PinTabContainerView::UpdateTargetLayoutForDrag(
@@ -6038,7 +6037,44 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
  #include "chrome/browser/ui/ui_features.h"
  #include "chrome/browser/ui/views/frame/browser_view.h"
  #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
-@@ -124,9 +125,16 @@ gfx::Range GetContainerRange(const TabCo
+@@ -53,6 +54,36 @@ namespace {
+ // it should be, relative to the source dragged view's origin.
+ DEFINE_OWNED_UI_CLASS_PROPERTY_KEY(gfx::Vector2d, kOffsetAtTabDragStart)
+ 
++enum class PersistentDropAction { kMakePin, kMakeFavorite, kRemove };
++
++struct PendingPersistentDrop {
++  PersistentDropAction action;
++  base::WeakPtr<content::WebContents> contents;
++};
++
++void CommitPersistentDrops(std::vector<PendingPersistentDrop> drops) {
++  for (const PendingPersistentDrop& drop : drops) {
++    tabs::TabInterface* tab =
++        drop.contents
++            ? tabs::TabInterface::MaybeGetFromContents(drop.contents.get())
++            : nullptr;
++    if (!tab) {
++      continue;
++    }
++    switch (drop.action) {
++      case PersistentDropAction::kMakePin:
++        helium::MakePin(tab);
++        break;
++      case PersistentDropAction::kMakeFavorite:
++        helium::MakeFavorite(tab);
++        break;
++      case PersistentDropAction::kRemove:
++        helium::RemoveAnchoredPinnedTab(tab);
++        break;
++    }
++  }
++}
++
+ // This is a shim around `TabCollectionNode` to make it compatible with the
+ // tab dragging logic in `TabDragController`. Longer term, core tab dragging
+ // logic will be updated to remove the `TabSlotView` dependency, which
+@@ -124,9 +155,16 @@ gfx::Range GetContainerRange(const TabCo
        return TabGroupDataFromNode(container_node).ListTabs();
      case TabCollectionNode::Type::PINNED:
        return gfx::Range(0, tab_strip_model.IndexOfFirstNonPinnedTab());
@@ -6056,59 +6092,14 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
      default:
        NOTREACHED();
    }
-@@ -356,7 +364,36 @@ void TabDragHandlerImpl::EndDrag(EndDrag
-   // drag (e.g. capture loss while dragging a detached window) and destroy
-   // itself when appropriate.
-   if (drag_controller_) {
-+    std::vector<PendingPersistentDrop> completed_drops;
-+    if (reason == EndDragReason::kComplete) {
-+      completed_drops = std::move(pending_persistent_drops_);
-+    }
-+    pending_persistent_drops_.clear();
-+
-     drag_controller_->EndDrag(reason);
-+
-+    // EndDrag() destroys the controller before returning. It is now safe for
-+    // the Space service to reparent tabs and rebuild persistent-item views.
-+    for (const PendingPersistentDrop& drop : completed_drops) {
-+      tabs::TabInterface* tab = drop.contents
-+                                    ? tabs::TabInterface::MaybeGetFromContents(
-+                                          drop.contents.get())
-+                                    : nullptr;
-+      if (!tab) {
-+        continue;
-+      }
-+      switch (drop.action) {
-+        case PersistentDropAction::kMakePin:
-+          helium::MakePin(tab);
-+          break;
-+        case PersistentDropAction::kMakeFavorite:
-+          helium::MakeFavorite(tab);
-+          break;
-+        case PersistentDropAction::kRemove:
-+          helium::RemoveAnchoredPinnedTab(tab);
-+          break;
-+      }
-+    }
-   }
- }
- 
-@@ -908,6 +945,7 @@ void TabDragHandlerImpl::OnNodeWillDestr
- void TabDragHandlerImpl::ResetDragState() {
-   drag_controller_.reset();
-   scroll_synchronizers_.clear();
-+  pending_persistent_drops_.clear();
- }
- 
- bool TabDragHandlerImpl::HandleDraggedTabsIntoPosition(
-@@ -917,6 +955,37 @@ bool TabDragHandlerImpl::HandleDraggedTa
+@@ -917,6 +955,40 @@ bool TabDragHandlerImpl::HandleDraggedTa
  
    const auto& drag_session_data = drag_controller_->GetSessionData();
  
 +  // Crossing a persistent-region boundary is a product mutation, not a raw
 +  // index move. Record the final hovered destination without restructuring the
 +  // model while Chromium's drag controller still owns collection/view refs.
-+  pending_persistent_drops_.clear();
++  std::vector<PendingPersistentDrop> pending_persistent_drops;
 +  for (const TabDragData& tab_drag_data : drag_session_data.tab_drag_data_) {
 +    if (!tab_drag_data.contents) {
 +      continue;
@@ -6117,24 +6108,27 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
 +        tabs::TabInterface::GetFromContents(tab_drag_data.contents);
 +    if (container_node.type() == TabCollectionNode::Type::PIN &&
 +        !helium::IsPersistentItemTab(tab)) {
-+      pending_persistent_drops_.push_back(
++      pending_persistent_drops.push_back(
 +          {PersistentDropAction::kMakePin,
 +           tab_drag_data.contents->GetWeakPtr()});
 +    } else if (container_node.type() == TabCollectionNode::Type::PINNED &&
 +               !helium::IsPersistentItemTab(tab)) {
-+      pending_persistent_drops_.push_back(
++      pending_persistent_drops.push_back(
 +          {PersistentDropAction::kMakeFavorite,
 +           tab_drag_data.contents->GetWeakPtr()});
 +    } else if (container_node.type() == TabCollectionNode::Type::UNPINNED &&
 +               helium::IsPersistentItemTab(tab)) {
-+      pending_persistent_drops_.push_back(
++      pending_persistent_drops.push_back(
 +          {PersistentDropAction::kRemove,
 +           tab_drag_data.contents->GetWeakPtr()});
 +    }
 +  }
-+  if (!pending_persistent_drops_.empty()) {
++  if (!pending_persistent_drops.empty()) {
++    drag_controller_->SetDeferredSuccessfulDropCallback(base::BindOnce(
++        &CommitPersistentDrops, std::move(pending_persistent_drops)));
 +    return true;
 +  }
++  drag_controller_->SetDeferredSuccessfulDropCallback(base::OnceClosure());
 +
    auto container_range = GetContainerRange(container_node, *tab_strip_model_);
    int container_start_index = container_range.start();
@@ -7935,3 +7929,196 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.h
    UnpinnedTabContainerView* GetUnpinnedTabsContainer();
  
    TabStripCollectionController* GetTabStripCollectionController() {
+Index: src/chrome/browser/ui/views/tabs/common/tab_group_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/tab_group_view.cc
++++ src/chrome/browser/ui/views/tabs/common/tab_group_view.cc
+@@ -358,8 +358,7 @@ bool TabGroupView::IsCollapsed() const {
+ }
+ 
+ views::ScrollView* TabGroupView::GetScrollViewForContainer() const {
+-  return views::ScrollView::GetScrollViewForContents(
+-      const_cast<views::View*>(parent()));
++  return GetAncestorScrollView(const_cast<TabGroupView*>(this));
+ }
+ 
+ void TabGroupView::UpdateTargetLayoutForDrag(
+Index: src/chrome/browser/ui/views/tabs/common/tab_strip_utils.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/tab_strip_utils.cc
++++ src/chrome/browser/ui/views/tabs/common/tab_strip_utils.cc
+@@ -10,6 +10,7 @@
+ #include "chrome/browser/ui/views/tabs/common/tab_group_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_view.h"
+ #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
++#include "ui/views/controls/scroll_view.h"
+ #include "ui/views/view.h"
+ #include "ui/views/view_utils.h"
+ 
+@@ -60,4 +61,14 @@ TabStripView* GetTabStripView(views::Vie
+     }
+   }
+   return nullptr;
++}
++
++views::ScrollView* GetAncestorScrollView(views::View* view) {
++  for (views::View* current = view; current; current = current->parent()) {
++    if (views::ScrollView* scroll_view =
++            views::ScrollView::GetScrollViewForContents(current)) {
++      return scroll_view;
++    }
++  }
++  return nullptr;
+ }
+Index: src/chrome/browser/ui/views/tabs/common/tab_strip_utils.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/tab_strip_utils.h
++++ src/chrome/browser/ui/views/tabs/common/tab_strip_utils.h
+@@ -12,6 +12,7 @@
+ class TabStripView;
+ 
+ namespace views {
++class ScrollView;
+ class View;
+ }
+ 
+@@ -34,4 +35,8 @@ std::optional<int> CalculateViewReplacem
+ // through the parent hierarchy until a `TabStripView` is found.
+ TabStripView* GetTabStripView(views::View* view);
+ 
++// Returns the ScrollView whose contents contain `view`, allowing intermediate
++// wrapper views between the contents root and `view`.
++views::ScrollView* GetAncestorScrollView(views::View* view);
++
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_TAB_STRIP_UTILS_H_
+Index: src/chrome/browser/ui/views/tabs/common/tab_strip_utils_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/tab_strip_utils_unittest.cc
++++ src/chrome/browser/ui/views/tabs/common/tab_strip_utils_unittest.cc
+@@ -5,6 +5,8 @@
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_utils.h"
+ 
+ #include "testing/gtest/include/gtest/gtest.h"
++#include "ui/views/controls/scroll_view.h"
++#include "ui/views/view.h"
+ 
+ TEST(TabStripViewReplacementTest, PreservesVisibleViewportPosition) {
+   const std::optional<int> delta = CalculateViewReplacementScrollDelta(
+@@ -27,3 +29,21 @@ TEST(TabStripViewReplacementTest, Offscr
+       gfx::Rect(0, 260, 100, 40), gfx::Rect(0, 40, 100, 200),
+       gfx::Rect(0, 360, 100, 40), gfx::Rect(0, 240, 100, 200)));
+ }
++
++TEST(TabStripScrollViewTest, FindsScrollViewThroughWrapperViews) {
++  views::ScrollView scroll_view;
++  auto contents = std::make_unique<views::View>();
++  auto* wrapper = contents->AddChildView(std::make_unique<views::View>());
++  auto* nested_container =
++      wrapper->AddChildView(std::make_unique<views::View>());
++  scroll_view.SetContents(std::move(contents));
++
++  EXPECT_EQ(&scroll_view, GetAncestorScrollView(nested_container));
++}
++
++TEST(TabStripScrollViewTest, ReturnsNullWithoutScrollViewAncestor) {
++  views::View root;
++  auto* nested_container = root.AddChildView(std::make_unique<views::View>());
++
++  EXPECT_EQ(nullptr, GetAncestorScrollView(nested_container));
++}
+Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
++++ src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
+@@ -12,6 +12,7 @@
+ #include "chrome/browser/ui/views/tabs/common/tab_drag_handler.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_group_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
++#include "chrome/browser/ui/views/tabs/common/tab_strip_utils.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_view.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/gfx/geometry/rect.h"
+@@ -274,8 +275,7 @@ void UnpinnedTabContainerView::ResetColl
+ }
+ 
+ views::ScrollView* UnpinnedTabContainerView::GetScrollViewForContainer() const {
+-  return views::ScrollView::GetScrollViewForContents(
+-      const_cast<UnpinnedTabContainerView*>(this));
++  return GetAncestorScrollView(const_cast<UnpinnedTabContainerView*>(this));
+ }
+ 
+ void UnpinnedTabContainerView::UpdateTargetLayoutForDrag(
+Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
++++ src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
+@@ -23,6 +23,7 @@
+ #include "base/numerics/safe_conversions.h"
+ #include "base/run_loop.h"
+ #include "base/scoped_observation.h"
++#include "base/task/sequenced_task_runner.h"
+ #include "base/trace_event/trace_event.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
+@@ -817,6 +818,11 @@ void TabDragController::SetDragLoopDoneC
+   drag_loop_done_callback_ = std::move(callback);
+ }
+ 
++void TabDragController::SetDeferredSuccessfulDropCallback(
++    base::OnceClosure callback) {
++  deferred_successful_drop_callback_ = std::move(callback);
++}
++
+ std::unique_ptr<tabs::TabModel> TabDragController::DetachTabAtForInsertion(
+     int drag_idx) {
+   CHECK_EQ(current_state_, DragState::kStopped)
+@@ -1867,6 +1873,14 @@ void TabDragController::EndDragImpl(EndD
+           << " state=" << static_cast<int>(current_state_);
+ 
+   DragState previous_state = current_state_;
++  base::OnceClosure deferred_successful_drop_callback;
++  if (type == EndDragType::kNormal &&
++      previous_state != DragState::kNotStarted) {
++    deferred_successful_drop_callback =
++        std::move(deferred_successful_drop_callback_);
++  } else {
++    deferred_successful_drop_callback_.Reset();
++  }
+   current_state_ = DragState::kStopped;
+   attached_context_tabs_closed_tracker_.reset();
+ 
+@@ -1931,6 +1945,10 @@ void TabDragController::EndDragImpl(EndD
+ 
+   TabDragContext* owning_context =
+       attached_context_ ? attached_context_.get() : source_context_.get();
++  if (deferred_successful_drop_callback) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, std::move(deferred_successful_drop_callback));
++  }
+   owning_context->DestroyDragController();
+ }
+ 
+Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h
++++ src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h
+@@ -205,6 +205,10 @@ class TabDragController : public views::
+   // Complete the current drag session.
+   void EndDrag(EndDragReason reason);
+ 
++  // Replaces the work to run asynchronously after a successful drop has fully
++  // released Chromium's drag-owned model and view state. Cleared on cancel.
++  void SetDeferredSuccessfulDropCallback(base::OnceClosure callback);
++
+   // Set a callback to be called when the nested drag loop / system DnD session
+   // finishes.
+   //
+@@ -674,5 +678,8 @@ class TabDragController : public views::
+   // DnD session.
+   base::OnceClosure drag_started_callback_;
+ 
++  // Product-level conversions that must happen after the drag transaction.
++  base::OnceClosure deferred_successful_drop_callback_;
++
+   // The tab thumbnail used as the drag icon for system-DnD-based tab dragging.
+   gfx::ImageSkia drag_image_;
