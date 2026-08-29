@@ -5663,7 +5663,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
-@@ -0,0 +1,2209 @@
+@@ -0,0 +1,2368 @@
 +// Copyright 2025 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -5717,6 +5717,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +#include "ui/compositor/layer.h"
 +#include "ui/gfx/canvas.h"
 +#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/transform.h"
 +#include "ui/views/accessibility/view_accessibility.h"
 +#include "ui/views/controls/button/label_button.h"
 +#include "ui/views/controls/scroll_view.h"
@@ -5901,6 +5902,18 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +  GURL url;
 +};
 +
++struct PinTabContainerView::PersistentDragPresentation {
++  struct Entry {
++    raw_ptr<views::View> view = nullptr;
++    gfx::Rect source_bounds;
++    bool created_layer = false;
++    bool filled_bounds_opaquely = false;
++  };
++
++  gfx::Point pointer_offset;
++  std::vector<Entry> entries;
++};
++
 +PinTabContainerView::PinTabContainerView(TabCollectionNode* collection_node)
 +    : DraggedTabsContainer(static_cast<views::View&>(*this),
 +                           collection_node,
@@ -6080,9 +6093,29 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +    gfx::Rect bounds = gfx::Rect(child->GetPreferredSize(child_size_bounds));
 +    bounds.set_x(x);
 +
++    const PersistentDragPresentation::Entry* persistent_drag_entry = nullptr;
++    if (persistent_drag_presentation_) {
++      const auto entry = std::ranges::find_if(
++          persistent_drag_presentation_->entries,
++          [child](const PersistentDragPresentation::Entry& entry) {
++            return entry.view == child;
++          });
++      if (entry != persistent_drag_presentation_->entries.end()) {
++        persistent_drag_entry = &*entry;
++      }
++    }
++    const int flow_height = bounds.height();
++
 +    auto drag_data = GetVisualDataForDraggedView(*child);
 +    CHECK(!drag_data || !drag_data->should_hide);
-+    bounds.set_y(drag_data ? drag_data->offset.y() : height);
++    if (persistent_drag_entry) {
++      // Persistent rows use a compositor transform while the projected order
++      // reserves their destination slots. Keeping their base bounds fixed
++      // prevents layout animation from fighting pointer motion.
++      bounds = persistent_drag_entry->source_bounds;
++    } else {
++      bounds.set_y(drag_data ? drag_data->offset.y() : height);
++    }
 +
 +    // If width is bounded, child views should respect the width constraints and
 +    // take up the available width excluding trailing horizontal padding.
@@ -6091,8 +6124,10 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +                       horizontal_padding);
 +    }
 +    layouts.child_layouts.emplace_back(child, true, bounds);
-+    if (!(drag_data && leaving_section)) {
-+      height += bounds.height() + kTabVerticalPadding;
++    const bool persistent_row_leaving =
++        persistent_drag_entry && sidebar_drag_over_tabs_;
++    if (!(drag_data && leaving_section) && !persistent_row_leaving) {
++      height += flow_height + kTabVerticalPadding;
 +      has_flow_child = true;
 +    }
 +    width = std::max(width, bounds.width() + bounds.x());
@@ -6177,7 +6212,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +}
 +
 +bool PinTabContainerView::IsViewDragging(const views::View& child_view) const {
-+  if (persistent_drag_view_ == &child_view) {
++  if (IsPersistentDragPresentationView(child_view)) {
 +    return true;
 +  }
 +  if (!collection_node_ || !collection_node_->GetController()) {
@@ -6198,6 +6233,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +}
 +
 +void PinTabContainerView::ResetCollectionNode() {
++  ClearPersistentDragPresentation();
 +  if (!UseSidebarProjection()) {
 +    if (TabStripView* tab_strip = GetTabStripView(this)) {
 +      tab_strip->CancelPersistentRowReplacement();
@@ -6855,9 +6891,10 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +
 +bool PinTabContainerView::BeginPersistentTabDrag(
 +    PersistentTabView& row,
-+    const ui::MouseEvent&,
++    const ui::MouseEvent& press_event,
 +    const ui::MouseEvent& drag_event) {
-+  return BeginPersistentTreeDrag(row, row.stable_id(), drag_event);
++  return BeginPersistentTreeDrag(row, row.stable_id(), press_event,
++                                 drag_event);
 +}
 +
 +std::optional<helium::SidebarItemPlacement>
@@ -6984,6 +7021,114 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +  InvalidateLayout();
 +}
 +
++void PinTabContainerView::BeginPersistentDragPresentation(
++    views::View& row,
++    const ui::MouseEvent& press_event) {
++  ClearPersistentDragPresentation();
++
++  auto presentation = std::make_unique<PersistentDragPresentation>();
++  presentation->pointer_offset = press_event.location();
++
++  const int source_depth = row_depths_.contains(&row) ? row_depths_.at(&row)
++                                                       : 0;
++  bool collecting = false;
++  for (views::View* child : children()) {
++    if (child == &row) {
++      collecting = true;
++    } else if (!collecting) {
++      continue;
++    } else if (!row_is_folders_.contains(&row) || !row_is_folders_.at(&row) ||
++               !row_depths_.contains(child) ||
++               row_depths_.at(child) <= source_depth) {
++      break;
++    }
++
++    const bool created_layer = child->layer() == nullptr;
++    PersistentDragPresentation::Entry entry{
++        .view = child,
++        .source_bounds = child->bounds(),
++        .created_layer = created_layer,
++        .filled_bounds_opaquely =
++            !created_layer && child->layer()->fills_bounds_opaquely(),
++    };
++    child->SetPaintToLayer();
++    child->layer()->SetFillsBoundsOpaquely(false);
++    if (child->layer()->parent()) {
++      child->layer()->parent()->StackAtTop(child->layer());
++    }
++    presentation->entries.push_back(std::move(entry));
++
++    if (!row_is_folders_.contains(&row) || !row_is_folders_.at(&row)) {
++      break;
++    }
++  }
++
++  if (!presentation->entries.empty()) {
++    persistent_drag_presentation_ = std::move(presentation);
++    InvalidateLayout();
++  }
++}
++
++void PinTabContainerView::UpdatePersistentDragPresentation(
++    const gfx::Point& point_in_screen) {
++  if (!persistent_drag_presentation_) {
++    return;
++  }
++
++  const PersistentDragPresentation::Entry& source =
++      persistent_drag_presentation_->entries.front();
++  if (!source.view || !source.view->parent()) {
++    return;
++  }
++  gfx::Point source_origin_in_screen = source.source_bounds.origin();
++  views::View::ConvertPointToScreen(source.view->parent(),
++                                    &source_origin_in_screen);
++  const int desired_source_y =
++      point_in_screen.y() - persistent_drag_presentation_->pointer_offset.y();
++  const int translation_y = desired_source_y - source_origin_in_screen.y();
++
++  for (const PersistentDragPresentation::Entry& entry :
++       persistent_drag_presentation_->entries) {
++    if (!entry.view || !entry.view->parent()) {
++      continue;
++    }
++    gfx::Transform transform;
++    transform.Translate(0, translation_y);
++    entry.view->SetTransform(transform);
++  }
++}
++
++void PinTabContainerView::ClearPersistentDragPresentation() {
++  if (!persistent_drag_presentation_) {
++    return;
++  }
++  for (const PersistentDragPresentation::Entry& entry :
++       persistent_drag_presentation_->entries) {
++    if (!entry.view) {
++      continue;
++    }
++    entry.view->SetTransform(gfx::Transform());
++    if (entry.created_layer && entry.view->layer()) {
++      entry.view->DestroyLayer();
++    } else if (entry.view->layer()) {
++      entry.view->layer()->SetFillsBoundsOpaquely(
++          entry.filled_bounds_opaquely);
++    }
++  }
++  persistent_drag_presentation_.reset();
++  InvalidateLayout();
++}
++
++bool PinTabContainerView::IsPersistentDragPresentationView(
++    const views::View& view) const {
++  return persistent_drag_presentation_ &&
++         std::ranges::any_of(
++             persistent_drag_presentation_->entries,
++             [&view](const PersistentDragPresentation::Entry& entry) {
++               return entry.view == &view;
++             });
++}
++
 +void PinTabContainerView::UpdatePersistentTabDrag(PersistentTabView& row,
 +                                                  const ui::MouseEvent& event) {
 +  UpdatePersistentTreeDrag(row, event);
@@ -7001,9 +7146,9 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +bool PinTabContainerView::BeginPersistentFolderDrag(
 +    views::View& row,
 +    std::string id,
-+    const ui::MouseEvent&,
++    const ui::MouseEvent& press_event,
 +    const ui::MouseEvent& drag_event) {
-+  return BeginPersistentTreeDrag(row, std::move(id), drag_event);
++  return BeginPersistentTreeDrag(row, std::move(id), press_event, drag_event);
 +}
 +
 +void PinTabContainerView::UpdatePersistentFolderDrag(
@@ -7020,6 +7165,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +bool PinTabContainerView::BeginPersistentTreeDrag(
 +    views::View& row,
 +    std::string id,
++    const ui::MouseEvent& press_event,
 +    const ui::MouseEvent& drag_event) {
 +  if (!collection_node_ || !space_service_ || id.empty() ||
 +      persistent_drag_view_) {
@@ -7028,6 +7174,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +  persistent_drag_view_ = &row;
 +  persistent_drag_id_ = std::move(id);
 +  if (UseSidebarProjection()) {
++    BeginPersistentDragPresentation(row, press_event);
 +    BrowserView* browser_view =
 +        collection_node_->GetController()
 +            ? collection_node_->GetController()->GetBrowserView()
@@ -7095,6 +7242,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +  }
 +  gfx::Point point_in_screen = event.location();
 +  views::View::ConvertPointToScreen(&row, &point_in_screen);
++  UpdatePersistentDragPresentation(point_in_screen);
 +  TabStripView* tab_strip = GetTabStripView(this);
 +  if (UseSidebarProjection()) {
 +    BrowserView* browser_view =
@@ -7208,6 +7356,15 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +      sidebar_preview_placement_.reset();
 +      ClearPersistentTabDragPreview();
 +      RestoreSidebarProjectionOrder();
++      return;
++    }
++
++    if (sidebar_drag_over_pins_ &&
++        sidebar_preview_placement_ == *placement) {
++      // Pointer motion within one semantic slot should move only the floating
++      // source presentation. Rebuilding the same projection on every mouse
++      // event adds work without changing any surrounding-row target bounds.
++      sidebar_drop_target_ = std::move(target);
 +      return;
 +    }
 +
@@ -7356,6 +7513,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +
 +    const std::string id = std::exchange(persistent_drag_id_, std::string());
 +    const std::string source_space_id = sidebar_drag_space_id_;
++    ClearPersistentDragPresentation();
 +    persistent_drag_view_ = nullptr;
 +    sidebar_drag_browser_ = nullptr;
 +    sidebar_drag_space_id_.clear();
@@ -7435,6 +7593,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +    sidebar_drag_over_pins_ = false;
 +    sidebar_drag_over_tabs_ = false;
 +    sidebar_tab_drop_before_.reset();
++    ClearPersistentDragPresentation();
 +    persistent_drag_view_ = nullptr;
 +    persistent_drag_id_.clear();
 +    persistent_drag_location_ = {};
@@ -7877,7 +8036,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,252 @@
 +// Copyright 2025 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -8015,6 +8174,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +  void UpdatePersistentRowPresentation(bool compact);
 +
 +  struct PersistentRowSpec;
++  struct PersistentDragPresentation;
 +  struct PersistentFolderConnector {
 +    raw_ptr<views::View> folder = nullptr;
 +    raw_ptr<views::View> last_descendant = nullptr;
@@ -8043,10 +8203,17 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +      const PersistentTabDropLocation& location);
 +  bool BeginPersistentTreeDrag(views::View& row,
 +                               std::string id,
++                               const ui::MouseEvent& press_event,
 +                               const ui::MouseEvent& drag_event);
 +  void UpdatePersistentTreeDrag(views::View& row, const ui::MouseEvent& event);
 +  void EndPersistentTreeDrag(views::View& row, const ui::MouseEvent& event);
 +  void CancelPersistentTreeDrag(views::View& row);
++  void BeginPersistentDragPresentation(
++      views::View& row,
++      const ui::MouseEvent& press_event);
++  void UpdatePersistentDragPresentation(const gfx::Point& point_in_screen);
++  void ClearPersistentDragPresentation();
++  bool IsPersistentDragPresentationView(const views::View& view) const;
 +  void ToggleFolder(helium::PersistentRecordKind kind,
 +                    std::string id,
 +                    std::string source_space_id);
@@ -8087,6 +8254,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +  std::map<const views::View*, bool> row_is_folders_;
 +  std::map<std::string, raw_ptr<views::View>, std::less<>> persistent_rows_;
 +  raw_ptr<views::View> persistent_drag_view_ = nullptr;
++  std::unique_ptr<PersistentDragPresentation> persistent_drag_presentation_;
 +  std::string persistent_drag_id_;
 +  PersistentTabDropLocation persistent_drag_location_;
 +  std::optional<size_t> external_drop_index_;
@@ -14246,3 +14414,33 @@ Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h
  
   private:
    // DraggedTabsContainer:
+Index: src/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
++++ src/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
+@@ -108,12 +108,21 @@ void DraggedTabsContainer::ApplyUpdatesF
+ 
+   auto* scroll_view = GetScrollViewForContainer();
+   CHECK(scroll_view);
+-  scroll_handler_.OnDraggedTabPositionUpdated(
+-      *scroll_view, views::View::ConvertRectToTarget(
+-                        base::to_address(host_view_), scroll_view,
+-                        dragged_bounds_in_container));
++  if (GetDragHandler().GetPersistentTabDropTarget() ==
++      PersistentTabDropTarget::kPin) {
++    // An ordinary TabView stays in this native container while a Pins drop is
++    // only semantic intent. Its out-of-container bounds must not drive this
++    // container's auto-scroll timer or hovering over Pins will scroll the
++    // shared sidebar all the way to its top.
++    scroll_handler_.StopScrolling();
++  } else {
++    scroll_handler_.OnDraggedTabPositionUpdated(
++        *scroll_view, views::View::ConvertRectToTarget(
++                          base::to_address(host_view_), scroll_view,
++                          dragged_bounds_in_container));
++  }
+ 
+   UpdateDraggingViewTransforms(point_in_container);
+
+   HandleTabDragInContainer(dragged_bounds_in_container);
+ }
