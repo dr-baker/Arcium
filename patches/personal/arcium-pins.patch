@@ -185,7 +185,7 @@ Index: src/chrome/browser/ui/BUILD.gn
 ===================================================================
 --- src.orig/chrome/browser/ui/BUILD.gn
 +++ src/chrome/browser/ui/BUILD.gn
-@@ -360,6 +360,24 @@ if (!is_android) {
+@@ -360,6 +360,26 @@ if (!is_android) {
    }
  }
  
@@ -196,6 +196,8 @@ Index: src/chrome/browser/ui/BUILD.gn
 +    "helium/helium_persistent_item_model_unittest.cc",
 +    "helium/helium_sidebar_drag_transaction.cc",
 +    "helium/helium_sidebar_drag_transaction_unittest.cc",
++    "helium/helium_sidebar_native_tab_drag_session.cc",
++    "helium/helium_sidebar_native_tab_drag_session_unittest.cc",
 +    "helium/helium_sidebar_pin_projection.cc",
 +    "helium/helium_sidebar_pin_projection_unittest.cc",
 +  ]
@@ -210,7 +212,7 @@ Index: src/chrome/browser/ui/BUILD.gn
  # Use a static library here because many test binaries depend on this but don't
  # require many files from it. This makes linking more efficient.
  # TODO(https://crbug.com/353332589): Once //chrome/browser is properly
-@@ -373,8 +391,16 @@ static_library("ui") {
+@@ -373,8 +393,18 @@ static_library("ui") {
      "confirm_bubble.h",
      "crypto_module_password_dialog.h",
      "enterprise_startup_dialog.h",
@@ -222,6 +224,8 @@ Index: src/chrome/browser/ui/BUILD.gn
 +    "helium/helium_persistent_item_model.h",
 +    "helium/helium_sidebar_drag_transaction.cc",
 +    "helium/helium_sidebar_drag_transaction.h",
++    "helium/helium_sidebar_native_tab_drag_session.cc",
++    "helium/helium_sidebar_native_tab_drag_session.h",
 +    "helium/helium_sidebar_pin_projection.cc",
 +    "helium/helium_sidebar_pin_projection.h",
      "helium/helium_space.cc",
@@ -1066,7 +1070,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/helium_space_service.cc
 +++ src/chrome/browser/ui/helium/helium_space_service.cc
-@@ -4,48 +4,373 @@
+@@ -4,48 +4,389 @@
  
  #include "chrome/browser/ui/helium/helium_space_service.h"
  
@@ -1097,6 +1101,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +#include "components/prefs/scoped_user_pref_update.h"
 +#include "components/sessions/content/session_tab_helper.h"
 +#include "components/tabs/public/tab_collection.h"
++#include "components/tabs/public/pin_tab_collection.h"
 +#include "components/tabs/public/tab_strip_collection.h"
 +#include "content/public/browser/web_contents.h"
  
@@ -1268,6 +1273,21 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    const base::DictValue* dict = value.GetIfDict();
 +    return dict && dict->FindString("source_id") && !dict->Find("id");
 +  });
++}
++
++bool StageInsertedPin(PersistentNodes* pins,
++                      PersistentLink link,
++                      std::string_view parent_id,
++                      std::string_view before_id) {
++  if (!pins || link.id.empty()) {
++    return false;
++  }
++  const std::string id = link.id;
++  pins->push_back(PersistentNode{.data = std::move(link)});
++  if (parent_id.empty() && before_id.empty()) {
++    return true;
++  }
++  return PersistentItemCodec::MoveNode(*pins, id, parent_id, before_id);
 +}
 +
 +void CollectLifecycleKeys(std::set<std::string>* keys,
@@ -1454,7 +1474,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
    }
  }
  
-@@ -56,16 +381,8 @@ void HeliumSpaceService::EnsureDefaultSp
+@@ -56,16 +397,8 @@ void HeliumSpaceService::EnsureDefaultSp
      }
      return;
    }
@@ -1473,7 +1493,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
  }
  
  HeliumSpace* HeliumSpaceService::GetDefaultSpace() {
-@@ -79,9 +396,8 @@ const HeliumSpace* HeliumSpaceService::G
+@@ -79,9 +412,8 @@ const HeliumSpace* HeliumSpaceService::G
  
  HeliumSpace* HeliumSpaceService::GetActiveSpace() {
    EnsureDefaultSpace();
@@ -1485,7 +1505,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      return active;
    }
    return spaces_.front().get();
-@@ -97,55 +413,1409 @@ HeliumSpace* HeliumSpaceService::GetSpac
+@@ -97,55 +429,1746 @@ HeliumSpace* HeliumSpaceService::GetSpac
  }
  
  HeliumSpace* HeliumSpaceService::GetOrCreateSpace(std::string id,
@@ -2236,7 +2256,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  const auto token = lifecycle_.GetLiveTab(ItemKey(browser, kind, id));
 +  if (!token) {
 +    return false;
-   }
++  }
 +  const auto association = live_associations_.find(*token);
 +  return association != live_associations_.end() && association->second->tab &&
 +         association->second->tab->GetBrowserWindowInterface() &&
@@ -2416,6 +2436,343 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  return true;
 +}
 +
++std::optional<std::string> HeliumSpaceService::ConvertTabToPinInSpace(
++    Browser* browser,
++    std::string_view source_space_id,
++    tabs::TabInterface* tab,
++    std::string_view parent_id,
++    std::string_view before_id) {
++  if (!IsEligibleBrowser(browser) || source_space_id.empty() || !tab ||
++      GetSpaceIdForBrowser(browser) != source_space_id ||
++      tab->GetProfile() != profile_ || profile_->IsOffTheRecord() ||
++      profile_->IsGuestSession() || IsPersistentItemTab(tab) ||
++      tab->IsPinned() || tab->IsSplit() || tab->GetGroup().has_value()) {
++    return std::nullopt;
++  }
++  BrowserWindowInterface* window = tab->GetBrowserWindowInterface();
++  TabStripModel* model = window ? window->GetTabStripModel() : nullptr;
++  const tabs::TabStripCollection* strip =
++      model && model->Root()
++          ? static_cast<const tabs::TabStripCollection*>(model->Root())
++          : nullptr;
++  if (!window || window->GetBrowserForMigrationOnly() != browser || !model ||
++      !strip ||
++      model->GetIndexOfTab(tab) == TabStripModel::kNoTab ||
++      strip->IsPinTab(tab) || !tab->GetContents()) {
++    return std::nullopt;
++  }
++  const GURL url = tab->GetContents()->GetLastCommittedURL();
++  if (!url.SchemeIsHTTPOrHTTPS()) {
++    return std::nullopt;
++  }
++  HeliumSpace* space = GetSpaceById(source_space_id);
++  if (!space) {
++    return std::nullopt;
++  }
++
++  std::string id;
++  do {
++    id = NewId();
++  } while (PersistentItemCodec::FindLink(space->pins(), id) ||
++           PersistentItemCodec::FindFolder(space->pins(), id) ||
++           lifecycle_.GetState(ItemKeyForSpace(
++               PersistentRecordKind::kPin, source_space_id, id)));
++  std::u16string title = tab->GetContents()->GetTitle();
++  if (title.empty()) {
++    title = base::UTF8ToUTF16(url.host());
++  }
++  const PersistentNodes original_pins = space->pins();
++  PersistentNodes staged_pins = original_pins;
++  if (!StageInsertedPin(
++          &staged_pins,
++          PersistentLink{.id = id, .title = std::move(title), .url = url},
++          parent_id, before_id)) {
++    return std::nullopt;
++  }
++
++  const std::string key = ItemKeyForSpace(
++      PersistentRecordKind::kPin, source_space_id, id);
++  space->SetPins(std::move(staged_pins));
++  if (!lifecycle_.AddDormant(key)) {
++    space->SetPins(original_pins);
++    return std::nullopt;
++  }
++  if (!AssociateLiveTab(key, PersistentRecordKind::kPin, id, tab)) {
++    lifecycle_.Forget(key);
++    space->SetPins(original_pins);
++    return std::nullopt;
++  }
++  NotifyItemsChanged();
++  return id;
++}
++
++bool HeliumSpaceService::ConvertPinToTabInSpace(
++    Browser* browser,
++    std::string_view source_space_id,
++    std::string_view id,
++    std::optional<tabs::TabHandle> before_tab_handle) {
++  if (!IsEligibleBrowser(browser) || source_space_id.empty() || id.empty() ||
++      GetSpaceIdForBrowser(browser) != source_space_id) {
++    return false;
++  }
++  HeliumSpace* space = GetSpaceById(source_space_id);
++  const std::optional<PersistentLink> link =
++      ResolvePinInSpace(source_space_id, id);
++  TabStripModel* model = browser->tab_strip_model();
++  if (!space || !link || !model || !model->Root()) {
++    return false;
++  }
++  const auto* strip =
++      static_cast<const tabs::TabStripCollection*>(model->Root());
++  tabs::TabInterface* before_tab =
++      before_tab_handle ? before_tab_handle->Get() : nullptr;
++
++  auto is_stable_ordinary_tab = [&](tabs::TabInterface* candidate) {
++    if (!candidate || candidate->GetProfile() != profile_ ||
++        candidate->IsPinned() || candidate->IsSplit() ||
++        candidate->GetGroup().has_value() || IsPersistentItemTab(candidate) ||
++        strip->IsPinTab(candidate)) {
++      return false;
++    }
++    BrowserWindowInterface* candidate_window =
++        candidate->GetBrowserWindowInterface();
++    return candidate_window &&
++           candidate_window->GetBrowserForMigrationOnly() == browser &&
++           candidate_window->GetTabStripModel() == model &&
++           model->GetIndexOfTab(candidate) != TabStripModel::kNoTab;
++  };
++  if (before_tab_handle && !is_stable_ordinary_tab(before_tab)) {
++    return false;
++  }
++
++  const std::string key = ItemKeyForSpace(
++      PersistentRecordKind::kPin, source_space_id, id);
++  const auto state = lifecycle_.GetState(key);
++  if (!state || *state == PersistentItemLifecycle::State::kMaterializing ||
++      *state == PersistentItemLifecycle::State::kClosing) {
++    return false;
++  }
++  tabs::TabInterface* live_tab =
++      GetLiveTabForPersistentItem(browser, PersistentRecordKind::kPin, id);
++  if (*state == PersistentItemLifecycle::State::kLive && !live_tab) {
++    return false;
++  }
++
++  PersistentNodes staged_pins = space->pins();
++  if (!PersistentItemCodec::RemoveNode(staged_pins, id)) {
++    return false;
++  }
++
++  if (live_tab) {
++    if (!IsLiveTabInExpectedCollection(PersistentRecordKind::kPin, live_tab)) {
++      return false;
++    }
++
++    tabs::TabCollection* original_parent =
++        const_cast<tabs::TabCollection*>(live_tab->GetParentCollection());
++    const std::optional<size_t> original_direct_index =
++        original_parent ? original_parent->GetIndexOfTab(live_tab)
++                        : std::nullopt;
++    if (!original_parent || !original_direct_index) {
++      return false;
++    }
++    const tabs::TabCollectionHandle original_parent_handle =
++        original_parent->GetHandle();
++    const tabs::TabHandle live_tab_handle = live_tab->GetHandle();
++    tabs::TabInterface* const transaction_tab = live_tab;
++
++    // Keep the association and durable record intact while the native tab is
++    // moved. Synchronous collection observers may invalidate the destination;
++    // suppress normal drag-detach handling until this transaction either
++    // commits or restores the original Pin collection position.
++    persistent_item_drags_.insert(transaction_tab);
++    auto end_transaction = [&]() {
++      persistent_item_drags_.erase(transaction_tab);
++    };
++    auto is_in_pin_tree = [](const tabs::TabCollection* collection,
++                             const tabs::TabStripCollection* owner) {
++      while (collection && collection != owner) {
++        if (collection == owner->pin_collection()) {
++          return true;
++        }
++        collection = collection->GetParentCollection();
++      }
++      return false;
++    };
++    auto restore_live_pin = [&]() {
++      tabs::TabInterface* rollback_tab = live_tab_handle.Get();
++      if (!rollback_tab) {
++        // Deletion observers own lifecycle cleanup. There is no ordinary tab
++        // left behind to conflict with the durable Pin.
++        return true;
++      }
++      BrowserWindowInterface* rollback_window =
++          rollback_tab->GetBrowserWindowInterface();
++      TabStripModel* rollback_model =
++          rollback_window ? rollback_window->GetTabStripModel() : nullptr;
++      Browser* rollback_browser =
++          rollback_window ? rollback_window->GetBrowserForMigrationOnly()
++                          : nullptr;
++      if (rollback_model != model || rollback_browser != browser ||
++          GetSpaceIdForBrowser(rollback_browser) != source_space_id) {
++        // A Pin cannot retain a live association after crossing its owning
++        // browser or Space boundary. Dematerialize it instead of moving the
++        // source Space's Pin into another browser's native collection.
++        DisassociateLiveTab(rollback_tab);
++        if (rollback_model) {
++          const int rollback_tab_index =
++              rollback_model->GetIndexOfTab(rollback_tab);
++          if (rollback_tab_index != TabStripModel::kNoTab) {
++            rollback_model->DetachAndDeleteWebContentsAt(rollback_tab_index);
++          }
++        }
++        RegisterDormantItems();
++        NotifyItemsChanged();
++        return true;
++      }
++      if (!rollback_model || !rollback_model->Root() ||
++          rollback_model->GetIndexOfTab(rollback_tab) ==
++              TabStripModel::kNoTab) {
++        // A detached or tearing-down tab is not an ordinary tab in any model.
++        // Its existing association remains intact until normal detach cleanup.
++        return true;
++      }
++      auto* rollback_strip = static_cast<tabs::TabStripCollection*>(
++          const_cast<tabs::TabCollection*>(rollback_model->Root()));
++      tabs::TabCollection* rollback_parent = original_parent_handle.Get();
++      size_t rollback_index = *original_direct_index;
++      if (!rollback_parent ||
++          !is_in_pin_tree(rollback_parent, rollback_strip)) {
++        // A synchronous observer may have removed an emptied folder. Root
++        // placement preserves the association until projection reconciliation
++        // restores the durable nesting.
++        rollback_parent = rollback_strip->pin_collection();
++        rollback_index = rollback_parent->ChildCount();
++      } else {
++        rollback_index =
++            std::min(rollback_index, rollback_parent->ChildCount());
++      }
++      tabs::TabCollection* current_parent = const_cast<tabs::TabCollection*>(
++          rollback_tab->GetParentCollection());
++      const std::optional<size_t> current_index =
++          current_parent ? current_parent->GetIndexOfTab(rollback_tab)
++                         : std::nullopt;
++      if (!rollback_strip->IsPinTab(rollback_tab) ||
++          current_parent != rollback_parent || !current_index ||
++          *current_index != rollback_index) {
++        rollback_model->MoveTabToPinCollection(rollback_tab, rollback_parent,
++                                               rollback_index);
++      }
++      return IsPersistentItemTab(rollback_tab) &&
++             rollback_strip->IsPinTab(rollback_tab);
++    };
++
++    model->MoveTabFromPin(live_tab);
++    live_tab = live_tab_handle.Get();
++    before_tab = before_tab_handle ? before_tab_handle->Get() : nullptr;
++    BrowserWindowInterface* live_window =
++        live_tab ? live_tab->GetBrowserWindowInterface() : nullptr;
++    const int source_index =
++        live_tab ? model->GetIndexOfTab(live_tab) : TabStripModel::kNoTab;
++    if (!live_tab || !live_window ||
++        live_window->GetBrowserForMigrationOnly() != browser ||
++        live_window->GetTabStripModel() != model ||
++        source_index == TabStripModel::kNoTab ||
++        (before_tab_handle && !is_stable_ordinary_tab(before_tab))) {
++      const bool restored = restore_live_pin();
++      end_transaction();
++      if (!restored) {
++        NotifyItemsChanged();
++      }
++      return false;
++    }
++    int destination = model->count() - 1;
++    if (before_tab) {
++      destination = model->GetIndexOfTab(before_tab);
++      if (source_index < destination) {
++        --destination;
++      }
++    }
++    model->MoveWebContentsAt(source_index, destination,
++                             /*select_after_move=*/false,
++                             /*group=*/std::nullopt);
++    before_tab = before_tab_handle ? before_tab_handle->Get() : nullptr;
++    const int final_index = model->GetIndexOfTab(live_tab);
++    const int final_before_index =
++        before_tab_handle && before_tab
++            ? model->GetIndexOfTab(before_tab)
++            : TabStripModel::kNoTab;
++    const bool moved_to_target =
++        before_tab_handle
++            ? final_index != TabStripModel::kNoTab &&
++                  is_stable_ordinary_tab(before_tab) &&
++                  final_index + 1 == final_before_index
++            : final_index != TabStripModel::kNoTab &&
++                  final_index == model->count() - 1;
++    if (!moved_to_target) {
++      const bool restored = restore_live_pin();
++      end_transaction();
++      if (!restored) {
++        NotifyItemsChanged();
++      }
++      return false;
++    }
++
++    // Nothing after this point can fail. Drop the association only after the
++    // native move is known-good, then remove the durable record exactly once.
++    CHECK(IsPersistentItemTab(live_tab));
++    DisassociateLiveTab(live_tab);
++    end_transaction();
++  } else {
++    const int destination =
++        before_tab ? model->GetIndexOfTab(before_tab) : -1;
++    content::WebContents* contents = chrome::AddAndReturnTabAt(
++        browser, link->url, destination, /*foreground=*/false);
++    tabs::TabInterface* created_tab =
++        contents ? tabs::TabInterface::MaybeGetFromContents(contents)
++                 : nullptr;
++    tabs::TabInterface* current_before_tab =
++        before_tab_handle ? before_tab_handle->Get() : nullptr;
++    const int created_index =
++        created_tab ? model->GetIndexOfTab(created_tab)
++                    : TabStripModel::kNoTab;
++    const int current_before_index =
++        before_tab_handle && current_before_tab
++            ? model->GetIndexOfTab(current_before_tab)
++            : TabStripModel::kNoTab;
++    const bool inserted_at_target =
++        before_tab_handle
++            ? is_stable_ordinary_tab(current_before_tab) &&
++                  created_index + 1 == current_before_index
++            : created_index == model->count() - 1;
++    if (!created_tab || !is_stable_ordinary_tab(created_tab) ||
++        !inserted_at_target) {
++      if (created_index != TabStripModel::kNoTab) {
++        model->DetachAndDeleteWebContentsAt(created_index);
++      }
++      return false;
++    }
++  }
++
++  space->SetPins(std::move(staged_pins));
++  if (live_tab) {
++    if (SessionService* sessions =
++            SessionServiceFactory::GetForProfile(profile_)) {
++      BrowserWindowInterface* live_window =
++          live_tab->GetBrowserWindowInterface();
++      if (live_window) {
++        sessions->AddTabExtraData(
++            live_window->GetSessionID(),
++            sessions::SessionTabHelper::IdForTab(live_tab->GetContents()),
++            kHeliumPersistentItemTabExtraDataKey, std::string());
++      }
++    }
++  }
++  RegisterDormantItems();
++  NotifyItemsChanged();
++  return true;
++}
++
 +bool HeliumSpaceService::MovePin(Browser* browser,
 +                                 std::string_view id,
 +                                 std::string_view parent_id,
@@ -2526,7 +2883,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
 +    return RemovePersistentItem(browser, association->kind,
 +                                association->item_id);
-+  }
+   }
 +  return false;
 +}
 +
@@ -2904,7 +3261,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      return false;
    }
    SetSpaceForBrowser(browser, found->second);
-@@ -158,20 +1828,32 @@ void HeliumSpaceService::AddSpaceToSessi
+@@ -158,20 +2181,32 @@ void HeliumSpaceService::AddSpaceToSessi
    if (!extra_data) {
      return;
    }
@@ -2945,7 +3302,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
  }
  
  std::vector<HeliumSpace*> HeliumSpaceService::GetSpaces() {
-@@ -186,33 +1868,74 @@ std::vector<HeliumSpace*> HeliumSpaceSer
+@@ -186,33 +2221,74 @@ std::vector<HeliumSpace*> HeliumSpaceSer
  
  void HeliumSpaceService::OnBrowserCreated(BrowserWindowInterface* window) {
    Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
@@ -3001,7 +3358,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    const TabStripSelectionChange& selection) {
 +  if (change.type() != TabStripModelChange::kRemoved) {
 +    return;
-+  }
+   }
 +  const TabStripModelChange::Remove* remove = change.GetRemove();
 +  CHECK(remove);
 +  for (const TabStripModelChange::RemovedTab& removed : remove->contents) {
@@ -3024,20 +3381,20 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +                                    weak_factory_.GetWeakPtr(), token));
 +      break;
 +    }
-   }
- }
- 
++  }
++}
++
 +void HeliumSpaceService::OnTabStripModelDestroyed(
 +    TabStripModel* tab_strip_model) {
 +  observed_tab_strip_models_.erase(tab_strip_model);
-+}
-+
+ }
+ 
  }  // namespace helium
 Index: src/chrome/browser/ui/helium/helium_space_service.h
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/helium_space_service.h
 +++ src/chrome/browser/ui/helium/helium_space_service.h
-@@ -5,47 +5,183 @@
+@@ -5,47 +5,203 @@
  #ifndef CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_SERVICE_H_
  #define CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_SERVICE_H_
  
@@ -3102,7 +3459,9 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +  int use_count = 0;
 +  int64_t last_used_internal_value = 0;
 +};
-+
+ 
+-// Profile-scoped owner of ordered Helium Spaces. Profile identity stays an
+-// implementation detail; Spaces are the user-facing browsing contexts.
 +// Import-neutral snapshot accepted by optional adapters. The caller owns
 +// provenance IDs; the Pins service owns durable replacement and migration.
 +struct ImportedPersistentSpace {
@@ -3110,9 +3469,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +  std::u16string name;
 +  PersistentNodes pins;
 +};
- 
--// Profile-scoped owner of ordered Helium Spaces. Profile identity stays an
--// implementation detail; Spaces are the user-facing browsing contexts.
++
 +// Profile-scoped owner of the durable sidebar model and every optional live
 +// tab association. The model never owns a TabInterface or WebContents.
  class HeliumSpaceService : public KeyedService,
@@ -3205,6 +3562,26 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +                      std::string_view id,
 +                      std::string_view parent_id,
 +                      std::string_view before_id);
++  // Converts one ordinary standalone tab into a live Pin in the browser's
++  // explicitly qualified Space. The durable tree is validated and persisted
++  // once at the requested parent/before position. Returns the new Pin ID.
++  std::optional<std::string> ConvertTabToPinInSpace(
++      Browser* browser,
++      std::string_view source_space_id,
++      tabs::TabInterface* tab,
++      std::string_view parent_id,
++      std::string_view before_id);
++  // Converts one Pin link into an ordinary tab in the same qualified Space.
++  // A nullopt before_tab appends; otherwise the handle must still name an
++  // ordinary standalone tab in this browser. Live Pins retain their durable
++  // record and association until native placement succeeds, and failed moves
++  // restore their Pin collection position. A Pin that synchronously leaves its
++  // owning browser is dematerialized back to its durable record. Folders are
++  // never converted.
++  bool ConvertPinToTabInSpace(Browser* browser,
++                              std::string_view source_space_id,
++                              std::string_view id,
++                              std::optional<tabs::TabHandle> before_tab);
 +  bool MovePin(Browser* browser,
 +               std::string_view id,
 +               std::string_view parent_id,
@@ -3227,7 +3604,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
    void SetSpaceForBrowser(Browser* browser, std::string_view id);
    bool RestoreSpaceForBrowserFromSession(
        Browser* browser,
-@@ -57,20 +193,88 @@ class HeliumSpaceService : public KeyedS
+@@ -57,20 +213,88 @@ class HeliumSpaceService : public KeyedS
  
    std::vector<HeliumSpace*> GetSpaces();
  
@@ -5286,7 +5663,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
-@@ -0,0 +1,2053 @@
+@@ -0,0 +1,2209 @@
 +// Copyright 2025 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -5317,6 +5694,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +#include "chrome/browser/ui/layout_constants.h"
 +#include "chrome/browser/ui/tabs/tab_strip_model.h"
 +#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/views/frame/base_tab_strip_region_view.h"
 +#include "chrome/browser/ui/views/frame/browser_view.h"
 +#include "chrome/browser/ui/views/tabs/common/dragged_tabs_container.h"
 +#include "chrome/browser/ui/views/tabs/common/persistent_tab_view.h"
@@ -6660,6 +7038,8 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +        browser ? std::string(space_service_->GetSpaceIdForBrowser(browser))
 +                : std::string();
 +    sidebar_drag_over_pins_ = false;
++    sidebar_drag_over_tabs_ = false;
++    sidebar_tab_drop_before_.reset();
 +    sidebar_drop_target_.reset();
 +    sidebar_preview_placement_.reset();
 +
@@ -6726,17 +7106,69 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +        browser && browser == sidebar_drag_browser_ &&
 +        space_service_->GetSpaceIdForBrowser(browser) == sidebar_drag_space_id_;
 +    if (!context_matches || !sidebar_drag_transaction_ ||
-+        !sidebar_drag_transaction_->is_active() || !tab_strip ||
-+        !tab_strip->IsPointInPinsRegion(point_in_screen)) {
-+      // TODO(arcium): Hand native detach and tab conversion to the unified
-+      // sidebar controller once that explicit transaction boundary exists.
++        !sidebar_drag_transaction_->is_active() || !tab_strip) {
 +      sidebar_drag_over_pins_ = false;
++      sidebar_drag_over_tabs_ = false;
++      sidebar_tab_drop_before_.reset();
 +      sidebar_drop_target_.reset();
 +      sidebar_preview_placement_.reset();
++      if (tab_strip) {
++        tab_strip->GetUnpinnedTabsContainer()
++            ->ClearPersistentTabDragPreview();
++      }
 +      ClearPersistentTabDragPreview();
 +      RestoreSidebarProjectionOrder();
 +      return;
 +    }
++
++    UnpinnedTabContainerView* ordinary =
++        tab_strip->GetUnpinnedTabsContainer();
++    if (!tab_strip->IsPointInPinsRegion(point_in_screen)) {
++      const bool is_folder = row_is_folders_.contains(&row) &&
++                             row_is_folders_.at(&row);
++      BaseTabStripRegionView* region =
++          views::AsViewClass<BaseTabStripRegionView>(tab_strip->parent());
++      if (is_folder || !ordinary || !region ||
++          !region->IsPointInOrdinaryTabDropRegion(point_in_screen)) {
++        sidebar_drag_over_pins_ = false;
++        sidebar_drag_over_tabs_ = false;
++        sidebar_tab_drop_before_.reset();
++        sidebar_drop_target_.reset();
++        sidebar_preview_placement_.reset();
++        if (ordinary) {
++          ordinary->ClearPersistentTabDragPreview();
++        }
++        ClearPersistentTabDragPreview();
++        RestoreSidebarProjectionOrder();
++        return;
++      }
++
++      tabs::TabInterface* before_tab =
++          ordinary->GetTabBeforePersistentDrop(point_in_screen);
++      sidebar_tab_drop_before_ =
++          before_tab ? std::optional(before_tab->GetHandle()) : std::nullopt;
++      helium::SidebarItemPlacement placement{
++          .section = helium::SidebarSection::kTabs,
++          .before_id = before_tab
++                           ? base::NumberToString(
++                                 before_tab->GetHandle().raw_value())
++                           : std::string(),
++      };
++      sidebar_drag_transaction_->UpdatePreview(
++          {.context = GetSidebarDragContext(browser), .placement = placement});
++      sidebar_drag_over_pins_ = false;
++      sidebar_drag_over_tabs_ = true;
++      sidebar_drop_target_.reset();
++      sidebar_preview_placement_ = placement;
++      ClearPersistentTabDragPreview();
++      RestoreSidebarProjectionOrder();
++      ordinary->UpdatePersistentTabDragPreview(point_in_screen);
++      return;
++    }
++
++    ordinary->ClearPersistentTabDragPreview();
++    sidebar_drag_over_tabs_ = false;
++    sidebar_tab_drop_before_.reset();
 +
 +    std::optional<helium::SidebarPinDropTarget> target =
 +        GetSidebarPinDropTarget(point_in_screen);
@@ -6748,6 +7180,8 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +        (move.result != helium::SidebarPinMoveIntent::Result::kMove &&
 +         move.result != helium::SidebarPinMoveIntent::Result::kNoOp)) {
 +      sidebar_drag_over_pins_ = false;
++      sidebar_drag_over_tabs_ = false;
++      sidebar_tab_drop_before_.reset();
 +      sidebar_drop_target_.reset();
 +      sidebar_preview_placement_.reset();
 +      ClearPersistentTabDragPreview();
@@ -6768,6 +7202,8 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +    }
 +    if (!placement) {
 +      sidebar_drag_over_pins_ = false;
++      sidebar_drag_over_tabs_ = false;
++      sidebar_tab_drop_before_.reset();
 +      sidebar_drop_target_.reset();
 +      sidebar_preview_placement_.reset();
 +      ClearPersistentTabDragPreview();
@@ -6820,33 +7256,56 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +    std::unique_ptr<helium::SidebarDragTransaction> transaction =
 +        std::move(sidebar_drag_transaction_);
 +    std::optional<helium::SidebarDragCommand> command;
++    const std::optional<tabs::TabHandle> tab_drop_before =
++        sidebar_tab_drop_before_;
 +
-+    if (transaction && transaction->is_active() && sidebar_drag_over_pins_ &&
-+        sidebar_drop_target_ && sidebar_preview_placement_ && browser &&
++    if (transaction && transaction->is_active() &&
++        (sidebar_drag_over_pins_ || sidebar_drag_over_tabs_) &&
++        sidebar_preview_placement_ && browser &&
 +        browser == sidebar_drag_browser_ &&
 +        space_service_->GetSpaceIdForBrowser(browser) ==
 +            sidebar_drag_space_id_) {
 +      std::unique_ptr<helium::HeliumSidebarPinProjection> fresh_projection =
 +          BuildSidebarProjection(browser);
 +      if (fresh_projection) {
-+        const helium::SidebarPinMoveIntent fresh_move =
-+            helium::ResolveSidebarPinDrop(*fresh_projection,
-+                                          {.space_id = sidebar_drag_space_id_,
-+                                           .item_id = persistent_drag_id_},
-+                                          sidebar_drop_target_);
 +        std::optional<helium::SidebarItemPlacement> fresh_target;
-+        if (fresh_move.result == helium::SidebarPinMoveIntent::Result::kMove) {
-+          fresh_target = helium::SidebarItemPlacement{
-+              .section = helium::SidebarSection::kPins,
-+              .parent_id = fresh_move.parent ? fresh_move.parent->item_id
-+                                             : std::string(),
-+              .before_id = fresh_move.before ? fresh_move.before->item_id
-+                                             : std::string(),
-+          };
-+        } else if (fresh_move.result ==
-+                   helium::SidebarPinMoveIntent::Result::kNoOp) {
-+          fresh_target =
-+              GetSidebarItemPlacement(*fresh_projection, persistent_drag_id_);
++        if (sidebar_drag_over_pins_ && sidebar_drop_target_) {
++          const helium::SidebarPinMoveIntent fresh_move =
++              helium::ResolveSidebarPinDrop(
++                  *fresh_projection,
++                  {.space_id = sidebar_drag_space_id_,
++                   .item_id = persistent_drag_id_},
++                  sidebar_drop_target_);
++          if (fresh_move.result ==
++              helium::SidebarPinMoveIntent::Result::kMove) {
++            fresh_target = helium::SidebarItemPlacement{
++                .section = helium::SidebarSection::kPins,
++                .parent_id = fresh_move.parent ? fresh_move.parent->item_id
++                                               : std::string(),
++                .before_id = fresh_move.before ? fresh_move.before->item_id
++                                               : std::string(),
++            };
++          } else if (fresh_move.result ==
++                     helium::SidebarPinMoveIntent::Result::kNoOp) {
++            fresh_target = GetSidebarItemPlacement(
++                *fresh_projection, persistent_drag_id_);
++          }
++        } else if (sidebar_drag_over_tabs_) {
++          tabs::TabInterface* before_tab =
++              tab_drop_before ? tab_drop_before->Get() : nullptr;
++          BrowserWindowInterface* before_window =
++              before_tab ? before_tab->GetBrowserWindowInterface() : nullptr;
++          if (!tab_drop_before ||
++              (before_tab && before_window &&
++               before_window->GetBrowserForMigrationOnly() == browser)) {
++            fresh_target = helium::SidebarItemPlacement{
++                .section = helium::SidebarSection::kTabs,
++                .before_id = before_tab
++                                 ? base::NumberToString(
++                                       before_tab->GetHandle().raw_value())
++                                 : std::string(),
++            };
++          }
 +        }
 +        std::optional<helium::SidebarItemPlacement> fresh_source =
 +            GetSidebarItemPlacement(*fresh_projection, persistent_drag_id_);
@@ -6860,10 +7319,17 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +            .target_context = context,
 +            .target_section_accepts_source =
 +                fresh_target.has_value() &&
-+                fresh_target == sidebar_preview_placement_,
++                fresh_target == sidebar_preview_placement_ &&
++                (sidebar_drag_over_pins_ ||
++                 (fresh_source_row &&
++                  fresh_source_row->kind ==
++                      helium::SidebarPinRowKind::kPin)),
 +            .target_parent_accepts_source = fresh_target.has_value(),
 +            .target_parent_exists = fresh_target.has_value(),
-+            .before_id_is_direct_child = fresh_target.has_value(),
++            .before_id_is_direct_child =
++                fresh_target.has_value() &&
++                (fresh_target->before_id.empty() ||
++                 sidebar_drag_over_pins_ || tab_drop_before.has_value()),
 +            .target_parent_is_source_or_descendant = false,
 +        };
 +        if (fresh_source && fresh_source_row) {
@@ -6894,9 +7360,13 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +    sidebar_drag_browser_ = nullptr;
 +    sidebar_drag_space_id_.clear();
 +    sidebar_drag_over_pins_ = false;
++    sidebar_drag_over_tabs_ = false;
++    sidebar_tab_drop_before_.reset();
 +    sidebar_drop_target_.reset();
 +    sidebar_preview_placement_.reset();
 +    if (TabStripView* current_tab_strip = GetTabStripView(this)) {
++      current_tab_strip->GetUnpinnedTabsContainer()
++          ->ClearPersistentTabDragPreview();
 +      current_tab_strip->ClearMainTabsDropPreview();
 +    }
 +    ClearPersistentTabDragPreview();
@@ -6906,6 +7376,12 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +      if (!space_service_->MovePinInSpace(
 +              browser, source_space_id, id, command->target.placement.parent_id,
 +              command->target.placement.before_id)) {
++        RestoreSidebarProjectionOrder();
++      }
++    } else if (command &&
++               command->action == helium::SidebarDragAction::kUnpin) {
++      if (!space_service_->ConvertPinToTabInSpace(
++              browser, source_space_id, id, tab_drop_before)) {
 +        RestoreSidebarProjectionOrder();
 +      }
 +    } else {
@@ -6957,10 +7433,14 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +    sidebar_drag_browser_ = nullptr;
 +    sidebar_drag_space_id_.clear();
 +    sidebar_drag_over_pins_ = false;
++    sidebar_drag_over_tabs_ = false;
++    sidebar_tab_drop_before_.reset();
 +    persistent_drag_view_ = nullptr;
 +    persistent_drag_id_.clear();
 +    persistent_drag_location_ = {};
 +    if (TabStripView* tab_strip = GetTabStripView(this)) {
++      tab_strip->GetUnpinnedTabsContainer()
++          ->ClearPersistentTabDragPreview();
 +      tab_strip->ClearMainTabsDropPreview();
 +    }
 +    ClearPersistentTabDragPreview();
@@ -6999,6 +7479,21 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +
 +PersistentTabDropLocation PinTabContainerView::GetPersistentDropLocationForDrag(
 +    const gfx::Point& point_in_screen) const {
++  if (UseSidebarProjection() && sidebar_projection_) {
++    const std::optional<helium::SidebarPinPlacement> placement =
++        helium::ResolveSidebarPinInsertion(
++            *sidebar_projection_, GetSidebarPinDropTarget(point_in_screen));
++    if (!placement) {
++      return {.target = PersistentTabDropTarget::kTab};
++    }
++    return {
++        .target = PersistentTabDropTarget::kPin,
++        .parent_id =
++            placement->parent ? placement->parent->item_id : std::string(),
++        .before_id =
++            placement->before ? placement->before->item_id : std::string(),
++    };
++  }
 +  std::string source_id;
 +  for (const views::View* child : children()) {
 +    if (GetDragHandler().IsViewDragging(*child)) {
@@ -7012,6 +7507,42 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +void PinTabContainerView::UpdatePersistentTabDragPreview(
 +    const gfx::Point& point_in_screen) {
 +  if (UseSidebarProjection()) {
++    const PersistentTabDropLocation location =
++        GetPersistentDropLocationForDrag(point_in_screen);
++    if (location.target != PersistentTabDropTarget::kPin) {
++      ClearPersistentTabDragPreview();
++      return;
++    }
++    UpdatePersistentFolderDropHighlight(location);
++    size_t insertion_index = children().size();
++    if (!location.before_id.empty()) {
++      for (size_t index = 0; index < children().size(); ++index) {
++        const auto id = row_ids_.find(children()[index]);
++        if (id != row_ids_.end() && id->second == location.before_id) {
++          insertion_index = index;
++          break;
++        }
++      }
++    } else if (!location.parent_id.empty()) {
++      for (size_t index = 0; index < children().size(); ++index) {
++        const auto id = row_ids_.find(children()[index]);
++        if (id == row_ids_.end() || id->second != location.parent_id) {
++          continue;
++        }
++        const int parent_depth = row_depths_.at(children()[index]);
++        insertion_index = index + 1;
++        while (insertion_index < children().size() &&
++               row_depths_.contains(children()[insertion_index]) &&
++               row_depths_.at(children()[insertion_index]) > parent_depth) {
++          ++insertion_index;
++        }
++        break;
++      }
++    }
++    if (external_drop_index_ != insertion_index) {
++      external_drop_index_ = insertion_index;
++      InvalidateLayout();
++    }
 +    return;
 +  }
 +  if (!IsHandlingDrag() && !persistent_drag_view_) {
@@ -7167,9 +7698,11 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +}
 +
 +void PinTabContainerView::OnTabDragPresentationEnded() {
-+  ClearPersistentTabDragPreview();
 +  if (TabStripView* tab_strip = GetTabStripView(this)) {
-+    tab_strip->ClearMainTabsDropPreview();
++    if (auto* region =
++            views::AsViewClass<BaseTabStripRegionView>(tab_strip->parent())) {
++      region->ClearTabDragBoundaryPresentation();
++    }
 +  }
 +  ScheduleReconcilePersistentRows();
 +}
@@ -7344,7 +7877,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,243 @@
 +// Copyright 2025 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -7372,6 +7905,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +#include "chrome/browser/ui/views/tabs/common/persistent_tab_view.h"
 +#include "chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h"
 +#include "chrome/browser/ui/views/tabs/common/tab_drag_handler.h"
++#include "components/tabs/public/tab_interface.h"
 +#include "ui/base/metadata/metadata_header_macros.h"
 +#include "ui/views/layout/delegating_layout_manager.h"
 +#include "ui/views/view.h"
@@ -7571,6 +8105,8 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +  raw_ptr<Browser> sidebar_drag_browser_ = nullptr;
 +  std::string sidebar_drag_space_id_;
 +  bool sidebar_drag_over_pins_ = false;
++  bool sidebar_drag_over_tabs_ = false;
++  std::optional<tabs::TabHandle> sidebar_tab_drop_before_;
 +  // Drag transactions receive only the monotonic generation. The pointer
 +  // value is retained locally to detect a controller replacement between
 +  // reconciliations and is revalidated explicitly before commit.
@@ -7659,25 +8195,17 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
 +++ src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
-@@ -12,13 +12,17 @@
+@@ -12,7 +12,9 @@
  #include "base/functional/bind.h"
  #include "base/notreached.h"
  #include "base/types/to_address.h"
-+#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 +#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
  #include "chrome/browser/ui/tabs/tab_group_model.h"
 +#include "chrome/browser/ui/tabs/tab_strip_model.h"
  #include "chrome/browser/ui/ui_features.h"
  #include "chrome/browser/ui/views/frame/browser_view.h"
  #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
- #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
- #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
- #include "chrome/browser/ui/views/tabs/common/tab_link_drop_handler.h"
-+#include "chrome/browser/ui/views/tabs/common/persistent_tab_drag_bridge.h"
- #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
- #include "chrome/browser/ui/views/tabs/common/tab_strip_view.h"
- #include "chrome/browser/ui/views/tabs/dragging/drag_session_data.h"
-@@ -26,11 +30,13 @@
+@@ -26,11 +28,13 @@
  #include "chrome/browser/ui/views/tabs/shared/tab_strip_types.h"
  #include "chrome/browser/ui/views/tabs/tab_slot_view.h"
  #include "components/tab_groups/tab_group_id.h"
@@ -7691,76 +8219,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
  #include "content/public/browser/web_contents.h"
  #include "ui/base/class_property.h"
  #include "ui/base/clipboard/clipboard_constants.h"
-@@ -49,10 +55,68 @@ DEFINE_UI_CLASS_PROPERTY_TYPE(gfx::Vecto
- 
- namespace {
- 
-+TabDragController* g_active_persistent_tab_drag_controller = nullptr;
-+
- // Stores the offset of the view's initial position to the target position
- // it should be, relative to the source dragged view's origin.
- DEFINE_OWNED_UI_CLASS_PROPERTY_KEY(gfx::Vector2d, kOffsetAtTabDragStart)
- 
-+enum class PersistentDropAction {
-+  kMakePin,
-+  kMakeFavorite,
-+  kReorderPin,
-+  kRemove
-+};
-+
-+struct PendingPersistentDrop {
-+  PersistentDropAction action;
-+  base::WeakPtr<content::WebContents> contents;
-+  std::string parent_id;
-+  std::string before_id;
-+  int tab_index = -1;
-+};
-+
-+void CommitPersistentDrops(std::vector<PendingPersistentDrop> drops) {
-+  for (const PendingPersistentDrop& drop : drops) {
-+    tabs::TabInterface* tab =
-+        drop.contents
-+            ? tabs::TabInterface::MaybeGetFromContents(drop.contents.get())
-+            : nullptr;
-+    if (!tab) {
-+      continue;
-+    }
-+    switch (drop.action) {
-+      case PersistentDropAction::kMakePin:
-+        if (helium::MakePin(tab)) {
-+          helium::MovePin(tab, drop.parent_id, drop.before_id);
-+        }
-+        break;
-+      case PersistentDropAction::kMakeFavorite:
-+        helium::MakeFavorite(tab);
-+        break;
-+      case PersistentDropAction::kReorderPin:
-+        helium::MovePin(tab, drop.parent_id, drop.before_id);
-+        break;
-+      case PersistentDropAction::kRemove: {
-+        BrowserWindowInterface* window = tab->GetBrowserWindowInterface();
-+        TabStripModel* model = window ? window->GetTabStripModel() : nullptr;
-+        helium::RemoveAnchoredPinnedTab(tab);
-+        if (model && drop.tab_index >= 0) {
-+          const int current_index = model->GetIndexOfTab(tab);
-+          if (current_index != TabStripModel::kNoTab && model->count() > 0) {
-+            const int target_index =
-+                std::clamp(drop.tab_index, model->IndexOfFirstUnpinnedTab(),
-+                           model->count() - 1);
-+            model->MoveWebContentsAt(current_index, target_index,
-+                                     /*select_after_move=*/false);
-+          }
-+        }
-+        break;
-+      }
-+    }
-+  }
-+}
-+
- // This is a shim around `TabCollectionNode` to make it compatible with the
- // tab dragging logic in `TabDragController`. Longer term, core tab dragging
- // logic will be updated to remove the `TabSlotView` dependency, which
-@@ -124,9 +188,16 @@ gfx::Range GetContainerRange(const TabCo
+@@ -124,9 +128,16 @@ gfx::Range GetContainerRange(const TabCo
        return TabGroupDataFromNode(container_node).ListTabs();
      case TabCollectionNode::Type::PINNED:
        return gfx::Range(0, tab_strip_model.IndexOfFirstNonPinnedTab());
@@ -7778,87 +8237,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
      default:
        NOTREACHED();
    }
-@@ -169,6 +240,79 @@ int GetInsertionIndexForNode(const TabCo
- 
- }  // namespace
- 
-+ScopedPersistentTabDragController::ScopedPersistentTabDragController(
-+    TabDragController* controller)
-+    : previous_(g_active_persistent_tab_drag_controller) {
-+  g_active_persistent_tab_drag_controller = controller;
-+}
-+
-+ScopedPersistentTabDragController::~ScopedPersistentTabDragController() {
-+  g_active_persistent_tab_drag_controller = previous_;
-+}
-+
-+TabDragController* GetActivePersistentTabDragController() {
-+  return g_active_persistent_tab_drag_controller;
-+}
-+
-+bool IsDraggingPersistentPinTabs(const TabDragController& drag_controller) {
-+  const auto& drag_data = drag_controller.GetSessionData().tab_drag_data_;
-+  return std::any_of(
-+      drag_data.cbegin(), drag_data.cend(), [](const auto& data) {
-+        if (!data.contents) {
-+          return false;
-+        }
-+        const tabs::TabInterface* tab =
-+            tabs::TabInterface::GetFromContents(data.contents);
-+        return helium::IsPersistentItemTab(tab) && !tab->IsPinned();
-+      });
-+}
-+
-+void ConfigurePersistentTabDrop(TabDragController& drag_controller,
-+                                const PersistentTabDropLocation& location) {
-+  const auto& drag_data = drag_controller.GetSessionData().tab_drag_data_;
-+  // Persistent conversion has one durable identity and one tree destination.
-+  // Reject multi-selection until the service exposes an atomic batch move;
-+  // applying item-by-item can partially convert the selection or reverse it.
-+  if (drag_data.size() != 1u) {
-+    drag_controller.SetDeferredSuccessfulDropCallback(base::OnceClosure());
-+    return;
-+  }
-+
-+  std::vector<PendingPersistentDrop> drops;
-+  for (const TabDragData& data : drag_data) {
-+    if (!data.contents) {
-+      continue;
-+    }
-+    tabs::TabInterface* tab =
-+        tabs::TabInterface::GetFromContents(data.contents);
-+    const bool persistent = helium::IsPersistentItemTab(tab);
-+    if (location.target == PersistentTabDropTarget::kPin && !persistent) {
-+      drops.push_back({PersistentDropAction::kMakePin,
-+                       data.contents->GetWeakPtr(), location.parent_id,
-+                       location.before_id});
-+    } else if (location.target == PersistentTabDropTarget::kPin && persistent &&
-+               !tab->IsPinned()) {
-+      drops.push_back({PersistentDropAction::kReorderPin,
-+                       data.contents->GetWeakPtr(), location.parent_id,
-+                       location.before_id});
-+    } else if (location.target == PersistentTabDropTarget::kFavorite &&
-+               !persistent) {
-+      drops.push_back(
-+          {PersistentDropAction::kMakeFavorite, data.contents->GetWeakPtr()});
-+    } else if (location.target == PersistentTabDropTarget::kTab && persistent) {
-+      drops.push_back({PersistentDropAction::kRemove,
-+                       data.contents->GetWeakPtr(),
-+                       {},
-+                       {},
-+                       location.tab_index});
-+    }
-+  }
-+
-+  drag_controller.SetDeferredSuccessfulDropCallback(
-+      drops.empty() ? base::OnceClosure()
-+                    : base::BindOnce(&CommitPersistentDrops, std::move(drops)));
-+}
-+
- TabDragHandlerImpl::TabDragHandlerImpl(
-     TabStripModel& tab_strip_model,
-     TabCollectionNode& root_node,
-@@ -209,6 +353,17 @@ void TabDragHandlerImpl::InitializeDrag(
+@@ -209,6 +220,17 @@ void TabDragHandlerImpl::InitializeDrag(
                               EventSourceFromEvent(event)) ==
        TabDragController::Liveness::kDeleted) {
      ResetDragState();
@@ -7876,15 +8255,15 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
    }
  }
  
-@@ -326,6 +481,7 @@ bool TabDragHandlerImpl::ContinueDrag(vi
+@@ -326,7 +348,6 @@ bool TabDragHandlerImpl::ContinueDrag(vi
    }
    gfx::Point screen_location(event.location());
    ConvertPointToScreen(&event_source_view, &screen_location);
-+  tab_strip_region_view_->UpdateTabDragPoint(screen_location);
- 
+-
    // Dragging may start a blocking loop, which may allow this to be destroyed.
    auto ref = weak_factory_.GetWeakPtr();
-@@ -363,6 +519,36 @@ void TabDragHandlerImpl::EndDrag(EndDrag
+   auto liveness = drag_controller_->Drag(screen_location);
+@@ -363,6 +384,36 @@ void TabDragHandlerImpl::EndDrag(EndDrag
  void TabDragHandlerImpl::HandleDraggedTabsIntoNode(
      const TabCollectionNode& node) {
    CHECK(drag_controller_);
@@ -7921,27 +8300,17 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
    const auto& drag_session_data = drag_controller_->GetSessionData();
  
    const TabDragData* source_drag_data =
-@@ -453,6 +639,29 @@ bool TabDragHandlerImpl::IsDraggingPinne
+@@ -453,6 +504,19 @@ bool TabDragHandlerImpl::IsDraggingPinne
                       [](const auto& tab_data) { return tab_data.pinned; });
  }
  
 +bool TabDragHandlerImpl::IsDraggingPersistentPinTabs() const {
-+  const TabDragController* controller =
-+      drag_controller_ ? drag_controller_.get()
-+                       : GetActivePersistentTabDragController();
-+  return controller && ::IsDraggingPersistentPinTabs(*controller);
++  return drag_controller_ && drag_controller_->IsDraggingPersistentPinTabs();
 +}
 +
 +void TabDragHandlerImpl::SetPersistentTabDropTarget(
 +    PersistentTabDropLocation location) {
 +  persistent_tab_drop_location_ = location;
-+  TabDragController* controller =
-+      drag_controller_ ? drag_controller_.get()
-+                       : GetActivePersistentTabDragController();
-+  if (!controller) {
-+    return;
-+  }
-+  ConfigurePersistentTabDrop(*controller, location);
 +}
 +
 +PersistentTabDropTarget TabDragHandlerImpl::GetPersistentTabDropTarget() const {
@@ -7951,7 +8320,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
  bool TabDragHandlerImpl::IsDraggingGroups() const {
    if (!drag_controller_) {
      return false;
-@@ -663,7 +872,17 @@ content::WebContents* TabDragHandlerImpl
+@@ -663,7 +727,17 @@ content::WebContents* TabDragHandlerImpl
  }
  
  bool TabDragHandlerImpl::IsTabDetachable(const TabSlotView* view) const {
@@ -7970,7 +8339,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
  }
  
  TabSlotView* TabDragHandlerImpl::GetTabGroupHeader(
-@@ -906,8 +1125,21 @@ void TabDragHandlerImpl::OnNodeWillDestr
+@@ -906,8 +980,21 @@ void TabDragHandlerImpl::OnNodeWillDestr
  }
  
  void TabDragHandlerImpl::ResetDragState() {
@@ -7992,7 +8361,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
  }
  
  bool TabDragHandlerImpl::HandleDraggedTabsIntoPosition(
-@@ -915,6 +1147,75 @@ bool TabDragHandlerImpl::HandleDraggedTa
+@@ -915,6 +1002,75 @@ bool TabDragHandlerImpl::HandleDraggedTa
      const TabCollectionNode* target) {
    CHECK(drag_controller_);
  
@@ -9895,7 +10264,18 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
 +++ src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
-@@ -15,6 +15,7 @@
+@@ -7,14 +7,18 @@
+ #include "base/callback_list.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/metrics/user_metrics.h"
++#include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_actions.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
  #include "chrome/browser/ui/tabs/hover_tab_selector.h"
  #include "chrome/browser/ui/tabs/tab_group_model.h"
  #include "chrome/browser/ui/views/frame/browser_view.h"
@@ -9903,7 +10283,7 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
  #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
  #include "chrome/browser/ui/views/tabs/common/root_tab_collection_node.h"
  #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
-@@ -150,6 +151,10 @@ PinnedTabContainerView* BaseTabStripRegi
+@@ -150,6 +154,10 @@ PinnedTabContainerView* BaseTabStripRegi
    return tab_strip_view_ ? tab_strip_view_->GetPinnedTabsContainer() : nullptr;
  }
  
@@ -9914,7 +10294,7 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
  UnpinnedTabContainerView* BaseTabStripRegionView::GetUnpinnedTabsContainer() {
    return tab_strip_view_ ? tab_strip_view_->GetUnpinnedTabsContainer()
                           : nullptr;
-@@ -394,6 +399,9 @@ void BaseTabStripRegionView::HandleDragU
+@@ -394,6 +402,9 @@ void BaseTabStripRegionView::HandleDragU
  
  void BaseTabStripRegionView::HandleDragExited() {
    SetLinkDropArrow(std::nullopt);
@@ -9924,15 +10304,13 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
  }
  
  void BaseTabStripRegionView::DisableTabStripEditingForTesting() {
-@@ -416,15 +424,76 @@ TabDragTarget* BaseTabStripRegionView::G
+@@ -416,15 +427,118 @@ TabDragTarget* BaseTabStripRegionView::G
      return nullptr;
    }
  
 -  // Note: if the drag has not attached to this tab strip yet, it doesn't matter
 -  // which container is used because the first drag loop iteration just attaches
 -  // it.
-+  UpdateTabDragPoint(point_in_screen);
-+
    if (drag_handler_->IsDraggingPinnedTabs()) {
      return &GetPinnedTabsContainer()->GetTabDragTarget(point_in_screen);
    }
@@ -9951,9 +10329,22 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
  }
  
 +void BaseTabStripRegionView::UpdateTabDragPoint(
++    TabDragController& drag_controller,
 +    const gfx::Point& point_in_screen) {
-+  if (!drag_handler_ ||
++  PinTabContainerView* pins_container = GetPinsContainer();
++  auto clear_native_pin_intent = [&] {
++    drag_controller.ClearNativeTabPinDropIntent();
++    ClearTabDragBoundaryPresentation();
++  };
++
++  if (!drag_handler_ || !pins_container || !tab_strip_view_ ||
 +      !GetTabStripDraggableBounds().Contains(point_in_screen)) {
++    clear_native_pin_intent();
++    return;
++  }
++
++  if (!drag_controller.HasEligibleNativeTabPinDragSession()) {
++    clear_native_pin_intent();
 +    return;
 +  }
 +
@@ -9966,39 +10357,70 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
 +  if (tab_strip_view_) {
 +    tab_strip_view_->SetMainTabsDropPreview();
 +  }
-+  PersistentTabDropLocation drop_location;
-+  PinTabContainerView* pins_container = GetPinsContainer();
-+  if (!pins_container) {
-+    return;
-+  }
 +  if (GetPinnedTabsContainer()->GetBoundsInScreen().Contains(point_in_screen)) {
-+    if (pins_container) {
-+      pins_container->ClearPersistentTabDragPreview();
-+      GetUnpinnedTabsContainer()->ClearPersistentTabDragPreview();
-+    }
-+    drop_location.target = PersistentTabDropTarget::kFavorite;
++    clear_native_pin_intent();
 +  } else if (tab_strip_view_->IsPointInPinsRegion(point_in_screen)) {
 +    GetUnpinnedTabsContainer()->ClearPersistentTabDragPreview();
-+    drop_location.target = PersistentTabDropTarget::kPin;
-+    drop_location =
++    PersistentTabDropLocation drop_location =
 +        pins_container->GetPersistentDropLocationForDrag(point_in_screen);
++    if (drop_location.target != PersistentTabDropTarget::kPin) {
++      clear_native_pin_intent();
++      return;
++    }
++    Browser* browser = browser_view_ ? browser_view_->browser() : nullptr;
++    helium::HeliumSpaceService* service =
++        browser ? helium::HeliumSpaceServiceFactory::GetForProfile(
++                      browser->profile())
++                : nullptr;
++    helium::SidebarNativeTabContext target_context{
++        .browser_session_id =
++            browser && browser->session_id().is_valid()
++                ? browser->session_id().id()
++                : 0,
++        .space_id = service
++                        ? std::string(service->GetSpaceIdForBrowser(browser))
++                        : std::string()};
++    drag_controller.UpdateNativeTabPinDropIntent(
++        {.context = std::move(target_context),
++         .placement = {.section = helium::SidebarSection::kPins,
++                       .parent_id = std::move(drop_location.parent_id),
++                       .before_id = std::move(drop_location.before_id)}});
++    if (drag_handler_->GetDragContext()->GetDragController() ==
++        &drag_controller) {
++      drop_location.target = PersistentTabDropTarget::kPin;
++      drag_handler_->SetPersistentTabDropTarget(std::move(drop_location));
++    }
 +    pins_container->UpdatePersistentTabDragPreview(point_in_screen);
 +  } else {
++    drag_controller.ClearNativeTabPinDropIntent();
 +    pins_container->ClearPersistentTabDragPreview();
-+    if (drag_handler_->IsDraggingPersistentPinTabs()) {
-+      GetUnpinnedTabsContainer()->UpdatePersistentTabDragPreview(
-+          point_in_screen);
-+    } else {
-+      GetUnpinnedTabsContainer()->ClearPersistentTabDragPreview();
-+    }
-+    gfx::Point point_in_tabs = views::View::ConvertPointFromScreen(
-+        GetUnpinnedTabsContainer(), point_in_screen);
-+    if (const auto tab_drop =
-+            GetUnpinnedTabsContainer()->GetLinkDropIndex(point_in_tabs)) {
-+      drop_location.tab_index = tab_drop->index;
++    GetUnpinnedTabsContainer()->ClearPersistentTabDragPreview();
++    if (drag_handler_->GetDragContext()->GetDragController() ==
++        &drag_controller) {
++      drag_handler_->SetPersistentTabDropTarget(
++          {.target = PersistentTabDropTarget::kTab});
 +    }
 +  }
-+  drag_handler_->SetPersistentTabDropTarget(drop_location);
++}
++
++bool BaseTabStripRegionView::IsPointInOrdinaryTabDropRegion(
++    const gfx::Point& point_in_screen) const {
++  return tab_strip_view_ &&
++         GetTabStripDraggableBounds().Contains(point_in_screen) &&
++         !tab_strip_view_->IsPointInPinsRegion(point_in_screen);
++}
++
++void BaseTabStripRegionView::ClearTabDragBoundaryPresentation() {
++  if (PinTabContainerView* pins_container = GetPinsContainer()) {
++    pins_container->ClearPersistentTabDragPreview();
++  }
++  if (UnpinnedTabContainerView* tabs_container =
++          GetUnpinnedTabsContainer()) {
++    tabs_container->ClearPersistentTabDragPreview();
++  }
++  if (tab_strip_view_) {
++    tab_strip_view_->ClearMainTabsDropPreview();
++  }
 +}
 +
  void BaseTabStripRegionView::ClearTabStripView(views::View* view) {
@@ -10024,11 +10446,15 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.h
    UnpinnedTabContainerView* GetUnpinnedTabsContainer();
  
    TabStripCollectionController* GetTabStripCollectionController() {
-@@ -48,6 +50,7 @@ class BaseTabStripRegionView : public Ta
+@@ -48,6 +50,11 @@ class BaseTabStripRegionView : public Ta
    }
  
    TabDragTarget* GetTabDragTarget(const gfx::Point& point_in_screen);
-+  void UpdateTabDragPoint(const gfx::Point& point_in_screen) override;
++  void UpdateTabDragPoint(TabDragController& drag_controller,
++                          const gfx::Point& point_in_screen) override;
++  bool IsPointInOrdinaryTabDropRegion(
++      const gfx::Point& point_in_screen) const;
++  void ClearTabDragBoundaryPresentation();
    virtual gfx::Rect GetTabStripDraggableBounds() const = 0;
  
    // TabStripRegionView:
@@ -10133,16 +10559,35 @@ Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
 +++ src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
-@@ -12,6 +12,8 @@
+@@ -4,7 +4,16 @@
+ 
+ #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
+ 
++#include <variant>
++
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/views/frame/base_tab_strip_region_view.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/tabs/common/dragged_tabs_container.h"
+ #include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h"
+@@ -12,7 +21,10 @@
  #include "chrome/browser/ui/views/tabs/common/tab_drag_handler.h"
  #include "chrome/browser/ui/views/tabs/common/tab_group_view.h"
  #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
 +#include "chrome/browser/ui/views/tabs/common/tab_strip_utils.h"
 +#include "chrome/browser/ui/views/tabs/common/tab_strip_view.h"
  #include "chrome/browser/ui/views/tabs/common/tab_view.h"
++#include "components/tabs/public/tab_strip_collection.h"
  #include "ui/base/metadata/metadata_impl_macros.h"
  #include "ui/gfx/geometry/rect.h"
-@@ -105,7 +107,6 @@ views::ProposedLayout UnpinnedTabContain
+ #include "ui/views/controls/scroll_view.h"
+@@ -105,7 +117,6 @@ views::ProposedLayout UnpinnedTabContain
    views::ProposedLayout layouts;
    int width = 0;
    int height = 0;
@@ -10150,7 +10595,7 @@ Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
    auto collapse_state = GetTabStripCollapseState();
  
    // Apply horizontal padding immediately at start of collapse animation by
-@@ -118,7 +119,16 @@ views::ProposedLayout UnpinnedTabContain
+@@ -118,7 +129,16 @@ views::ProposedLayout UnpinnedTabContain
  
    // Layout children in order. Children will have their preferred height and
    // fill available width.
@@ -10168,7 +10613,7 @@ Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
      // The leading inset should not be applied for tab groups when the tab strip
      // is collapsed since the group color line is drawn in that space.
      int x =
-@@ -145,28 +155,58 @@ views::ProposedLayout UnpinnedTabContain
+@@ -145,28 +165,116 @@ views::ProposedLayout UnpinnedTabContain
                         horizontal_padding);
      }
      layouts.child_layouts.emplace_back(child, child->GetVisible(), bounds);
@@ -10188,17 +10633,6 @@ Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
 +    height += GetLayoutConstant(LayoutConstant::kVerticalTabHeight) +
 +              (has_flow_child ? kTabVerticalPadding : 0);
 +  }
-+
-+  layouts.host_size = gfx::Size(width, height);
-+  return layouts;
-+}
-+
-+void UnpinnedTabContainerView::OnTabDragPresentationEnded() {
-+  ClearPersistentTabDragPreview();
-+  if (TabStripView* tab_strip = GetTabStripView(this)) {
-+    tab_strip->ClearMainTabsDropPreview();
-+  }
-+}
  
 -  if (IsHandlingDrag()) {
 -    dragged_view_bottom = GetDraggingViewsBounds().bottom();
@@ -10210,21 +10644,44 @@ Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
 -      // dragged_view_bottom = GetDraggingViewsBounds().bottom();
 -      dragged_view_bottom =
 -          std::min(dragged_view_bottom, size_bounds.height().value());
++  layouts.host_size = gfx::Size(width, height);
++  return layouts;
++}
++
++void UnpinnedTabContainerView::OnTabDragPresentationEnded() {
++  if (TabStripView* tab_strip = GetTabStripView(this)) {
++    if (auto* region =
++            views::AsViewClass<BaseTabStripRegionView>(tab_strip->parent())) {
++      region->ClearTabDragBoundaryPresentation();
+     }
+   }
+-  layouts.host_size = gfx::Size(width, std::max(height, dragged_view_bottom));
+-  return layouts;
++}
++
 +void UnpinnedTabContainerView::UpdatePersistentTabDragPreview(
 +    const gfx::Point& point_in_screen) {
 +  const std::vector<views::View*> children =
 +      collection_node_ ? collection_node_->GetDirectChildren()
 +                       : std::vector<views::View*>();
 +  size_t insertion_index = children.size();
-+  for (size_t index = 0; index < children.size(); ++index) {
-+    if (point_in_screen.y() <
-+        children[index]->GetBoundsInScreen().CenterPoint().y()) {
-+      insertion_index = index;
-+      break;
-     }
-   }
--  layouts.host_size = gfx::Size(width, std::max(height, dragged_view_bottom));
--  return layouts;
++  tabs::TabInterface* before_tab =
++      GetTabBeforePersistentDrop(point_in_screen);
++  if (before_tab) {
++    for (size_t index = 0; index < children.size(); ++index) {
++      TabView* tab_view = views::AsViewClass<TabView>(children[index]);
++      if (!tab_view) {
++        continue;
++      }
++      tabs::ConstChildPtr node_data =
++          tab_view->collection_node()->GetNodeData();
++      const auto* tab = std::get_if<const tabs::TabInterface*>(&node_data);
++      if (tab && *tab == before_tab) {
++        insertion_index = index;
++        break;
++      }
++    }
++  }
 +  if (external_drop_index_ == insertion_index) {
 +    return;
 +  }
@@ -10238,10 +10695,56 @@ Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
 +  }
 +  external_drop_index_.reset();
 +  InvalidateLayout();
++}
++
++tabs::TabInterface* UnpinnedTabContainerView::GetTabBeforePersistentDrop(
++    const gfx::Point& point_in_screen) {
++  BrowserView* browser_view =
++      collection_node_ && collection_node_->GetController()
++          ? collection_node_->GetController()->GetBrowserView()
++          : nullptr;
++  Browser* browser = browser_view ? browser_view->browser() : nullptr;
++  TabStripModel* model = browser ? browser->tab_strip_model() : nullptr;
++  if (!model) {
++    return nullptr;
++  }
++
++  const gfx::Point point_in_container =
++      views::View::ConvertPointFromScreen(this, point_in_screen);
++  const std::optional<BrowserRootView::DropIndex> drop =
++      GetLinkDropIndex(point_in_container);
++  if (!drop || drop->index < model->IndexOfFirstUnpinnedTab()) {
++    return nullptr;
++  }
++  const auto* strip =
++      model->Root()
++          ? static_cast<const tabs::TabStripCollection*>(model->Root())
++          : nullptr;
++  helium::HeliumSpaceService* service =
++      helium::HeliumSpaceServiceFactory::GetForProfile(browser->profile());
++  if (!strip || !service) {
++    return nullptr;
++  }
++  for (int index = drop->index; index < model->count(); ++index) {
++    tabs::TabInterface* candidate = model->GetTabAtIndex(index);
++    BrowserWindowInterface* candidate_window =
++        candidate ? candidate->GetBrowserWindowInterface() : nullptr;
++    if (!candidate || candidate->GetProfile() != browser->profile() ||
++        candidate->IsPinned() || candidate->IsSplit() ||
++        candidate->GetGroup().has_value() ||
++        service->IsPersistentItemTab(candidate) || strip->IsPinTab(candidate) ||
++        !candidate_window ||
++        candidate_window->GetBrowserForMigrationOnly() != browser ||
++        candidate_window->GetTabStripModel() != model) {
++      continue;
++    }
++    return candidate;
++  }
++  return nullptr;
  }
  
  gfx::Size UnpinnedTabContainerView::GetMinimumSize() const {
-@@ -274,8 +314,7 @@ void UnpinnedTabContainerView::ResetColl
+@@ -274,8 +382,7 @@ void UnpinnedTabContainerView::ResetColl
  }
  
  views::ScrollView* UnpinnedTabContainerView::GetScrollViewForContainer() const {
@@ -10255,15 +10758,125 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
 +++ src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
-@@ -23,6 +23,7 @@
+@@ -13,6 +13,7 @@
+ 
+ #include "base/auto_reset.h"
+ #include "base/check.h"
++#include "base/command_line.h"
+ #include "base/containers/adapters.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+@@ -23,13 +24,20 @@
  #include "base/numerics/safe_conversions.h"
  #include "base/run_loop.h"
  #include "base/scoped_observation.h"
 +#include "base/task/sequenced_task_runner.h"
  #include "base/trace_event/trace_event.h"
  #include "build/build_config.h"
++#include "chrome/browser/profiles/profile.h"
  #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
-@@ -458,12 +459,15 @@ TabDragController::Liveness TabDragContr
++#include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_window.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
++#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/browser/ui/sad_tab_helper.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/split_tab_util.h"
+@@ -57,6 +65,7 @@
+ #include "components/tab_groups/tab_group_id.h"
+ #include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "components/tabs/public/tab_strip_collection.h"
+ #include "components/viz/common/frame_sinks/copy_output_result.h"
+ #include "content/public/browser/render_widget_host_view.h"
+ #include "content/public/browser/web_contents.h"
+@@ -147,6 +156,80 @@ constexpr char kTabDraggingPresentationT
+ constexpr char kDragToNewBrowserPresentationTimeHistogram[] =
+     "Browser.TabDragging.DragToNewBrowserPresentationTime";
+ 
++constexpr char kArciumSidebarProjectionSwitch[] =
++    "arcium-sidebar-projection";
++
++bool UseArciumSidebarProjection() {
++  return base::CommandLine::ForCurrentProcess()->HasSwitch(
++      kArciumSidebarProjectionSwitch);
++}
++
++std::optional<helium::SidebarNativeTabContext> GetNativeTabContext(
++    Browser* browser) {
++  if (!browser || !browser->session_id().is_valid()) {
++    return std::nullopt;
++  }
++  helium::HeliumSpaceService* service =
++      helium::HeliumSpaceServiceFactory::GetForProfile(browser->profile());
++  if (!service) {
++    return std::nullopt;
++  }
++  helium::SidebarNativeTabContext context{
++      .browser_session_id = browser->session_id().id(),
++      .space_id = std::string(service->GetSpaceIdForBrowser(browser))};
++  return context.valid() ? std::make_optional(std::move(context))
++                         : std::nullopt;
++}
++
++bool IsEligibleOrdinaryTab(const tabs::TabInterface* tab) {
++  if (!tab || tab->IsPinned() || tab->IsSplit() || tab->GetGroup() ||
++      helium::IsPersistentItemTab(tab) || !tab->GetContents() ||
++      !tab->GetContents()->GetLastCommittedURL().SchemeIsHTTPOrHTTPS()) {
++    return false;
++  }
++  const BrowserWindowInterface* window = tab->GetBrowserWindowInterface();
++  const Profile* profile = tab->GetProfile();
++  const TabStripModel* model = window ? window->GetTabStripModel() : nullptr;
++  const auto* strip =
++      model && model->Root()
++          ? static_cast<const tabs::TabStripCollection*>(model->Root())
++          : nullptr;
++  return window && profile && model && strip && !strip->IsPinTab(tab) &&
++         window->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
++         !profile->IsOffTheRecord() && !profile->IsGuestSession();
++}
++
++void ExecuteNativeTabPinCommand(
++    base::WeakPtr<content::WebContents> contents,
++    helium::SidebarNativeTabPinCommand command) {
++  if (!contents || !command.source_context.valid() ||
++      command.placement.section != helium::SidebarSection::kPins) {
++    return;
++  }
++  BrowserWindowInterface* window = BrowserWindowInterface::FromSessionID(
++      SessionID::FromSerializedValue(
++          command.source_context.browser_session_id));
++  Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
++  tabs::TabInterface* tab =
++      tabs::TabInterface::MaybeGetFromContents(contents.get());
++  if (!browser || !tab || tab->GetBrowserWindowInterface() != window ||
++      !IsEligibleOrdinaryTab(tab) ||
++      browser->tab_strip_model()->GetIndexOfTab(tab) ==
++          TabStripModel::kNoTab) {
++    return;
++  }
++  helium::HeliumSpaceService* service =
++      helium::HeliumSpaceServiceFactory::GetForProfile(browser->profile());
++  if (!service || service->GetSpaceIdForBrowser(browser) !=
++                      command.source_context.space_id) {
++    return;
++  }
++
++  service->ConvertTabToPinInSpace(
++      browser, command.source_context.space_id, tab,
++      command.placement.parent_id, command.placement.before_id);
++}
++
+ #if BUILDFLAG(IS_CHROMEOS)
+ 
+ // Returns the aura::Window which stores the window properties for tab-dragging.
+@@ -458,12 +541,15 @@ TabDragController::Liveness TabDragContr
      ref->detach_behavior_ = DetachBehavior::kNotDetachable;
    }
  #endif  // BUILDFLAG(IS_CHROMEOS)
@@ -10281,19 +10894,157 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
  
    ref->source_context_emptiness_tracker_ =
        std::make_unique<SourceTabStripEmptinessTracker>(
-@@ -817,6 +821,11 @@ void TabDragController::SetDragLoopDoneC
-   drag_loop_done_callback_ = std::move(callback);
+@@ -496,6 +582,8 @@ TabDragController::Liveness TabDragContr
+     }
+   }
+ 
++  ref->InitializeNativeTabPinDragSession();
++
+   ref->drag_data_.source_view_index_ =
+       std::ranges::find(dragging_views, source_view) - dragging_views.begin();
+ 
+@@ -620,6 +708,92 @@ TabDragContext* TabDragController::GetSo
+                                : nullptr;
  }
  
-+void TabDragController::SetDeferredSuccessfulDropCallback(
-+    base::OnceClosure callback) {
-+  deferred_successful_drop_callback_ = std::move(callback);
++bool TabDragController::HasEligibleNativeTabPinDragSession() const {
++  return native_tab_pin_drag_session_ &&
++         native_tab_pin_drag_session_->accepts_intent();
 +}
 +
- std::unique_ptr<tabs::TabModel> TabDragController::DetachTabAtForInsertion(
-     int drag_idx) {
-   CHECK_EQ(current_state_, DragState::kStopped)
-@@ -976,7 +985,7 @@ TabDragController::Liveness TabDragContr
++bool TabDragController::HasNativeTabPinDropIntent() const {
++  return native_tab_pin_drag_session_ &&
++         native_tab_pin_drag_session_->has_intent();
++}
++
++bool TabDragController::IsDraggingPersistentPinTabs() const {
++  return std::ranges::any_of(drag_data_.tab_drag_data_, [](const auto& data) {
++    if (!data.contents) {
++      return false;
++    }
++    const tabs::TabInterface* tab =
++        tabs::TabInterface::MaybeGetFromContents(data.contents);
++    return tab && helium::IsPersistentItemTab(tab) && !tab->IsPinned();
++  });
++}
++
++void TabDragController::UpdateNativeTabPinDropIntent(
++    helium::SidebarNativeTabPinIntent intent) {
++  if (native_tab_pin_drag_session_) {
++    native_tab_pin_drag_session_->UpdatePinIntent(std::move(intent));
++  }
++}
++
++void TabDragController::ClearNativeTabPinDropIntent() {
++  if (native_tab_pin_drag_session_) {
++    native_tab_pin_drag_session_->ClearIntent();
++  }
++}
++
++void TabDragController::InitializeNativeTabPinDragSession() {
++  if (!UseArciumSidebarProjection()) {
++    return;
++  }
++  BrowserView* source_browser_view = GetBrowserViewForContext(source_context_);
++  std::optional<helium::SidebarNativeTabContext> context =
++      GetNativeTabContext(source_browser_view ? source_browser_view->browser()
++                                              : nullptr);
++  if (!context) {
++    return;
++  }
++
++  bool eligible = drag_data_.tab_drag_data_.size() == 1u;
++  if (eligible) {
++    const TabDragData& data = drag_data_.tab_drag_data_.front();
++    tabs::TabInterface* tab =
++        data.contents
++            ? tabs::TabInterface::MaybeGetFromContents(data.contents)
++            : nullptr;
++    eligible = data.view_type == TabSlotView::ViewType::kTab &&
++               IsEligibleOrdinaryTab(tab);
++  }
++  native_tab_pin_drag_session_ =
++      std::make_unique<helium::SidebarNativeTabDragSession>(
++          std::move(*context), eligible);
++}
++
++void TabDragController::InvalidateNativeTabPinDragSession() {
++  if (native_tab_pin_drag_session_) {
++    native_tab_pin_drag_session_->Invalidate();
++  }
++}
++
++std::optional<helium::SidebarNativeTabContext>
++TabDragController::GetNativeTabPinContext(
++    const TabDragContext* context) const {
++  BrowserView* browser_view = GetBrowserViewForContext(context);
++  return GetNativeTabContext(browser_view ? browser_view->browser() : nullptr);
++}
++
++bool TabDragController::IsNativeTabPinSourceStillEligible() const {
++  if (drag_data_.tab_drag_data_.size() != 1u) {
++    return false;
++  }
++  const TabDragData& data = drag_data_.tab_drag_data_.front();
++  tabs::TabInterface* tab =
++      data.contents ? tabs::TabInterface::MaybeGetFromContents(data.contents)
++                    : nullptr;
++  return data.view_type == TabSlotView::ViewType::kTab &&
++         IsEligibleOrdinaryTab(tab);
++}
++
+ void TabDragController::SetGroupHeaderWasCollapsedFromDrag(
+     bool was_collapsed_from_drag) {
+   if (drag_data_.group_header_drag_data_.has_value()) {
+@@ -697,6 +871,15 @@ TabDragController::Liveness TabDragContr
+ 
+   bring_to_front_timer_.Stop();
+ 
++  const auto update_sidebar_intent = [&] {
++    BrowserView* sidebar_browser_view = GetBrowserViewForContext(
++        attached_context_ ? attached_context_.get() : source_context_.get());
++    if (sidebar_browser_view && sidebar_browser_view->tab_strip_view()) {
++      sidebar_browser_view->tab_strip_view()->UpdateTabDragPoint(
++          *this, point_in_screen);
++    }
++  };
++
+   if (current_state_ == DragState::kNotStarted) {
+     if (!CanStartDrag(point_in_screen)) {
+       return Liveness::kAlive;  // User hasn't dragged far enough yet.
+@@ -719,8 +902,11 @@ TabDragController::Liveness TabDragContr
+ 
+     StartDrag();
+ 
++    update_sidebar_intent();
++
+     if (drag_data_.num_dragging_tabs() ==
+-        source_context_->GetTabStripModel()->count()) {
++            source_context_->GetTabStripModel()->count() &&
++        !HasNativeTabPinDropIntent()) {
+       if (ShouldDragWindowUsingSystemDnD()) {
+         return StartSystemDnDSessionIfNecessary(attached_context_,
+                                                 point_in_screen);
+@@ -742,7 +928,9 @@ TabDragController::Liveness TabDragContr
+     }
+ 
+     current_state_ = DragState::kDraggingTabs;
+-      StartDraggingTabsSession(true, point_in_screen);
++    StartDraggingTabsSession(true, point_in_screen);
++  } else {
++    update_sidebar_intent();
+   }
+ 
+   return ContinueDragging(point_in_screen);
+@@ -882,6 +1070,7 @@ void TabDragController::OnWidgetDestroye
+ void TabDragController::OnSourceTabStripEmpty() {
+   // NULL out source_context_ so that we don't attempt to add back to it (in
+   // the case of a revert).
++  InvalidateNativeTabPinDragSession();
+   source_context_ = nullptr;
+ }
+ 
+@@ -976,7 +1165,7 @@ TabDragController::Liveness TabDragContr
    DCHECK(attached_context_);
  
    TabDragContext* target_context = source_context_;
@@ -10302,7 +11053,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
      auto [alive, context, drop_target] = GetDragTargetForPoint(point_in_screen);
      if (alive == Liveness::kDeleted) {
        return Liveness::kDeleted;
-@@ -991,6 +1000,11 @@ TabDragController::Liveness TabDragContr
+@@ -991,6 +1180,11 @@ TabDragController::Liveness TabDragContr
        }
        target_context = delegate_context;
      }
@@ -10314,28 +11065,65 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
    }
  
    if (target_context != attached_context_) {
-@@ -1867,6 +1881,14 @@ void TabDragController::EndDragImpl(EndD
+@@ -1480,6 +1674,8 @@ TabDragController::Detach(ReleaseCapture
+   TRACE_EVENT1("views", "TabDragController::Detach", "release_capture",
+                release_capture);
+ 
++  InvalidateNativeTabPinDragSession();
++
+   attached_context_tabs_closed_tracker_.reset();
+ 
+   // Detaching may trigger the Widget bounds to change. Such bounds changes
+@@ -1867,6 +2063,40 @@ void TabDragController::EndDragImpl(EndD
            << " state=" << static_cast<int>(current_state_);
  
    DragState previous_state = current_state_;
-+  base::OnceClosure deferred_successful_drop_callback;
-+  if (type == EndDragType::kNormal &&
-+      previous_state != DragState::kNotStarted) {
-+    deferred_successful_drop_callback =
-+        std::move(deferred_successful_drop_callback_);
-+  } else {
-+    deferred_successful_drop_callback_.Reset();
++  base::OnceClosure native_tab_pin_commit_callback;
++  if (native_tab_pin_drag_session_) {
++    const bool successful_drop = type == EndDragType::kNormal &&
++                                 previous_state != DragState::kNotStarted;
++    // A release can follow a coalesced final mouse movement. Reclassify the
++    // actual release point before accepting the deferred Pin intent so a
++    // pointer that left Pins cannot commit the last delivered hover target.
++    if (successful_drop && attached_context_) {
++      BrowserView* final_browser_view =
++          GetBrowserViewForContext(attached_context_);
++      if (final_browser_view && final_browser_view->tab_strip_view()) {
++        final_browser_view->tab_strip_view()->UpdateTabDragPoint(
++            *this, GetCursorScreenPoint());
++      } else {
++        ClearNativeTabPinDropIntent();
++      }
++    }
++    const std::optional<helium::SidebarNativeTabContext> final_context =
++        GetNativeTabPinContext(attached_context_);
++    const bool source_still_eligible =
++        successful_drop && IsNativeTabPinSourceStillEligible();
++    std::optional<helium::SidebarNativeTabPinCommand> command =
++        native_tab_pin_drag_session_->Complete(
++            successful_drop,
++            final_context.value_or(helium::SidebarNativeTabContext()),
++            source_still_eligible);
++    if (command && drag_data_.tab_drag_data_.size() == 1u &&
++        drag_data_.tab_drag_data_.front().contents) {
++      native_tab_pin_commit_callback = base::BindOnce(
++          &ExecuteNativeTabPinCommand,
++          drag_data_.tab_drag_data_.front().contents->GetWeakPtr(),
++          std::move(*command));
++    }
 +  }
    current_state_ = DragState::kStopped;
    attached_context_tabs_closed_tracker_.reset();
  
-@@ -1931,6 +1953,10 @@ void TabDragController::EndDragImpl(EndD
+@@ -1931,6 +2161,12 @@ void TabDragController::EndDragImpl(EndD
  
    TabDragContext* owning_context =
        attached_context_ ? attached_context_.get() : source_context_.get();
-+  if (deferred_successful_drop_callback) {
++  if (native_tab_pin_commit_callback) {
++    // Run only after Chromium has cleared drag_data_ and returned from the
++    // controller teardown that still owns model and view references.
 +    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
-+        FROM_HERE, std::move(deferred_successful_drop_callback));
++        FROM_HERE, std::move(native_tab_pin_commit_callback));
 +  }
    owning_context->DestroyDragController();
  }
@@ -10344,18 +11132,32 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h
 +++ src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h
-@@ -205,6 +205,10 @@ class TabDragController : public views::
+@@ -20,6 +20,7 @@
+ #include "base/scoped_observation.h"
+ #include "base/timer/timer.h"
+ #include "base/uuid.h"
++#include "chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/views/tabs/dragging/drag_session_data.h"
+ #include "chrome/browser/ui/views/tabs/dragging/dragging_tabs_session.h"
+@@ -205,6 +206,16 @@ class TabDragController : public views::
    // Complete the current drag session.
    void EndDrag(EndDragReason reason);
  
-+  // Replaces the work to run asynchronously after a successful drop has fully
-+  // released Chromium's drag-owned model and view state. Cleared on cancel.
-+  void SetDeferredSuccessfulDropCallback(base::OnceClosure callback);
++  // Product-level sidebar intent owned by this exact native drag controller.
++  // The ordinary TabView remains in Chromium's tab container until the drag
++  // has ended and a validated command is posted for later execution.
++  bool HasEligibleNativeTabPinDragSession() const;
++  bool HasNativeTabPinDropIntent() const;
++  bool IsDraggingPersistentPinTabs() const;
++  void UpdateNativeTabPinDropIntent(
++      helium::SidebarNativeTabPinIntent intent);
++  void ClearNativeTabPinDropIntent();
 +
    // Set a callback to be called when the nested drag loop / system DnD session
    // finishes.
    //
-@@ -290,7 +294,11 @@ class TabDragController : public views::
+@@ -290,7 +301,11 @@ class TabDragController : public views::
  
    // Specifies what should happen when a drag motion exits the tab strip region
    // in an attempt to detach a tab.
@@ -10368,12 +11170,25 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h
  
    // These values are persisted to logs. Entries should not be renumbered and
    // numeric values should never be reused.
-@@ -674,6 +682,9 @@ class TabDragController : public views::
+@@ -447,6 +462,12 @@ class TabDragController : public views::
+   // not TAB_DESTROYED then one of CompleteDrag() or RevertDrag() is invoked.
+   void EndDragImpl(EndDragType how_end);
+ 
++  void InitializeNativeTabPinDragSession();
++  void InvalidateNativeTabPinDragSession();
++  std::optional<helium::SidebarNativeTabContext>
++  GetNativeTabPinContext(const TabDragContext* context) const;
++  bool IsNativeTabPinSourceStillEligible() const;
++
+   // Reverts a cancelled drag operation.
+   void RevertDrag();
+ 
+@@ -674,6 +695,9 @@ class TabDragController : public views::
    // DnD session.
    base::OnceClosure drag_started_callback_;
  
-+  // Product-level conversions that must happen after the drag transaction.
-+  base::OnceClosure deferred_successful_drop_callback_;
++  std::unique_ptr<helium::SidebarNativeTabDragSession>
++      native_tab_pin_drag_session_;
 +
    // The tab thumbnail used as the drag icon for system-DnD-based tab dragging.
    gfx::ImageSkia drag_image_;
@@ -11479,7 +12294,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
 +++ src/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
-@@ -45,9 +45,18 @@ enum class PersistentTabDropTarget { kFa
+@@ -45,7 +45,9 @@ enum class PersistentTabDropTarget { kFa
  // persistent Pin tree, whose visible rows are not all TabCollectionNodes.
  struct PersistentTabDropLocation {
    PersistentTabDropTarget target = PersistentTabDropTarget::kTab;
@@ -11488,17 +12303,8 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
 +  int tab_index = -1;
  };
  
-+// Arms the durable Pin/tab conversion on the TabDragController that actually
-+// owns the captured gesture. Vertical tabs can be dragged by either the common
-+// collection handler or Chromium's legacy TabStrip drag context.
-+void ConfigurePersistentTabDrop(TabDragController& drag_controller,
-+                                const PersistentTabDropLocation& location);
-+bool IsDraggingPersistentPinTabs(const TabDragController& drag_controller);
-+
  // Interface for views to interact with drag handling.
- class TabDragHandler {
-  public:
-@@ -96,6 +105,7 @@ class TabDragHandler {
+@@ -96,6 +98,7 @@ class TabDragHandler {
    // while TabDragController owns it.
    virtual void SetPersistentTabDropTarget(
        PersistentTabDropLocation location) = 0;
@@ -11506,7 +12312,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
  
    // Returns true if there is an ongoing drag where a group is being moved.
    virtual bool IsDraggingGroups() const = 0;
-@@ -153,8 +163,8 @@ class TabDragHandlerImpl : public TabDra
+@@ -153,8 +156,8 @@ class TabDragHandlerImpl : public TabDra
    bool IsViewDragging(const views::View& view) const override;
    bool IsDraggingPinnedTabs() const override;
    bool IsDraggingPersistentPinTabs() const override;
@@ -11531,35 +12337,15 @@ Index: src/chrome/browser/ui/views/tabs/tab_strip.cc
  #include "base/feature_list.h"
  #include "base/functional/bind.h"
  #include "base/functional/callback.h"
-@@ -46,7 +46,9 @@
+@@ -46,6 +46,7 @@
  #include "chrome/browser/ui/view_ids.h"
  #include "chrome/browser/ui/views/frame/browser_frame_view.h"
  #include "chrome/browser/ui/views/frame/browser_view.h"
 +#include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
  #include "chrome/browser/ui/views/tabs/browser_tab_strip_controller.h"
-+#include "chrome/browser/ui/views/tabs/common/persistent_tab_drag_bridge.h"
  #include "chrome/browser/ui/views/tabs/dragging/tab_drag_context.h"
  #include "chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h"
- #include "chrome/browser/ui/views/tabs/hovercard/tab_hover_card_controller.h"
-@@ -364,6 +366,17 @@ class TabStrip::TabDragContextImpl : pub
-     gfx::Point screen_location(event.location());
-     views::View::ConvertPointToScreen(view, &screen_location);
- 
-+    BrowserWindowInterface* browser_window =
-+        tab_strip_->GetBrowserWindowInterface();
-+    BrowserView* browser_view =
-+        browser_window ? BrowserView::GetBrowserViewForBrowser(browser_window)
-+                       : nullptr;
-+    ScopedPersistentTabDragController persistent_drag_scope(
-+        drag_controller_.get());
-+    if (browser_view && browser_view->tab_strip_view()) {
-+      browser_view->tab_strip_view()->UpdateTabDragPoint(screen_location);
-+    }
-+
-     // Note: `tab_strip_` can be destroyed during drag, also destroying `this`.
-     const TabDragController::Liveness drag_controller_alive =
-         drag_controller_->Drag(screen_location);
-@@ -990,9 +1003,10 @@ class TabStrip::TabDragContextImpl : pub
+@@ -990,9 +991,10 @@ class TabStrip::TabDragContextImpl : pub
      }
  
      TabSlotView* const left_tab = GetTabAt(candidate_index - 1);
@@ -11573,7 +12359,7 @@ Index: src/chrome/browser/ui/views/tabs/tab_strip.cc
  
      // This might be in the middle of a group, which may or may not be fine.
      std::optional<tab_groups::TabGroupId> left_group = left_tab->group();
-@@ -1976,8 +1990,12 @@ void TabStrip::OnGroupContentsChanged(co
+@@ -1976,8 +1978,12 @@ void TabStrip::OnGroupContentsChanged(co
  
  void TabStrip::UpdateHoverCard(HoverCardAnchorTarget* anchor_target,
                                 HoverCardUpdateType update_type) {
@@ -11588,40 +12374,6 @@ Index: src/chrome/browser/ui/views/tabs/tab_strip.cc
    if (tab_container_) {
      tab_container_->UpdateHoverCard(anchor_target, update_type);
    }
-Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_drag_bridge.h
-===================================================================
---- /dev/null
-+++ src/chrome/browser/ui/views/tabs/common/persistent_tab_drag_bridge.h
-@@ -0,0 +1,29 @@
-+// Copyright 2026 The Chromium Authors
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
-+
-+#ifndef CHROME_BROWSER_UI_VIEWS_TABS_COMMON_PERSISTENT_TAB_DRAG_BRIDGE_H_
-+#define CHROME_BROWSER_UI_VIEWS_TABS_COMMON_PERSISTENT_TAB_DRAG_BRIDGE_H_
-+
-+class TabDragController;
-+
-+// Exposes the controller that owns the current native tab-drag update to the
-+// shared sidebar coordinator. Some vertical-tab gestures are still captured by
-+// TabStrip's legacy drag context rather than TabDragHandlerImpl.
-+class ScopedPersistentTabDragController {
-+ public:
-+  explicit ScopedPersistentTabDragController(TabDragController* controller);
-+  ~ScopedPersistentTabDragController();
-+
-+  ScopedPersistentTabDragController(
-+      const ScopedPersistentTabDragController&) = delete;
-+  ScopedPersistentTabDragController& operator=(
-+      const ScopedPersistentTabDragController&) = delete;
-+
-+ private:
-+  TabDragController* previous_ = nullptr;
-+};
-+
-+TabDragController* GetActivePersistentTabDragController();
-+
-+#endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_PERSISTENT_TAB_DRAG_BRIDGE_H_
 Index: src/chrome/browser/ui/helium/helium_sidebar_drag_transaction.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/helium_sidebar_drag_transaction.cc
@@ -12069,10 +12821,41 @@ Index: src/chrome/browser/ui/helium/helium_sidebar_pin_projection.cc
    }
  
    const bool same_parent = source_node->parent_id == destination_parent_id;
-@@ -198,4 +298,159 @@ SidebarPinMoveIntent ResolveSidebarPinDr
+@@ -198,4 +298,190 @@ SidebarPinMoveIntent ResolveSidebarPinDr
    return intent;
  }
  
++std::optional<SidebarPinPlacement> ResolveSidebarPinInsertion(
++    const HeliumSidebarPinProjection& projection,
++    const std::optional<SidebarPinDropTarget>& target) {
++  if (!projection.valid()) {
++    return std::nullopt;
++  }
++  if (!target) {
++    return SidebarPinPlacement{};
++  }
++  const SidebarPinRow* target_row = projection.FindVisibleRow(target->key);
++  if (!target_row) {
++    return std::nullopt;
++  }
++  if (target->position == SidebarPinDropPosition::kInside) {
++    if (target_row->kind != SidebarPinRowKind::kFolder) {
++      return std::nullopt;
++    }
++    return SidebarPinPlacement{.parent = target->key};
++  }
++
++  std::optional<SidebarPinPlacement> target_placement =
++      projection.GetDurablePlacement(target->key);
++  if (!target_placement) {
++    return std::nullopt;
++  }
++  if (target->position == SidebarPinDropPosition::kBefore) {
++    target_placement->before = target->key;
++  }
++  return target_placement;
++}
++
 +std::optional<std::vector<SidebarPinRow>> PreviewSidebarPinMove(
 +    const HeliumSidebarPinProjection& projection,
 +    const SidebarPinMoveIntent& intent) {
@@ -12314,10 +13097,17 @@ Index: src/chrome/browser/ui/helium/helium_sidebar_pin_projection.h
  };
  
  SidebarPinMoveIntent ResolveSidebarPinDrop(
-@@ -109,6 +136,13 @@ SidebarPinMoveIntent ResolveSidebarPinDr
+@@ -109,6 +136,20 @@ SidebarPinMoveIntent ResolveSidebarPinDr
      const SidebarPinKey& source,
      const std::optional<SidebarPinDropTarget>& target);
  
++// Resolves an external item insertion without pretending that item already
++// belongs to the durable Pin tree. A null target is root append, which is the
++// only valid destination when a Space has no Pins yet.
++std::optional<SidebarPinPlacement> ResolveSidebarPinInsertion(
++    const HeliumSidebarPinProjection& projection,
++    const std::optional<SidebarPinDropTarget>& target);
++
 +// Returns the visible rows after logically applying a validated move without
 +// changing the projection or durable tree. A valid no-op returns an exact copy
 +// of the current rows. Invalid and cancelled intents fail closed with nullopt.
@@ -12404,7 +13194,38 @@ Index: src/chrome/browser/ui/helium/helium_sidebar_pin_projection_unittest.cc
       StableIdentitySurvivesDormantAndLiveMetadataChanges) {
    HeliumSidebarPinProjection dormant("space-a", PinTree());
    HeliumSidebarPinProjection::LiveBindings bindings = {{"first", 42}};
-@@ -166,5 +209,144 @@ TEST(HeliumSidebarPinProjectionTest, Qua
+@@ -113,6 +156,30 @@ TEST(HeliumSidebarPinProjectionTest, Res
+   EXPECT_FALSE(inside.before);
+ }
+ 
++TEST(HeliumSidebarPinProjectionTest,
++     ResolvesExternalInsertionIncludingEmptyRoot) {
++  HeliumSidebarPinProjection empty("space-a", {});
++  EXPECT_EQ(SidebarPinPlacement{},
++            ResolveSidebarPinInsertion(empty, std::nullopt));
++
++  HeliumSidebarPinProjection projection("space-a", PinTree());
++  const SidebarPinKey folder = Key("outer");
++  const SidebarPinKey child = Key("first");
++
++  EXPECT_EQ((SidebarPinPlacement{.parent = folder}),
++            ResolveSidebarPinInsertion(
++                projection,
++                SidebarPinDropTarget{
++                    .key = folder,
++                    .position = SidebarPinDropPosition::kInside}));
++  EXPECT_EQ((SidebarPinPlacement{.parent = folder, .before = child}),
++            ResolveSidebarPinInsertion(
++                projection,
++                SidebarPinDropTarget{
++                    .key = child,
++                    .position = SidebarPinDropPosition::kBefore}));
++}
++
+ TEST(HeliumSidebarPinProjectionTest, ExcludesFolderSubtreeDestinations) {
+   HeliumSidebarPinProjection projection("space-a", PinTree());
+ 
+@@ -166,5 +233,144 @@ TEST(HeliumSidebarPinProjectionTest, Qua
            .result);
  }
  
@@ -13131,3 +13952,297 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
  TEST_F(PersistentTabViewTest, CompactGridHidesTitleAndUsesPinnedMetrics) {
    auto tile = MakeView(PersistentTabView::PresentationMode::kCompactGrid);
  
+Index: src/chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session.cc
+@@ -0,0 +1,64 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session.h"
++
++#include <utility>
++
++namespace helium {
++
++SidebarNativeTabDragSession::SidebarNativeTabDragSession(
++    SidebarNativeTabContext source_context,
++    bool source_is_single_eligible_tab)
++    : source_context_(std::move(source_context)),
++      source_was_single_eligible_tab_(source_is_single_eligible_tab) {}
++
++SidebarNativeTabDragSession::~SidebarNativeTabDragSession() = default;
++
++bool SidebarNativeTabDragSession::UpdatePinIntent(
++    SidebarNativeTabPinIntent intent) {
++  if (!active_ || invalidated_ || !source_was_single_eligible_tab_ ||
++      !source_context_.valid() || intent.context != source_context_ ||
++      intent.placement.section != SidebarSection::kPins) {
++    intent_.reset();
++    return false;
++  }
++  intent_ = std::move(intent);
++  return true;
++}
++
++void SidebarNativeTabDragSession::ClearIntent() {
++  intent_.reset();
++}
++
++void SidebarNativeTabDragSession::Invalidate() {
++  intent_.reset();
++  invalidated_ = true;
++}
++
++std::optional<SidebarNativeTabPinCommand>
++SidebarNativeTabDragSession::Complete(
++    bool successful_drop,
++    const SidebarNativeTabContext& final_context,
++    bool source_is_still_single_eligible_tab) {
++  if (!active_) {
++    return std::nullopt;
++  }
++  active_ = false;
++
++  if (!successful_drop || invalidated_ || !source_was_single_eligible_tab_ ||
++      !source_is_still_single_eligible_tab || !intent_ ||
++      final_context != source_context_ || intent_->context != source_context_ ||
++      intent_->placement.section != SidebarSection::kPins) {
++    intent_.reset();
++    return std::nullopt;
++  }
++
++  SidebarNativeTabPinCommand command{
++      .source_context = source_context_, .placement = intent_->placement};
++  intent_.reset();
++  return command;
++}
++
++}  // namespace helium
+Index: src/chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session.h
+@@ -0,0 +1,83 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_HELIUM_SIDEBAR_NATIVE_TAB_DRAG_SESSION_H_
++#define CHROME_BROWSER_UI_HELIUM_HELIUM_SIDEBAR_NATIVE_TAB_DRAG_SESSION_H_
++
++#include <cstdint>
++#include <optional>
++#include <string>
++
++#include "chrome/browser/ui/helium/helium_sidebar_drag_transaction.h"
++
++namespace helium {
++
++// A concrete browser and Space identity captured before Chromium starts moving
++// any tab or view. SessionID values are process-session identities, while the
++// Space id is durable profile data.
++struct SidebarNativeTabContext {
++  int32_t browser_session_id = 0;
++  std::string space_id;
++
++  bool valid() const { return browser_session_id > 0 && !space_id.empty(); }
++  bool operator==(const SidebarNativeTabContext&) const = default;
++};
++
++struct SidebarNativeTabPinIntent {
++  SidebarNativeTabContext context;
++  SidebarItemPlacement placement;
++
++  bool operator==(const SidebarNativeTabPinIntent&) const = default;
++};
++
++struct SidebarNativeTabPinCommand {
++  SidebarNativeTabContext source_context;
++  SidebarItemPlacement placement;
++
++  bool operator==(const SidebarNativeTabPinCommand&) const = default;
++};
++
++// Owns the value-only Pin intent for one ordinary native-tab drag. Chromium
++// continues to own and animate the TabView in its ordinary tab container.
++class SidebarNativeTabDragSession {
++ public:
++  SidebarNativeTabDragSession(SidebarNativeTabContext source_context,
++                              bool source_is_single_eligible_tab);
++  ~SidebarNativeTabDragSession();
++
++  SidebarNativeTabDragSession(const SidebarNativeTabDragSession&) = delete;
++  SidebarNativeTabDragSession& operator=(const SidebarNativeTabDragSession&) =
++      delete;
++
++  bool UpdatePinIntent(SidebarNativeTabPinIntent intent);
++  void ClearIntent();
++  void Invalidate();
++
++  std::optional<SidebarNativeTabPinCommand> Complete(
++      bool successful_drop,
++      const SidebarNativeTabContext& final_context,
++      bool source_is_still_single_eligible_tab);
++
++  bool active() const { return active_; }
++  bool has_intent() const { return intent_.has_value(); }
++  bool invalidated() const { return invalidated_; }
++  bool accepts_intent() const {
++    return active_ && !invalidated_ && source_was_single_eligible_tab_ &&
++           source_context_.valid();
++  }
++  const SidebarNativeTabContext& source_context() const {
++    return source_context_;
++  }
++
++ private:
++  const SidebarNativeTabContext source_context_;
++  const bool source_was_single_eligible_tab_;
++  std::optional<SidebarNativeTabPinIntent> intent_;
++  bool active_ = true;
++  bool invalidated_ = false;
++};
++
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_SIDEBAR_NATIVE_TAB_DRAG_SESSION_H_
+Index: src/chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session_unittest.cc
+@@ -0,0 +1,102 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session.h"
++
++#include <utility>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace helium {
++namespace {
++
++SidebarNativeTabContext Context(int browser_session_id = 12,
++                                std::string space_id = "space-a") {
++  return {.browser_session_id = browser_session_id,
++          .space_id = std::move(space_id)};
++}
++
++SidebarNativeTabPinIntent Intent(
++    SidebarNativeTabContext context = Context(),
++    std::string parent_id = "folder",
++    std::string before_id = "next") {
++  return {.context = std::move(context),
++          .placement = {.section = SidebarSection::kPins,
++                        .parent_id = std::move(parent_id),
++                        .before_id = std::move(before_id)}};
++}
++
++TEST(SidebarNativeTabDragSessionTest, CommitsSameWindowSameSpacePinDrop) {
++  SidebarNativeTabDragSession session(Context(), true);
++  ASSERT_TRUE(session.UpdatePinIntent(Intent()));
++
++  const auto command = session.Complete(true, Context(), true);
++
++  ASSERT_TRUE(command);
++  EXPECT_EQ(command->source_context, Context());
++  EXPECT_EQ(command->placement, Intent().placement);
++}
++
++TEST(SidebarNativeTabDragSessionTest, ClearIntentMakesDropANoOp) {
++  SidebarNativeTabDragSession session(Context(), true);
++  ASSERT_TRUE(session.UpdatePinIntent(Intent()));
++  session.ClearIntent();
++
++  EXPECT_FALSE(session.Complete(true, Context(), true));
++}
++
++TEST(SidebarNativeTabDragSessionTest, RejectsDifferentBrowserOrSpace) {
++  SidebarNativeTabDragSession session(Context(), true);
++
++  EXPECT_FALSE(session.UpdatePinIntent(Intent(Context(13))));
++  EXPECT_FALSE(session.UpdatePinIntent(Intent(Context(12, "space-b"))));
++  EXPECT_FALSE(session.has_intent());
++}
++
++TEST(SidebarNativeTabDragSessionTest, DetachInvalidatesEntireSession) {
++  SidebarNativeTabDragSession session(Context(), true);
++  ASSERT_TRUE(session.UpdatePinIntent(Intent()));
++  session.Invalidate();
++
++  EXPECT_TRUE(session.invalidated());
++  EXPECT_FALSE(session.UpdatePinIntent(Intent()));
++  EXPECT_FALSE(session.Complete(true, Context(), true));
++}
++
++TEST(SidebarNativeTabDragSessionTest, RejectsFinalContextTransfer) {
++  SidebarNativeTabDragSession different_window(Context(), true);
++  ASSERT_TRUE(different_window.UpdatePinIntent(Intent()));
++  EXPECT_FALSE(different_window.Complete(true, Context(13), true));
++
++  SidebarNativeTabDragSession different_space(Context(), true);
++  ASSERT_TRUE(different_space.UpdatePinIntent(Intent()));
++  EXPECT_FALSE(
++      different_space.Complete(true, Context(12, "space-b"), true));
++}
++
++TEST(SidebarNativeTabDragSessionTest, RejectsCancelledAndIneligibleDrops) {
++  SidebarNativeTabDragSession cancelled(Context(), true);
++  ASSERT_TRUE(cancelled.UpdatePinIntent(Intent()));
++  EXPECT_FALSE(cancelled.Complete(false, Context(), true));
++
++  SidebarNativeTabDragSession multi(Context(), false);
++  EXPECT_FALSE(multi.UpdatePinIntent(Intent()));
++  EXPECT_FALSE(multi.Complete(true, Context(), true));
++
++  SidebarNativeTabDragSession changed(Context(), true);
++  ASSERT_TRUE(changed.UpdatePinIntent(Intent()));
++  EXPECT_FALSE(changed.Complete(true, Context(), false));
++}
++
++TEST(SidebarNativeTabDragSessionTest, CompletionIsTerminal) {
++  SidebarNativeTabDragSession session(Context(), true);
++  ASSERT_TRUE(session.UpdatePinIntent(Intent()));
++  ASSERT_TRUE(session.Complete(true, Context(), true));
++
++  EXPECT_FALSE(session.UpdatePinIntent(Intent()));
++  EXPECT_FALSE(session.Complete(true, Context(), true));
++}
++
++}  // namespace
++}  // namespace helium
+Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h
++++ src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h
+@@ -19,6 +19,10 @@
+ class TabCollectionNode;
+ class TabGroupView;
+ 
++namespace tabs {
++class TabInterface;
++}
++
+ // The view class that represents the unpinned tab region for the
+ // tab strip. It manages the layout of the all the unpinned tabs and
+ // serves as the drag target for unpinned tabs which aren't grouped.
+@@ -52,11 +56,14 @@ class UnpinnedTabContainerView
+   // DraggedTabsContainer:
+   DraggedTabsContainer& GetTabDragTarget(
+       const gfx::Point& point_in_screen) override;
++  void OnTabDragPresentationEnded() override;
+ 
+   std::optional<BrowserRootView::DropIndex> GetLinkDropIndex(
+       const gfx::Point& point_in_local_coords);
+   void UpdatePersistentTabDragPreview(const gfx::Point& point_in_screen);
+   void ClearPersistentTabDragPreview();
++  tabs::TabInterface* GetTabBeforePersistentDrop(
++      const gfx::Point& point_in_screen);
+ 
+  private:
+   // DraggedTabsContainer:
