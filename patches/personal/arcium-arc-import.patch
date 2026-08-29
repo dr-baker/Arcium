@@ -18,6 +18,27 @@ Index: src/chrome/browser/importer/BUILD.gn
      "brave_external_process_importer_client.cc",
      "brave_external_process_importer_host.cc",
      "brave_in_process_importer_bridge.cc",
+@@ -84,14 +86,20 @@ source_set("browser_tests") {
+   testonly = true
+   defines = [ "HAS_OUT_OF_PROC_TEST_RUNNER" ]
+   sources = [
++    "arcium_arc_import_browsertest.cc",
+     "importer_unittest_utils.cc",
+     "importer_unittest_utils.h",
+   ]
+ 
+   deps = [
++    ":impl",
+     "//base",
++    "//chrome/browser/ui",
+     "//chrome/common/importer",
++    "//chrome/test:test_support",
++    "//components/tab_groups",
+     "//components/user_data_importer/common",
++    "//content/test:test_support",
+     "//testing/gtest",
+   ]
+ 
 Index: src/chrome/browser/importer/arcium_arc_import.cc
 ===================================================================
 --- /dev/null
@@ -1668,3 +1689,142 @@ Index: src/chrome/utility/importer/external_process_importer_bridge.h
  
    void AddHomePage(const GURL& home_page) override;
  
+Index: src/chrome/browser/importer/arcium_arc_import_browsertest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/importer/arcium_arc_import_browsertest.cc
+@@ -0,0 +1,134 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/importer/arcium_arc_import.h"
++
++#include <map>
++#include <string>
++
++#include "chrome/browser/ui/arcium/tab_provenance.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium/helium_space.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/test/base/in_process_browser_test.h"
++#include "components/tab_groups/tab_group.h"
++#include "components/tab_groups/tab_group_visual_data.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/test/browser_test.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace arcium {
++namespace {
++
++constexpr char kSnapshot[] = R"json({
++  "version": 1,
++  "source_profile": "arc-profile",
++  "favorites": [
++    {"type":"tab","source_id":"favorite","title":"Favorite",
++     "url":"https://favorite.test/"}
++  ],
++  "spaces": [
++    {"id":"space-a","name":"Space A","source_profile":"arc-profile",
++     "pins":[
++       {"type":"tab","source_id":"root","title":"Root",
++        "url":"https://root.test/"},
++       {"type":"folder","source_id":"outer","title":"Outer",
++        "collapsed":true,"children":[
++          {"type":"tab","source_id":"outer-tab","title":"Outer tab",
++           "url":"https://outer.test/"},
++          {"type":"folder","source_id":"inner","title":"Inner",
++           "collapsed":false,"children":[
++             {"type":"tab","source_id":"inner-tab","title":"Inner tab",
++              "url":"https://inner.test/"}
++           ]}
++        ]}
++     ]},
++    {"id":"space-b","name":"Space B","source_profile":"arc-profile",
++     "pins":[
++       {"type":"tab","source_id":"other-space","title":"Other space",
++        "url":"https://space-b.test/"}
++     ]}
++  ]
++})json";
++
++Browser* BrowserForSpace(helium::HeliumSpaceService* service,
++                         std::string_view id) {
++  helium::HeliumSpace* space = service->GetSpaceById(id);
++  if (!space || !space->GetPrimaryBrowser()) {
++    return nullptr;
++  }
++  return space->GetPrimaryBrowser()->GetBrowserForMigrationOnly();
++}
++
++std::map<std::string, content::WebContents*> ArcTabs(Browser* browser) {
++  std::map<std::string, content::WebContents*> result;
++  for (int index = 0; index < browser->tab_strip_model()->count(); ++index) {
++    content::WebContents* contents =
++        browser->tab_strip_model()->GetWebContentsAt(index);
++    const TabProvenance* provenance = TabProvenance::FromWebContents(contents);
++    if (provenance && provenance->source() == "arc") {
++      EXPECT_EQ("arc-profile", provenance->collection_id());
++      result[provenance->item_id()] = contents;
++    }
++  }
++  return result;
++}
++
++std::map<std::u16string, bool> GroupCollapseState(Browser* browser) {
++  std::map<std::u16string, bool> result;
++  for (const tab_groups::TabGroupId& group_id :
++       browser->tab_strip_model()->group_model()->ListTabGroups()) {
++    const tab_groups::TabGroup* group =
++        browser->tab_strip_model()->group_model()->GetTabGroup(group_id);
++    result[group->visual_data()->title()] =
++        group->visual_data()->is_collapsed();
++  }
++  return result;
++}
++
++class ArciumArcImportBrowserTest : public InProcessBrowserTest {};
++
++IN_PROC_BROWSER_TEST_F(ArciumArcImportBrowserTest,
++                       ImportsNestedFoldersAsTabsWithoutPins) {
++  helium::HeliumSpaceService* service =
++      helium::HeliumSpaceServiceFactory::GetForProfile(browser()->profile());
++  ASSERT_TRUE(service);
++  content::WebContents* unrelated =
++      browser()->tab_strip_model()->GetActiveWebContents();
++
++  ASSERT_TRUE(ImportArcSidebarSnapshot(browser()->profile(), kSnapshot));
++  Browser* space_a = BrowserForSpace(service, "space-a");
++  Browser* space_b = BrowserForSpace(service, "space-b");
++  ASSERT_TRUE(space_a);
++  ASSERT_TRUE(space_b);
++  EXPECT_NE(space_a, space_b);
++
++  const auto space_a_tabs = ArcTabs(space_a);
++  EXPECT_EQ(4u, space_a_tabs.size());
++  EXPECT_TRUE(space_a_tabs.contains("favorite"));
++  EXPECT_TRUE(space_a_tabs.contains("root"));
++  EXPECT_TRUE(space_a_tabs.contains("outer-tab"));
++  EXPECT_TRUE(space_a_tabs.contains("inner-tab"));
++  const auto space_b_tabs = ArcTabs(space_b);
++  EXPECT_EQ(1u, space_b_tabs.size());
++  EXPECT_TRUE(space_b_tabs.contains("other-space"));
++
++  const std::map<std::u16string, bool> group_state =
++      GroupCollapseState(space_a);
++  EXPECT_EQ(false, group_state.at(u"Favorites"));
++  EXPECT_EQ(true, group_state.at(u"Outer"));
++  EXPECT_EQ(false, group_state.at(u"Outer / Inner"));
++
++  ASSERT_TRUE(ImportArcSidebarSnapshot(browser()->profile(), kSnapshot));
++  EXPECT_EQ(4u, ArcTabs(space_a).size());
++  EXPECT_EQ(1u, ArcTabs(space_b).size());
++  EXPECT_NE(-1, browser()->tab_strip_model()->GetIndexOfWebContents(unrelated));
++}
++
++}  // namespace
++}  // namespace arcium
