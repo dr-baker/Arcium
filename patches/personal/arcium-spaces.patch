@@ -118,10 +118,34 @@ Index: src/chrome/browser/ui/BUILD.gn
 ===================================================================
 --- src.orig/chrome/browser/ui/BUILD.gn
 +++ src/chrome/browser/ui/BUILD.gn
-@@ -368,11 +368,19 @@ if (!is_android) {
+@@ -360,6 +360,21 @@ if (!is_android) {
+   }
+ }
+ 
++executable("arcium_optional_navigation_tests") {
++  testonly = true
++  sources = [
++    "arcium/optional_navigation.cc",
++    "arcium/optional_navigation_unittest.cc",
++  ]
++  deps = [
++    "//base",
++    "//content/public/browser",
++    "//testing/gtest",
++    "//testing/gtest:gtest_main",
++    "//url",
++  ]
++}
++
+ # Use a static library here because many test binaries depend on this but don't
+ # require many files from it. This makes linking more efficient.
+ # TODO(https://crbug.com/353332589): Once //chrome/browser is properly
+@@ -368,11 +383,21 @@ if (!is_android) {
  # circular includes from each other.
  static_library("ui") {
    sources = [
++    "arcium/optional_navigation.cc",
++    "arcium/optional_navigation.h",
 +    "arcium/tab_provenance.cc",
 +    "arcium/tab_provenance.h",
      "confirm_bubble.h",
@@ -1569,3 +1593,154 @@ Index: src/chrome/browser/ui/browser_tabrestore.cc
  
    std::vector<std::unique_ptr<NavigationEntry>> entries =
        ContentSerializedNavigationBuilder::ToNavigationEntries(
+Index: src/chrome/browser/ui/arcium/optional_navigation.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/arcium/optional_navigation.cc
+@@ -0,0 +1,31 @@
++// Copyright 2026 The Arcium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/arcium/optional_navigation.h"
++
++#include <utility>
++
++#include "base/no_destructor.h"
++
++namespace arcium {
++namespace {
++
++OptionalNavigationHandler& GetHandler() {
++  static base::NoDestructor<OptionalNavigationHandler> handler;
++  return *handler;
++}
++
++}  // namespace
++
++void SetOptionalNavigationHandler(OptionalNavigationHandler handler) {
++  GetHandler() = std::move(handler);
++}
++
++bool MaybeHandleOptionalNavigation(Profile* profile,
++                                   const content::OpenURLParams& params) {
++  OptionalNavigationHandler& handler = GetHandler();
++  return handler && handler.Run(profile, params);
++}
++
++}  // namespace arcium
+Index: src/chrome/browser/ui/arcium/optional_navigation.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/arcium/optional_navigation.h
+@@ -0,0 +1,27 @@
++// Copyright 2026 The Arcium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_ARCIUM_OPTIONAL_NAVIGATION_H_
++#define CHROME_BROWSER_UI_ARCIUM_OPTIONAL_NAVIGATION_H_
++
++#include "base/functional/callback.h"
++#include "content/public/browser/page_navigator.h"
++
++class Profile;
++
++namespace arcium {
++
++// Optional features can install a handler for navigation that a caller has
++// already decided may leave the normal browser path. An empty handler always
++// falls through to normal Chromium navigation.
++using OptionalNavigationHandler =
++    base::RepeatingCallback<bool(Profile*, const content::OpenURLParams&)>;
++
++void SetOptionalNavigationHandler(OptionalNavigationHandler handler);
++bool MaybeHandleOptionalNavigation(Profile* profile,
++                                   const content::OpenURLParams& params);
++
++}  // namespace arcium
++
++#endif  // CHROME_BROWSER_UI_ARCIUM_OPTIONAL_NAVIGATION_H_
+Index: src/chrome/browser/ui/arcium/optional_navigation_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/arcium/optional_navigation_unittest.cc
+@@ -0,0 +1,78 @@
++// Copyright 2026 The Arcium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/arcium/optional_navigation.h"
++
++#include "base/functional/bind.h"
++#include "content/public/common/referrer.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/base/window_open_disposition.h"
++#include "url/gurl.h"
++#include "url/origin.h"
++
++namespace arcium {
++namespace {
++
++class OptionalNavigationTest : public testing::Test {
++ protected:
++  void SetUp() override { SetOptionalNavigationHandler({}); }
++  void TearDown() override { SetOptionalNavigationHandler({}); }
++};
++
++content::OpenURLParams MakeParams(const GURL& url) {
++  return content::OpenURLParams(
++      url,
++      content::Referrer(GURL("https://source.test/page"),
++                        network::mojom::ReferrerPolicy::kStrictOrigin),
++      WindowOpenDisposition::CURRENT_TAB, ui::PAGE_TRANSITION_LINK,
++      /*is_renderer_initiated=*/true,
++      /*started_from_context_menu=*/true);
++}
++
++TEST_F(OptionalNavigationTest, FallsThroughWithoutHandler) {
++  EXPECT_FALSE(MaybeHandleOptionalNavigation(
++      /*profile=*/nullptr, MakeParams(GURL("https://example.test/"))));
++}
++
++TEST_F(OptionalNavigationTest, PreservesNavigationContext) {
++  bool called = false;
++  SetOptionalNavigationHandler(base::BindRepeating(
++      [](bool* called, Profile* profile, const content::OpenURLParams& params) {
++        *called = true;
++        EXPECT_EQ(nullptr, profile);
++        EXPECT_EQ(GURL("https://example.test/peek"), params.url);
++        EXPECT_EQ(GURL("https://source.test/page"), params.referrer.url);
++        EXPECT_EQ(
++            static_cast<int>(network::mojom::ReferrerPolicy::kStrictOrigin),
++            static_cast<int>(params.referrer.policy));
++        EXPECT_TRUE(params.initiator_origin.has_value());
++        if (params.initiator_origin) {
++          EXPECT_EQ(url::Origin::Create(GURL("https://source.test")),
++                    *params.initiator_origin);
++        }
++        EXPECT_TRUE(params.is_renderer_initiated);
++        EXPECT_TRUE(params.started_from_context_menu);
++        EXPECT_TRUE(params.user_gesture);
++        return true;
++      },
++      &called));
++
++  content::OpenURLParams params = MakeParams(GURL("https://example.test/peek"));
++  params.initiator_origin = url::Origin::Create(GURL("https://source.test"));
++  params.user_gesture = true;
++  EXPECT_TRUE(MaybeHandleOptionalNavigation(/*profile=*/nullptr, params));
++  EXPECT_TRUE(called);
++}
++
++TEST_F(OptionalNavigationTest, PreservesFallthroughFromInstalledHandler) {
++  SetOptionalNavigationHandler(base::BindRepeating(
++      [](Profile*, const content::OpenURLParams&) { return false; }));
++
++  EXPECT_FALSE(MaybeHandleOptionalNavigation(
++      /*profile=*/nullptr, MakeParams(GURL("https://example.test/"))));
++}
++
++}  // namespace
++}  // namespace arcium

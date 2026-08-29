@@ -185,8 +185,8 @@ Index: src/chrome/browser/ui/BUILD.gn
 ===================================================================
 --- src.orig/chrome/browser/ui/BUILD.gn
 +++ src/chrome/browser/ui/BUILD.gn
-@@ -360,6 +360,26 @@ if (!is_android) {
-   }
+@@ -375,6 +375,27 @@ executable("arcium_optional_navigation_t
+   ]
  }
  
 +executable("helium_persistent_item_model_tests") {
@@ -203,6 +203,7 @@ Index: src/chrome/browser/ui/BUILD.gn
 +  ]
 +  deps = [
 +    "//base",
++    "//net",
 +    "//testing/gtest",
 +    "//testing/gtest:gtest_main",
 +    "//url",
@@ -212,10 +213,12 @@ Index: src/chrome/browser/ui/BUILD.gn
  # Use a static library here because many test binaries depend on this but don't
  # require many files from it. This makes linking more efficient.
  # TODO(https://crbug.com/353332589): Once //chrome/browser is properly
-@@ -373,8 +393,18 @@ static_library("ui") {
+@@ -390,8 +411,20 @@ static_library("ui") {
      "confirm_bubble.h",
      "crypto_module_password_dialog.h",
      "enterprise_startup_dialog.h",
++    "helium/helium_anchored_navigation_throttle.cc",
++    "helium/helium_anchored_navigation_throttle.h",
 +    "helium/helium_favorites_and_pins.cc",
 +    "helium/helium_favorites_and_pins.h",
      "helium/helium_layout_state_controller.cc",
@@ -318,7 +321,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
-@@ -0,0 +1,430 @@
+@@ -0,0 +1,495 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -334,6 +337,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/sessions/session_service.h"
 +#include "chrome/browser/sessions/session_service_factory.h"
++#include "chrome/browser/ui/arcium/optional_navigation.h"
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 +#include "chrome/browser/ui/helium/helium_space_service.h"
 +#include "chrome/browser/ui/helium/helium_space_service_factory.h"
@@ -414,6 +418,37 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +  return helper && helper->HasAnchoredPinnedTabHome();
 +}
 +
++content::OpenURLParams OpenURLParamsFromNavigateParams(
++    const NavigateParams& params) {
++  content::OpenURLParams open_url_params(
++      params.url, params.referrer, params.disposition, params.transition,
++      params.is_renderer_initiated, params.started_from_context_menu);
++  open_url_params.initiator_frame_token = params.initiator_frame_token;
++  open_url_params.initiator_process_id = params.initiator_process_id;
++  open_url_params.initiator_origin = params.initiator_origin;
++  open_url_params.initiator_base_url = params.initiator_base_url;
++  open_url_params.initiator_navigation_state =
++      params.initiator_navigation_state;
++  open_url_params.source_site_instance = params.source_site_instance;
++  open_url_params.redirect_chain = params.redirect_chain;
++  open_url_params.post_data = params.post_data;
++  open_url_params.extra_headers = params.extra_headers;
++  open_url_params.frame_tree_node_id = params.frame_tree_node_id;
++  open_url_params.user_gesture = params.user_gesture;
++  open_url_params.started_by_ad = params.started_by_ad;
++  open_url_params.should_replace_current_entry =
++      params.should_replace_current_entry;
++  open_url_params.blob_url_loader_factory = params.blob_url_loader_factory;
++  open_url_params.is_service_worker_open_window =
++      params.is_service_worker_open_window;
++  open_url_params.href_translate = params.href_translate;
++  open_url_params.reload_type = params.reload_type;
++  open_url_params.impression = params.impression;
++  open_url_params.internal_scroll_to_text_fragment =
++      params.internal_scroll_to_text_fragment;
++  return open_url_params;
++}
++
 +void PersistAnchoredPinnedTabExtraData(tabs::TabInterface* tab) {
 +  if (!tab) {
 +    return;
@@ -460,8 +495,8 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +
 +bool IsFavoriteTab(const tabs::TabInterface* tab) {
 +  HeliumSpaceService* service = GetSpaceService(tab);
-+  return service && service->GetPersistentItemKind(tab) ==
-+                        PersistentRecordKind::kFavorite;
++  return service &&
++         service->GetPersistentItemKind(tab) == PersistentRecordKind::kFavorite;
 +}
 +
 +bool IsPersistentItemTab(const tabs::TabInterface* tab) {
@@ -733,7 +768,8 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +  RestoreAnchoredPinnedTabHome(tab, home_url,
 +                               base::UTF8ToUTF16(title_it->second));
 +
-+  // Place restored anchored tabs that are not native pins into the pins section.
++  // Place restored anchored tabs that are not native pins into the pins
++  // section.
 +  if (tab && !tab->IsPinned()) {
 +    if (tabs::TabStripCollection* const strip = GetTabStripCollection(tab)) {
 +      if (!strip->IsPinTab(tab)) {
@@ -744,8 +780,40 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +}
 +
 +bool MaybeConvertAnchoredFavoriteOrPinNavigation(NavigateParams* params) {
-+  // Pin/favorite anchored tabs navigate in place.
-+  return false;
++  if (!params || !IsHeliumFavoritesAndPinsEnabled()) {
++    return false;
++  }
++  content::WebContents* source = params->source_contents;
++  tabs::TabInterface* tab =
++      source ? tabs::TabInterface::MaybeGetFromContents(source) : nullptr;
++  GURL home_url;
++  std::u16string home_title;
++  const bool is_link_transition = ui::PageTransitionCoreTypeIs(
++      params->transition, ui::PAGE_TRANSITION_LINK);
++  PersistentNavigationDisposition disposition =
++      PersistentNavigationDisposition::kExplicitNewTarget;
++  if (params->disposition == WindowOpenDisposition::CURRENT_TAB) {
++    disposition = PersistentNavigationDisposition::kCurrentTab;
++  } else if (params->disposition == WindowOpenDisposition::NEW_FOREGROUND_TAB &&
++             params->is_renderer_initiated && params->user_gesture &&
++             !params->started_from_context_menu) {
++    // Page-authored target=_blank links are ordinary clicks. Command-click,
++    // context-menu actions, and browser commands remain explicit overrides.
++    disposition = PersistentNavigationDisposition::kPageRequestedNewTarget;
++  }
++  if (!ShouldUseOptionalNavigationForAnchoredItem(
++          disposition, is_link_transition,
++          GetAnchoredPinnedTabHome(tab, &home_url, &home_title), home_url,
++          params->url)) {
++    return false;
++  }
++  Profile* profile = tab->GetProfile();
++  if (!arcium::MaybeHandleOptionalNavigation(
++          profile, OpenURLParamsFromNavigateParams(*params))) {
++    return false;
++  }
++  params->disposition = WindowOpenDisposition::IGNORE_ACTION;
++  return true;
 +}
 +
 +}  // namespace helium
@@ -4200,6 +4268,14 @@ Index: src/chrome/browser/ui/tabs/BUILD.gn
        "pinned_tab_service.cc",
        "pinned_tab_service_factory.cc",
        "recent_tabs_sub_menu_model.cc",
+@@ -754,6 +756,7 @@ if (!is_android) {
+   source_set("unit_tests") {
+     testonly = true
+     sources = [
++      "../helium/helium_anchored_navigation_throttle_unittest.cc",
+       "inactive_window_mouse_event_controller_unittest.cc",
+       "page_context_eligibility_helper_unittest.cc",
+       "split_view_iph_controller_unittest.cc",
 Index: src/chrome/browser/ui/tabs/pin_tab_codec.cc
 ===================================================================
 --- /dev/null
@@ -11580,7 +11656,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_persistent_item_model.cc
-@@ -0,0 +1,573 @@
+@@ -0,0 +1,577 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -11837,18 +11913,22 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.cc
 +             : PersistentLiveCollection::kPinList;
 +}
 +
-+bool ShouldOpenAnchoredNavigationInLittleArc(
++bool ShouldUseOptionalNavigationForAnchoredItem(
 +    PersistentNavigationDisposition disposition,
 +    bool is_link_transition,
 +    bool is_anchored_live_item,
 +    const GURL& home_url,
 +    const GURL& target_url) {
-+  if (disposition != PersistentNavigationDisposition::kCurrentTab ||
++  if ((disposition != PersistentNavigationDisposition::kCurrentTab &&
++       disposition !=
++           PersistentNavigationDisposition::kPageRequestedNewTarget) ||
 +      !is_link_transition || !is_anchored_live_item || !target_url.is_valid() ||
 +      !home_url.is_valid()) {
 +    return false;
 +  }
-+  return target_url.GetWithoutRef() != home_url.GetWithoutRef();
++  // Navigating within the saved site's normal URL space belongs in the Pin.
++  // A cross-site ordinary click may use an installed optional handler.
++  return net::SchemefulSite(target_url) != net::SchemefulSite(home_url);
 +}
 +
 +std::vector<PersistentGridChild> PackPersistentGridChildren(
@@ -12158,7 +12238,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_persistent_item_model.h
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,175 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -12194,11 +12274,16 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.h
 +PersistentItemCloseAction GetPersistentItemCloseAction(bool has_durable_record,
 +                                                       bool is_away_from_home);
 +
-+// CURRENT_TAB link navigations away from a live item's stored home open in
-+// Little Arc. Explicit new-tab/window dispositions are left unchanged.
-+enum class PersistentNavigationDisposition { kCurrentTab, kExplicitNewTarget };
++// Current-tab and plain page-authored link navigations may use an installed
++// optional handler. Explicit new-tab/window actions stay on Chromium's normal
++// navigation path.
++enum class PersistentNavigationDisposition {
++  kCurrentTab,
++  kPageRequestedNewTarget,
++  kExplicitNewTarget
++};
 +
-+bool ShouldOpenAnchoredNavigationInLittleArc(
++bool ShouldUseOptionalNavigationForAnchoredItem(
 +    PersistentNavigationDisposition disposition,
 +    bool is_link_transition,
 +    bool is_anchored_live_item,
@@ -12333,7 +12418,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
-@@ -0,0 +1,337 @@
+@@ -0,0 +1,343 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -12617,22 +12702,28 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
 +            LiveCollectionForKind(PersistentRecordKind::kPin));
 +}
 +
-+TEST(AnchoredNavigationPolicyTest, OnlyCurrentTabLinksAwayFromHomeDivert) {
++TEST(AnchoredNavigationPolicyTest, OrdinaryCrossSiteLinksMayDivert) {
 +  const GURL home("https://home.test/");
 +  const GURL away("https://away.test/");
-+  EXPECT_TRUE(ShouldOpenAnchoredNavigationInLittleArc(
++  EXPECT_TRUE(ShouldUseOptionalNavigationForAnchoredItem(
 +      PersistentNavigationDisposition::kCurrentTab, true, true, home, away));
-+  EXPECT_FALSE(ShouldOpenAnchoredNavigationInLittleArc(
++  EXPECT_FALSE(ShouldUseOptionalNavigationForAnchoredItem(
 +      PersistentNavigationDisposition::kCurrentTab, true, true, home, home));
-+  EXPECT_FALSE(ShouldOpenAnchoredNavigationInLittleArc(
++  EXPECT_FALSE(ShouldUseOptionalNavigationForAnchoredItem(
 +      PersistentNavigationDisposition::kCurrentTab, true, true, home,
 +      GURL("https://home.test/#section")));
-+  EXPECT_FALSE(ShouldOpenAnchoredNavigationInLittleArc(
++  EXPECT_FALSE(ShouldUseOptionalNavigationForAnchoredItem(
++      PersistentNavigationDisposition::kCurrentTab, true, true, home,
++      GURL("https://docs.home.test/guide?step=2")));
++  EXPECT_TRUE(ShouldUseOptionalNavigationForAnchoredItem(
++      PersistentNavigationDisposition::kPageRequestedNewTarget, true, true,
++      home, away));
++  EXPECT_FALSE(ShouldUseOptionalNavigationForAnchoredItem(
 +      PersistentNavigationDisposition::kExplicitNewTarget, true, true, home,
 +      away));
-+  EXPECT_FALSE(ShouldOpenAnchoredNavigationInLittleArc(
++  EXPECT_FALSE(ShouldUseOptionalNavigationForAnchoredItem(
 +      PersistentNavigationDisposition::kCurrentTab, false, true, home, away));
-+  EXPECT_FALSE(ShouldOpenAnchoredNavigationInLittleArc(
++  EXPECT_FALSE(ShouldUseOptionalNavigationForAnchoredItem(
 +      PersistentNavigationDisposition::kCurrentTab, true, false, home, away));
 +}
 +
@@ -14776,7 +14867,7 @@ Index: src/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
 +++ src/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
-@@ -108,12 +108,21 @@ void DraggedTabsContainer::ApplyUpdatesF
+@@ -108,10 +108,19 @@ void DraggedTabsContainer::ApplyUpdatesF
  
    auto* scroll_view = GetScrollViewForContainer();
    CHECK(scroll_view);
@@ -14800,5 +14891,473 @@ Index: src/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
  
    UpdateDraggingViewTransforms(point_in_container);
  
-   HandleTabDragInContainer(dragged_bounds_in_container);
- }
+Index: src/chrome/browser/ui/helium/helium_anchored_navigation_throttle.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/helium/helium_anchored_navigation_throttle.cc
+@@ -0,0 +1,143 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium/helium_anchored_navigation_throttle.h"
++
++#include <memory>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/arcium/optional_navigation.h"
++#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
++#include "chrome/browser/ui/helium/helium_persistent_item_model.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/navigation_throttle_registry.h"
++#include "content/public/browser/reload_type.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/page_transition_types.h"
++
++namespace helium {
++namespace {
++
++bool ResolveAnchoredHome(content::WebContents* contents,
++                         GURL* home_url,
++                         Profile** profile) {
++  tabs::TabInterface* tab =
++      contents ? tabs::TabInterface::MaybeGetFromContents(contents) : nullptr;
++  std::u16string home_title;
++  if (!GetAnchoredPinnedTabHome(tab, home_url, &home_title) ||
++      !tab->GetProfile()) {
++    return false;
++  }
++  *profile = tab->GetProfile();
++  return true;
++}
++
++bool OpenOptionalNavigation(Profile* profile,
++                            const content::OpenURLParams& params) {
++  return arcium::MaybeHandleOptionalNavigation(profile, params);
++}
++
++}  // namespace
++
++void HeliumAnchoredNavigationThrottle::MaybeCreateAndAdd(
++    content::NavigationThrottleRegistry& registry) {
++  if (!IsHeliumFavoritesAndPinsEnabled()) {
++    return;
++  }
++  content::NavigationHandle& handle = registry.GetNavigationHandle();
++  if (!handle.IsInPrimaryMainFrame()) {
++    return;
++  }
++  // Attach for any live anchored tab so a same-home start that later redirects
++  // away can still be diverted. Destination checks happen in MaybeDivert().
++  content::WebContents* contents = handle.GetWebContents();
++  tabs::TabInterface* tab =
++      contents ? tabs::TabInterface::MaybeGetFromContents(contents) : nullptr;
++  if (!IsAnchoredTab(tab)) {
++    return;
++  }
++  registry.AddThrottle(std::make_unique<HeliumAnchoredNavigationThrottle>(
++      registry, ProductionDependencies()));
++}
++
++HeliumAnchoredNavigationThrottle::Dependencies
++HeliumAnchoredNavigationThrottle::ProductionDependencies() {
++  return {
++      .resolve_anchored_home = base::BindRepeating(&ResolveAnchoredHome),
++      .open_optional_navigation = base::BindRepeating(&OpenOptionalNavigation),
++  };
++}
++
++HeliumAnchoredNavigationThrottle::HeliumAnchoredNavigationThrottle(
++    content::NavigationThrottleRegistry& registry,
++    Dependencies dependencies)
++    : content::NavigationThrottle(registry),
++      dependencies_(std::move(dependencies)) {}
++
++HeliumAnchoredNavigationThrottle::~HeliumAnchoredNavigationThrottle() = default;
++
++content::NavigationThrottle::ThrottleCheckResult
++HeliumAnchoredNavigationThrottle::WillStartRequest() {
++  return MaybeDivert();
++}
++
++content::NavigationThrottle::ThrottleCheckResult
++HeliumAnchoredNavigationThrottle::WillRedirectRequest() {
++  return MaybeDivert();
++}
++
++const char* HeliumAnchoredNavigationThrottle::GetNameForLogging() {
++  return "HeliumAnchoredNavigationThrottle";
++}
++
++bool HeliumAnchoredNavigationThrottle::IsOrdinaryCurrentTabLinkNavigation()
++    const {
++  content::NavigationHandle* handle = navigation_handle();
++  if (!handle || !handle->IsInPrimaryMainFrame() ||
++      !handle->IsRendererInitiated() || handle->IsFormSubmission() ||
++      handle->IsSameDocument() ||
++      handle->GetReloadType() != content::ReloadType::NONE) {
++    return false;
++  }
++  const ui::PageTransition transition = handle->GetPageTransition();
++  return ui::PageTransitionCoreTypeIs(transition, ui::PAGE_TRANSITION_LINK) &&
++         ui::PageTransitionIsNewNavigation(transition) &&
++         handle->WasInitiatedByLinkClick();
++}
++
++content::NavigationThrottle::ThrottleCheckResult
++HeliumAnchoredNavigationThrottle::MaybeDivert() {
++  if (diverted_ || !IsOrdinaryCurrentTabLinkNavigation()) {
++    return PROCEED;
++  }
++
++  content::WebContents* contents = navigation_handle()->GetWebContents();
++  GURL home_url;
++  Profile* profile = nullptr;
++  const bool is_anchored =
++      dependencies_.resolve_anchored_home &&
++      dependencies_.resolve_anchored_home.Run(contents, &home_url, &profile);
++  const bool is_link_transition = ui::PageTransitionCoreTypeIs(
++      navigation_handle()->GetPageTransition(), ui::PAGE_TRANSITION_LINK);
++  if (!ShouldUseOptionalNavigationForAnchoredItem(
++          PersistentNavigationDisposition::kCurrentTab, is_link_transition,
++          is_anchored, home_url, navigation_handle()->GetURL()) ||
++      !profile || !dependencies_.open_optional_navigation) {
++    return PROCEED;
++  }
++
++  content::OpenURLParams params =
++      content::OpenURLParams::FromNavigationHandle(navigation_handle());
++  if (!dependencies_.open_optional_navigation.Run(profile, params)) {
++    return PROCEED;
++  }
++
++  diverted_ = true;
++  return CANCEL_AND_IGNORE;
++}
++
++}  // namespace helium
+Index: src/chrome/browser/ui/helium/helium_anchored_navigation_throttle.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/helium/helium_anchored_navigation_throttle.h
+@@ -0,0 +1,66 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_HELIUM_ANCHORED_NAVIGATION_THROTTLE_H_
++#define CHROME_BROWSER_UI_HELIUM_HELIUM_ANCHORED_NAVIGATION_THROTTLE_H_
++
++#include "base/functional/callback.h"
++#include "content/public/browser/navigation_throttle.h"
++#include "content/public/browser/page_navigator.h"
++#include "url/gurl.h"
++
++class Profile;
++
++namespace content {
++class NavigationThrottleRegistry;
++class WebContents;
++}  // namespace content
++
++namespace helium {
++
++// Intercepts renderer-initiated primary-main-frame link navigations that would
++// take a live Favorite/Pin away from its stored home. Those destinations open
++// in Helium Little Arc; the original same-tab navigation is ignored only after
++// the popup is created. chrome::Navigate never sees ordinary same-tab renderer
++// link clicks, so this throttle is the ownership point for that path.
++class HeliumAnchoredNavigationThrottle : public content::NavigationThrottle {
++ public:
++  using ResolveAnchoredHomeCallback = base::RepeatingCallback<
++      bool(content::WebContents* contents, GURL* home_url, Profile** profile)>;
++  using OpenOptionalNavigationCallback =
++      base::RepeatingCallback<bool(Profile* profile,
++                                   const content::OpenURLParams& params)>;
++
++  struct Dependencies {
++    ResolveAnchoredHomeCallback resolve_anchored_home;
++    OpenOptionalNavigationCallback open_optional_navigation;
++  };
++
++  static void MaybeCreateAndAdd(content::NavigationThrottleRegistry& registry);
++  static Dependencies ProductionDependencies();
++
++  HeliumAnchoredNavigationThrottle(
++      content::NavigationThrottleRegistry& registry,
++      Dependencies dependencies);
++  HeliumAnchoredNavigationThrottle(const HeliumAnchoredNavigationThrottle&) =
++      delete;
++  HeliumAnchoredNavigationThrottle& operator=(
++      const HeliumAnchoredNavigationThrottle&) = delete;
++  ~HeliumAnchoredNavigationThrottle() override;
++
++  ThrottleCheckResult WillStartRequest() override;
++  ThrottleCheckResult WillRedirectRequest() override;
++  const char* GetNameForLogging() override;
++
++ private:
++  ThrottleCheckResult MaybeDivert();
++  bool IsOrdinaryCurrentTabLinkNavigation() const;
++
++  Dependencies dependencies_;
++  bool diverted_ = false;
++};
++
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_ANCHORED_NAVIGATION_THROTTLE_H_
+Index: src/chrome/browser/ui/helium/helium_anchored_navigation_throttle_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/helium/helium_anchored_navigation_throttle_unittest.cc
+@@ -0,0 +1,223 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium/helium_anchored_navigation_throttle.h"
++
++#include <memory>
++#include <optional>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/test/base/chrome_render_view_host_test_harness.h"
++#include "content/public/browser/navigation_throttle.h"
++#include "content/public/browser/page_navigator.h"
++#include "content/public/browser/reload_type.h"
++#include "content/public/browser/site_instance.h"
++#include "content/public/test/mock_navigation_handle.h"
++#include "content/public/test/mock_navigation_throttle_registry.h"
++#include "services/network/public/cpp/resource_request_body.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "testing/gmock/include/gmock/gmock.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/base/page_transition_types.h"
++#include "url/gurl.h"
++#include "url/origin.h"
++
++using content::NavigationThrottle;
++using ::testing::Return;
++
++namespace helium {
++namespace {
++
++constexpr char kHome[] = "https://home.test/";
++constexpr char kAway[] = "https://away.test/away";
++constexpr char kHomeFragment[] = "https://home.test/#section";
++constexpr char kReferrer[] = "https://source.test/page";
++
++class HeliumAnchoredNavigationThrottleTest
++    : public ChromeRenderViewHostTestHarness {
++ public:
++  void SetUp() override {
++    ChromeRenderViewHostTestHarness::SetUp();
++    handle_ = std::make_unique<content::MockNavigationHandle>(
++        GURL(kAway), web_contents()->GetPrimaryMainFrame());
++    handle_->set_is_renderer_initiated(true);
++    handle_->set_is_in_primary_main_frame(true);
++    handle_->set_page_transition(ui::PAGE_TRANSITION_LINK);
++    handle_->set_is_form_submission(false);
++    handle_->set_is_same_document(false);
++    handle_->set_reload_type(content::ReloadType::NONE);
++    handle_->set_redirect_chain({GURL(kAway)});
++    handle_->SetReferrer(blink::mojom::Referrer::New(
++        GURL(kReferrer), network::mojom::ReferrerPolicy::kStrictOrigin));
++    handle_->set_initiator_origin(
++        url::Origin::Create(GURL("https://source.test")));
++    ON_CALL(*handle_, HasUserGesture()).WillByDefault(Return(true));
++    ON_CALL(*handle_, WasInitiatedByLinkClick()).WillByDefault(Return(true));
++    registry_ = std::make_unique<content::MockNavigationThrottleRegistry>(
++        handle_.get(),
++        content::MockNavigationThrottleRegistry::RegistrationMode::kHold);
++  }
++
++  void TearDown() override {
++    throttle_.reset();
++    registry_.reset();
++    handle_.reset();
++    ChromeRenderViewHostTestHarness::TearDown();
++  }
++
++ protected:
++  HeliumAnchoredNavigationThrottle::Dependencies MakeDependencies(
++      bool is_anchored,
++      bool open_succeeds) {
++    HeliumAnchoredNavigationThrottle::Dependencies deps;
++    deps.resolve_anchored_home = base::BindRepeating(
++        [](bool is_anchored, const GURL& home, Profile* profile,
++           content::WebContents*, GURL* home_url, Profile** out_profile) {
++          if (!is_anchored) {
++            return false;
++          }
++          *home_url = home;
++          *out_profile = profile;
++          return true;
++        },
++        is_anchored, GURL(kHome), profile());
++    deps.open_optional_navigation = base::BindRepeating(
++        [](int* open_count, std::optional<content::OpenURLParams>* last_params,
++           bool* open_succeeds, Profile*,
++           const content::OpenURLParams& params) {
++          ++*open_count;
++          *last_params = params;
++          return *open_succeeds;
++        },
++        &open_count_, &last_params_, &open_succeeds_);
++    open_succeeds_ = open_succeeds;
++    return deps;
++  }
++
++  HeliumAnchoredNavigationThrottle* CreateThrottle(bool is_anchored = true,
++                                                   bool open_succeeds = true) {
++    throttle_ = std::make_unique<HeliumAnchoredNavigationThrottle>(
++        *registry_, MakeDependencies(is_anchored, open_succeeds));
++    return throttle_.get();
++  }
++
++  int open_count_ = 0;
++  std::optional<content::OpenURLParams> last_params_;
++  bool open_succeeds_ = true;
++  std::unique_ptr<content::MockNavigationHandle> handle_;
++  std::unique_ptr<content::MockNavigationThrottleRegistry> registry_;
++  std::unique_ptr<HeliumAnchoredNavigationThrottle> throttle_;
++};
++
++TEST_F(HeliumAnchoredNavigationThrottleTest,
++       DivertsRendererLinkAwayFromHomeOnce) {
++  HeliumAnchoredNavigationThrottle* throttle = CreateThrottle();
++  EXPECT_EQ(NavigationThrottle::CANCEL_AND_IGNORE,
++            throttle->WillStartRequest().action());
++  EXPECT_EQ(1, open_count_);
++  ASSERT_TRUE(last_params_.has_value());
++  EXPECT_EQ(GURL(kAway), last_params_->url);
++  EXPECT_EQ(GURL(kReferrer), last_params_->referrer.url);
++  ASSERT_TRUE(last_params_->initiator_origin.has_value());
++  EXPECT_EQ(url::Origin::Create(GURL("https://source.test")),
++            *last_params_->initiator_origin);
++  EXPECT_TRUE(last_params_->is_renderer_initiated);
++  EXPECT_TRUE(last_params_->user_gesture);
++  EXPECT_FALSE(last_params_->started_from_context_menu);
++
++  handle_->set_url(GURL("https://away.test/redirected"));
++  EXPECT_EQ(NavigationThrottle::PROCEED,
++            throttle->WillRedirectRequest().action());
++  EXPECT_EQ(1, open_count_);
++}
++
++TEST_F(HeliumAnchoredNavigationThrottleTest, PopupFailureFallsBackToSameTab) {
++  HeliumAnchoredNavigationThrottle* throttle =
++      CreateThrottle(/*is_anchored=*/true, /*open_succeeds=*/false);
++  EXPECT_EQ(NavigationThrottle::PROCEED, throttle->WillStartRequest().action());
++  EXPECT_EQ(1, open_count_);
++}
++
++TEST_F(HeliumAnchoredNavigationThrottleTest, UnanchoredTabBypass) {
++  HeliumAnchoredNavigationThrottle* throttle =
++      CreateThrottle(/*is_anchored=*/false);
++  EXPECT_EQ(NavigationThrottle::PROCEED, throttle->WillStartRequest().action());
++  EXPECT_EQ(0, open_count_);
++}
++
++TEST_F(HeliumAnchoredNavigationThrottleTest, HomeAndFragmentStayInTab) {
++  handle_->set_url(GURL(kHome));
++  HeliumAnchoredNavigationThrottle* throttle = CreateThrottle();
++  EXPECT_EQ(NavigationThrottle::PROCEED, throttle->WillStartRequest().action());
++  EXPECT_EQ(0, open_count_);
++
++  handle_->set_url(GURL(kHomeFragment));
++  EXPECT_EQ(NavigationThrottle::PROCEED, throttle->WillStartRequest().action());
++  EXPECT_EQ(0, open_count_);
++}
++
++TEST_F(HeliumAnchoredNavigationThrottleTest, SubframeBypass) {
++  handle_->set_is_in_primary_main_frame(false);
++  HeliumAnchoredNavigationThrottle* throttle = CreateThrottle();
++  EXPECT_EQ(NavigationThrottle::PROCEED, throttle->WillStartRequest().action());
++  EXPECT_EQ(0, open_count_);
++}
++
++TEST_F(HeliumAnchoredNavigationThrottleTest, FormAndScriptBypass) {
++  handle_->set_is_form_submission(true);
++  HeliumAnchoredNavigationThrottle* throttle = CreateThrottle();
++  EXPECT_EQ(NavigationThrottle::PROCEED, throttle->WillStartRequest().action());
++  EXPECT_EQ(0, open_count_);
++
++  handle_->set_is_form_submission(false);
++  EXPECT_CALL(*handle_, WasInitiatedByLinkClick())
++      .WillRepeatedly(Return(false));
++  EXPECT_EQ(NavigationThrottle::PROCEED, throttle->WillStartRequest().action());
++  EXPECT_EQ(0, open_count_);
++}
++
++TEST_F(HeliumAnchoredNavigationThrottleTest, TypedReloadAndHistoryBypass) {
++  HeliumAnchoredNavigationThrottle* throttle = CreateThrottle();
++
++  handle_->set_page_transition(ui::PAGE_TRANSITION_TYPED);
++  EXPECT_EQ(NavigationThrottle::PROCEED, throttle->WillStartRequest().action());
++  handle_->set_page_transition(ui::PAGE_TRANSITION_RELOAD);
++  handle_->set_reload_type(content::ReloadType::NORMAL);
++  EXPECT_EQ(NavigationThrottle::PROCEED, throttle->WillStartRequest().action());
++  handle_->set_reload_type(content::ReloadType::NONE);
++  handle_->set_page_transition(ui::PageTransitionFromInt(
++      ui::PAGE_TRANSITION_LINK | ui::PAGE_TRANSITION_FORWARD_BACK));
++  EXPECT_EQ(NavigationThrottle::PROCEED, throttle->WillStartRequest().action());
++  EXPECT_EQ(0, open_count_);
++}
++
++TEST_F(HeliumAnchoredNavigationThrottleTest, RedirectAwayFromHomeDivertsOnce) {
++  handle_->set_url(GURL(kHome));
++  HeliumAnchoredNavigationThrottle* throttle = CreateThrottle();
++  EXPECT_EQ(NavigationThrottle::PROCEED, throttle->WillStartRequest().action());
++  EXPECT_EQ(0, open_count_);
++
++  handle_->set_url(GURL(kAway));
++  EXPECT_EQ(NavigationThrottle::CANCEL_AND_IGNORE,
++            throttle->WillRedirectRequest().action());
++  EXPECT_EQ(1, open_count_);
++  ASSERT_TRUE(last_params_.has_value());
++  EXPECT_EQ(GURL(kAway), last_params_->url);
++}
++
++TEST_F(HeliumAnchoredNavigationThrottleTest,
++       UnsupportedDestinationFallsBackWhenHandlerDeclines) {
++  handle_->set_url(GURL("mailto:person@example.test"));
++  handle_->set_redirect_chain({handle_->GetURL()});
++  HeliumAnchoredNavigationThrottle* throttle =
++      CreateThrottle(/*is_anchored=*/true, /*open_succeeds=*/false);
++  EXPECT_EQ(NavigationThrottle::PROCEED, throttle->WillStartRequest().action());
++  EXPECT_EQ(1, open_count_);
++  ASSERT_TRUE(last_params_.has_value());
++  EXPECT_EQ(GURL("mailto:person@example.test"), last_params_->url);
++}
++
++}  // namespace
++}  // namespace helium
+Index: src/chrome/browser/chrome_content_browser_client_navigation_throttles.cc
+===================================================================
+--- src.orig/chrome/browser/chrome_content_browser_client_navigation_throttles.cc
++++ src/chrome/browser/chrome_content_browser_client_navigation_throttles.cc
+@@ -92,6 +92,7 @@
+ #include "chrome/browser/devtools/devtools_navigation_throttle.h"
+ #include "chrome/browser/page_info/web_view_side_panel_throttle.h"
+ #include "chrome/browser/themes/theme_service_factory.h"
++#include "chrome/browser/ui/helium/helium_anchored_navigation_throttle.h"
+ #include "chrome/browser/ui/lens/lens_overlay_side_panel_navigation_throttle.h"
+ #include "chrome/browser/ui/read_anything/read_anything_side_panel_navigation_throttle.h"
+ #include "chrome/browser/ui/search/chrome_search_navigation_throttle.h"
+@@ -296,6 +297,10 @@ void CreateAndAddChromeThrottlesForNavig
+       registry.AddThrottle(std::move(throttle));
+     }
+ 
++#if !BUILDFLAG(IS_ANDROID)
++    helium::HeliumAnchoredNavigationThrottle::MaybeCreateAndAdd(registry);
++#endif  // !BUILDFLAG(IS_ANDROID)
++
+ #if BUILDFLAG(IS_ANDROID)
+     CrossDeviceSigninFlowNavigationThrottle::MaybeCreateAndAdd(registry);
+ #endif  // BUILDFLAG(IS_ANDROID)

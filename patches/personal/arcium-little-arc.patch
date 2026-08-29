@@ -185,27 +185,35 @@ Index: src/chrome/browser/ui/BUILD.gn
 ===================================================================
 --- src.orig/chrome/browser/ui/BUILD.gn
 +++ src/chrome/browser/ui/BUILD.gn
-@@ -372,6 +372,7 @@ executable("helium_persistent_item_model
-   ]
-   deps = [
-     "//base",
-+    "//net",
-     "//testing/gtest",
-     "//testing/gtest:gtest_main",
-     "//url",
-@@ -393,8 +394,12 @@ static_library("ui") {
-     "enterprise_startup_dialog.h",
-     "helium/helium_favorites_and_pins.cc",
-     "helium/helium_favorites_and_pins.h",
-+    "helium/helium_anchored_navigation_throttle.cc",
-+    "helium/helium_anchored_navigation_throttle.h",
-     "helium/helium_layout_state_controller.cc",
-     "helium/helium_layout_state_controller.h",
+@@ -360,6 +360,19 @@ if (!is_android) {
+   }
+ }
+ 
++executable("helium_little_arc_tests") {
++  testonly = true
++  sources = [ "helium/helium_little_arc_unittest.cc" ]
++  deps = [
++    ":ui",
++    "//base/test:test_support",
++    "//chrome/test:test_support",
++    "//testing/gtest",
++    "//testing/gtest:gtest_main",
++    "//url",
++  ]
++}
++
+ executable("arcium_optional_navigation_tests") {
+   testonly = true
+   sources = [
+@@ -431,6 +444,8 @@ static_library("ui") {
+     "helium/helium_space_service.h",
+     "helium/helium_space_service_factory.cc",
+     "helium/helium_space_service_factory.h",
 +    "helium/helium_little_arc.cc",
 +    "helium/helium_little_arc.h",
-     "helium/helium_persistent_item_model.cc",
-     "helium/helium_persistent_item_model.h",
-     "helium/helium_sidebar_drag_transaction.cc",
+     "idle_bubble.h",
+     "managed_ui.cc",
+     "managed_ui.h",
 Index: src/chrome/browser/ui/browser_command_controller.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/browser_command_controller.cc
@@ -247,7 +255,7 @@ Index: src/chrome/browser/ui/helium/helium_little_arc.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_little_arc.cc
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,281 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -257,10 +265,12 @@ Index: src/chrome/browser/ui/helium/helium_little_arc.cc
 +#include <algorithm>
 +#include <vector>
 +
++#include "base/functional/bind.h"
 +#include "base/memory/weak_ptr.h"
 +#include "base/no_destructor.h"
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/search/search.h"
++#include "chrome/browser/ui/arcium/optional_navigation.h"
 +#include "chrome/browser/ui/browser.h"
 +#include "chrome/browser/ui/browser_commands.h"
 +#include "chrome/browser/ui/browser_window.h"
@@ -278,6 +288,7 @@ Index: src/chrome/browser/ui/helium/helium_little_arc.cc
 +#include "chrome/common/pref_names.h"
 +#include "components/prefs/pref_service.h"
 +#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/page_navigator.h"
 +#include "content/public/browser/web_contents.h"
 +#include "ui/base/mojom/window_show_state.mojom.h"
 +#include "ui/base/page_transition_types.h"
@@ -395,7 +406,18 @@ Index: src/chrome/browser/ui/helium/helium_little_arc.cc
 +  return created;
 +}
 +
++bool HandleOptionalNavigation(Profile* profile,
++                              const content::OpenURLParams& params) {
++  return CanOpenUrlInLittleArc(profile, params.url) &&
++         OpenUrlInLittleArc(profile, params) != nullptr;
++}
++
 +}  // namespace
++
++void InitializeLittleArc() {
++  arcium::SetOptionalNavigationHandler(
++      base::BindRepeating(&HandleOptionalNavigation));
++}
 +
 +bool ShouldOpenExternalLinksInLittleArc(Profile* profile) {
 +  if (!profile) {
@@ -409,13 +431,15 @@ Index: src/chrome/browser/ui/helium/helium_little_arc.cc
 +  return browser && LittleArcTracker::GetInstance().Contains(browser);
 +}
 +
-+Browser* OpenUrlsInLittleArc(Profile* profile, const std::vector<GURL>& urls) {
-+  if (!profile || urls.size() != 1u || !urls.front().is_valid() ||
-+      !urls.front().SchemeIsHTTPOrHTTPS()) {
-+    return nullptr;
-+  }
-+  if (Browser::GetCreationStatusForProfile(profile) !=
-+      Browser::CreationStatus::kOk) {
++bool CanOpenUrlInLittleArc(Profile* profile, const GURL& url) {
++  return profile && url.is_valid() && url.SchemeIsHTTPOrHTTPS() &&
++         Browser::GetCreationStatusForProfile(profile) ==
++             Browser::CreationStatus::kOk;
++}
++
++Browser* OpenUrlInLittleArc(Profile* profile,
++                            const content::OpenURLParams& open_url_params) {
++  if (!CanOpenUrlInLittleArc(profile, open_url_params.url)) {
 +    return nullptr;
 +  }
 +
@@ -432,7 +456,8 @@ Index: src/chrome/browser/ui/helium/helium_little_arc.cc
 +  if (!browser) {
 +    return nullptr;
 +  }
-+  NavigateParams nav(browser, urls.front(), ui::PAGE_TRANSITION_LINK);
++  NavigateParams nav(browser, open_url_params.url, open_url_params.transition);
++  nav.FillNavigateParamsFromOpenURLParams(open_url_params);
 +  nav.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
 +  nav.window_action = NavigateParams::WindowAction::kNoAction;
 +  nav.web_app_navigation_data.emplace();
@@ -456,6 +481,17 @@ Index: src/chrome/browser/ui/helium/helium_little_arc.cc
 +  }
 +  browser->window()->Show();
 +  return browser;
++}
++
++Browser* OpenUrlsInLittleArc(Profile* profile, const std::vector<GURL>& urls) {
++  if (urls.size() != 1u) {
++    return nullptr;
++  }
++  content::OpenURLParams params(urls.front(), content::Referrer(),
++                                WindowOpenDisposition::NEW_FOREGROUND_TAB,
++                                ui::PAGE_TRANSITION_LINK,
++                                /*is_renderer_initiated=*/false);
++  return OpenUrlInLittleArc(profile, params);
 +}
 +
 +bool PromoteLittleArcToTab(Browser* browser) {
@@ -505,7 +541,7 @@ Index: src/chrome/browser/ui/helium/helium_little_arc.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_little_arc.h
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,48 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -519,7 +555,14 @@ Index: src/chrome/browser/ui/helium/helium_little_arc.h
 +class GURL;
 +class Profile;
 +
++namespace content {
++struct OpenURLParams;
++}  // namespace content
++
 +namespace helium {
++
++// Installs Little Arc as the process-wide optional-navigation handler.
++void InitializeLittleArc();
 +
 +// Opens external links in a temporary popup so the main window's tab state is
 +// left alone. ⌘O promotes the peek into a normal tab.
@@ -527,9 +570,18 @@ Index: src/chrome/browser/ui/helium/helium_little_arc.h
 +
 +bool IsLittleArcBrowser(const Browser* browser);
 +
++// Returns true when |profile| may create a Little Arc popup for |url|. The
++// exact profile, including an off-the-record profile, owns the new popup.
++bool CanOpenUrlInLittleArc(Profile* profile, const GURL& url);
++
 +// Opens |urls| in a new Little Arc popup for |profile|. Returns the popup, or
 +// nullptr if creation failed.
 +Browser* OpenUrlsInLittleArc(Profile* profile, const std::vector<GURL>& urls);
++
++// Opens one link while retaining Chromium's referrer, initiator, and context
++// menu navigation state.
++Browser* OpenUrlInLittleArc(Profile* profile,
++                            const content::OpenURLParams& params);
 +
 +// Moves the Little Arc contents into the profile's last tabbed window and
 +// closes the popup. Returns false if |browser| is not a Little Arc window.
@@ -632,140 +684,210 @@ Index: src/chrome/common/pref_names.h
  // A boolean pref set to true if the minimal location bar should be used.
  inline constexpr char kHeliumMinimalLocationBar[] =
      "helium.browser.minimal_location_bar";
-Index: src/chrome/browser/chrome_content_browser_client_navigation_throttles.cc
+Index: src/chrome/app/chrome_command_ids.h
 ===================================================================
---- src.orig/chrome/browser/chrome_content_browser_client_navigation_throttles.cc
-+++ src/chrome/browser/chrome_content_browser_client_navigation_throttles.cc
-@@ -92,6 +92,7 @@
- #include "chrome/browser/devtools/devtools_navigation_throttle.h"
- #include "chrome/browser/page_info/web_view_side_panel_throttle.h"
- #include "chrome/browser/themes/theme_service_factory.h"
-+#include "chrome/browser/ui/helium/helium_anchored_navigation_throttle.h"
- #include "chrome/browser/ui/lens/lens_overlay_side_panel_navigation_throttle.h"
- #include "chrome/browser/ui/read_anything/read_anything_side_panel_navigation_throttle.h"
- #include "chrome/browser/ui/search/chrome_search_navigation_throttle.h"
-@@ -296,6 +297,10 @@ void CreateAndAddChromeThrottlesForNavig
-       registry.AddThrottle(std::move(throttle));
+--- src.orig/chrome/app/chrome_command_ids.h
++++ src/chrome/app/chrome_command_ids.h
+@@ -377,6 +377,7 @@
+ #define IDC_CONTENT_CONTEXT_COPYLINKTEXT 50107
+ #define IDC_CONTENT_CONTEXT_OPENLINKINPROFILE 50108
+ #define IDC_CONTENT_CONTEXT_OPENLINKBOOKMARKAPP 50109
++#define IDC_CONTENT_CONTEXT_OPENLINKLITTLEARC 50110
+ #define IDC_CONTENT_CONTEXT_OPENLINKSPLITVIEW 50111
+ #define IDC_CONTENT_CONTEXT_ADD_LINK_TO_READING_LIST 50112
+ // Image items.
+Index: src/chrome/app/generated_resources.grd
+===================================================================
+--- src.orig/chrome/app/generated_resources.grd
++++ src/chrome/app/generated_resources.grd
+@@ -720,6 +720,9 @@ are declared in tools/grit/grit_args.gni
+           <message name="IDS_CONTENT_CONTEXT_OPENLINKNEWTAB" desc="The name of the Open Link in New Tab command in the content area context menu">
+             Open link in new &amp;tab
+           </message>
++          <message name="IDS_CONTENT_CONTEXT_OPENLINKLITTLEARC" desc="The name of the Open Link in Little Arc command in the content area context menu">
++            Open link in Little &amp;Arc
++          </message>
+           <message name="IDS_CONTENT_CONTEXT_OPENLINKNEWWINDOW" desc="The name of the Open Link in New Window command in the content area context menu">
+             Open link in new &amp;window
+           </message>
+@@ -1067,6 +1070,9 @@ are declared in tools/grit/grit_args.gni
+           <message name="IDS_CONTENT_CONTEXT_OPENLINKNEWTAB" desc="In Title Case: The name of the Open Link in New Tab command in the content area context menu">
+             Open Link in New &amp;Tab
+           </message>
++          <message name="IDS_CONTENT_CONTEXT_OPENLINKLITTLEARC" desc="In Title Case: The name of the Open Link in Little Arc command in the content area context menu">
++            Open Link in Little &amp;Arc
++          </message>
+           <message name="IDS_CONTENT_CONTEXT_OPENLINKNEWWINDOW" desc="In Title Case: The name of the Open Link in New Window command in the content area context menu">
+             Open Link in New &amp;Window
+           </message>
+Index: src/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+===================================================================
+--- src.orig/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
++++ src/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+@@ -257,6 +257,7 @@
+ #include "chrome/browser/ui/autofill/autofill_client_provider_factory.h"
+ #include "chrome/browser/ui/find_bar/find_bar_state_factory.h"
+ #include "chrome/browser/ui/hats/hats_service_factory.h"
++#include "chrome/browser/ui/helium/helium_little_arc.h"
+ #include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/browser/ui/prefs/prefs_tab_helper.h"
+ #include "chrome/browser/ui/safety_hub/menu_notification_service_factory.h"
+@@ -1303,6 +1304,7 @@ void ChromeBrowserMainExtraPartsProfiles
+   PersonalContextServiceFactory::GetInstance();
+ #if !BUILDFLAG(IS_ANDROID)
+   PinnedTabServiceFactory::GetInstance();
++  helium::InitializeLittleArc();
+   helium::HeliumSpaceServiceFactory::GetInstance();
+   PinnedToolbarActionsModelFactory::GetInstance();
+ #endif
+Index: src/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+===================================================================
+--- src.orig/chrome/browser/renderer_context_menu/render_view_context_menu.cc
++++ src/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+@@ -113,6 +113,7 @@
+ #include "chrome/browser/ui/chrome_pages.h"
+ #include "chrome/browser/ui/exclusive_access/exclusive_access_manager.h"
+ #include "chrome/browser/ui/exclusive_access/keyboard_lock_controller.h"
++#include "chrome/browser/ui/helium/helium_little_arc.h"
+ #include "chrome/browser/ui/lens/lens_overlay_entry_point_controller.h"
+ #include "chrome/browser/ui/lens/lens_search_controller.h"
+ #include "chrome/browser/ui/lens/lens_string_utils.h"
+@@ -1897,6 +1898,10 @@ void RenderViewContextMenu::AppendLinkIt
+           IDC_CONTENT_CONTEXT_OPENLINKNEWTAB,
+           in_app ? IDS_CONTENT_CONTEXT_OPENLINKNEWTAB_INAPP
+                  : IDS_CONTENT_CONTEXT_OPENLINKNEWTAB);
++      if (helium::CanOpenUrlInLittleArc(GetProfile(), params_.link_url)) {
++        menu_model_.AddItemWithStringId(IDC_CONTENT_CONTEXT_OPENLINKLITTLEARC,
++                                        IDS_CONTENT_CONTEXT_OPENLINKLITTLEARC);
++      }
      }
  
-+#if !BUILDFLAG(IS_ANDROID)
-+    helium::HeliumAnchoredNavigationThrottle::MaybeCreateAndAdd(registry);
-+#endif  // !BUILDFLAG(IS_ANDROID)
+     if (show_open_in_new_window) {
+@@ -3298,6 +3303,10 @@ bool RenderViewContextMenu::IsCommandIdE
+     case IDC_CONTENT_CONTEXT_PARTIAL_TRANSLATE:
+       return navigation_allowed;
+ 
++    case IDC_CONTENT_CONTEXT_OPENLINKLITTLEARC:
++      return navigation_allowed &&
++             helium::CanOpenUrlInLittleArc(GetProfile(), params_.link_url) &&
++             IsOpenLinkAllowedByDlp(params_.link_url);
+     case IDC_CONTENT_CONTEXT_OPENLINKBOOKMARKAPP:
+     case IDC_CONTENT_CONTEXT_OPENLINKINPROFILE:
+     case IDC_CONTENT_CONTEXT_OPENLINKNEWTAB:
+@@ -3647,6 +3656,19 @@ void RenderViewContextMenu::ExecuteComma
+         source_web_contents_->OpenURL(params,
+                                       /*navigation_handle_callback=*/{});
+       }
++      break;
++    }
 +
- #if BUILDFLAG(IS_ANDROID)
-     CrossDeviceSigninFlowNavigationThrottle::MaybeCreateAndAdd(registry);
- #endif  // BUILDFLAG(IS_ANDROID)
-Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
++    case IDC_CONTENT_CONTEXT_OPENLINKLITTLEARC: {
++      OpenURLParams params = GetOpenURLParamsWithExtraHeaders(
++          params_.link_url, params_.frame_url, params_.frame_origin,
++          WindowOpenDisposition::NEW_FOREGROUND_TAB, ui::PAGE_TRANSITION_LINK,
++          /*extra_headers=*/std::string(), /*started_from_context_menu=*/true);
++      if (!helium::CanOpenUrlInLittleArc(GetProfile(), params_.link_url) ||
++          !helium::OpenUrlInLittleArc(GetProfile(), params)) {
++        source_web_contents_->OpenURL(params,
++                                      /*navigation_handle_callback=*/{});
++      }
+       break;
+     }
+ 
+Index: src/chrome/browser/renderer_context_menu/render_view_context_menu_unittest.cc
 ===================================================================
---- src.orig/chrome/browser/ui/helium/helium_favorites_and_pins.cc
-+++ src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
-@@ -13,6 +13,7 @@
- #include "chrome/browser/sessions/session_service.h"
- #include "chrome/browser/sessions/session_service_factory.h"
- #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+--- src.orig/chrome/browser/renderer_context_menu/render_view_context_menu_unittest.cc
++++ src/chrome/browser/renderer_context_menu/render_view_context_menu_unittest.cc
+@@ -572,6 +572,42 @@ TEST_F(RenderViewContextMenuPrefsTest,
+ }
+ #endif  // BUILDFLAG(ENABLE_PRINT_PREVIEW)
+ 
++TEST_F(RenderViewContextMenuPrefsTest, LittleArcCommandRequiresEligibleLink) {
++  content::ContextMenuParams params = CreateParams(MenuItem::LINK);
++  auto menu = std::make_unique<TestRenderViewContextMenu>(
++      *web_contents()->GetPrimaryMainFrame(), params);
++  menu->Init();
++
++  EXPECT_TRUE(menu->IsItemPresent(IDC_CONTENT_CONTEXT_OPENLINKLITTLEARC));
++  EXPECT_TRUE(menu->IsCommandIdEnabled(IDC_CONTENT_CONTEXT_OPENLINKLITTLEARC));
++
++  params.link_url = GURL("mailto:person@example.test");
++  menu = std::make_unique<TestRenderViewContextMenu>(
++      *web_contents()->GetPrimaryMainFrame(), params);
++  menu->Init();
++  EXPECT_FALSE(menu->IsItemPresent(IDC_CONTENT_CONTEXT_OPENLINKLITTLEARC));
++  EXPECT_FALSE(menu->IsCommandIdEnabled(IDC_CONTENT_CONTEXT_OPENLINKLITTLEARC));
++}
++
++TEST_F(RenderViewContextMenuPrefsTest,
++       LittleArcIneligibleExecutionFallsBackWithContext) {
++  TestNavigationDelegate delegate;
++  web_contents()->SetDelegate(&delegate);
++  content::RenderFrameHost& main_frame = *web_contents()->GetPrimaryMainFrame();
++
++  content::ContextMenuParams params = CreateParams(MenuItem::LINK);
++  params.link_url = GURL("mailto:person@example.test");
++  auto menu = std::make_unique<TestRenderViewContextMenu>(main_frame, params);
++  menu->ExecuteCommand(IDC_CONTENT_CONTEXT_OPENLINKLITTLEARC, 0);
++
++  ASSERT_TRUE(delegate.last_navigation_params());
++  EXPECT_EQ(params.link_url, delegate.last_navigation_params()->url);
++  EXPECT_TRUE(delegate.last_navigation_params()->started_from_context_menu);
++  EXPECT_TRUE(delegate.last_navigation_params()->initiator_origin.has_value());
++  EXPECT_EQ(main_frame.GetFrameToken(),
++            delegate.last_navigation_params()->initiator_frame_token);
++}
++
+ #if BUILDFLAG(IS_CHROMEOS)
+ class RenderViewContextMenuDlpPrefsTest
+     : public RenderViewContextMenuPrefsTest {
+Index: src/chrome/browser/ui/helium/helium_little_arc_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/helium/helium_little_arc_unittest.cc
+@@ -0,0 +1,45 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
 +#include "chrome/browser/ui/helium/helium_little_arc.h"
- #include "chrome/browser/ui/helium/helium_space_service.h"
- #include "chrome/browser/ui/helium/helium_space_service_factory.h"
- #include "chrome/browser/ui/navigator/browser_navigator_params.h"
-@@ -403,8 +404,40 @@ void RestoreAnchoredPinnedTabExtraData(
- }
- 
- bool MaybeConvertAnchoredFavoriteOrPinNavigation(NavigateParams* params) {
--  // Pin/favorite anchored tabs navigate in place.
--  return false;
-+  if (!params || !IsHeliumFavoritesAndPinsEnabled()) {
-+    return false;
-+  }
-+  content::WebContents* source = params->source_contents;
-+  tabs::TabInterface* tab =
-+      source ? tabs::TabInterface::MaybeGetFromContents(source) : nullptr;
-+  GURL home_url;
-+  std::u16string home_title;
-+  const bool is_link_transition = ui::PageTransitionCoreTypeIs(
-+      params->transition, ui::PAGE_TRANSITION_LINK);
-+  PersistentNavigationDisposition disposition =
-+      PersistentNavigationDisposition::kExplicitNewTarget;
-+  if (params->disposition == WindowOpenDisposition::CURRENT_TAB) {
-+    disposition = PersistentNavigationDisposition::kCurrentTab;
-+  } else if (params->disposition ==
-+                 WindowOpenDisposition::NEW_FOREGROUND_TAB &&
-+             params->is_renderer_initiated && params->user_gesture &&
-+             !params->started_from_context_menu) {
-+    // Page-authored target=_blank links are ordinary clicks. Command-click,
-+    // context-menu actions, and browser commands remain explicit overrides.
-+    disposition = PersistentNavigationDisposition::kPageRequestedNewTarget;
-+  }
-+  if (!ShouldOpenAnchoredNavigationInLittleArc(
-+          disposition, is_link_transition,
-+          GetAnchoredPinnedTabHome(tab, &home_url, &home_title), home_url,
-+          params->url)) {
-+    return false;
-+  }
-+  Profile* profile = tab->GetProfile();
-+  if (!OpenUrlsInLittleArc(profile, {params->url})) {
-+    return false;
-+  }
-+  params->disposition = WindowOpenDisposition::IGNORE_ACTION;
-+  return true;
- }
- 
- }  // namespace helium
-Index: src/chrome/browser/ui/helium/helium_persistent_item_model.cc
-===================================================================
---- src.orig/chrome/browser/ui/helium/helium_persistent_item_model.cc
-+++ src/chrome/browser/ui/helium/helium_persistent_item_model.cc
-@@ -260,12 +260,16 @@ bool ShouldOpenAnchoredNavigationInLittl
-     bool is_anchored_live_item,
-     const GURL& home_url,
-     const GURL& target_url) {
--  if (disposition != PersistentNavigationDisposition::kCurrentTab ||
-+  if ((disposition != PersistentNavigationDisposition::kCurrentTab &&
-+       disposition !=
-+           PersistentNavigationDisposition::kPageRequestedNewTarget) ||
-       !is_link_transition || !is_anchored_live_item || !target_url.is_valid() ||
-       !home_url.is_valid()) {
-     return false;
-   }
--  return target_url.GetWithoutRef() != home_url.GetWithoutRef();
-+  // Navigating within the saved site's normal URL space belongs in the Pin.
-+  // A cross-site ordinary click peeks without replacing the anchored item.
-+  return net::SchemefulSite(target_url) != net::SchemefulSite(home_url);
- }
- 
- std::vector<PersistentGridChild> PackPersistentGridChildren(
-Index: src/chrome/browser/ui/helium/helium_persistent_item_model.h
-===================================================================
---- src.orig/chrome/browser/ui/helium/helium_persistent_item_model.h
-+++ src/chrome/browser/ui/helium/helium_persistent_item_model.h
-@@ -35,7 +35,13 @@ PersistentItemCloseAction GetPersistentI
- 
- // CURRENT_TAB link navigations away from a live item's stored home open in
- // Little Arc. Explicit new-tab/window dispositions are left unchanged.
--enum class PersistentNavigationDisposition { kCurrentTab, kExplicitNewTarget };
-+// A plain page-authored foreground target behaves like an ordinary link.
-+// Explicit user requests for another tab/window remain stock Chromium actions.
-+enum class PersistentNavigationDisposition {
-+  kCurrentTab,
-+  kPageRequestedNewTarget,
-+  kExplicitNewTarget
-+};
- 
- bool ShouldOpenAnchoredNavigationInLittleArc(
-     PersistentNavigationDisposition disposition,
-Index: src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
-===================================================================
---- src.orig/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
-+++ src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
-@@ -272,6 +272,12 @@ TEST(AnchoredNavigationPolicyTest, OnlyC
-       PersistentNavigationDisposition::kCurrentTab, true, true, home,
-       GURL("https://home.test/#section")));
-   EXPECT_FALSE(ShouldOpenAnchoredNavigationInLittleArc(
-+      PersistentNavigationDisposition::kCurrentTab, true, true, home,
-+      GURL("https://docs.home.test/guide?step=2")));
-+  EXPECT_TRUE(ShouldOpenAnchoredNavigationInLittleArc(
-+      PersistentNavigationDisposition::kPageRequestedNewTarget, true, true,
-+      home, away));
-+  EXPECT_FALSE(ShouldOpenAnchoredNavigationInLittleArc(
-       PersistentNavigationDisposition::kExplicitNewTarget, true, true, home,
-       away));
-   EXPECT_FALSE(ShouldOpenAnchoredNavigationInLittleArc(
++
++#include <memory>
++
++#include "chrome/test/base/testing_profile.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++
++namespace helium {
++namespace {
++
++TEST(LittleArcEligibilityTest, AcceptsWebUrlsForExactRegularAndOtrProfiles) {
++  TestingProfile profile;
++  Profile* otr_profile =
++      profile.GetPrimaryOTRProfile(/*create_if_needed=*/true);
++
++  EXPECT_TRUE(CanOpenUrlInLittleArc(&profile, GURL("https://example.test/")));
++  EXPECT_TRUE(CanOpenUrlInLittleArc(otr_profile, GURL("http://example.test/")));
++  EXPECT_NE(&profile, otr_profile);
++}
++
++TEST(LittleArcEligibilityTest, RejectsUnsupportedAndInvalidUrls) {
++  TestingProfile profile;
++
++  EXPECT_FALSE(CanOpenUrlInLittleArc(&profile, GURL()));
++  EXPECT_FALSE(
++      CanOpenUrlInLittleArc(&profile, GURL("mailto:person@example.test")));
++  EXPECT_FALSE(CanOpenUrlInLittleArc(&profile, GURL("file:///tmp/example")));
++}
++
++TEST(LittleArcEligibilityTest, RejectsProfilesThatCannotCreateWindows) {
++  TestingProfile::Builder builder;
++  builder.DisallowBrowserWindows();
++  std::unique_ptr<TestingProfile> profile = builder.Build();
++
++  EXPECT_FALSE(
++      CanOpenUrlInLittleArc(profile.get(), GURL("https://example.test/")));
++}
++
++}  // namespace
++}  // namespace helium
