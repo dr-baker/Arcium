@@ -605,3 +605,98 @@ Index: src/chrome/browser/ui/webui/settings/settings_localized_strings_provider.
        {"importChooseFile", IDS_SETTINGS_IMPORT_CHOOSE_FILE},
        {"importCommit", IDS_SETTINGS_IMPORT_COMMIT},
        {"noProfileFound", IDS_SETTINGS_IMPORT_NO_PROFILE_FOUND},
+Index: src/chrome/browser/importer/arcium_arc_import_browsertest.cc
+===================================================================
+--- src.orig/chrome/browser/importer/arcium_arc_import_browsertest.cc
++++ src/chrome/browser/importer/arcium_arc_import_browsertest.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <map>
+ #include <string>
++#include <utility>
+ 
+ #include "chrome/browser/ui/arcium/tab_provenance.h"
+ #include "chrome/browser/ui/browser.h"
+@@ -21,6 +22,7 @@
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/test/browser_test.h"
+ #include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
+ 
+ namespace arcium {
+ namespace {
+@@ -130,5 +132,74 @@ IN_PROC_BROWSER_TEST_F(ArciumArcImportBr
+   EXPECT_NE(-1, browser()->tab_strip_model()->GetIndexOfWebContents(unrelated));
+ }
+ 
++helium::PersistentNode Link(std::string id,
++                            std::u16string title,
++                            const char* url) {
++  return helium::PersistentNode{
++      .data = helium::PersistentLink{
++          .id = std::move(id), .title = std::move(title), .url = GURL(url)}};
++}
++
++helium::PersistentNode Folder(std::string id,
++                              std::u16string title,
++                              bool collapsed,
++                              helium::PersistentNodes children) {
++  return helium::PersistentNode{
++      .data = helium::PersistentFolder{.id = std::move(id),
++                                       .title = std::move(title),
++                                       .collapsed = collapsed,
++                                       .children = std::move(children)}};
++}
++
++IN_PROC_BROWSER_TEST_F(ArciumArcImportBrowserTest,
++                       ImportsNestedFoldersAsDormantPins) {
++  helium::HeliumSpaceService* service =
++      helium::HeliumSpaceServiceFactory::GetForProfile(browser()->profile());
++  ASSERT_TRUE(service);
++  const int original_tab_count = browser()->tab_strip_model()->count();
++
++  ASSERT_TRUE(ImportArcSidebarSnapshot(browser()->profile(), kSnapshot,
++                                       ArcSidebarDestination::kPins));
++  EXPECT_EQ(original_tab_count, browser()->tab_strip_model()->count());
++  ASSERT_EQ(2u, service->GetSpaces().size());
++
++  helium::HeliumSpace* space_a = service->GetSpaceById("space-a");
++  helium::HeliumSpace* space_b = service->GetSpaceById("space-b");
++  ASSERT_TRUE(space_a);
++  ASSERT_TRUE(space_b);
++  EXPECT_EQ("arc-profile", space_a->source_profile());
++  EXPECT_EQ("arc-profile", space_b->source_profile());
++
++  const helium::PersistentNodes expected_space_a = {
++      Link("arc:arc-profile:space-a:root", u"Root", "https://root.test/"),
++      Folder("arc:arc-profile:space-a:outer", u"Outer", true,
++             {Link("arc:arc-profile:space-a:outer-tab", u"Outer tab",
++                   "https://outer.test/"),
++              Folder("arc:arc-profile:space-a:inner", u"Inner", false,
++                     {Link("arc:arc-profile:space-a:inner-tab", u"Inner tab",
++                           "https://inner.test/")})})};
++  const helium::PersistentNodes expected_space_b = {
++      Link("arc:arc-profile:space-b:other-space", u"Other space",
++           "https://space-b.test/")};
++  const helium::PersistentNodes expected_favorites = {
++      Link("arc:arc-profile:favorite:favorite", u"Favorite",
++           "https://favorite.test/")};
++  EXPECT_EQ(expected_space_a, space_a->pins());
++  EXPECT_EQ(expected_space_b, space_b->pins());
++  EXPECT_EQ(expected_favorites, service->GetFavoritesForSpace(*space_a));
++  EXPECT_EQ(expected_favorites, service->GetFavoritesForSpace(*space_b));
++
++  ASSERT_TRUE(ImportArcSidebarSnapshot(browser()->profile(), kSnapshot,
++                                       ArcSidebarDestination::kPins));
++  EXPECT_EQ(original_tab_count, browser()->tab_strip_model()->count());
++  ASSERT_EQ(2u, service->GetSpaces().size());
++  space_a = service->GetSpaceById("space-a");
++  space_b = service->GetSpaceById("space-b");
++  ASSERT_TRUE(space_a);
++  ASSERT_TRUE(space_b);
++  EXPECT_EQ(expected_space_a, space_a->pins());
++  EXPECT_EQ(expected_space_b, space_b->pins());
++}
++
+ }  // namespace
+ }  // namespace arcium
