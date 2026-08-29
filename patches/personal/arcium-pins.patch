@@ -5178,7 +5178,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
-@@ -0,0 +1,1288 @@
+@@ -0,0 +1,1232 @@
 +// Copyright 2025 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -5565,7 +5565,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +}
 +
 +bool PinTabContainerView::IsDragging() const {
-+  if (folder_drag_view_) {
++  if (persistent_drag_view_) {
 +    return true;
 +  }
 +  if (!collection_node_ || !collection_node_->GetController()) {
@@ -5575,7 +5575,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +}
 +
 +bool PinTabContainerView::IsViewDragging(const views::View& child_view) const {
-+  if (folder_drag_view_ == &child_view) {
++  if (persistent_drag_view_ == &child_view) {
 +    return true;
 +  }
 +  if (!collection_node_ || !collection_node_->GetController()) {
@@ -5600,9 +5600,9 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +    tab_strip->CancelPersistentRowReplacement();
 +  }
 +  pending_replacement_key_.reset();
-+  folder_drag_view_ = nullptr;
-+  folder_drag_id_.clear();
-+  folder_drag_location_ = {};
++  persistent_drag_view_ = nullptr;
++  persistent_drag_id_.clear();
++  persistent_drag_location_ = {};
 +  ClearPersistentTabDragPreview();
 +  row_depths_.clear();
 +  row_ids_.clear();
@@ -6009,115 +6009,21 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +
 +bool PinTabContainerView::BeginPersistentTabDrag(
 +    PersistentTabView& row,
-+    const ui::MouseEvent& press_event,
++    const ui::MouseEvent&,
 +    const ui::MouseEvent& drag_event) {
-+  if (!collection_node_ || !space_service_) {
-+    return false;
-+  }
-+  BrowserView* browser_view =
-+      collection_node_->GetController()->GetBrowserView();
-+  Browser* browser = browser_view ? browser_view->browser() : nullptr;
-+  if (!browser) {
-+    return false;
-+  }
-+  const std::string id = row.stable_id();
-+  TabStripView* tab_strip = GetTabStripView(this);
-+  if (tab_strip) {
-+    tab_strip->BeginPersistentRowReplacement(&row);
-+    pending_replacement_key_ =
-+        PersistentLinkKey(helium::PersistentRecordKind::kPin, id);
-+  }
-+  if (!space_service_->ActivatePersistentItem(
-+          browser, helium::PersistentRecordKind::kPin, id)) {
-+    if (tab_strip) {
-+      tab_strip->CancelPersistentRowReplacement();
-+    }
-+    pending_replacement_key_.reset();
-+    return false;
-+  }
-+  ReconcilePersistentRows();
-+
-+  tabs::TabInterface* tab = space_service_->GetLiveTabForPersistentItem(
-+      browser, helium::PersistentRecordKind::kPin, id);
-+  TabCollectionNode* node =
-+      tab ? collection_node_->GetNodeForHandle(tab->GetHandle()) : nullptr;
-+  auto* native_view =
-+      node ? views::AsViewClass<TabView>(node->view()) : nullptr;
-+  if (!native_view) {
-+    space_service_->ClosePersistentItemInstance(
-+        browser, helium::PersistentRecordKind::kPin, id,
-+        space_service_->GetSpaceIdForBrowser(browser));
-+    return false;
-+  }
-+
-+  auto* controller = collection_node_->GetController();
-+  const ui::ListSelectionModel original_selection =
-+      controller->GetSelectionModel();
-+  ui::MouseEvent native_press(
-+      press_event, static_cast<views::View*>(&row),
-+      static_cast<views::View*>(native_view));
-+  controller->GetDragHandler().InitializeDrag(*node, original_selection,
-+                                               native_press);
-+  materialized_drag_view_ = native_view;
-+  materialized_drag_id_ = id;
-+
-+  ui::MouseEvent native_drag(
-+      drag_event, static_cast<views::View*>(&row),
-+      static_cast<views::View*>(native_view));
-+  if (!controller->GetDragHandler().ContinueDrag(*native_view, native_drag)) {
-+    controller->GetDragHandler().EndDrag(EndDragReason::kCancel);
-+    materialized_drag_view_ = nullptr;
-+    materialized_drag_id_.clear();
-+    space_service_->ClosePersistentItemInstance(
-+        browser, helium::PersistentRecordKind::kPin, id,
-+        space_service_->GetSpaceIdForBrowser(browser));
-+    return false;
-+  }
-+  return true;
++  return BeginPersistentTreeDrag(row, row.stable_id(), drag_event);
 +}
 +
 +void PinTabContainerView::UpdatePersistentTabDrag(
 +    PersistentTabView& row,
 +    const ui::MouseEvent& event) {
-+  if (!materialized_drag_view_ || !collection_node_) {
-+    return;
-+  }
-+  ui::MouseEvent native_event(
-+      event, static_cast<views::View*>(&row),
-+      static_cast<views::View*>(materialized_drag_view_.get()));
-+  collection_node_->GetController()->GetDragHandler().ContinueDrag(
-+      *materialized_drag_view_, native_event);
++  UpdatePersistentTreeDrag(row, event);
 +}
 +
 +void PinTabContainerView::EndPersistentTabDrag(
 +    PersistentTabView& row,
 +    const ui::MouseEvent& event) {
-+  if (!collection_node_ || materialized_drag_id_.empty()) {
-+    return;
-+  }
-+  gfx::Point point_in_screen = event.location();
-+  views::View::ConvertPointToScreen(&row, &point_in_screen);
-+  BrowserView* browser_view =
-+      collection_node_->GetController()->GetBrowserView();
-+  Browser* browser = browser_view ? browser_view->browser() : nullptr;
-+  const std::string id = std::exchange(materialized_drag_id_, std::string());
-+  materialized_drag_view_ = nullptr;
-+  collection_node_->GetController()->GetDragHandler().EndDrag(
-+      EndDragReason::kComplete);
-+
-+  TabStripView* tab_strip = GetTabStripView(this);
-+  auto* ordinary = tab_strip ? tab_strip->GetUnpinnedTabsContainer() : nullptr;
-+  if (!browser || !ordinary ||
-+      point_in_screen.y() >= ordinary->GetBoundsInScreen().y()) {
-+    return;
-+  }
-+  const PersistentTabDropLocation location =
-+      GetPersistentDropLocation(id, point_in_screen);
-+  space_service_->MovePin(browser, id, location.parent_id,
-+                          location.before_id);
-+  space_service_->ClosePersistentItemInstance(
-+      browser, helium::PersistentRecordKind::kPin, id,
-+      space_service_->GetSpaceIdForBrowser(browser));
++  EndPersistentTreeDrag(row, event);
 +}
 +
 +bool PinTabContainerView::BeginPersistentFolderDrag(
@@ -6125,47 +6031,85 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +    std::string id,
 +    const ui::MouseEvent&,
 +    const ui::MouseEvent& drag_event) {
-+  if (!space_service_ || id.empty()) {
-+    return false;
-+  }
-+  folder_drag_view_ = &row;
-+  folder_drag_id_ = std::move(id);
-+  UpdatePersistentFolderDrag(row, drag_event);
-+  return true;
++  return BeginPersistentTreeDrag(row, std::move(id), drag_event);
 +}
 +
 +void PinTabContainerView::UpdatePersistentFolderDrag(
 +    views::View& row,
 +    const ui::MouseEvent& event) {
-+  if (folder_drag_view_ != &row || folder_drag_id_.empty()) {
-+    return;
-+  }
-+  gfx::Point point_in_screen = event.location();
-+  views::View::ConvertPointToScreen(&row, &point_in_screen);
-+  folder_drag_location_ =
-+      GetPersistentDropLocation(folder_drag_id_, point_in_screen);
-+  UpdatePersistentTabDragPreview(point_in_screen);
++  UpdatePersistentTreeDrag(row, event);
 +}
 +
 +void PinTabContainerView::EndPersistentFolderDrag(
 +    views::View& row,
 +    const ui::MouseEvent& event) {
-+  if (folder_drag_view_ != &row || folder_drag_id_.empty()) {
++  EndPersistentTreeDrag(row, event);
++}
++
++bool PinTabContainerView::BeginPersistentTreeDrag(
++    views::View& row,
++    std::string id,
++    const ui::MouseEvent& drag_event) {
++  if (!collection_node_ || !space_service_ || id.empty() ||
++      persistent_drag_view_) {
++    return false;
++  }
++  persistent_drag_view_ = &row;
++  persistent_drag_id_ = std::move(id);
++  UpdatePersistentTreeDrag(row, drag_event);
++  return true;
++}
++
++void PinTabContainerView::UpdatePersistentTreeDrag(
++    views::View& row,
++    const ui::MouseEvent& event) {
++  if (persistent_drag_view_ != &row || persistent_drag_id_.empty()) {
 +    return;
 +  }
-+  UpdatePersistentFolderDrag(row, event);
++  gfx::Point point_in_screen = event.location();
++  views::View::ConvertPointToScreen(&row, &point_in_screen);
++  TabStripView* tab_strip = GetTabStripView(this);
++  auto* ordinary = tab_strip ? tab_strip->GetUnpinnedTabsContainer() : nullptr;
++  if (ordinary &&
++      point_in_screen.y() >= ordinary->GetBoundsInScreen().y()) {
++    persistent_drag_location_ = {
++        .target = PersistentTabDropTarget::kTab};
++    ClearPersistentTabDragPreview();
++    return;
++  }
++  persistent_drag_location_ =
++      GetPersistentDropLocation(persistent_drag_id_, point_in_screen);
++  UpdatePersistentTabDragPreview(point_in_screen);
++}
++
++void PinTabContainerView::EndPersistentTreeDrag(
++    views::View& row,
++    const ui::MouseEvent& event) {
++  if (persistent_drag_view_ != &row || persistent_drag_id_.empty()) {
++    return;
++  }
++  UpdatePersistentTreeDrag(row, event);
 +  BrowserView* browser_view =
 +      collection_node_ && collection_node_->GetController()
 +          ? collection_node_->GetController()->GetBrowserView()
 +          : nullptr;
 +  Browser* browser = browser_view ? browser_view->browser() : nullptr;
-+  const std::string id = std::exchange(folder_drag_id_, std::string());
-+  folder_drag_view_ = nullptr;
-+  if (browser) {
-+    space_service_->MovePin(browser, id, folder_drag_location_.parent_id,
-+                            folder_drag_location_.before_id);
++  const std::string id = std::exchange(persistent_drag_id_, std::string());
++  persistent_drag_view_ = nullptr;
++  const PersistentTabDropLocation location = persistent_drag_location_;
++  persistent_drag_location_ = {};
++  const bool is_folder = row_is_folders_.contains(&row) &&
++                         row_is_folders_.at(&row);
++  if (browser && location.target == PersistentTabDropTarget::kTab &&
++      !is_folder &&
++      space_service_->ActivatePersistentItem(
++          browser, helium::PersistentRecordKind::kPin, id)) {
++    space_service_->RemovePersistentItem(
++        browser, helium::PersistentRecordKind::kPin, id);
++  } else if (browser && location.target == PersistentTabDropTarget::kPin) {
++    space_service_->MovePin(browser, id, location.parent_id,
++                            location.before_id);
 +  }
-+  folder_drag_location_ = {};
 +  ClearPersistentTabDragPreview();
 +  ScheduleReconcilePersistentRows();
 +}
@@ -6203,11 +6147,11 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +
 +void PinTabContainerView::UpdatePersistentTabDragPreview(
 +    const gfx::Point& point_in_screen) {
-+  if (!IsHandlingDrag() && !folder_drag_view_) {
++  if (!IsHandlingDrag() && !persistent_drag_view_) {
 +    return;
 +  }
 +
-+  views::View* dragged_view = folder_drag_view_;
++  views::View* dragged_view = persistent_drag_view_;
 +  size_t current_index = 0;
 +  if (!dragged_view) {
 +    for (size_t index = 0; index < children().size(); ++index) {
@@ -6471,7 +6415,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,180 @@
 +// Copyright 2025 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -6620,6 +6564,13 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +      const gfx::Point& point_in_screen) const;
 +  void UpdatePersistentFolderDropHighlight(
 +      const PersistentTabDropLocation& location);
++  bool BeginPersistentTreeDrag(views::View& row,
++                               std::string id,
++                               const ui::MouseEvent& drag_event);
++  void UpdatePersistentTreeDrag(views::View& row,
++                                const ui::MouseEvent& event);
++  void EndPersistentTreeDrag(views::View& row,
++                             const ui::MouseEvent& event);
 +  void ToggleFolder(helium::PersistentRecordKind kind, std::string id);
 +
 +  raw_ptr<TabCollectionNode> collection_node_;
@@ -6630,11 +6581,9 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +  std::map<const views::View*, std::string> row_parent_ids_;
 +  std::map<const views::View*, bool> row_is_folders_;
 +  std::map<std::string, raw_ptr<views::View>, std::less<>> persistent_rows_;
-+  raw_ptr<TabView> materialized_drag_view_ = nullptr;
-+  std::string materialized_drag_id_;
-+  raw_ptr<views::View> folder_drag_view_ = nullptr;
-+  std::string folder_drag_id_;
-+  PersistentTabDropLocation folder_drag_location_;
++  raw_ptr<views::View> persistent_drag_view_ = nullptr;
++  std::string persistent_drag_id_;
++  PersistentTabDropLocation persistent_drag_location_;
 +  raw_ptr<views::View> folder_drop_highlight_ = nullptr;
 +  std::vector<PersistentFolderConnector> folder_connectors_;
 +  bool reconcile_scheduled_ = false;
