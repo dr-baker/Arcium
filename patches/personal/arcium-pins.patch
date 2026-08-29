@@ -4403,15 +4403,16 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/tabs/tab_strip_model.cc
 +++ src/chrome/browser/ui/tabs/tab_strip_model.cc
-@@ -60,6 +60,7 @@
+@@ -60,6 +60,8 @@
  #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
  #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
 +#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
++#include "chrome/browser/ui/helium/helium_persistent_item_model.h"
  #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_bubble.h"
  #include "chrome/browser/ui/tab_ui_helper.h"
  #include "chrome/browser/ui/tabs/features.h"
-@@ -108,6 +109,8 @@
+@@ -108,6 +110,8 @@
  #include "components/tabs/public/tab_group_tab_collection.h"
  #include "components/tabs/public/tab_interface.h"
  #include "components/tabs/public/tab_strip_collection.h"
@@ -4420,7 +4421,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  #include "components/tabs/public/unpinned_tab_collection.h"
  #include "components/web_modal/web_contents_modal_dialog_manager.h"
  #include "components/webapps/common/web_app_id.h"
-@@ -1144,6 +1147,57 @@ int TabStripModel::MoveWebContentsAt(
+@@ -1144,6 +1148,57 @@ int TabStripModel::MoveWebContentsAt(
    return to_position;
  }
  
@@ -4478,7 +4479,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  void TabStripModel::MoveSelectedTabsTo(
      int index,
      std::optional<tab_groups::TabGroupId> into_group) {
-@@ -1467,9 +1521,20 @@ void TabStripModel::SetTabBlocked(int in
+@@ -1467,9 +1522,20 @@ void TabStripModel::SetTabBlocked(int in
  }
  
  int TabStripModel::SetTabPinned(int index, bool pinned) {
@@ -4500,7 +4501,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
    if (IsTabPinned(index) == pinned) {
      return index;
    }
-@@ -1559,6 +1624,10 @@ int TabStripModel::IndexOfFirstNonPinned
+@@ -1559,6 +1625,10 @@ int TabStripModel::IndexOfFirstNonPinned
    return contents_data_->IndexOfFirstNonPinnedTab();
  }
  
@@ -4511,7 +4512,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  void TabStripModel::ExtendSelectionTo(int index) {
    CHECK(ContainsIndex(index));
    tabs::TabStripModelSelectionState new_model = selection_model_;
-@@ -2474,6 +2543,15 @@ bool TabStripModel::IsContextMenuCommand
+@@ -2474,6 +2544,15 @@ bool TabStripModel::IsContextMenuCommand
      return false;
    }
  
@@ -4527,7 +4528,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
    switch (command_id) {
      case CommandNewTabToRight:
      case CommandCloseTab:
-@@ -2526,8 +2604,19 @@ bool TabStripModel::IsContextMenuCommand
+@@ -2526,8 +2605,19 @@ bool TabStripModel::IsContextMenuCommand
      case CommandTogglePinned:
        return true;
  
@@ -4548,7 +4549,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  
      case CommandSendTabToSelf:
        return true;
-@@ -2538,12 +2627,12 @@ bool TabStripModel::IsContextMenuCommand
+@@ -2538,12 +2628,12 @@ bool TabStripModel::IsContextMenuCommand
      case CommandAddToNewGroup:
      case CommandAddToNewGroupFromMenuItem:
      case CommandAddToExistingGroup:
@@ -4563,7 +4564,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  
      case CommandRemoveFromGroup:
        return SupportsTabGroups();
-@@ -2733,7 +2822,61 @@ void TabStripModel::ExecuteContextMenuCo
+@@ -2733,7 +2823,61 @@ void TabStripModel::ExecuteContextMenuCo
        break;
      }
  
@@ -4625,7 +4626,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
        base::UmaHistogramCounts1000(
            "Tab.ContextMenu.TogglePinned.SelectedTabsCount",
            selection_model_.size());
-@@ -3469,13 +3612,13 @@ bool TabStripModel::ShouldRunUnloadListe
+@@ -3469,13 +3613,13 @@ bool TabStripModel::ShouldRunUnloadListe
  
  int TabStripModel::ConstrainInsertionIndex(int index, bool pinned_tab) const {
    return pinned_tab ? std::clamp(index, 0, IndexOfFirstNonPinnedTab())
@@ -4641,7 +4642,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  }
  
  std::vector<int> TabStripModel::GetIndicesForCommand(int index) const {
-@@ -3771,8 +3914,16 @@ tabs::TabInterface* TabStripModel::GetTa
+@@ -3771,8 +3915,25 @@ tabs::TabInterface* TabStripModel::GetTa
  void TabStripModel::CloseTabs(base::span<content::WebContents* const> items,
                                uint32_t close_types) {
    std::vector<content::WebContents*> filtered_items;
@@ -4650,10 +4651,19 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
    for (content::WebContents* contents : items) {
      tabs::TabInterface* tab = GetTabForWebContents(contents);
 +    if (preserve_anchored_tabs && helium::IsAnchoredPinnedTab(tab)) {
-+      if (items.size() == 1u) {
-+        helium::ReturnAnchoredPinnedTabHome(tab);
++      const helium::PersistentItemCloseAction action =
++          helium::GetPersistentItemCloseAction(
++              helium::IsPersistentItemTab(tab),
++              helium::IsAnchoredPinnedTabAwayFromHome(tab));
++      if (action == helium::PersistentItemCloseAction::kReturnHome) {
++        if (items.size() == 1u) {
++          helium::ReturnAnchoredPinnedTabHome(tab);
++        }
++        continue;
 +      }
-+      continue;
++      if (action == helium::PersistentItemCloseAction::kKeepOpen) {
++        continue;
++      }
 +    }
      if (IsTabClosable(tab)) {
        filtered_items.push_back(contents);
@@ -5178,7 +5188,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
-@@ -0,0 +1,1232 @@
+@@ -0,0 +1,1272 @@
 +// Copyright 2025 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -5284,18 +5294,21 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +  using UpdateDragCallback = base::RepeatingCallback<void(
 +      views::View&,
 +      const ui::MouseEvent&)>;
++  using CancelDragCallback = base::RepeatingCallback<void(views::View&)>;
 +
 +  PersistentFolderRow(views::Button::PressedCallback callback,
 +                      std::u16string_view text,
 +                      std::string stable_id,
 +                      BeginDragCallback begin_drag,
 +                      UpdateDragCallback update_drag,
-+                      UpdateDragCallback end_drag)
++                      UpdateDragCallback end_drag,
++                      CancelDragCallback cancel_drag)
 +      : LabelButton(std::move(callback), text),
 +        stable_id_(std::move(stable_id)),
 +        begin_drag_(std::move(begin_drag)),
 +        update_drag_(std::move(update_drag)),
-+        end_drag_(std::move(end_drag)) {
++        end_drag_(std::move(end_drag)),
++        cancel_drag_(std::move(cancel_drag)) {
 +    // The vertical tab collection paints through a translucent compositor
 +    // layer. Virtual rows have no opaque background of their own, so use
 +    // grayscale antialiasing like other labels in translucent browser chrome.
@@ -5363,6 +5376,16 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +    views::LabelButton::OnMouseReleased(event);
 +  }
 +
++  void OnMouseCaptureLost() override {
++    const bool was_dragging = dragging_;
++    dragging_ = false;
++    drag_start_event_.reset();
++    views::LabelButton::OnMouseCaptureLost();
++    if (was_dragging) {
++      cancel_drag_.Run(*this);
++    }
++  }
++
 + private:
 +  const std::string stable_id_;
 +  std::u16string title_;
@@ -5370,6 +5393,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +  BeginDragCallback begin_drag_;
 +  UpdateDragCallback update_drag_;
 +  UpdateDragCallback end_drag_;
++  CancelDragCallback cancel_drag_;
 +  std::unique_ptr<ui::MouseEvent> drag_start_event_;
 +  bool dragging_ = false;
 +};
@@ -5783,6 +5807,8 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +              &PinTabContainerView::UpdatePersistentFolderDrag,
 +              weak_ptr_factory_.GetWeakPtr()),
 +          base::BindRepeating(&PinTabContainerView::EndPersistentFolderDrag,
++                              weak_ptr_factory_.GetWeakPtr()),
++          base::BindRepeating(&PinTabContainerView::CancelPersistentTreeDrag,
 +                              weak_ptr_factory_.GetWeakPtr()));
 +      folder_row->SetHorizontalAlignment(gfx::ALIGN_LEFT);
 +      row = AddChildWithoutAnimation(std::move(folder_row));
@@ -5846,6 +5872,9 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +      continue;
 +    }
 +    views::View* stale_row = it->second;
++    if (persistent_drag_view_ == stale_row) {
++      CancelPersistentTreeDrag(*stale_row);
++    }
 +    row_depths_.erase(stale_row);
 +    row_ids_.erase(stale_row);
 +    row_parent_ids_.erase(stale_row);
@@ -6026,6 +6055,10 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +  EndPersistentTreeDrag(row, event);
 +}
 +
++void PinTabContainerView::CancelPersistentTabDrag(PersistentTabView& row) {
++  CancelPersistentTreeDrag(row);
++}
++
 +bool PinTabContainerView::BeginPersistentFolderDrag(
 +    views::View& row,
 +    std::string id,
@@ -6114,6 +6147,17 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +  ScheduleReconcilePersistentRows();
 +}
 +
++void PinTabContainerView::CancelPersistentTreeDrag(views::View& row) {
++  if (persistent_drag_view_ != &row) {
++    return;
++  }
++  persistent_drag_view_ = nullptr;
++  persistent_drag_id_.clear();
++  persistent_drag_location_ = {};
++  ClearPersistentTabDragPreview();
++  ScheduleReconcilePersistentRows();
++}
++
 +std::string PinTabContainerView::GetPersistentIdForView(
 +    const views::View& view) const {
 +  if (const auto known = row_ids_.find(&view); known != row_ids_.end()) {
@@ -6176,6 +6220,12 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +    const PersistentTabDropLocation location =
 +        GetPersistentDropLocation(source_id->second, point_in_screen);
 +    UpdatePersistentFolderDropHighlight(location);
++    // Chromium owns live TabViews during a native drag and supplies their
++    // animation. Manual child reordering is reserved for virtual rows, which
++    // have no TabCollectionNode and therefore no native drag presentation.
++    if (!persistent_drag_view_) {
++      return;
++    }
 +    size_t insertion_index = children().size();
 +    if (!location.before_id.empty()) {
 +      for (size_t index = 0; index < children().size(); ++index) {
@@ -6415,7 +6465,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,182 @@
 +// Copyright 2025 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -6510,6 +6560,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +                               const ui::MouseEvent& event) override;
 +  void EndPersistentTabDrag(PersistentTabView& row,
 +                            const ui::MouseEvent& event) override;
++  void CancelPersistentTabDrag(PersistentTabView& row) override;
 +
 +  bool BeginPersistentFolderDrag(views::View& row,
 +                                 std::string id,
@@ -6571,6 +6622,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +                                const ui::MouseEvent& event);
 +  void EndPersistentTreeDrag(views::View& row,
 +                             const ui::MouseEvent& event);
++  void CancelPersistentTreeDrag(views::View& row);
 +  void ToggleFolder(helium::PersistentRecordKind kind, std::string id);
 +
 +  raw_ptr<TabCollectionNode> collection_node_;
@@ -6816,7 +6868,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
    const auto& drag_session_data = drag_controller_->GetSessionData();
  
    const TabDragData* source_drag_data =
-@@ -453,6 +546,63 @@ bool TabDragHandlerImpl::IsDraggingPinne
+@@ -453,6 +546,72 @@ bool TabDragHandlerImpl::IsDraggingPinne
                       [](const auto& tab_data) { return tab_data.pinned; });
  }
  
@@ -6843,9 +6895,18 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
 +
 +  persistent_tab_drop_location_ = location;
 +
++  const auto& drag_data =
++      drag_controller_->GetSessionData().tab_drag_data_;
++  // Persistent conversion has one durable identity and one tree destination.
++  // Reject multi-selection until the service exposes an atomic batch move;
++  // applying item-by-item can partially convert the selection or reverse it.
++  if (drag_data.size() != 1u) {
++    drag_controller_->SetDeferredSuccessfulDropCallback(base::OnceClosure());
++    return;
++  }
++
 +  std::vector<PendingPersistentDrop> drops;
-+  for (const TabDragData& data :
-+       drag_controller_->GetSessionData().tab_drag_data_) {
++  for (const TabDragData& data : drag_data) {
 +    if (!data.contents) {
 +      continue;
 +    }
@@ -6880,7 +6941,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
  bool TabDragHandlerImpl::IsDraggingGroups() const {
    if (!drag_controller_) {
      return false;
-@@ -663,7 +813,17 @@ content::WebContents* TabDragHandlerImpl
+@@ -663,7 +822,17 @@ content::WebContents* TabDragHandlerImpl
  }
  
  bool TabDragHandlerImpl::IsTabDetachable(const TabSlotView* view) const {
@@ -6899,7 +6960,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
  }
  
  TabSlotView* TabDragHandlerImpl::GetTabGroupHeader(
-@@ -906,8 +1066,20 @@ void TabDragHandlerImpl::OnNodeWillDestr
+@@ -906,8 +1075,20 @@ void TabDragHandlerImpl::OnNodeWillDestr
  }
  
  void TabDragHandlerImpl::ResetDragState() {
@@ -6920,7 +6981,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
  }
  
  bool TabDragHandlerImpl::HandleDraggedTabsIntoPosition(
-@@ -915,6 +1087,67 @@ bool TabDragHandlerImpl::HandleDraggedTa
+@@ -915,6 +1096,67 @@ bool TabDragHandlerImpl::HandleDraggedTa
      const TabCollectionNode* target) {
    CHECK(drag_controller_);
  
@@ -8740,7 +8801,7 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
  UnpinnedTabContainerView* BaseTabStripRegionView::GetUnpinnedTabsContainer() {
    return tab_strip_view_ ? tab_strip_view_->GetUnpinnedTabsContainer()
                           : nullptr;
-@@ -416,15 +421,48 @@ TabDragTarget* BaseTabStripRegionView::G
+@@ -416,15 +421,53 @@ TabDragTarget* BaseTabStripRegionView::G
      return nullptr;
    }
  
@@ -8752,11 +8813,16 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
    if (drag_handler_->IsDraggingPinnedTabs()) {
      return &GetPinnedTabsContainer()->GetTabDragTarget(point_in_screen);
    }
-+  if (auto* pins_container = GetPinsContainer();
-+      pins_container &&
-+      point_in_screen.y() <
-+          GetUnpinnedTabsContainer()->GetBoundsInScreen().y()) {
-+    return &pins_container->GetTabDragTarget(point_in_screen);
++  if (auto* pins_container = GetPinsContainer()) {
++    // The pointer selects the deferred persistent drop intent, while the live
++    // TabView remains in its source collection until TabDragController has
++    // released every view and model reference. Crossing the visual divider
++    // during the native drag used to invoke Chromium's generic collection move
++    // with an index from the other collection and could CHECK at the bottom.
++    if (drag_handler_->IsDraggingPersistentPinTabs()) {
++      return &pins_container->GetTabDragTarget(point_in_screen);
++    }
++    return &GetUnpinnedTabsContainer()->GetTabDragTarget(point_in_screen);
 +  }
    return &GetUnpinnedTabsContainer()->GetTabDragTarget(point_in_screen);
  }
@@ -9118,7 +9184,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_persistent_item_model.cc
-@@ -0,0 +1,526 @@
+@@ -0,0 +1,536 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -9357,6 +9423,16 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.cc
 +}
 +
 +}  // namespace
++
++PersistentItemCloseAction GetPersistentItemCloseAction(
++    bool has_durable_record,
++    bool is_away_from_home) {
++  if (is_away_from_home) {
++    return PersistentItemCloseAction::kReturnHome;
++  }
++  return has_durable_record ? PersistentItemCloseAction::kClose
++                            : PersistentItemCloseAction::kKeepOpen;
++}
 +
 +PersistentLiveCollection LiveCollectionForKind(PersistentRecordKind kind) {
 +  return kind == PersistentRecordKind::kFavorite
@@ -9649,7 +9725,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_persistent_item_model.h
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,165 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -9677,6 +9753,14 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.h
 +enum class PersistentLiveCollection { kPinnedGrid, kPinList };
 +
 +PersistentLiveCollection LiveCollectionForKind(PersistentRecordKind kind);
++
++// Closing an anchored tab has different product meaning depending on whether
++// a durable home row can represent the item after its live tab disappears.
++enum class PersistentItemCloseAction { kClose, kReturnHome, kKeepOpen };
++
++PersistentItemCloseAction GetPersistentItemCloseAction(
++    bool has_durable_record,
++    bool is_away_from_home);
 +
 +// CURRENT_TAB link navigations away from a live item's stored home open in
 +// Little Arc. Explicit new-tab/window dispositions are left unchanged.
@@ -9811,7 +9895,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,285 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -9837,6 +9921,24 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
 +               .children = {Link("nested", "https://nested.test/"),
 +                            {.data = PersistentFolder{.id = "empty",
 +                                                      .title = u"Empty"}}}}}};
++}
++
++TEST(PersistentItemClosePolicyTest, DurableItemClosesOnlyAtHome) {
++  EXPECT_EQ(PersistentItemCloseAction::kReturnHome,
++            GetPersistentItemCloseAction(/*has_durable_record=*/true,
++                                         /*is_away_from_home=*/true));
++  EXPECT_EQ(PersistentItemCloseAction::kClose,
++            GetPersistentItemCloseAction(/*has_durable_record=*/true,
++                                         /*is_away_from_home=*/false));
++}
++
++TEST(PersistentItemClosePolicyTest, LegacyAnchorStaysLiveAtHome) {
++  EXPECT_EQ(PersistentItemCloseAction::kReturnHome,
++            GetPersistentItemCloseAction(/*has_durable_record=*/false,
++                                         /*is_away_from_home=*/true));
++  EXPECT_EQ(PersistentItemCloseAction::kKeepOpen,
++            GetPersistentItemCloseAction(/*has_durable_record=*/false,
++                                         /*is_away_from_home=*/false));
 +}
 +
 +TEST(PersistentItemCodecTest, ExactRoundTripPreservesTreeStateAndOrder) {
