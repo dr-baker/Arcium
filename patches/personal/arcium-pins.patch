@@ -10472,7 +10472,7 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
  }
  
  void BaseTabStripRegionView::DisableTabStripEditingForTesting() {
-@@ -416,15 +427,118 @@ TabDragTarget* BaseTabStripRegionView::G
+@@ -416,15 +427,121 @@ TabDragTarget* BaseTabStripRegionView::G
      return nullptr;
    }
  
@@ -10500,8 +10500,18 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
 +    TabDragController& drag_controller,
 +    const gfx::Point& point_in_screen) {
 +  PinTabContainerView* pins_container = GetPinsContainer();
++  const bool owns_native_boundary =
++      drag_controller.HasEligibleNativeTabPinDragSession();
++  auto set_semantic_target = [&](PersistentTabDropLocation location) {
++    if (owns_native_boundary && drag_handler_ &&
++        drag_handler_->GetDragContext()->GetDragController() ==
++            &drag_controller) {
++      drag_handler_->SetPersistentTabDropTarget(std::move(location));
++    }
++  };
 +  auto clear_native_pin_intent = [&] {
 +    drag_controller.ClearNativeTabPinDropIntent();
++    set_semantic_target({.target = PersistentTabDropTarget::kTab});
 +    ClearTabDragBoundaryPresentation();
 +  };
 +
@@ -10511,7 +10521,7 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
 +    return;
 +  }
 +
-+  if (!drag_controller.HasEligibleNativeTabPinDragSession()) {
++  if (!owns_native_boundary) {
 +    clear_native_pin_intent();
 +    return;
 +  }
@@ -10553,21 +10563,14 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
 +         .placement = {.section = helium::SidebarSection::kPins,
 +                       .parent_id = std::move(drop_location.parent_id),
 +                       .before_id = std::move(drop_location.before_id)}});
-+    if (drag_handler_->GetDragContext()->GetDragController() ==
-+        &drag_controller) {
-+      drop_location.target = PersistentTabDropTarget::kPin;
-+      drag_handler_->SetPersistentTabDropTarget(std::move(drop_location));
-+    }
++    drop_location.target = PersistentTabDropTarget::kPin;
++    set_semantic_target(std::move(drop_location));
 +    pins_container->UpdatePersistentTabDragPreview(point_in_screen);
 +  } else {
 +    drag_controller.ClearNativeTabPinDropIntent();
 +    pins_container->ClearPersistentTabDragPreview();
 +    GetUnpinnedTabsContainer()->ClearPersistentTabDragPreview();
-+    if (drag_handler_->GetDragContext()->GetDragController() ==
-+        &drag_controller) {
-+      drag_handler_->SetPersistentTabDropTarget(
-+          {.target = PersistentTabDropTarget::kTab});
-+    }
++    set_semantic_target({.target = PersistentTabDropTarget::kTab});
 +  }
 +}
 +
@@ -11180,20 +11183,22 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
    if (current_state_ == DragState::kNotStarted) {
      if (!CanStartDrag(point_in_screen)) {
        return Liveness::kAlive;  // User hasn't dragged far enough yet.
-@@ -719,8 +902,11 @@ TabDragController::Liveness TabDragContr
+@@ -719,8 +902,12 @@ TabDragController::Liveness TabDragContr
  
      StartDrag();
  
+-    if (drag_data_.num_dragging_tabs() ==
+-        source_context_->GetTabStripModel()->count()) {
 +    update_sidebar_intent();
 +
-     if (drag_data_.num_dragging_tabs() ==
--        source_context_->GetTabStripModel()->count()) {
-+            source_context_->GetTabStripModel()->count() &&
-+        !HasNativeTabPinDropIntent()) {
++    if (helium::ShouldStartWholeWindowDragImmediately(
++            drag_data_.num_dragging_tabs() ==
++                source_context_->GetTabStripModel()->count(),
++            native_tab_pin_drag_session_.get())) {
        if (ShouldDragWindowUsingSystemDnD()) {
          return StartSystemDnDSessionIfNecessary(attached_context_,
                                                  point_in_screen);
-@@ -742,7 +928,9 @@ TabDragController::Liveness TabDragContr
+@@ -742,7 +929,9 @@ TabDragController::Liveness TabDragContr
      }
  
      current_state_ = DragState::kDraggingTabs;
@@ -11204,7 +11209,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
    }
  
    return ContinueDragging(point_in_screen);
-@@ -882,6 +1070,7 @@ void TabDragController::OnWidgetDestroye
+@@ -882,6 +1071,7 @@ void TabDragController::OnWidgetDestroye
  void TabDragController::OnSourceTabStripEmpty() {
    // NULL out source_context_ so that we don't attempt to add back to it (in
    // the case of a revert).
@@ -11212,7 +11217,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
    source_context_ = nullptr;
  }
  
-@@ -976,7 +1165,7 @@ TabDragController::Liveness TabDragContr
+@@ -976,7 +1166,7 @@ TabDragController::Liveness TabDragContr
    DCHECK(attached_context_);
  
    TabDragContext* target_context = source_context_;
@@ -11221,7 +11226,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
      auto [alive, context, drop_target] = GetDragTargetForPoint(point_in_screen);
      if (alive == Liveness::kDeleted) {
        return Liveness::kDeleted;
-@@ -991,6 +1180,11 @@ TabDragController::Liveness TabDragContr
+@@ -991,6 +1181,11 @@ TabDragController::Liveness TabDragContr
        }
        target_context = delegate_context;
      }
@@ -11233,7 +11238,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
    }
  
    if (target_context != attached_context_) {
-@@ -1480,6 +1674,8 @@ TabDragController::Detach(ReleaseCapture
+@@ -1480,6 +1675,8 @@ TabDragController::Detach(ReleaseCapture
    TRACE_EVENT1("views", "TabDragController::Detach", "release_capture",
                 release_capture);
  
@@ -11242,7 +11247,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
    attached_context_tabs_closed_tracker_.reset();
  
    // Detaching may trigger the Widget bounds to change. Such bounds changes
-@@ -1867,6 +2063,40 @@ void TabDragController::EndDragImpl(EndD
+@@ -1867,6 +2064,40 @@ void TabDragController::EndDragImpl(EndD
            << " state=" << static_cast<int>(current_state_);
  
    DragState previous_state = current_state_;
@@ -11283,7 +11288,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
    current_state_ = DragState::kStopped;
    attached_context_tabs_closed_tracker_.reset();
  
-@@ -1931,6 +2161,12 @@ void TabDragController::EndDragImpl(EndD
+@@ -1931,6 +2162,12 @@ void TabDragController::EndDragImpl(EndD
  
    TabDragContext* owning_context =
        attached_context_ ? attached_context_.get() : source_context_.get();
@@ -14124,7 +14129,7 @@ Index: src/chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session.cc
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,71 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -14188,12 +14193,19 @@ Index: src/chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session.cc
 +  return command;
 +}
 +
++bool ShouldStartWholeWindowDragImmediately(
++    bool is_dragging_every_tab,
++    const SidebarNativeTabDragSession* sidebar_session) {
++  return is_dragging_every_tab &&
++         (!sidebar_session || !sidebar_session->accepts_intent());
++}
++
 +}  // namespace helium
 Index: src/chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session.h
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,92 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -14274,6 +14286,15 @@ Index: src/chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session.h
 +  bool invalidated_ = false;
 +};
 +
++// An eligible sidebar conversion must begin as a native tab drag even when it
++// is the only tab in the window. The pointer cannot express a Pin destination
++// until after Chromium's initial drag threshold has been crossed. If it later
++// leaves the sidebar, the native drag path still promotes it to a whole-window
++// drag.
++bool ShouldStartWholeWindowDragImmediately(
++    bool is_dragging_every_tab,
++    const SidebarNativeTabDragSession* sidebar_session);
++
 +}  // namespace helium
 +
 +#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_SIDEBAR_NATIVE_TAB_DRAG_SESSION_H_
@@ -14281,7 +14302,7 @@ Index: src/chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session_unitt
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session_unittest.cc
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,113 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -14380,6 +14401,17 @@ Index: src/chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session_unitt
 +
 +  EXPECT_FALSE(session.UpdatePinIntent(Intent()));
 +  EXPECT_FALSE(session.Complete(true, Context(), true));
++}
++
++TEST(SidebarNativeTabDragSessionTest,
++     EligibleSessionDefersImmediateWholeWindowDrag) {
++  SidebarNativeTabDragSession eligible(Context(), true);
++  EXPECT_FALSE(ShouldStartWholeWindowDragImmediately(true, &eligible));
++
++  SidebarNativeTabDragSession ineligible(Context(), false);
++  EXPECT_TRUE(ShouldStartWholeWindowDragImmediately(true, &ineligible));
++  EXPECT_TRUE(ShouldStartWholeWindowDragImmediately(true, nullptr));
++  EXPECT_FALSE(ShouldStartWholeWindowDragImmediately(false, nullptr));
 +}
 +
 +}  // namespace
