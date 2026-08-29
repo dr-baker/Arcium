@@ -318,13 +318,14 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
-@@ -0,0 +1,410 @@
+@@ -0,0 +1,430 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
 +
++#include <optional>
 +#include <string>
 +#include <utility>
 +
@@ -457,6 +458,12 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +  return strip && strip->IsPinTab(tab);
 +}
 +
++bool IsFavoriteTab(const tabs::TabInterface* tab) {
++  HeliumSpaceService* service = GetSpaceService(tab);
++  return service && service->GetPersistentItemKind(tab) ==
++                        PersistentRecordKind::kFavorite;
++}
++
 +bool IsPersistentItemTab(const tabs::TabInterface* tab) {
 +  HeliumSpaceService* service = GetSpaceService(tab);
 +  return service && service->IsPersistentItemTab(tab);
@@ -515,8 +522,10 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +    return false;
 +  }
 +  HeliumSpaceService* service = GetSpaceService(tab);
-+  return (!service || !service->IsPersistentItemTab(tab)) &&
-+         IsHTTPOrHTTPS(tab->GetContents()->GetLastCommittedURL());
++  const std::optional<PersistentRecordKind> kind =
++      service ? service->GetPersistentItemKind(tab) : std::nullopt;
++  return kind == PersistentRecordKind::kPin ||
++         (!kind && IsHTTPOrHTTPS(tab->GetContents()->GetLastCommittedURL()));
 +}
 +
 +bool MakeFavorite(tabs::TabInterface* tab) {
@@ -524,7 +533,18 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +    return false;
 +  }
 +  HeliumSpaceService* service = GetSpaceService(tab);
-+  return service && service->AddFavoriteFromTab(tab);
++  if (!service) {
++    return false;
++  }
++  if (service->GetPersistentItemKind(tab) == PersistentRecordKind::kPin) {
++    BrowserWindowInterface* window = tab->GetBrowserWindowInterface();
++    Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
++    const std::optional<std::string> id = service->GetPersistentItemId(tab);
++    return browser && id &&
++           service->PromotePinToFavorite(
++               browser, service->GetSpaceIdForBrowser(browser), *id);
++  }
++  return service->AddFavoriteFromTab(tab);
 +}
 +
 +bool MakePin(tabs::TabInterface* tab) {
@@ -733,7 +753,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_favorites_and_pins.h
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,71 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -764,6 +784,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.h
 +bool CanMakeFavorite(const tabs::TabInterface* tab);
 +bool MakeFavorite(tabs::TabInterface* tab);
 +bool IsPinTab(const tabs::TabInterface* tab);
++bool IsFavoriteTab(const tabs::TabInterface* tab);
 +bool IsPersistentItemTab(const tabs::TabInterface* tab);
 +void SetPersistentItemTabDragInProgress(tabs::TabInterface* tab,
 +                                        bool in_progress);
@@ -1505,7 +1526,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      return active;
    }
    return spaces_.front().get();
-@@ -97,55 +429,1746 @@ HeliumSpace* HeliumSpaceService::GetSpac
+@@ -97,55 +429,1841 @@ HeliumSpace* HeliumSpaceService::GetSpac
  }
  
  HeliumSpace* HeliumSpaceService::GetOrCreateSpace(std::string id,
@@ -1922,6 +1943,101 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +
 +bool HeliumSpaceService::AddPinFromTab(tabs::TabInterface* tab) {
 +  return AddFromTab(tab, PersistentRecordKind::kPin);
++}
++
++bool HeliumSpaceService::PromotePinToFavorite(
++    Browser* browser,
++    std::string_view source_space_id,
++    std::string_view id) {
++  if (!IsEligibleBrowser(browser) || source_space_id.empty() || id.empty() ||
++      GetSpaceIdForBrowser(browser) != source_space_id) {
++    return false;
++  }
++  HeliumSpace* space = GetSpaceById(source_space_id);
++  const std::optional<PersistentLink> pin =
++      ResolvePinInSpace(source_space_id, id);
++  if (!space || !pin) {
++    return false;
++  }
++
++  const std::string pin_key = ItemKeyForSpace(
++      PersistentRecordKind::kPin, source_space_id, id);
++  const std::optional<PersistentItemLifecycle::State> pin_state =
++      lifecycle_.GetState(pin_key);
++  if (!pin_state ||
++      *pin_state == PersistentItemLifecycle::State::kMaterializing ||
++      *pin_state == PersistentItemLifecycle::State::kClosing) {
++    return false;
++  }
++
++  const std::optional<uint64_t> live_token = lifecycle_.GetLiveTab(pin_key);
++  LiveAssociation* live_association = nullptr;
++  tabs::TabInterface* live_tab = nullptr;
++  if (live_token) {
++    const auto association = live_associations_.find(*live_token);
++    if (association == live_associations_.end() ||
++        association->second->kind != PersistentRecordKind::kPin ||
++        association->second->item_id != id || !association->second->tab ||
++        !IsLiveTabInExpectedCollection(PersistentRecordKind::kPin,
++                                       association->second->tab)) {
++      return false;
++    }
++    live_association = association->second.get();
++    live_tab = live_association->tab;
++  }
++
++  PersistentNodes staged_pins = space->pins();
++  if (!PersistentItemCodec::RemoveNode(staged_pins, id)) {
++    return false;
++  }
++  PersistentLink favorite = *pin;
++  do {
++    favorite.id = NewId();
++  } while (ResolveItem(browser, PersistentRecordKind::kFavorite, favorite.id) ||
++           lifecycle_.GetState(ItemKeyForSpace(
++               PersistentRecordKind::kFavorite, std::string_view(),
++               favorite.id)));
++  PersistentNodes staged_favorites = local_favorites_;
++  staged_favorites.push_back(PersistentNode{.data = favorite});
++  const std::string favorite_key = ItemKeyForSpace(
++      PersistentRecordKind::kFavorite, std::string_view(), favorite.id);
++
++  if (!lifecycle_.Rekey(pin_key, favorite_key)) {
++    return false;
++  }
++
++  space->SetPins(std::move(staged_pins));
++  local_favorites_ = std::move(staged_favorites);
++  PersistLocalFavorites();
++  if (const auto usage = persistent_item_usage_.find(pin_key);
++      usage != persistent_item_usage_.end()) {
++    persistent_item_usage_.insert_or_assign(favorite_key, usage->second);
++    persistent_item_usage_.erase(usage);
++    PersistPersistentItemUsage();
++  }
++
++  if (live_association && live_tab) {
++    live_association->key = favorite_key;
++    live_association->kind = PersistentRecordKind::kFavorite;
++    live_association->item_id = favorite.id;
++    SeedAnchoredHome(live_tab, favorite);
++    if (SessionService* sessions =
++            SessionServiceFactory::GetForProfile(profile_)) {
++      BrowserWindowInterface* window = live_tab->GetBrowserWindowInterface();
++      if (window) {
++        sessions->AddTabExtraData(
++            window->GetSessionID(),
++            sessions::SessionTabHelper::IdForTab(live_tab->GetContents()),
++            kHeliumPersistentItemTabExtraDataKey, favorite_key);
++      }
++    }
++    persistent_item_drags_.insert(live_tab);
++    MoveLiveTabToPersistentRegion(PersistentRecordKind::kFavorite, live_tab);
++    persistent_item_drags_.erase(live_tab);
++  }
++
++  NotifyItemsChanged();
++  return true;
 +}
 +
 +bool HeliumSpaceService::CreatePinFolderForTab(tabs::TabInterface* tab) {
@@ -2401,7 +2517,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    persistent_item_usage_.insert_or_assign(new_key, usage->second);
 +    persistent_item_usage_.erase(usage);
 +    PersistPersistentItemUsage();
-+  }
+   }
 +  RegisterDormantItems();
 +  NotifyItemsChanged();
 +  return true;
@@ -2883,7 +2999,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
 +    return RemovePersistentItem(browser, association->kind,
 +                                association->item_id);
-   }
++  }
 +  return false;
 +}
 +
@@ -3261,7 +3377,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      return false;
    }
    SetSpaceForBrowser(browser, found->second);
-@@ -158,20 +2181,32 @@ void HeliumSpaceService::AddSpaceToSessi
+@@ -158,20 +2276,32 @@ void HeliumSpaceService::AddSpaceToSessi
    if (!extra_data) {
      return;
    }
@@ -3302,7 +3418,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
  }
  
  std::vector<HeliumSpace*> HeliumSpaceService::GetSpaces() {
-@@ -186,33 +2221,74 @@ std::vector<HeliumSpace*> HeliumSpaceSer
+@@ -186,33 +2316,74 @@ std::vector<HeliumSpace*> HeliumSpaceSer
  
  void HeliumSpaceService::OnBrowserCreated(BrowserWindowInterface* window) {
    Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
@@ -3394,7 +3510,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/helium_space_service.h
 +++ src/chrome/browser/ui/helium/helium_space_service.h
-@@ -5,47 +5,203 @@
+@@ -5,47 +5,209 @@
  #ifndef CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_SERVICE_H_
  #define CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_SERVICE_H_
  
@@ -3511,6 +3627,12 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +                              std::string_view id);
 +  bool AddFavoriteFromTab(tabs::TabInterface* tab);
 +  bool AddPinFromTab(tabs::TabInterface* tab);
++  // Moves one Space-scoped Pin into the profile-scoped Favorites collection.
++  // A live instance keeps the same TabInterface while its durable identity and
++  // native collection change together.
++  bool PromotePinToFavorite(Browser* browser,
++                            std::string_view source_space_id,
++                            std::string_view id);
 +  bool CreatePinFolderForTab(tabs::TabInterface* tab);
 +  bool ReplacePersistentItemHome(tabs::TabInterface* tab);
 +  bool RemovePersistentItem(tabs::TabInterface* tab);
@@ -3604,7 +3726,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
    void SetSpaceForBrowser(Browser* browser, std::string_view id);
    bool RestoreSpaceForBrowserFromSession(
        Browser* browser,
-@@ -57,20 +213,88 @@ class HeliumSpaceService : public KeyedS
+@@ -57,20 +219,88 @@ class HeliumSpaceService : public KeyedS
  
    std::vector<HeliumSpace*> GetSpaces();
  
@@ -4685,34 +4807,59 @@ Index: src/chrome/browser/ui/tabs/tab_menu_model.cc
  #include "chrome/browser/ui/color/chrome_color_id.h"
  #include "chrome/browser/ui/immersive/immersive_mode_controller.h"
  #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_context_menu_delegate.h"
-@@ -428,6 +429,27 @@ void TabMenuModel::Build(int index) {
-       TabStripModel::CommandTogglePinned,
-       will_pin ? IDS_TAB_CXMENU_PIN_TAB : IDS_TAB_CXMENU_UNPIN_TAB);
+@@ -423,17 +424,48 @@ void TabMenuModel::Build(int index) {
+                       IDS_TAB_CXMENU_DUPLICATE);
+   SetElementIdentifierAt(GetItemCount() - 1, kDuplicateMenuItem);
  
-+  if (helium::IsHeliumFavoritesAndPinsEnabled() && tab_interface_) {
-+    if (helium::IsPinTab(tab_interface_.get()) ||
-+        helium::IsAnchoredPinnedTab(tab_interface_.get())) {
+-  bool will_pin = tab_strip_->WillContextMenuPin(index);
++  const bool favorites_and_pins_enabled =
++      helium::IsHeliumFavoritesAndPinsEnabled();
++  const bool will_pin = tab_strip_->WillContextMenuPin(index);
++  const bool will_favorite =
++      favorites_and_pins_enabled && tab_interface_
++          ? !helium::IsFavoriteTab(tab_interface_.get())
++          : will_pin;
+   AddItemWithStringId(
+       TabStripModel::CommandTogglePinned,
+-      will_pin ? IDS_TAB_CXMENU_PIN_TAB : IDS_TAB_CXMENU_UNPIN_TAB);
++      will_favorite ? IDS_TAB_CXMENU_PIN_TAB : IDS_TAB_CXMENU_UNPIN_TAB);
++
++  if (favorites_and_pins_enabled && tab_interface_) {
++    if (helium::IsPinTab(tab_interface_.get())) {
 +      AddSeparator(ui::NORMAL_SEPARATOR);
-+      if (helium::IsPinTab(tab_interface_.get())) {
-+        AddItemWithStringId(TabStripModel::CommandNewPinFolder,
-+                            IDS_TAB_CXMENU_NEW_PIN_FOLDER);
-+      }
++      AddItemWithStringId(TabStripModel::CommandNewPinFolder,
++                          IDS_TAB_CXMENU_NEW_PIN_FOLDER);
 +      AddItemWithStringId(TabStripModel::CommandResetPinHome,
 +                          IDS_TAB_CXMENU_RESET_PIN_HOME);
 +      AddItemWithStringId(TabStripModel::CommandReplacePinHome,
 +                          IDS_TAB_CXMENU_REPLACE_PIN_HOME);
 +      AddItemWithStringId(TabStripModel::CommandRemovePin,
 +                          IDS_TAB_CXMENU_REMOVE_PIN);
++    } else if (helium::IsFavoriteTab(tab_interface_.get())) {
++      AddSeparator(ui::NORMAL_SEPARATOR);
++      AddItemWithStringId(TabStripModel::CommandResetPinHome,
++                          IDS_TAB_CXMENU_RESET_PIN_HOME);
++      AddItemWithStringId(TabStripModel::CommandReplacePinHome,
++                          IDS_TAB_CXMENU_REPLACE_PIN_HOME);
 +    } else if (helium::CanMakePin(tab_interface_.get())) {
 +      AddSeparator(ui::NORMAL_SEPARATOR);
 +      AddItemWithStringId(TabStripModel::CommandMakePin,
 +                          IDS_TAB_CXMENU_MAKE_PIN);
 +    }
 +  }
-+
+ 
    if (features::IsMenuSimplificationEnabled()) {
      SetIconForCommandId(
          TabStripModel::CommandTogglePinned,
+         ui::ImageModel::FromVectorIcon(
+-            will_pin ? features::IsRoundedIconsEnabled() ? views::kKeepIcon
+-                                                         : views::kPinOldIcon
++            will_favorite
++                ? features::IsRoundedIconsEnabled() ? views::kKeepIcon
++                                                    : views::kPinOldIcon
+             : features::IsRoundedIconsEnabled() ? views::kKeepFilledIcon
+                                                 : views::kUnpinOldIcon,
+             ui::kColorMenuIcon, ui::SimpleMenuModel::kDefaultIconSize));
 Index: src/chrome/browser/ui/tabs/tab_model.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/tabs/tab_model.cc
@@ -5003,28 +5150,35 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
    switch (command_id) {
      case CommandNewTabToRight:
      case CommandCloseTab:
-@@ -2526,8 +2605,19 @@ bool TabStripModel::IsContextMenuCommand
-     case CommandTogglePinned:
-       return true;
+@@ -2524,10 +2603,25 @@ bool TabStripModel::IsContextMenuCommand
+     }
  
+     case CommandTogglePinned:
+-      return true;
++      return !helium::IsHeliumFavoritesAndPinsEnabled() ||
++             helium::IsFavoriteTab(GetTabAtIndex(context_index)) ||
++             helium::CanMakeFavorite(GetTabAtIndex(context_index));
++
 +    case CommandMakePin:
 +      return helium::CanMakePin(GetTabAtIndex(context_index));
 +
 +    case CommandResetPinHome:
 +    case CommandReplacePinHome:
-+    case CommandRemovePin:
 +      return helium::IsAnchoredPinnedTab(GetTabAtIndex(context_index));
++
++    case CommandRemovePin:
++      return helium::IsPinTab(GetTabAtIndex(context_index));
 +
 +    case CommandNewPinFolder:
 +      return helium::IsPinTab(GetTabAtIndex(context_index));
-+
+ 
      case CommandToggleGrouped:
 -      return SupportsTabGroups();
 +      return SupportsTabGroups() && !selection_contains_anchored_tab();
  
      case CommandSendTabToSelf:
        return true;
-@@ -2538,12 +2628,12 @@ bool TabStripModel::IsContextMenuCommand
+@@ -2538,12 +2632,12 @@ bool TabStripModel::IsContextMenuCommand
      case CommandAddToNewGroup:
      case CommandAddToNewGroupFromMenuItem:
      case CommandAddToExistingGroup:
@@ -5039,7 +5193,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  
      case CommandRemoveFromGroup:
        return SupportsTabGroups();
-@@ -2733,7 +2823,61 @@ void TabStripModel::ExecuteContextMenuCo
+@@ -2733,7 +2827,64 @@ void TabStripModel::ExecuteContextMenuCo
        break;
      }
  
@@ -5086,14 +5240,17 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
 +    }
 +
      case CommandTogglePinned: {
-+      if (helium::IsHeliumFavoritesAndPinsEnabled() &&
-+          WillContextMenuPin(context_index)) {
-+        std::vector<tabs::TabInterface*> tabs;
++      if (helium::IsHeliumFavoritesAndPinsEnabled()) {
++        std::vector<tabs::TabInterface*> selected_tabs;
 +        for (int index : GetIndicesForCommand(context_index)) {
-+          tabs.push_back(GetTabAtIndex(index));
++          selected_tabs.push_back(GetTabAtIndex(index));
 +        }
-+        for (tabs::TabInterface* tab : tabs) {
-+          helium::MakePin(tab);
++        for (tabs::TabInterface* tab : selected_tabs) {
++          if (helium::IsFavoriteTab(tab)) {
++            helium::RemoveAnchoredPinnedTab(tab);
++          } else {
++            helium::MakeFavorite(tab);
++          }
 +        }
 +        break;
 +      }
@@ -5101,7 +5258,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
        base::UmaHistogramCounts1000(
            "Tab.ContextMenu.TogglePinned.SelectedTabsCount",
            selection_model_.size());
-@@ -3469,13 +3613,13 @@ bool TabStripModel::ShouldRunUnloadListe
+@@ -3469,13 +3620,13 @@ bool TabStripModel::ShouldRunUnloadListe
  
  int TabStripModel::ConstrainInsertionIndex(int index, bool pinned_tab) const {
    return pinned_tab ? std::clamp(index, 0, IndexOfFirstNonPinnedTab())
@@ -5117,7 +5274,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  }
  
  std::vector<int> TabStripModel::GetIndicesForCommand(int index) const {
-@@ -3771,8 +3915,25 @@ tabs::TabInterface* TabStripModel::GetTa
+@@ -3771,8 +3922,25 @@ tabs::TabInterface* TabStripModel::GetTa
  void TabStripModel::CloseTabs(base::span<content::WebContents* const> items,
                                uint32_t close_types) {
    std::vector<content::WebContents*> filtered_items;
@@ -5663,7 +5820,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
-@@ -0,0 +1,2368 @@
+@@ -0,0 +1,2386 @@
 +// Copyright 2025 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -5679,12 +5836,12 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +#include <utility>
 +#include <variant>
 +
-+#include "base/command_line.h"
 +#include "base/strings/strcat.h"
 +#include "base/strings/string_number_conversions.h"
 +#include "base/strings/utf_string_conversions.h"
 +#include "base/task/sequenced_task_runner.h"
 +#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
 +#include "chrome/browser/ui/helium/helium_persistent_item_model.h"
 +#include "chrome/browser/ui/helium/helium_sidebar_drag_transaction.h"
 +#include "chrome/browser/ui/helium/helium_sidebar_pin_projection.h"
@@ -5731,8 +5888,6 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +#include "ui/views/view_utils.h"
 +
 +namespace {
-+
-+constexpr char kArciumSidebarProjectionSwitch[] = "arcium-sidebar-projection";
 +
 +std::string PersistentLinkKey(helium::PersistentRecordKind kind,
 +                              std::string_view space_id,
@@ -5973,8 +6128,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +}
 +
 +bool PinTabContainerView::UseSidebarProjection() const {
-+  return base::CommandLine::ForCurrentProcess()->HasSwitch(
-+      kArciumSidebarProjectionSwitch);
++  return helium::IsHeliumFavoritesAndPinsEnabled();
 +}
 +
 +std::unique_ptr<helium::HeliumSidebarPinProjection>
@@ -6606,6 +6760,9 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +          base::BindRepeating(&PinTabContainerView::RemovePersistentItem,
 +                              weak_ptr_factory_.GetWeakPtr(), spec.kind,
 +                              spec.id, space_id),
++          base::BindRepeating(&PinTabContainerView::FavoritePersistentItem,
++                              weak_ptr_factory_.GetWeakPtr(), spec.kind,
++                              spec.id, space_id),
 +          this);
 +      row = AddChildWithoutAnimation(std::move(link_row));
 +      persistent_rows_.emplace(spec.key, row);
@@ -6887,6 +7044,24 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +    }
 +    space_service_->RemovePersistentItem(browser, kind, id);
 +  }
++}
++
++void PinTabContainerView::FavoritePersistentItem(
++    helium::PersistentRecordKind kind,
++    std::string id,
++    std::string source_space_id) {
++  if (kind != helium::PersistentRecordKind::kPin || !collection_node_ ||
++      !collection_node_->GetController() || !space_service_) {
++    return;
++  }
++  BrowserView* browser_view =
++      collection_node_->GetController()->GetBrowserView();
++  Browser* browser = browser_view ? browser_view->browser() : nullptr;
++  if (!browser ||
++      space_service_->GetSpaceIdForBrowser(browser) != source_space_id) {
++    return;
++  }
++  space_service_->PromotePinToFavorite(browser, source_space_id, id);
 +}
 +
 +bool PinTabContainerView::BeginPersistentTabDrag(
@@ -8036,7 +8211,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,255 @@
 +// Copyright 2025 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -8235,6 +8410,9 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +  bool DematerializePersistentItem(helium::PersistentRecordKind kind,
 +                                   std::string id,
 +                                   std::string source_space_id);
++  void FavoritePersistentItem(helium::PersistentRecordKind kind,
++                              std::string id,
++                              std::string source_space_id);
 +  std::optional<helium::SidebarPinDropTarget> GetSidebarPinDropTarget(
 +      const gfx::Point& point_in_screen) const;
 +  std::optional<helium::SidebarItemPlacement> GetSidebarItemPlacement(
@@ -10929,15 +11107,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
 +++ src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
-@@ -13,6 +13,7 @@
- 
- #include "base/auto_reset.h"
- #include "base/check.h"
-+#include "base/command_line.h"
- #include "base/containers/adapters.h"
- #include "base/feature_list.h"
- #include "base/functional/bind.h"
-@@ -23,13 +24,20 @@
+@@ -23,13 +23,20 @@
  #include "base/numerics/safe_conversions.h"
  #include "base/run_loop.h"
  #include "base/scoped_observation.h"
@@ -10958,7 +11128,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
  #include "chrome/browser/ui/sad_tab_helper.h"
  #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
  #include "chrome/browser/ui/tabs/split_tab_util.h"
-@@ -57,6 +65,7 @@
+@@ -57,6 +64,7 @@
  #include "components/tab_groups/tab_group_id.h"
  #include "components/tabs/public/tab_group.h"
  #include "components/tabs/public/tab_interface.h"
@@ -10966,18 +11136,10 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
  #include "components/viz/common/frame_sinks/copy_output_result.h"
  #include "content/public/browser/render_widget_host_view.h"
  #include "content/public/browser/web_contents.h"
-@@ -147,6 +156,80 @@ constexpr char kTabDraggingPresentationT
+@@ -147,6 +155,72 @@ constexpr char kTabDraggingPresentationT
  constexpr char kDragToNewBrowserPresentationTimeHistogram[] =
      "Browser.TabDragging.DragToNewBrowserPresentationTime";
  
-+constexpr char kArciumSidebarProjectionSwitch[] =
-+    "arcium-sidebar-projection";
-+
-+bool UseArciumSidebarProjection() {
-+  return base::CommandLine::ForCurrentProcess()->HasSwitch(
-+      kArciumSidebarProjectionSwitch);
-+}
-+
 +std::optional<helium::SidebarNativeTabContext> GetNativeTabContext(
 +    Browser* browser) {
 +  if (!browser || !browser->session_id().is_valid()) {
@@ -11047,7 +11209,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
  #if BUILDFLAG(IS_CHROMEOS)
  
  // Returns the aura::Window which stores the window properties for tab-dragging.
-@@ -458,12 +541,15 @@ TabDragController::Liveness TabDragContr
+@@ -458,12 +532,15 @@ TabDragController::Liveness TabDragContr
      ref->detach_behavior_ = DetachBehavior::kNotDetachable;
    }
  #endif  // BUILDFLAG(IS_CHROMEOS)
@@ -11065,7 +11227,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
  
    ref->source_context_emptiness_tracker_ =
        std::make_unique<SourceTabStripEmptinessTracker>(
-@@ -496,6 +582,8 @@ TabDragController::Liveness TabDragContr
+@@ -496,6 +573,8 @@ TabDragController::Liveness TabDragContr
      }
    }
  
@@ -11074,7 +11236,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
    ref->drag_data_.source_view_index_ =
        std::ranges::find(dragging_views, source_view) - dragging_views.begin();
  
-@@ -620,6 +708,92 @@ TabDragContext* TabDragController::GetSo
+@@ -620,6 +699,92 @@ TabDragContext* TabDragController::GetSo
                                 : nullptr;
  }
  
@@ -11113,7 +11275,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
 +}
 +
 +void TabDragController::InitializeNativeTabPinDragSession() {
-+  if (!UseArciumSidebarProjection()) {
++  if (!helium::IsHeliumFavoritesAndPinsEnabled()) {
 +    return;
 +  }
 +  BrowserView* source_browser_view = GetBrowserViewForContext(source_context_);
@@ -11167,7 +11329,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
  void TabDragController::SetGroupHeaderWasCollapsedFromDrag(
      bool was_collapsed_from_drag) {
    if (drag_data_.group_header_drag_data_.has_value()) {
-@@ -697,6 +871,15 @@ TabDragController::Liveness TabDragContr
+@@ -697,6 +862,15 @@ TabDragController::Liveness TabDragContr
  
    bring_to_front_timer_.Stop();
  
@@ -11183,7 +11345,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
    if (current_state_ == DragState::kNotStarted) {
      if (!CanStartDrag(point_in_screen)) {
        return Liveness::kAlive;  // User hasn't dragged far enough yet.
-@@ -719,8 +902,12 @@ TabDragController::Liveness TabDragContr
+@@ -719,8 +893,12 @@ TabDragController::Liveness TabDragContr
  
      StartDrag();
  
@@ -11198,7 +11360,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
        if (ShouldDragWindowUsingSystemDnD()) {
          return StartSystemDnDSessionIfNecessary(attached_context_,
                                                  point_in_screen);
-@@ -742,7 +929,9 @@ TabDragController::Liveness TabDragContr
+@@ -742,7 +920,9 @@ TabDragController::Liveness TabDragContr
      }
  
      current_state_ = DragState::kDraggingTabs;
@@ -11209,7 +11371,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
    }
  
    return ContinueDragging(point_in_screen);
-@@ -882,6 +1071,7 @@ void TabDragController::OnWidgetDestroye
+@@ -882,6 +1062,7 @@ void TabDragController::OnWidgetDestroye
  void TabDragController::OnSourceTabStripEmpty() {
    // NULL out source_context_ so that we don't attempt to add back to it (in
    // the case of a revert).
@@ -11217,7 +11379,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
    source_context_ = nullptr;
  }
  
-@@ -976,7 +1166,7 @@ TabDragController::Liveness TabDragContr
+@@ -976,7 +1157,7 @@ TabDragController::Liveness TabDragContr
    DCHECK(attached_context_);
  
    TabDragContext* target_context = source_context_;
@@ -11226,7 +11388,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
      auto [alive, context, drop_target] = GetDragTargetForPoint(point_in_screen);
      if (alive == Liveness::kDeleted) {
        return Liveness::kDeleted;
-@@ -991,6 +1181,11 @@ TabDragController::Liveness TabDragContr
+@@ -991,6 +1172,11 @@ TabDragController::Liveness TabDragContr
        }
        target_context = delegate_context;
      }
@@ -11238,7 +11400,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
    }
  
    if (target_context != attached_context_) {
-@@ -1480,6 +1675,8 @@ TabDragController::Detach(ReleaseCapture
+@@ -1480,6 +1666,8 @@ TabDragController::Detach(ReleaseCapture
    TRACE_EVENT1("views", "TabDragController::Detach", "release_capture",
                 release_capture);
  
@@ -11247,7 +11409,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
    attached_context_tabs_closed_tracker_.reset();
  
    // Detaching may trigger the Widget bounds to change. Such bounds changes
-@@ -1867,6 +2064,40 @@ void TabDragController::EndDragImpl(EndD
+@@ -1867,6 +2055,40 @@ void TabDragController::EndDragImpl(EndD
            << " state=" << static_cast<int>(current_state_);
  
    DragState previous_state = current_state_;
@@ -11288,7 +11450,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
    current_state_ = DragState::kStopped;
    attached_context_tabs_closed_tracker_.reset();
  
-@@ -1931,6 +2162,12 @@ void TabDragController::EndDragImpl(EndD
+@@ -1931,6 +2153,12 @@ void TabDragController::EndDragImpl(EndD
  
    TabDragContext* owning_context =
        attached_context_ ? attached_context_.get() : source_context_.get();
@@ -11418,7 +11580,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_persistent_item_model.cc
-@@ -0,0 +1,550 @@
+@@ -0,0 +1,573 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -11843,6 +12005,29 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.cc
 +  return true;
 +}
 +
++bool PersistentItemLifecycle::Rekey(std::string_view old_id,
++                                    std::string new_id) {
++  if (new_id.empty() || entries_.contains(new_id)) {
++    return false;
++  }
++  const auto found = entries_.find(old_id);
++  if (found == entries_.end()) {
++    return false;
++  }
++  auto entry = entries_.extract(found);
++  if (entry.mapped().live_tab) {
++    auto live = items_by_live_tab_.find(*entry.mapped().live_tab);
++    if (live == items_by_live_tab_.end() || live->second != old_id) {
++      entries_.insert(std::move(entry));
++      return false;
++    }
++    live->second = new_id;
++  }
++  entry.key() = std::move(new_id);
++  entries_.insert(std::move(entry));
++  return true;
++}
++
 +void PersistentItemLifecycle::RetainOnly(const std::set<std::string>& ids) {
 +  for (auto it = entries_.begin(); it != entries_.end();) {
 +    if (ids.contains(it->first)) {
@@ -11973,7 +12158,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_persistent_item_model.h
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,170 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -12114,6 +12299,9 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.h
 +
 +  bool AddDormant(std::string id);
 +  bool Forget(std::string_view id);
++  // Replaces one durable identity without changing its lifecycle state or
++  // live-tab token. The destination must not already exist.
++  bool Rekey(std::string_view old_id, std::string new_id);
 +  void RetainOnly(const std::set<std::string>& ids);
 +  ActivationDecision BeginActivation(std::string_view id);
 +  bool DidMaterialize(std::string_view id, LiveTabToken live_tab);
@@ -12145,7 +12333,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,337 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -12290,6 +12478,26 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
 +            lifecycle.GetItemForLiveTab(9));
 +  EXPECT_TRUE(lifecycle.Forget("favorite"));
 +  EXPECT_FALSE(lifecycle.GetItemForLiveTab(9));
++}
++
++TEST(PersistentItemLifecycleTest, RekeyPreservesLiveAssociation) {
++  PersistentItemLifecycle lifecycle;
++  ASSERT_TRUE(lifecycle.AddDormant("pin"));
++  ASSERT_TRUE(lifecycle.RestoreLive("pin", 41));
++
++  EXPECT_TRUE(lifecycle.Rekey("pin", "favorite"));
++  EXPECT_FALSE(lifecycle.GetState("pin"));
++  EXPECT_EQ(PersistentItemLifecycle::State::kLive,
++            lifecycle.GetState("favorite"));
++  EXPECT_EQ(41u, lifecycle.GetLiveTab("favorite"));
++  EXPECT_EQ(std::optional<std::string_view>("favorite"),
++            lifecycle.GetItemForLiveTab(41));
++
++  ASSERT_TRUE(lifecycle.AddDormant("occupied"));
++  EXPECT_FALSE(lifecycle.Rekey("favorite", "occupied"));
++  EXPECT_EQ(PersistentItemLifecycle::State::kLive,
++            lifecycle.GetState("favorite"));
++  EXPECT_EQ(41u, lifecycle.GetLiveTab("favorite"));
 +}
 +
 +TEST(PersistentItemLifecycleTest, ReconcileForgetsRemovedDurableItems) {
@@ -13555,7 +13763,37 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
  #include "chrome/browser/ui/views/tabs/tab/tab_icon.h"
  #include "chrome/browser/ui/views/tabs/tab/tab_title.h"
  #include "chrome/grit/generated_resources.h"
-@@ -93,6 +94,10 @@ PersistentTabView::PersistentTabView(Pro
+@@ -70,12 +71,19 @@ bool ShouldApplyGeneratedFavicon(Persist
+   return state != PersistentFaviconState::kResolved;
+ }
+ 
+-void AppendDormantPersistentItemMenuItems(ui::SimpleMenuModel* model) {
++void AppendDormantPersistentItemMenuItems(ui::SimpleMenuModel* model,
++                                          bool is_pin) {
+   CHECK(model);
+   model->AddItem(static_cast<int>(PersistentItemMenuCommand::kOpen),
+                  l10n_util::GetStringUTF16(IDS_HISTORY_OPEN));
++  if (is_pin) {
++    model->AddItem(static_cast<int>(PersistentItemMenuCommand::kFavorite),
++                   l10n_util::GetStringUTF16(IDS_TAB_CXMENU_PIN_TAB));
++  }
+   model->AddItem(static_cast<int>(PersistentItemMenuCommand::kRemove),
+-                 l10n_util::GetStringUTF16(IDS_NTP_CUSTOM_LINKS_REMOVE));
++                 l10n_util::GetStringUTF16(
++                     is_pin ? IDS_TAB_CXMENU_REMOVE_PIN
++                            : IDS_TAB_CXMENU_UNPIN_TAB));
+ }
+ 
+ PersistentTabView::PersistentTabView(Profile* profile,
+@@ -85,6 +93,7 @@ PersistentTabView::PersistentTabView(Pro
+                                      PresentationMode presentation_mode,
+                                      PressedCallback callback,
+                                      base::RepeatingClosure remove_callback,
++                                     base::RepeatingClosure favorite_callback,
+                                      PersistentTabDragDelegate* drag_delegate)
+     : views::Button(std::move(callback)),
+       profile_(profile),
+@@ -93,7 +102,12 @@ PersistentTabView::PersistentTabView(Pro
        tab_style_(TabStyle::Get()),
        icon_(AddChildView(std::make_unique<TabIcon>())),
        title_(AddChildView(std::make_unique<TabTitle>())),
@@ -13564,9 +13802,11 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
 +                              base::Unretained(this)),
 +          base::BindRepeating([](views::View*, const ui::MouseEvent&) {})))),
        remove_callback_(std::move(remove_callback)),
++      favorite_callback_(std::move(favorite_callback)),
        drag_delegate_(drag_delegate),
        url_(std::move(url)) {
-@@ -114,6 +119,7 @@ PersistentTabView::PersistentTabView(Pro
+   CHECK(profile_);
+@@ -114,6 +128,7 @@ PersistentTabView::PersistentTabView(Pro
  
    title_->SetText(std::move(title));
    title_->SetVisible(presentation_mode_ != PresentationMode::kCompactGrid);
@@ -13574,7 +13814,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
    SetFavicon(
        favicon::GetDefaultFaviconModel(kColorTabBackgroundActiveFrameActive),
        PersistentFaviconState::kPlaceholder);
-@@ -146,6 +152,18 @@ void PersistentTabView::ApplyGeneratedFa
+@@ -146,6 +161,18 @@ void PersistentTabView::ApplyGeneratedFa
  void PersistentTabView::Update(std::u16string title,
                                 const GURL& url,
                                 bool selected) {
@@ -13593,7 +13833,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
    if (title_->GetText() != title) {
      title_->SetText(title);
      SetTooltipText(title);
-@@ -160,12 +178,19 @@ void PersistentTabView::Update(std::u16s
+@@ -160,12 +187,19 @@ void PersistentTabView::Update(std::u16s
          PersistentFaviconState::kPlaceholder);
      LoadFavicon();
    }
@@ -13617,7 +13857,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
      LoadFavicon();
    }
  }
-@@ -193,8 +218,20 @@ void PersistentTabView::Layout(PassKey)
+@@ -193,8 +227,20 @@ void PersistentTabView::Layout(PassKey)
  
    const int title_x =
        contents.x() + kHorizontalInset + kIconDesignWidth + kHorizontalInset;
@@ -13639,7 +13879,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
    const int title_height = title_->GetLineHeight();
    title_->SetBounds(title_x,
                      contents.y() + (contents.height() - title_height) / 2,
-@@ -255,6 +292,7 @@ void PersistentTabView::OnThemeChanged()
+@@ -255,6 +301,7 @@ void PersistentTabView::OnThemeChanged()
  }
  
  void PersistentTabView::StateChanged(ButtonState old_state) {
@@ -13647,7 +13887,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
    UpdateColors();
  }
  
-@@ -262,41 +300,48 @@ bool PersistentTabView::OnMousePressed(c
+@@ -262,41 +309,48 @@ bool PersistentTabView::OnMousePressed(c
    if (drag_delegate_ && event.IsOnlyLeftMouseButton()) {
      drag_start_event_ = std::make_unique<ui::MouseEvent>(event);
      dragging_ = false;
@@ -13700,7 +13940,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
    views::Button::OnMouseCaptureLost();
    if (was_dragging && drag_delegate_) {
      drag_delegate_->CancelPersistentTabDrag(*this);
-@@ -304,6 +349,7 @@ void PersistentTabView::OnMouseCaptureLo
+@@ -304,6 +358,7 @@ void PersistentTabView::OnMouseCaptureLo
  }
  
  void PersistentTabView::SetSelected(bool selected) {
@@ -13708,7 +13948,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
    if (selected_ == selected) {
      return;
    }
-@@ -312,9 +358,41 @@ void PersistentTabView::SetSelected(bool
+@@ -312,9 +367,41 @@ void PersistentTabView::SetSelected(bool
    // active treatment while ownership remains with the ordinary live tab.
    icon_->SetActiveState(selected_);
    GetViewAccessibility().SetIsSelected(selected_);
@@ -13750,7 +13990,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
  void PersistentTabView::UpdateColors() {
    if (!GetColorProvider()) {
      return;
-@@ -328,6 +406,7 @@ void PersistentTabView::UpdateColors() {
+@@ -328,6 +415,7 @@ void PersistentTabView::UpdateColors() {
        selection_state, selected_ || hovered, hovered, IsFrameActive(),
        GetColorProvider());
    title_->SetEnabledColor(colors.foreground_color);
@@ -13758,7 +13998,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
    views::FocusRing::Get(this)->SetColorId(colors.focus_ring_color);
    SchedulePaint();
  }
-@@ -406,12 +485,19 @@ void PersistentTabView::ApplyMonogramFav
+@@ -406,12 +494,19 @@ void PersistentTabView::ApplyMonogramFav
  
  void PersistentTabView::SetFavicon(const ui::ImageModel& favicon_model,
                                     PersistentFaviconState state) {
@@ -13781,6 +14021,32 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
    icon_->SetData(data);
    icon_->SetActiveState(selected_);
  }
+@@ -463,7 +558,8 @@ void PersistentTabView::ShowContextMenuF
+     const gfx::Point& point,
+     ui::mojom::MenuSourceType source_type) {
+   context_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
+-  AppendDormantPersistentItemMenuItems(context_menu_model_.get());
++  AppendDormantPersistentItemMenuItems(context_menu_model_.get(),
++                                       !favorite_callback_.is_null());
+   context_menu_runner_ = std::make_unique<views::MenuRunner>(
+       context_menu_model_.get(),
+       views::MenuRunner::HAS_MNEMONICS | views::MenuRunner::CONTEXT_MENU);
+@@ -489,6 +585,15 @@ void PersistentTabView::ExecuteCommand(i
+             FROM_HERE, remove_callback_);
+       }
+       break;
++    case PersistentItemMenuCommand::kFavorite:
++      if (context_menu_runner_) {
++        context_menu_runner_->Cancel();
++      }
++      if (favorite_callback_) {
++        base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++            FROM_HERE, favorite_callback_);
++      }
++      break;
+   }
+ }
+ 
 Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
@@ -13810,7 +14076,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
  class TabIcon;
  class TabStyle;
  class TabTitle;
-@@ -38,8 +41,8 @@ namespace views {
+@@ -38,11 +41,12 @@ namespace views {
  class MenuRunner;
  }  // namespace views
  
@@ -13821,7 +14087,21 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
  enum class PersistentItemMenuCommand {
    kOpen = 1,
    kRemove = 2,
-@@ -85,6 +88,16 @@ class PersistentTabView : public views::
++  kFavorite = 3,
+ };
+ 
+ enum class PersistentFaviconState {
+@@ -53,7 +57,8 @@ enum class PersistentFaviconState {
+ 
+ bool ShouldApplyGeneratedFavicon(PersistentFaviconState state);
+ 
+-void AppendDormantPersistentItemMenuItems(ui::SimpleMenuModel* model);
++void AppendDormantPersistentItemMenuItems(ui::SimpleMenuModel* model,
++                                          bool is_pin);
+ 
+ class PersistentTabView;
+ 
+@@ -85,6 +90,16 @@ class PersistentTabView : public views::
      kFullRow,
    };
  
@@ -13838,7 +14118,15 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
    PersistentTabView(Profile* profile,
                      std::string stable_id,
                      std::u16string title,
-@@ -100,6 +113,12 @@ class PersistentTabView : public views::
+@@ -92,6 +107,7 @@ class PersistentTabView : public views::
+                     PresentationMode presentation_mode,
+                     PressedCallback callback,
+                     base::RepeatingClosure remove_callback,
++                    base::RepeatingClosure favorite_callback = {},
+                     PersistentTabDragDelegate* drag_delegate = nullptr);
+   PersistentTabView(const PersistentTabView&) = delete;
+   PersistentTabView& operator=(const PersistentTabView&) = delete;
+@@ -100,6 +116,12 @@ class PersistentTabView : public views::
    const std::string& stable_id() const { return stable_id_; }
    const GURL& url() const { return url_; }
    bool selected() const { return selected_; }
@@ -13851,7 +14139,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
    PresentationMode presentation_mode() const { return presentation_mode_; }
    bool using_generated_favicon_for_testing() const {
      return favicon_state_ == PersistentFaviconState::kGenerated;
-@@ -110,11 +129,18 @@ class PersistentTabView : public views::
+@@ -110,11 +132,18 @@ class PersistentTabView : public views::
    void SetResolvedFaviconStateForTesting();
    void ApplyGeneratedFaviconForTesting();
    bool title_visible_for_testing() const;
@@ -13870,7 +14158,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
    // views::ContextMenuController:
    void ShowContextMenuForViewImpl(
        views::View* source,
-@@ -142,6 +168,10 @@ class PersistentTabView : public views::
+@@ -142,6 +171,10 @@ class PersistentTabView : public views::
    void OnMouseCaptureLost() override;
  
    void SetSelected(bool selected);
@@ -13881,7 +14169,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
    void UpdateColors();
    void LoadFavicon();
    void OnExactFaviconAvailable(
-@@ -151,6 +181,7 @@ class PersistentTabView : public views::
+@@ -151,6 +184,7 @@ class PersistentTabView : public views::
    void ApplyMonogramFavicon();
    void SetFavicon(const ui::ImageModel& favicon_model,
                    PersistentFaviconState state);
@@ -13889,12 +14177,13 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
    void OnFaviconAvailable(
        const GURL& requested_url,
        const favicon_base::FaviconRawBitmapResult& bitmap_result);
-@@ -164,13 +195,17 @@ class PersistentTabView : public views::
+@@ -164,13 +198,18 @@ class PersistentTabView : public views::
    const raw_ptr<const TabStyle> tab_style_;
    const raw_ptr<TabIcon> icon_;
    const raw_ptr<TabTitle> title_;
 +  const raw_ptr<TabCloseButton> close_button_;
    base::RepeatingClosure remove_callback_;
++  base::RepeatingClosure favorite_callback_;
    raw_ptr<PersistentTabDragDelegate> drag_delegate_ = nullptr;
    std::unique_ptr<ui::MouseEvent> drag_start_event_;
    bool dragging_ = false;
@@ -14069,7 +14358,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
 +      PersistentTabView::PresentationMode::kFullRow,
 +      base::BindRepeating([](int* count) { ++*count; },
 +                          base::Unretained(&activation_count)),
-+      base::RepeatingClosure(), &drag_delegate);
++      base::RepeatingClosure(), base::RepeatingClosure(), &drag_delegate);
 +  row->SetBounds(0, 0, 240, 40);
 +
 +  ui::MouseEvent press(ui::EventType::kMousePressed, gfx::Point(5, 5),
@@ -14100,7 +14389,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
 +      PersistentTabView::PresentationMode::kFullRow,
 +      base::BindRepeating([](int* count) { ++*count; },
 +                          base::Unretained(&activation_count)),
-+      base::RepeatingClosure(), &drag_delegate);
++      base::RepeatingClosure(), base::RepeatingClosure(), &drag_delegate);
 +  row->SetBounds(0, 0, 240, 40);
 +
 +  ui::MouseEvent press(ui::EventType::kMousePressed, gfx::Point(5, 5),
@@ -14125,6 +14414,43 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
  TEST_F(PersistentTabViewTest, CompactGridHidesTitleAndUsesPinnedMetrics) {
    auto tile = MakeView(PersistentTabView::PresentationMode::kCompactGrid);
  
+@@ -108,18 +296,32 @@ TEST_F(PersistentTabViewTest,
+   EXPECT_TRUE(row->using_generated_favicon_for_testing());
+ }
+ 
+-TEST_F(PersistentTabViewTest, DormantMenuExposesOpenAndRemove) {
++TEST_F(PersistentTabViewTest, DormantFavoriteMenuExposesOpenAndUnfavorite) {
+   ui::SimpleMenuModel model(nullptr);
+-  AppendDormantPersistentItemMenuItems(&model);
++  AppendDormantPersistentItemMenuItems(&model, false);
+   ASSERT_EQ(2u, model.GetItemCount());
+   EXPECT_EQ(static_cast<int>(PersistentItemMenuCommand::kOpen),
+             model.GetCommandIdAt(0));
+   EXPECT_EQ(static_cast<int>(PersistentItemMenuCommand::kRemove),
+             model.GetCommandIdAt(1));
+-  EXPECT_EQ(l10n_util::GetStringUTF16(IDS_NTP_CUSTOM_LINKS_REMOVE),
++  EXPECT_EQ(l10n_util::GetStringUTF16(IDS_TAB_CXMENU_UNPIN_TAB),
+             model.GetLabelAt(1));
+-  EXPECT_NE(l10n_util::GetStringUTF16(IDS_TAB_CXMENU_REMOVE_PIN),
++}
++
++TEST_F(PersistentTabViewTest, DormantPinMenuAlsoExposesFavorite) {
++  ui::SimpleMenuModel model(nullptr);
++  AppendDormantPersistentItemMenuItems(&model, true);
++  ASSERT_EQ(3u, model.GetItemCount());
++  EXPECT_EQ(static_cast<int>(PersistentItemMenuCommand::kOpen),
++            model.GetCommandIdAt(0));
++  EXPECT_EQ(static_cast<int>(PersistentItemMenuCommand::kFavorite),
++            model.GetCommandIdAt(1));
++  EXPECT_EQ(l10n_util::GetStringUTF16(IDS_TAB_CXMENU_PIN_TAB),
+             model.GetLabelAt(1));
++  EXPECT_EQ(static_cast<int>(PersistentItemMenuCommand::kRemove),
++            model.GetCommandIdAt(2));
++  EXPECT_EQ(l10n_util::GetStringUTF16(IDS_TAB_CXMENU_REMOVE_PIN),
++            model.GetLabelAt(2));
+ }
+ 
+ TEST_F(PersistentTabViewTest, PressEmitsExactlyOneActivation) {
 Index: src/chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session.cc
 ===================================================================
 --- /dev/null
@@ -14473,6 +14799,6 @@ Index: src/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
 +  }
  
    UpdateDraggingViewTransforms(point_in_container);
-
+ 
    HandleTabDragInContainer(dragged_bounds_in_container);
  }
