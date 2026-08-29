@@ -306,7 +306,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
-@@ -0,0 +1,379 @@
+@@ -0,0 +1,410 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -450,6 +450,13 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +  return service && service->IsPersistentItemTab(tab);
 +}
 +
++void SetPersistentItemTabDragInProgress(tabs::TabInterface* tab,
++                                        bool in_progress) {
++  if (HeliumSpaceService* service = GetSpaceService(tab)) {
++    service->SetPersistentItemDragInProgress(tab, in_progress);
++  }
++}
++
 +bool IsAnchoredTab(const tabs::TabInterface* tab) {
 +  if (!IsHeliumFavoritesAndPinsEnabled() || !IsEligibleTabContext(tab) ||
 +      !IsStandaloneTab(tab)) {
@@ -482,7 +489,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +
 +bool CanMakePin(const tabs::TabInterface* tab) {
 +  if (!IsHeliumFavoritesAndPinsEnabled() || !IsEligibleTabContext(tab) ||
-+      !IsStandaloneTab(tab) || IsPinTab(tab) || tab->IsPinned()) {
++      !IsStandaloneTab(tab) || tab->IsPinned()) {
 +    return false;
 +  }
 +  HeliumSpaceService* service = GetSpaceService(tab);
@@ -514,6 +521,30 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +  }
 +  HeliumSpaceService* service = GetSpaceService(tab);
 +  return service && service->AddPinFromTab(tab);
++}
++
++bool MovePinBefore(tabs::TabInterface* tab, std::string_view target_id) {
++  HeliumSpaceService* service = GetSpaceService(tab);
++  BrowserWindowInterface* window =
++      tab ? tab->GetBrowserWindowInterface() : nullptr;
++  Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
++  const std::optional<std::string> id =
++      service ? service->GetPersistentItemId(tab) : std::nullopt;
++  return service && browser && id &&
++         service->MovePinBefore(browser, *id, target_id);
++}
++
++bool MovePin(tabs::TabInterface* tab,
++             std::string_view parent_id,
++             std::string_view before_id) {
++  HeliumSpaceService* service = GetSpaceService(tab);
++  BrowserWindowInterface* window =
++      tab ? tab->GetBrowserWindowInterface() : nullptr;
++  Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
++  const std::optional<std::string> id =
++      service ? service->GetPersistentItemId(tab) : std::nullopt;
++  return service && browser && id &&
++         service->MovePin(browser, *id, parent_id, before_id);
 +}
 +
 +bool CreatePinFolder(tabs::TabInterface* tab) {
@@ -690,7 +721,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_favorites_and_pins.h
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,70 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -700,6 +731,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.h
 +
 +#include <map>
 +#include <string>
++#include <string_view>
 +
 +#include "base/feature_list.h"
 +#include "url/gurl.h"
@@ -721,6 +753,8 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.h
 +bool MakeFavorite(tabs::TabInterface* tab);
 +bool IsPinTab(const tabs::TabInterface* tab);
 +bool IsPersistentItemTab(const tabs::TabInterface* tab);
++void SetPersistentItemTabDragInProgress(tabs::TabInterface* tab,
++                                        bool in_progress);
 +bool IsAnchoredTab(const tabs::TabInterface* tab);
 +bool IsAnchoredTabAwayFromHome(const tabs::TabInterface* tab);
 +
@@ -729,6 +763,10 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.h
 +bool IsAnchoredPinnedTabAwayFromHome(const tabs::TabInterface* tab);
 +
 +bool MakePin(tabs::TabInterface* tab);
++bool MovePinBefore(tabs::TabInterface* tab, std::string_view target_id);
++bool MovePin(tabs::TabInterface* tab,
++             std::string_view parent_id,
++             std::string_view before_id);
 +bool CreatePinFolder(tabs::TabInterface* tab);
 +bool GetAnchoredPinnedTabHome(const tabs::TabInterface* tab,
 +                              GURL* home_url,
@@ -812,7 +850,7 @@ Index: src/chrome/browser/ui/helium/helium_space.cc
  
  HeliumSpace::~HeliumSpace() = default;
  
-@@ -47,25 +52,67 @@ void HeliumSpace::SetName(std::u16string
+@@ -47,25 +52,86 @@ void HeliumSpace::SetName(std::u16string
    name_ = name.empty() ? u"Space" : std::move(name);
    ScopedListPrefUpdate update(profile_->GetPrefs(), kHeliumSpacesPref);
    if (base::DictValue* record = FindSpaceRecord(update.Get(), id_)) {
@@ -844,6 +882,25 @@ Index: src/chrome/browser/ui/helium/helium_space.cc
 +
 +bool HeliumSpace::RemovePin(std::string_view id) {
 +  if (!PersistentItemCodec::RemoveNode(pins_, id)) {
++    return false;
++  }
++  PersistPins();
++  return true;
++}
++
++bool HeliumSpace::MovePinBefore(std::string_view id,
++                                std::string_view target_id) {
++  if (!PersistentItemCodec::MoveLinkBefore(pins_, id, target_id)) {
++    return false;
++  }
++  PersistPins();
++  return true;
++}
++
++bool HeliumSpace::MovePin(std::string_view id,
++                          std::string_view parent_id,
++                          std::string_view before_id) {
++  if (!PersistentItemCodec::MoveNode(pins_, id, parent_id, before_id)) {
 +    return false;
 +  }
 +  PersistPins();
@@ -890,7 +947,7 @@ Index: src/chrome/browser/ui/helium/helium_space.cc
            match = window;
            return false;
          }
-@@ -76,31 +123,27 @@ BrowserWindowInterface* HeliumSpace::Get
+@@ -76,31 +142,27 @@ BrowserWindowInterface* HeliumSpace::Get
  }
  
  BrowserWindowInterface* HeliumSpace::ActivateOrCreatePrimaryWindow() {
@@ -933,7 +990,7 @@ Index: src/chrome/browser/ui/helium/helium_space.h
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/helium_space.h
 +++ src/chrome/browser/ui/helium/helium_space.h
-@@ -6,38 +6,53 @@
+@@ -6,38 +6,57 @@
  #define CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_H_
  
  #include <string>
@@ -974,6 +1031,10 @@ Index: src/chrome/browser/ui/helium/helium_space.h
 +  void AppendPin(PersistentLink pin);
 +  bool UpdatePinHome(std::string_view id, GURL url, std::u16string title);
 +  bool RemovePin(std::string_view id);
++  bool MovePinBefore(std::string_view id, std::string_view target_id);
++  bool MovePin(std::string_view id,
++               std::string_view parent_id,
++               std::string_view before_id);
 +  bool ToggleFolderCollapsed(std::string_view folder_id);
  
 -  // Primary TYPE_NORMAL tabbed window for this Space, if any.
@@ -1411,7 +1472,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      return active;
    }
    return spaces_.front().get();
-@@ -97,55 +409,1338 @@ HeliumSpace* HeliumSpaceService::GetSpac
+@@ -97,55 +409,1395 @@ HeliumSpace* HeliumSpaceService::GetSpac
  }
  
  HeliumSpace* HeliumSpaceService::GetOrCreateSpace(std::string id,
@@ -1602,7 +1663,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +                     association->second->tab &&
 +                     association->second->tab->IsActivated();
 +    item.is_live = true;
-   }
++  }
 +  return items;
 +}
 +
@@ -1913,6 +1974,19 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  return std::nullopt;
 +}
 +
++std::optional<std::string> HeliumSpaceService::GetPersistentItemId(
++    const tabs::TabInterface* tab) const {
++  if (!tab) {
++    return std::nullopt;
++  }
++  for (const auto& [token, association] : live_associations_) {
++    if (association->tab == tab) {
++      return association->item_id;
++    }
++  }
++  return std::nullopt;
++}
++
 +bool HeliumSpaceService::GetPersistentItemHome(
 +    const tabs::TabInterface* tab,
 +    GURL* home_url,
@@ -2016,7 +2090,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  std::u16string title = item.title;
 +  if (title.empty()) {
 +    title = base::UTF8ToUTF16(item.url.host());
-+  }
+   }
 +  helper->SetAnchoredPinnedTabHome(item.url, std::move(title));
 +}
 +
@@ -2024,6 +2098,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    uint64_t token,
 +    tabs::TabInterface* tab,
 +    tabs::TabInterface::DetachReason reason) {
++  persistent_item_drags_.erase(tab);
 +  if (reason != tabs::TabInterface::DetachReason::kDelete) {
 +    return;
 +  }
@@ -2041,6 +2116,9 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  if (association == live_associations_.end()) {
 +    return;
 +  }
++  if (persistent_item_drags_.contains(tab)) {
++    return;
++  }
 +  BrowserWindowInterface* window = tab->GetBrowserWindowInterface();
 +  Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
 +  if (IsItemKeyVisibleInBrowser(browser, association->second->key) &&
@@ -2055,6 +2133,19 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
 +      FROM_HERE, base::BindOnce(&HeliumSpaceService::CompleteLiveTabClose,
 +                                weak_factory_.GetWeakPtr(), token));
++}
++
++void HeliumSpaceService::SetPersistentItemDragInProgress(
++    tabs::TabInterface* tab,
++    bool in_progress) {
++  if (!tab) {
++    return;
++  }
++  if (in_progress) {
++    persistent_item_drags_.insert(tab);
++  } else {
++    persistent_item_drags_.erase(tab);
++  }
 +}
 +
 +bool HeliumSpaceService::IsLiveTabInExpectedCollection(
@@ -2274,6 +2365,33 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    PersistPersistentItemUsage();
 +  }
 +  RegisterDormantItems();
++  NotifyItemsChanged();
++  return true;
++}
++
++bool HeliumSpaceService::MovePinBefore(Browser* browser,
++                                       std::string_view id,
++                                       std::string_view target_id) {
++  HeliumSpace* space =
++      browser ? GetSpaceById(GetSpaceIdForBrowser(browser)) : nullptr;
++  if (!space || !space->MovePinBefore(id, target_id)) {
++    return false;
++  }
++  NotifyItemsChanged();
++  return true;
++}
++
++bool HeliumSpaceService::MovePin(Browser* browser,
++                                 std::string_view id,
++                                 std::string_view parent_id,
++                                 std::string_view before_id) {
++  HeliumSpace* space =
++      IsEligibleBrowser(browser)
++          ? GetSpaceById(GetSpaceIdForBrowser(browser))
++          : nullptr;
++  if (!space || !space->MovePin(id, parent_id, before_id)) {
++    return false;
++  }
 +  NotifyItemsChanged();
 +  return true;
 +}
@@ -2759,7 +2877,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      return false;
    }
    SetSpaceForBrowser(browser, found->second);
-@@ -158,20 +1753,32 @@ void HeliumSpaceService::AddSpaceToSessi
+@@ -158,20 +1810,32 @@ void HeliumSpaceService::AddSpaceToSessi
    if (!extra_data) {
      return;
    }
@@ -2800,7 +2918,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
  }
  
  std::vector<HeliumSpace*> HeliumSpaceService::GetSpaces() {
-@@ -191,27 +1798,20 @@ void HeliumSpaceService::OnBrowserCreate
+@@ -191,27 +1855,20 @@ void HeliumSpaceService::OnBrowserCreate
        !GetSpaceIdForBrowser(browser).empty()) {
      return;
    }
@@ -2919,7 +3037,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
  class HeliumSpaceService : public KeyedService,
                             public BrowserCollectionObserver {
   public:
-@@ -39,13 +83,83 @@ class HeliumSpaceService : public KeyedS
+@@ -39,13 +83,94 @@ class HeliumSpaceService : public KeyedS
    HeliumSpaceService& operator=(const HeliumSpaceService&) = delete;
    ~HeliumSpaceService() override;
  
@@ -2959,7 +3077,11 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +                            PersistentRecordKind kind,
 +                            std::string_view id);
 +  bool IsPersistentItemTab(const tabs::TabInterface* tab) const;
++  void SetPersistentItemDragInProgress(tabs::TabInterface* tab,
++                                       bool in_progress);
 +  std::optional<PersistentRecordKind> GetPersistentItemKind(
++      const tabs::TabInterface* tab) const;
++  std::optional<std::string> GetPersistentItemId(
 +      const tabs::TabInterface* tab) const;
 +  bool GetPersistentItemHome(const tabs::TabInterface* tab,
 +                             GURL* home_url,
@@ -2987,6 +3109,13 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +                      std::string_view id,
 +                      std::string_view source_space_id,
 +                      std::string_view target_space_id);
++  bool MovePinBefore(Browser* browser,
++                     std::string_view id,
++                     std::string_view target_id);
++  bool MovePin(Browser* browser,
++               std::string_view id,
++               std::string_view parent_id,
++               std::string_view before_id);
 +  bool ToggleFolderCollapsed(Browser* browser,
 +                             PersistentRecordKind kind,
 +                             std::string_view folder_id);
@@ -3005,7 +3134,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
    void SetSpaceForBrowser(Browser* browser, std::string_view id);
    bool RestoreSpaceForBrowserFromSession(
        Browser* browser,
-@@ -57,20 +171,82 @@ class HeliumSpaceService : public KeyedS
+@@ -57,20 +182,83 @@ class HeliumSpaceService : public KeyedS
  
    std::vector<HeliumSpace*> GetSpaces();
  
@@ -3082,6 +3211,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +  std::map<std::string, UsageEntry, std::less<>> persistent_item_usage_;
 +  uint64_t next_live_token_ = 1;
 +  std::map<uint64_t, std::unique_ptr<LiveAssociation>> live_associations_;
++  std::set<tabs::TabInterface*> persistent_item_drags_;
 +  std::map<SessionID, std::string> session_space_ids_;
 +  base::RepeatingClosureList items_changed_callbacks_;
    base::ScopedObservation<ProfileBrowserCollection, BrowserCollectionObserver>
@@ -5048,7 +5178,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
-@@ -0,0 +1,773 @@
+@@ -0,0 +1,1288 @@
 +// Copyright 2025 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -5056,8 +5186,10 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +#include "chrome/browser/ui/views/tabs/common/pin_tab_container_view.h"
 +
 +#include <algorithm>
++#include <optional>
 +#include <set>
 +#include <string_view>
++#include <utility>
 +#include <variant>
 +
 +#include "base/strings/strcat.h"
@@ -5144,9 +5276,26 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +  METADATA_HEADER(PersistentFolderRow, views::LabelButton)
 +
 + public:
++  using BeginDragCallback = base::RepeatingCallback<bool(
++      views::View&,
++      std::string,
++      const ui::MouseEvent&,
++      const ui::MouseEvent&)>;
++  using UpdateDragCallback = base::RepeatingCallback<void(
++      views::View&,
++      const ui::MouseEvent&)>;
++
 +  PersistentFolderRow(views::Button::PressedCallback callback,
-+                      std::u16string_view text)
-+      : LabelButton(std::move(callback), text) {
++                      std::u16string_view text,
++                      std::string stable_id,
++                      BeginDragCallback begin_drag,
++                      UpdateDragCallback update_drag,
++                      UpdateDragCallback end_drag)
++      : LabelButton(std::move(callback), text),
++        stable_id_(std::move(stable_id)),
++        begin_drag_(std::move(begin_drag)),
++        update_drag_(std::move(update_drag)),
++        end_drag_(std::move(end_drag)) {
 +    // The vertical tab collection paints through a translucent compositor
 +    // layer. Virtual rows have no opaque background of their own, so use
 +    // grayscale antialiasing like other labels in translucent browser chrome.
@@ -5176,9 +5325,53 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +    SetImageLabelSpacing(8);
 +  }
 +
++  void SetDropTarget(bool drop_target) {
++    SetState(drop_target ? STATE_HOVERED : STATE_NORMAL);
++  }
++
++  bool OnMousePressed(const ui::MouseEvent& event) override {
++    if (event.IsOnlyLeftMouseButton()) {
++      drag_start_event_ = std::make_unique<ui::MouseEvent>(event);
++      dragging_ = false;
++    }
++    return views::LabelButton::OnMousePressed(event);
++  }
++
++  bool OnMouseDragged(const ui::MouseEvent& event) override {
++    if (drag_start_event_) {
++      if (!dragging_ &&
++          ExceededDragThreshold(event.location() -
++                                drag_start_event_->location())) {
++        dragging_ = begin_drag_.Run(*this, stable_id_, *drag_start_event_,
++                                   event);
++      } else if (dragging_) {
++        update_drag_.Run(*this, event);
++      }
++    }
++    return dragging_ || views::LabelButton::OnMouseDragged(event);
++  }
++
++  void OnMouseReleased(const ui::MouseEvent& event) override {
++    if (dragging_) {
++      end_drag_.Run(*this, event);
++      dragging_ = false;
++      drag_start_event_.reset();
++      SetState(STATE_NORMAL);
++      return;
++    }
++    drag_start_event_.reset();
++    views::LabelButton::OnMouseReleased(event);
++  }
++
 + private:
++  const std::string stable_id_;
 +  std::u16string title_;
 +  bool collapsed_ = false;
++  BeginDragCallback begin_drag_;
++  UpdateDragCallback update_drag_;
++  UpdateDragCallback end_drag_;
++  std::unique_ptr<ui::MouseEvent> drag_start_event_;
++  bool dragging_ = false;
 +};
 +
 +BEGIN_METADATA(PersistentFolderRow)
@@ -5191,6 +5384,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +  std::string id;
 +  helium::PersistentRecordKind kind;
 +  int depth = 0;
++  std::string parent_id;
 +  bool folder = false;
 +  bool collapsed = false;
 +  bool selected = false;
@@ -5371,6 +5565,9 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +}
 +
 +bool PinTabContainerView::IsDragging() const {
++  if (folder_drag_view_) {
++    return true;
++  }
 +  if (!collection_node_ || !collection_node_->GetController()) {
 +    return false;
 +  }
@@ -5378,6 +5575,9 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +}
 +
 +bool PinTabContainerView::IsViewDragging(const views::View& child_view) const {
++  if (folder_drag_view_ == &child_view) {
++    return true;
++  }
 +  if (!collection_node_ || !collection_node_->GetController()) {
 +    return false;
 +  }
@@ -5400,6 +5600,14 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +    tab_strip->CancelPersistentRowReplacement();
 +  }
 +  pending_replacement_key_.reset();
++  folder_drag_view_ = nullptr;
++  folder_drag_id_.clear();
++  folder_drag_location_ = {};
++  ClearPersistentTabDragPreview();
++  row_depths_.clear();
++  row_ids_.clear();
++  row_parent_ids_.clear();
++  row_is_folders_.clear();
 +  folder_connectors_.clear();
 +  collapse_state_subscription_ = {};
 +  items_changed_subscription_ = {};
@@ -5419,6 +5627,9 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +
 +void PinTabContainerView::RemoveCollectionChild(views::View* child) {
 +  row_depths_.erase(child);
++  row_ids_.erase(child);
++  row_parent_ids_.erase(child);
++  row_is_folders_.erase(child);
 +  folder_connectors_.clear();
 +  layout_manager_->AnimateAndDestroyChildView(child);
 +}
@@ -5545,7 +5756,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +      space_service_->GetSpaceIdForBrowser(browser));
 +  if (space) {
 +    AppendPersistentNodes(space->pins(), helium::PersistentRecordKind::kPin, 0,
-+                          false, &rows);
++                          {}, false, &rows);
 +  }
 +
 +  std::set<std::string, std::less<>> desired_keys;
@@ -5564,7 +5775,15 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +          base::BindRepeating(&PinTabContainerView::ToggleFolder,
 +                              weak_ptr_factory_.GetWeakPtr(), spec.kind,
 +                              spec.id),
-+          spec.title);
++          spec.title, spec.id,
++          base::BindRepeating(
++              &PinTabContainerView::BeginPersistentFolderDrag,
++              base::Unretained(this)),
++          base::BindRepeating(
++              &PinTabContainerView::UpdatePersistentFolderDrag,
++              weak_ptr_factory_.GetWeakPtr()),
++          base::BindRepeating(&PinTabContainerView::EndPersistentFolderDrag,
++                              weak_ptr_factory_.GetWeakPtr()));
 +      folder_row->SetHorizontalAlignment(gfx::ALIGN_LEFT);
 +      row = AddChildWithoutAnimation(std::move(folder_row));
 +      persistent_rows_.emplace(spec.key, row);
@@ -5577,7 +5796,8 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +                              spec.id),
 +          base::BindRepeating(&PinTabContainerView::RemovePersistentItem,
 +                              weak_ptr_factory_.GetWeakPtr(), spec.kind,
-+                              spec.id));
++                              spec.id),
++          this);
 +      row = AddChildWithoutAnimation(std::move(link_row));
 +      persistent_rows_.emplace(spec.key, row);
 +    }
@@ -5610,6 +5830,9 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +    views::View* displayed_row = live_tab_view ? live_tab_view : row;
 +    displayed_row->SetVisible(true);
 +    row_depths_[displayed_row] = spec.depth;
++    row_ids_[displayed_row] = spec.id;
++    row_parent_ids_[displayed_row] = spec.parent_id;
++    row_is_folders_[displayed_row] = spec.folder;
 +    displayed_rows.push_back(displayed_row);
 +    ReorderChildView(displayed_row, target_index++);
 +    if (pending_replacement_key_ == spec.key && live_tab_view) {
@@ -5624,6 +5847,9 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +    }
 +    views::View* stale_row = it->second;
 +    row_depths_.erase(stale_row);
++    row_ids_.erase(stale_row);
++    row_parent_ids_.erase(stale_row);
++    row_is_folders_.erase(stale_row);
 +    RemoveChildViewT(stale_row);
 +    it = persistent_rows_.erase(it);
 +  }
@@ -5670,6 +5896,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +    const std::vector<helium::PersistentNode>& nodes,
 +    helium::PersistentRecordKind kind,
 +    int depth,
++    std::string_view parent_id,
 +    bool only_live,
 +    std::vector<PersistentRowSpec>* rows) {
 +  BrowserView* browser_view =
@@ -5686,6 +5913,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +          .id = link->id,
 +          .kind = kind,
 +          .depth = depth,
++          .parent_id = std::string(parent_id),
 +          .selected = browser && space_service_->IsPersistentItemActive(
 +                                     browser, kind, link->id),
 +          .live_tab = browser ? space_service_->GetLiveTabForPersistentItem(
@@ -5705,11 +5933,12 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +        .id = folder.id,
 +        .kind = kind,
 +        .depth = depth,
++        .parent_id = std::string(parent_id),
 +        .folder = true,
 +        .collapsed = folder.collapsed,
 +        .title = folder.title,
 +    });
-+    AppendPersistentNodes(folder.children, kind, depth + 1,
++    AppendPersistentNodes(folder.children, kind, depth + 1, folder.id,
 +                          only_live || folder.collapsed, rows);
 +  }
 +}
@@ -5778,6 +6007,422 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +  }
 +}
 +
++bool PinTabContainerView::BeginPersistentTabDrag(
++    PersistentTabView& row,
++    const ui::MouseEvent& press_event,
++    const ui::MouseEvent& drag_event) {
++  if (!collection_node_ || !space_service_) {
++    return false;
++  }
++  BrowserView* browser_view =
++      collection_node_->GetController()->GetBrowserView();
++  Browser* browser = browser_view ? browser_view->browser() : nullptr;
++  if (!browser) {
++    return false;
++  }
++  const std::string id = row.stable_id();
++  TabStripView* tab_strip = GetTabStripView(this);
++  if (tab_strip) {
++    tab_strip->BeginPersistentRowReplacement(&row);
++    pending_replacement_key_ =
++        PersistentLinkKey(helium::PersistentRecordKind::kPin, id);
++  }
++  if (!space_service_->ActivatePersistentItem(
++          browser, helium::PersistentRecordKind::kPin, id)) {
++    if (tab_strip) {
++      tab_strip->CancelPersistentRowReplacement();
++    }
++    pending_replacement_key_.reset();
++    return false;
++  }
++  ReconcilePersistentRows();
++
++  tabs::TabInterface* tab = space_service_->GetLiveTabForPersistentItem(
++      browser, helium::PersistentRecordKind::kPin, id);
++  TabCollectionNode* node =
++      tab ? collection_node_->GetNodeForHandle(tab->GetHandle()) : nullptr;
++  auto* native_view =
++      node ? views::AsViewClass<TabView>(node->view()) : nullptr;
++  if (!native_view) {
++    space_service_->ClosePersistentItemInstance(
++        browser, helium::PersistentRecordKind::kPin, id,
++        space_service_->GetSpaceIdForBrowser(browser));
++    return false;
++  }
++
++  auto* controller = collection_node_->GetController();
++  const ui::ListSelectionModel original_selection =
++      controller->GetSelectionModel();
++  ui::MouseEvent native_press(
++      press_event, static_cast<views::View*>(&row),
++      static_cast<views::View*>(native_view));
++  controller->GetDragHandler().InitializeDrag(*node, original_selection,
++                                               native_press);
++  materialized_drag_view_ = native_view;
++  materialized_drag_id_ = id;
++
++  ui::MouseEvent native_drag(
++      drag_event, static_cast<views::View*>(&row),
++      static_cast<views::View*>(native_view));
++  if (!controller->GetDragHandler().ContinueDrag(*native_view, native_drag)) {
++    controller->GetDragHandler().EndDrag(EndDragReason::kCancel);
++    materialized_drag_view_ = nullptr;
++    materialized_drag_id_.clear();
++    space_service_->ClosePersistentItemInstance(
++        browser, helium::PersistentRecordKind::kPin, id,
++        space_service_->GetSpaceIdForBrowser(browser));
++    return false;
++  }
++  return true;
++}
++
++void PinTabContainerView::UpdatePersistentTabDrag(
++    PersistentTabView& row,
++    const ui::MouseEvent& event) {
++  if (!materialized_drag_view_ || !collection_node_) {
++    return;
++  }
++  ui::MouseEvent native_event(
++      event, static_cast<views::View*>(&row),
++      static_cast<views::View*>(materialized_drag_view_.get()));
++  collection_node_->GetController()->GetDragHandler().ContinueDrag(
++      *materialized_drag_view_, native_event);
++}
++
++void PinTabContainerView::EndPersistentTabDrag(
++    PersistentTabView& row,
++    const ui::MouseEvent& event) {
++  if (!collection_node_ || materialized_drag_id_.empty()) {
++    return;
++  }
++  gfx::Point point_in_screen = event.location();
++  views::View::ConvertPointToScreen(&row, &point_in_screen);
++  BrowserView* browser_view =
++      collection_node_->GetController()->GetBrowserView();
++  Browser* browser = browser_view ? browser_view->browser() : nullptr;
++  const std::string id = std::exchange(materialized_drag_id_, std::string());
++  materialized_drag_view_ = nullptr;
++  collection_node_->GetController()->GetDragHandler().EndDrag(
++      EndDragReason::kComplete);
++
++  TabStripView* tab_strip = GetTabStripView(this);
++  auto* ordinary = tab_strip ? tab_strip->GetUnpinnedTabsContainer() : nullptr;
++  if (!browser || !ordinary ||
++      point_in_screen.y() >= ordinary->GetBoundsInScreen().y()) {
++    return;
++  }
++  const PersistentTabDropLocation location =
++      GetPersistentDropLocation(id, point_in_screen);
++  space_service_->MovePin(browser, id, location.parent_id,
++                          location.before_id);
++  space_service_->ClosePersistentItemInstance(
++      browser, helium::PersistentRecordKind::kPin, id,
++      space_service_->GetSpaceIdForBrowser(browser));
++}
++
++bool PinTabContainerView::BeginPersistentFolderDrag(
++    views::View& row,
++    std::string id,
++    const ui::MouseEvent&,
++    const ui::MouseEvent& drag_event) {
++  if (!space_service_ || id.empty()) {
++    return false;
++  }
++  folder_drag_view_ = &row;
++  folder_drag_id_ = std::move(id);
++  UpdatePersistentFolderDrag(row, drag_event);
++  return true;
++}
++
++void PinTabContainerView::UpdatePersistentFolderDrag(
++    views::View& row,
++    const ui::MouseEvent& event) {
++  if (folder_drag_view_ != &row || folder_drag_id_.empty()) {
++    return;
++  }
++  gfx::Point point_in_screen = event.location();
++  views::View::ConvertPointToScreen(&row, &point_in_screen);
++  folder_drag_location_ =
++      GetPersistentDropLocation(folder_drag_id_, point_in_screen);
++  UpdatePersistentTabDragPreview(point_in_screen);
++}
++
++void PinTabContainerView::EndPersistentFolderDrag(
++    views::View& row,
++    const ui::MouseEvent& event) {
++  if (folder_drag_view_ != &row || folder_drag_id_.empty()) {
++    return;
++  }
++  UpdatePersistentFolderDrag(row, event);
++  BrowserView* browser_view =
++      collection_node_ && collection_node_->GetController()
++          ? collection_node_->GetController()->GetBrowserView()
++          : nullptr;
++  Browser* browser = browser_view ? browser_view->browser() : nullptr;
++  const std::string id = std::exchange(folder_drag_id_, std::string());
++  folder_drag_view_ = nullptr;
++  if (browser) {
++    space_service_->MovePin(browser, id, folder_drag_location_.parent_id,
++                            folder_drag_location_.before_id);
++  }
++  folder_drag_location_ = {};
++  ClearPersistentTabDragPreview();
++  ScheduleReconcilePersistentRows();
++}
++
++std::string PinTabContainerView::GetPersistentIdForView(
++    const views::View& view) const {
++  if (const auto known = row_ids_.find(&view); known != row_ids_.end()) {
++    return known->second;
++  }
++  if (const auto* row = views::AsViewClass<PersistentTabView>(&view)) {
++    return row->stable_id();
++  }
++  const auto* tab_view = views::AsViewClass<TabView>(&view);
++  const tabs::TabInterface* tab =
++      tab_view ? std::get<const tabs::TabInterface*>(
++                     tab_view->collection_node()->GetNodeData())
++               : nullptr;
++  const std::optional<std::string> id =
++      space_service_ ? space_service_->GetPersistentItemId(tab) : std::nullopt;
++  return id.value_or(std::string());
++}
++
++PersistentTabDropLocation
++PinTabContainerView::GetPersistentDropLocationForDrag(
++    const gfx::Point& point_in_screen) const {
++  std::string source_id;
++  for (const views::View* child : children()) {
++    if (GetDragHandler().IsViewDragging(*child)) {
++      source_id = GetPersistentIdForView(*child);
++      break;
++    }
++  }
++  return GetPersistentDropLocation(source_id, point_in_screen);
++}
++
++void PinTabContainerView::UpdatePersistentTabDragPreview(
++    const gfx::Point& point_in_screen) {
++  if (!IsHandlingDrag() && !folder_drag_view_) {
++    return;
++  }
++
++  views::View* dragged_view = folder_drag_view_;
++  size_t current_index = 0;
++  if (!dragged_view) {
++    for (size_t index = 0; index < children().size(); ++index) {
++      if (GetDragHandler().IsViewDragging(*children()[index])) {
++        dragged_view = children()[index];
++        current_index = index;
++        break;
++      }
++    }
++  } else {
++    current_index = GetIndexOf(dragged_view).value_or(0);
++  }
++  if (!dragged_view) {
++    const PersistentTabDropLocation location =
++        GetPersistentDropLocation({}, point_in_screen);
++    UpdatePersistentFolderDropHighlight(location);
++    return;
++  }
++
++  const auto source_id = row_ids_.find(dragged_view);
++  if (source_id != row_ids_.end()) {
++    const PersistentTabDropLocation location =
++        GetPersistentDropLocation(source_id->second, point_in_screen);
++    UpdatePersistentFolderDropHighlight(location);
++    size_t insertion_index = children().size();
++    if (!location.before_id.empty()) {
++      for (size_t index = 0; index < children().size(); ++index) {
++        const auto id = row_ids_.find(children()[index]);
++        if (id != row_ids_.end() && id->second == location.before_id) {
++          insertion_index = index;
++          break;
++        }
++      }
++    } else if (!location.parent_id.empty()) {
++      for (size_t index = 0; index < children().size(); ++index) {
++        const auto id = row_ids_.find(children()[index]);
++        if (id == row_ids_.end() || id->second != location.parent_id) {
++          continue;
++        }
++        const int parent_depth = row_depths_.at(children()[index]);
++        insertion_index = index + 1;
++        while (insertion_index < children().size() &&
++               row_depths_.contains(children()[insertion_index]) &&
++               row_depths_.at(children()[insertion_index]) > parent_depth) {
++          ++insertion_index;
++        }
++        break;
++      }
++    }
++
++    const int source_depth = row_depths_.at(dragged_view);
++    size_t block_end = current_index + 1;
++    if (row_is_folders_.at(dragged_view)) {
++      while (block_end < children().size() &&
++             row_depths_.contains(children()[block_end]) &&
++             row_depths_.at(children()[block_end]) > source_depth) {
++        ++block_end;
++      }
++    }
++    if (insertion_index >= current_index && insertion_index <= block_end) {
++      return;
++    }
++    std::vector<views::View*> block(children().begin() + current_index,
++                                    children().begin() + block_end);
++    if (insertion_index > block_end) {
++      insertion_index -= block.size();
++    }
++    int target_depth = 0;
++    if (!location.parent_id.empty()) {
++      for (const auto& [view, id] : row_ids_) {
++        if (id == location.parent_id) {
++          target_depth = row_depths_.at(view) + 1;
++          break;
++        }
++      }
++    }
++    const int depth_delta = target_depth - source_depth;
++    for (size_t offset = 0; offset < block.size(); ++offset) {
++      row_depths_[block[offset]] += depth_delta;
++      ReorderChildView(block[offset], insertion_index + offset);
++    }
++    InvalidateLayout();
++    return;
++  }
++
++  size_t insertion_index = children().size();
++  for (size_t index = 0; index < children().size(); ++index) {
++    const views::View* child = children()[index];
++    if (child == dragged_view || !child->GetVisible()) {
++      continue;
++    }
++    if (point_in_screen.y() < child->GetBoundsInScreen().CenterPoint().y()) {
++      insertion_index = index;
++      break;
++    }
++  }
++  if (insertion_index > current_index) {
++    --insertion_index;
++  }
++  insertion_index =
++      std::min(insertion_index, children().size() - 1);
++  if (insertion_index == current_index) {
++    return;
++  }
++  ReorderChildView(dragged_view, insertion_index);
++  InvalidateLayout();
++}
++
++void PinTabContainerView::OnTabDragPresentationEnded() {
++  ClearPersistentTabDragPreview();
++  ScheduleReconcilePersistentRows();
++}
++
++void PinTabContainerView::ClearPersistentTabDragPreview() {
++  if (auto* folder =
++          views::AsViewClass<PersistentFolderRow>(folder_drop_highlight_)) {
++    folder->SetDropTarget(false);
++  }
++  folder_drop_highlight_ = nullptr;
++}
++
++void PinTabContainerView::UpdatePersistentFolderDropHighlight(
++    const PersistentTabDropLocation& location) {
++  views::View* highlighted_folder = nullptr;
++  if (!location.parent_id.empty()) {
++    for (views::View* view : children()) {
++      if (row_ids_.contains(view) &&
++          row_ids_.at(view) == location.parent_id &&
++          row_is_folders_.at(view)) {
++        highlighted_folder = view;
++        break;
++      }
++    }
++  }
++  if (folder_drop_highlight_ == highlighted_folder) {
++    return;
++  }
++  ClearPersistentTabDragPreview();
++  folder_drop_highlight_ = highlighted_folder;
++  if (auto* folder =
++          views::AsViewClass<PersistentFolderRow>(highlighted_folder)) {
++    folder->SetDropTarget(true);
++  }
++}
++
++PersistentTabDropLocation PinTabContainerView::GetPersistentDropLocation(
++    std::string_view source_id,
++    const gfx::Point& point_in_screen) const {
++  PersistentTabDropLocation location;
++  location.target = PersistentTabDropTarget::kPin;
++  std::vector<const views::View*> visible;
++  std::optional<int> skipped_subtree_depth;
++  for (const views::View* child : children()) {
++    if (!child->GetVisible() || !row_ids_.contains(child)) {
++      continue;
++    }
++    const int depth = row_depths_.at(child);
++    if (row_ids_.at(child) == source_id) {
++      skipped_subtree_depth = depth;
++      continue;
++    }
++    if (skipped_subtree_depth) {
++      if (depth > *skipped_subtree_depth) {
++        continue;
++      }
++      skipped_subtree_depth.reset();
++    }
++    visible.push_back(child);
++  }
++  for (size_t index = 0; index < visible.size(); ++index) {
++    const views::View* child = visible[index];
++    const gfx::Rect bounds = child->GetBoundsInScreen();
++    if (point_in_screen.y() < bounds.y()) {
++      location.parent_id = row_parent_ids_.at(child);
++      location.before_id = row_ids_.at(child);
++      return location;
++    }
++    if (point_in_screen.y() >= bounds.bottom()) {
++      continue;
++    }
++    const bool folder = row_is_folders_.at(child);
++    const int relative_y = point_in_screen.y() - bounds.y();
++    const bool middle_zone = relative_y >= bounds.height() / 3 &&
++                             relative_y < bounds.height() * 2 / 3;
++    const bool indented_zone =
++        point_in_screen.x() >=
++        bounds.x() + std::max(48, bounds.width() / 3);
++    const bool inside_folder =
++        folder &&
++        (middle_zone ||
++         (indented_zone && relative_y >= bounds.height() / 6 &&
++          relative_y < bounds.height() * 5 / 6));
++    if (inside_folder) {
++      location.parent_id = row_ids_.at(child);
++      return location;
++    }
++    location.parent_id = row_parent_ids_.at(child);
++    if (relative_y < bounds.height() / 2) {
++      location.before_id = row_ids_.at(child);
++      return location;
++    }
++    const int depth = row_depths_.at(child);
++    for (size_t next = index + 1; next < visible.size(); ++next) {
++      if (row_depths_.at(visible[next]) <= depth) {
++        if (row_depths_.at(visible[next]) == depth) {
++          location.before_id = row_ids_.at(visible[next]);
++        }
++        return location;
++      }
++    }
++    return location;
++  }
++  return location;
++}
++
 +void PinTabContainerView::ToggleFolder(helium::PersistentRecordKind kind,
 +                                       std::string id) {
 +  if (!collection_node_ || !collection_node_->GetController() ||
@@ -5826,7 +6471,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,175 @@
 +// Copyright 2025 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -5837,6 +6482,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +#include <map>
 +#include <optional>
 +#include <string>
++#include <string_view>
 +#include <vector>
 +
 +#include "base/callback_list.h"
@@ -5844,13 +6490,16 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +#include "base/memory/weak_ptr.h"
 +#include "chrome/browser/ui/views/frame/browser_root_view.h"
 +#include "chrome/browser/ui/views/tabs/common/dragged_tabs_container.h"
++#include "chrome/browser/ui/views/tabs/common/persistent_tab_view.h"
 +#include "chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h"
++#include "chrome/browser/ui/views/tabs/common/tab_drag_handler.h"
 +#include "ui/base/metadata/metadata_header_macros.h"
 +#include "ui/views/layout/delegating_layout_manager.h"
 +#include "ui/views/view.h"
 +
 +class TabCollectionNode;
 +class TabGroupView;
++class TabView;
 +
 +namespace helium {
 +struct PersistentNode;
@@ -5869,7 +6518,8 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +    : public views::View,
 +      public views::LayoutDelegate,
 +      public DraggedTabsContainer,
-+      public TabCollectionAnimatingLayoutManager::Delegate {
++      public TabCollectionAnimatingLayoutManager::Delegate,
++      public PersistentTabDragDelegate {
 +  METADATA_HEADER(PinTabContainerView, views::View)
 +
 + public:
@@ -5899,7 +6549,32 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +  std::optional<BrowserRootView::DropIndex> GetLinkDropIndex(
 +      const gfx::Point& point_in_local_coords);
 +
++  // Returns the stable persistent item immediately after the proposed drop.
++  // Dormant Pin rows participate even though they have no TabCollectionNode.
++  PersistentTabDropLocation GetPersistentDropLocationForDrag(
++      const gfx::Point& point_in_screen) const;
++  void UpdatePersistentTabDragPreview(const gfx::Point& point_in_screen);
++  void ClearPersistentTabDragPreview();
++
 +  views::View* AddChildWithoutAnimation(std::unique_ptr<views::View> child);
++
++  // PersistentTabDragDelegate:
++  bool BeginPersistentTabDrag(PersistentTabView& row,
++                              const ui::MouseEvent& press_event,
++                              const ui::MouseEvent& drag_event) override;
++  void UpdatePersistentTabDrag(PersistentTabView& row,
++                               const ui::MouseEvent& event) override;
++  void EndPersistentTabDrag(PersistentTabView& row,
++                            const ui::MouseEvent& event) override;
++
++  bool BeginPersistentFolderDrag(views::View& row,
++                                 std::string id,
++                                 const ui::MouseEvent& press_event,
++                                 const ui::MouseEvent& drag_event);
++  void UpdatePersistentFolderDrag(views::View& row,
++                                  const ui::MouseEvent& event);
++  void EndPersistentFolderDrag(views::View& row,
++                               const ui::MouseEvent& event);
 +
 + private:
 +  // DraggedTabsContainer:
@@ -5909,6 +6584,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +  const views::ProposedLayout& GetLayoutForDrag() const override;
 +  const TabCollectionNode* GetCollectionNodeFromView(
 +      const views::View& view) const override;
++  void OnTabDragPresentationEnded() override;
 +
 +  void ResetCollectionNode();
 +  void ScheduleReconcilePersistentRows();
@@ -5930,6 +6606,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +  void AppendPersistentNodes(const std::vector<helium::PersistentNode>& nodes,
 +                             helium::PersistentRecordKind kind,
 +                             int depth,
++                             std::string_view parent_id,
 +                             bool only_live,
 +                             std::vector<PersistentRowSpec>* rows);
 +  bool HasLiveDescendant(const helium::PersistentNode& node,
@@ -5937,13 +6614,28 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +  void ActivatePersistentItem(helium::PersistentRecordKind kind,
 +                              std::string id);
 +  void RemovePersistentItem(helium::PersistentRecordKind kind, std::string id);
++  std::string GetPersistentIdForView(const views::View& view) const;
++  PersistentTabDropLocation GetPersistentDropLocation(
++      std::string_view source_id,
++      const gfx::Point& point_in_screen) const;
++  void UpdatePersistentFolderDropHighlight(
++      const PersistentTabDropLocation& location);
 +  void ToggleFolder(helium::PersistentRecordKind kind, std::string id);
 +
 +  raw_ptr<TabCollectionNode> collection_node_;
 +  const raw_ref<TabCollectionAnimatingLayoutManager> layout_manager_;
 +  raw_ptr<helium::HeliumSpaceService> space_service_ = nullptr;
 +  std::map<const views::View*, int> row_depths_;
++  std::map<const views::View*, std::string> row_ids_;
++  std::map<const views::View*, std::string> row_parent_ids_;
++  std::map<const views::View*, bool> row_is_folders_;
 +  std::map<std::string, raw_ptr<views::View>, std::less<>> persistent_rows_;
++  raw_ptr<TabView> materialized_drag_view_ = nullptr;
++  std::string materialized_drag_id_;
++  raw_ptr<views::View> folder_drag_view_ = nullptr;
++  std::string folder_drag_id_;
++  PersistentTabDropLocation folder_drag_location_;
++  raw_ptr<views::View> folder_drop_highlight_ = nullptr;
 +  std::vector<PersistentFolderConnector> folder_connectors_;
 +  bool reconcile_scheduled_ = false;
 +  std::optional<std::string> pending_replacement_key_;
@@ -6037,15 +6729,31 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
  #include "chrome/browser/ui/ui_features.h"
  #include "chrome/browser/ui/views/frame/browser_view.h"
  #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
-@@ -53,6 +54,36 @@ namespace {
+@@ -31,6 +32,8 @@
+ #include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_group_tab_collection.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "components/tabs/public/pin_tab_collection.h"
++#include "components/tabs/public/tab_strip_collection.h"
+ #include "content/public/browser/web_contents.h"
+ #include "ui/base/class_property.h"
+ #include "ui/base/clipboard/clipboard_constants.h"
+@@ -53,6 +56,48 @@ namespace {
  // it should be, relative to the source dragged view's origin.
  DEFINE_OWNED_UI_CLASS_PROPERTY_KEY(gfx::Vector2d, kOffsetAtTabDragStart)
  
-+enum class PersistentDropAction { kMakePin, kMakeFavorite, kRemove };
++enum class PersistentDropAction {
++  kMakePin,
++  kMakeFavorite,
++  kReorderPin,
++  kRemove
++};
 +
 +struct PendingPersistentDrop {
 +  PersistentDropAction action;
 +  base::WeakPtr<content::WebContents> contents;
++  std::string parent_id;
++  std::string before_id;
 +};
 +
 +void CommitPersistentDrops(std::vector<PendingPersistentDrop> drops) {
@@ -6059,10 +6767,15 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
 +    }
 +    switch (drop.action) {
 +      case PersistentDropAction::kMakePin:
-+        helium::MakePin(tab);
++        if (helium::MakePin(tab)) {
++          helium::MovePin(tab, drop.parent_id, drop.before_id);
++        }
 +        break;
 +      case PersistentDropAction::kMakeFavorite:
 +        helium::MakeFavorite(tab);
++        break;
++      case PersistentDropAction::kReorderPin:
++        helium::MovePin(tab, drop.parent_id, drop.before_id);
 +        break;
 +      case PersistentDropAction::kRemove:
 +        helium::RemoveAnchoredPinnedTab(tab);
@@ -6074,7 +6787,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
  // This is a shim around `TabCollectionNode` to make it compatible with the
  // tab dragging logic in `TabDragController`. Longer term, core tab dragging
  // logic will be updated to remove the `TabSlotView` dependency, which
-@@ -124,9 +155,16 @@ gfx::Range GetContainerRange(const TabCo
+@@ -124,9 +169,16 @@ gfx::Range GetContainerRange(const TabCo
        return TabGroupDataFromNode(container_node).ListTabs();
      case TabCollectionNode::Type::PINNED:
        return gfx::Range(0, tab_strip_model.IndexOfFirstNonPinnedTab());
@@ -6092,47 +6805,240 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
      default:
        NOTREACHED();
    }
-@@ -917,6 +955,40 @@ bool TabDragHandlerImpl::HandleDraggedTa
+@@ -209,6 +261,16 @@ void TabDragHandlerImpl::InitializeDrag(
+                              EventSourceFromEvent(event)) ==
+       TabDragController::Liveness::kDeleted) {
+     ResetDragState();
++    return;
++  }
++  for (const TabDragData& data :
++       drag_controller_->GetSessionData().tab_drag_data_) {
++    tabs::TabInterface* tab =
++        data.contents ? tabs::TabInterface::GetFromContents(data.contents)
++                      : nullptr;
++    if (tab && helium::IsPersistentItemTab(tab)) {
++      helium::SetPersistentItemTabDragInProgress(tab, true);
++    }
+   }
+ }
  
+@@ -326,6 +388,7 @@ bool TabDragHandlerImpl::ContinueDrag(vi
+   }
+   gfx::Point screen_location(event.location());
+   ConvertPointToScreen(&event_source_view, &screen_location);
++  tab_strip_region_view_->UpdateTabDragPoint(screen_location);
+ 
+   // Dragging may start a blocking loop, which may allow this to be destroyed.
+   auto ref = weak_factory_.GetWeakPtr();
+@@ -363,6 +426,36 @@ void TabDragHandlerImpl::EndDrag(EndDrag
+ void TabDragHandlerImpl::HandleDraggedTabsIntoNode(
+     const TabCollectionNode& node) {
+   CHECK(drag_controller_);
++
++  auto* strip = static_cast<tabs::TabStripCollection*>(
++      const_cast<tabs::TabCollection*>(tab_strip_model_->Root()));
++  if (node.type() == TabCollectionNode::Type::PIN) {
++    for (const TabDragData& data :
++         drag_controller_->GetSessionData().tab_drag_data_) {
++      tabs::TabInterface* tab =
++          data.contents ? tabs::TabInterface::GetFromContents(data.contents)
++                        : nullptr;
++      if (tab && !strip->IsPinTab(tab) && !tab->IsPinned() &&
++          !tab->IsSplit() && !tab->GetGroup()) {
++        tab_strip_model_->MoveTabToPin(tab);
++      }
++    }
++    return;
++  }
++  if (node.type() == TabCollectionNode::Type::UNPINNED &&
++      IsDraggingPersistentPinTabs()) {
++    for (const TabDragData& data :
++         drag_controller_->GetSessionData().tab_drag_data_) {
++      tabs::TabInterface* tab =
++          data.contents ? tabs::TabInterface::GetFromContents(data.contents)
++                        : nullptr;
++      if (tab && strip->IsPinTab(tab)) {
++        tab_strip_model_->MoveTabFromPin(tab);
++      }
++    }
++    return;
++  }
++
    const auto& drag_session_data = drag_controller_->GetSessionData();
  
-+  // Crossing a persistent-region boundary is a product mutation, not a raw
-+  // index move. Record the final hovered destination without restructuring the
-+  // model while Chromium's drag controller still owns collection/view refs.
-+  std::vector<PendingPersistentDrop> pending_persistent_drops;
-+  for (const TabDragData& tab_drag_data : drag_session_data.tab_drag_data_) {
-+    if (!tab_drag_data.contents) {
+   const TabDragData* source_drag_data =
+@@ -453,6 +546,63 @@ bool TabDragHandlerImpl::IsDraggingPinne
+                      [](const auto& tab_data) { return tab_data.pinned; });
+ }
+ 
++bool TabDragHandlerImpl::IsDraggingPersistentPinTabs() const {
++  if (!drag_controller_) {
++    return false;
++  }
++  const auto& drag_data = drag_controller_->GetSessionData().tab_drag_data_;
++  return std::any_of(drag_data.cbegin(), drag_data.cend(), [](const auto& data) {
++    if (!data.contents) {
++      return false;
++    }
++    const tabs::TabInterface* tab =
++        tabs::TabInterface::GetFromContents(data.contents);
++    return helium::IsPersistentItemTab(tab) && !tab->IsPinned();
++  });
++}
++
++void TabDragHandlerImpl::SetPersistentTabDropTarget(
++    PersistentTabDropLocation location) {
++  if (!drag_controller_) {
++    return;
++  }
++
++  persistent_tab_drop_location_ = location;
++
++  std::vector<PendingPersistentDrop> drops;
++  for (const TabDragData& data :
++       drag_controller_->GetSessionData().tab_drag_data_) {
++    if (!data.contents) {
 +      continue;
 +    }
 +    tabs::TabInterface* tab =
-+        tabs::TabInterface::GetFromContents(tab_drag_data.contents);
-+    if (container_node.type() == TabCollectionNode::Type::PIN &&
-+        !helium::IsPersistentItemTab(tab)) {
-+      pending_persistent_drops.push_back(
-+          {PersistentDropAction::kMakePin,
-+           tab_drag_data.contents->GetWeakPtr()});
-+    } else if (container_node.type() == TabCollectionNode::Type::PINNED &&
-+               !helium::IsPersistentItemTab(tab)) {
-+      pending_persistent_drops.push_back(
-+          {PersistentDropAction::kMakeFavorite,
-+           tab_drag_data.contents->GetWeakPtr()});
-+    } else if (container_node.type() == TabCollectionNode::Type::UNPINNED &&
-+               helium::IsPersistentItemTab(tab)) {
-+      pending_persistent_drops.push_back(
-+          {PersistentDropAction::kRemove,
-+           tab_drag_data.contents->GetWeakPtr()});
++        tabs::TabInterface::GetFromContents(data.contents);
++    const bool persistent = helium::IsPersistentItemTab(tab);
++    if (location.target == PersistentTabDropTarget::kPin && !persistent) {
++      drops.push_back(
++          {PersistentDropAction::kMakePin, data.contents->GetWeakPtr(),
++           location.parent_id, location.before_id});
++    } else if (location.target == PersistentTabDropTarget::kPin &&
++               persistent && !tab->IsPinned()) {
++      drops.push_back(
++          {PersistentDropAction::kReorderPin, data.contents->GetWeakPtr(),
++           location.parent_id, location.before_id});
++    } else if (location.target == PersistentTabDropTarget::kFavorite &&
++               !persistent) {
++      drops.push_back(
++          {PersistentDropAction::kMakeFavorite, data.contents->GetWeakPtr()});
++    } else if (location.target == PersistentTabDropTarget::kTab && persistent) {
++      drops.push_back(
++          {PersistentDropAction::kRemove, data.contents->GetWeakPtr()});
 +    }
 +  }
-+  if (!pending_persistent_drops.empty()) {
-+    drag_controller_->SetDeferredSuccessfulDropCallback(base::BindOnce(
-+        &CommitPersistentDrops, std::move(pending_persistent_drops)));
++
++  drag_controller_->SetDeferredSuccessfulDropCallback(
++      drops.empty()
++          ? base::OnceClosure()
++          : base::BindOnce(&CommitPersistentDrops, std::move(drops)));
++}
++
+ bool TabDragHandlerImpl::IsDraggingGroups() const {
+   if (!drag_controller_) {
+     return false;
+@@ -663,7 +813,17 @@ content::WebContents* TabDragHandlerImpl
+ }
+ 
+ bool TabDragHandlerImpl::IsTabDetachable(const TabSlotView* view) const {
+-  return true;
++  const auto* slot_view = views::AsViewClass<DraggedTabSlotView>(view);
++  CHECK(slot_view);
++  if (slot_view->node().type() != TabCollectionNode::Type::TAB) {
 +    return true;
 +  }
-+  drag_controller_->SetDeferredSuccessfulDropCallback(base::OnceClosure());
++  const auto* tab =
++      std::get<const tabs::TabInterface*>(slot_view->node().GetNodeData());
++  // A Pin belongs to its Space, not to one browser window. It must first cross
++  // the Pin/tab divider and become an ordinary tab before Chromium may detach
++  // it into another window.
++  return !helium::IsPersistentItemTab(tab);
+ }
+ 
+ TabSlotView* TabDragHandlerImpl::GetTabGroupHeader(
+@@ -906,8 +1066,20 @@ void TabDragHandlerImpl::OnNodeWillDestr
+ }
+ 
+ void TabDragHandlerImpl::ResetDragState() {
++  if (drag_controller_) {
++    for (const TabDragData& data :
++         drag_controller_->GetSessionData().tab_drag_data_) {
++      tabs::TabInterface* tab =
++          data.contents ? tabs::TabInterface::MaybeGetFromContents(data.contents)
++                        : nullptr;
++      if (tab) {
++        helium::SetPersistentItemTabDragInProgress(tab, false);
++      }
++    }
++  }
+   drag_controller_.reset();
+   scroll_synchronizers_.clear();
++  persistent_tab_drop_location_ = {};
+ }
+ 
+ bool TabDragHandlerImpl::HandleDraggedTabsIntoPosition(
+@@ -915,6 +1087,67 @@ bool TabDragHandlerImpl::HandleDraggedTa
+     const TabCollectionNode* target) {
+   CHECK(drag_controller_);
+ 
++  if (container_node.type() == TabCollectionNode::Type::PIN) {
++    auto* strip = static_cast<tabs::TabStripCollection*>(
++        const_cast<tabs::TabCollection*>(tab_strip_model_->Root()));
++    tabs::TabCollection* destination =
++        static_cast<tabs::TabCollection*>(strip->pin_collection());
++    size_t direct_index = destination->ChildCount();
++    if (target) {
++      tabs::ConstChildPtr target_data = target->GetNodeData();
++      if (const auto* target_tab =
++              std::get_if<const tabs::TabInterface*>(&target_data)) {
++        destination = const_cast<tabs::TabCollection*>(
++            (*target_tab)->GetParentCollection());
++        direct_index =
++            destination
++                ->GetDirectChildIndexOfCollectionContainingTab(*target_tab)
++                .value_or(destination->ChildCount());
++      } else if (const auto* target_collection =
++                     std::get_if<const tabs::TabCollection*>(&target_data)) {
++        tabs::TabCollection* collection =
++            const_cast<tabs::TabCollection*>(*target_collection);
++        if (tabs::TabCollection* parent = collection->GetParentCollection()) {
++          destination = parent;
++          direct_index =
++              parent->GetIndexOfCollection(collection).value_or(
++                  parent->ChildCount());
++        }
++      }
++    }
 +
++    bool moved = false;
++    for (const TabDragData& data :
++         drag_controller_->GetSessionData().tab_drag_data_) {
++      tabs::TabInterface* tab =
++          data.contents ? tabs::TabInterface::GetFromContents(data.contents)
++                        : nullptr;
++      if (!tab || !strip->IsPinTab(tab) || tab->IsSplit() || tab->GetGroup()) {
++        continue;
++      }
++      tabs::TabCollection* current_parent =
++          const_cast<tabs::TabCollection*>(tab->GetParentCollection());
++      const size_t current_direct =
++          current_parent == destination
++              ? destination
++                    ->GetDirectChildIndexOfCollectionContainingTab(tab)
++                    .value_or(destination->ChildCount())
++              : destination->ChildCount();
++      size_t adjusted_index = direct_index;
++      if (current_parent == destination && current_direct < adjusted_index) {
++        --adjusted_index;
++      }
++      if (current_parent == destination && current_direct == adjusted_index) {
++        continue;
++      }
++      tab_strip_model_->MoveTabToPinCollection(tab, destination,
++                                               adjusted_index);
++      direct_index = adjusted_index + 1;
++      moved = true;
++    }
++    return moved;
++  }
++
+   const auto& drag_session_data = drag_controller_->GetSessionData();
+ 
    auto container_range = GetContainerRange(container_node, *tab_strip_model_);
-   int container_start_index = container_range.start();
-   int container_end_index = container_range.end();
 Index: src/chrome/browser/ui/views/tabs/common/tab_link_drop_handler.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/common/tab_link_drop_handler.cc
@@ -7885,30 +8791,58 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
  UnpinnedTabContainerView* BaseTabStripRegionView::GetUnpinnedTabsContainer() {
    return tab_strip_view_ ? tab_strip_view_->GetUnpinnedTabsContainer()
                           : nullptr;
-@@ -416,12 +421,20 @@ TabDragTarget* BaseTabStripRegionView::G
+@@ -416,15 +421,48 @@ TabDragTarget* BaseTabStripRegionView::G
      return nullptr;
    }
  
 -  // Note: if the drag has not attached to this tab strip yet, it doesn't matter
 -  // which container is used because the first drag loop iteration just attaches
 -  // it.
-+  // Persistent Pins and ordinary tabs share a scroller, so their drag target
-+  // must follow the pointer across the visible boundary. Using the dragged
-+  // tab's Chromium pinnedness here makes both directions unreachable: Arcium
-+  // Pins are service-owned persistent items, not Chromium pinned tabs.
-+  // Favorites retain Chromium's pinned collection and behavior.
++  UpdateTabDragPoint(point_in_screen);
++
    if (drag_handler_->IsDraggingPinnedTabs()) {
      return &GetPinnedTabsContainer()->GetTabDragTarget(point_in_screen);
    }
-+
 +  if (auto* pins_container = GetPinsContainer();
 +      pins_container &&
-+      pins_container->GetBoundsInScreen().Contains(point_in_screen)) {
++      point_in_screen.y() <
++          GetUnpinnedTabsContainer()->GetBoundsInScreen().y()) {
 +    return &pins_container->GetTabDragTarget(point_in_screen);
 +  }
    return &GetUnpinnedTabsContainer()->GetTabDragTarget(point_in_screen);
  }
  
++void BaseTabStripRegionView::UpdateTabDragPoint(
++    const gfx::Point& point_in_screen) {
++  if (!drag_handler_ ||
++      !GetTabStripDraggableBounds().Contains(point_in_screen)) {
++    return;
++  }
++
++  // Pointer location describes the durable result of a successful drop. It
++  // must not select the DraggedTabsContainer: Chromium's drag presentation is
++  // tied to the container that already owns the dragged view.
++  PersistentTabDropLocation drop_location;
++  PinTabContainerView* pins_container = GetPinsContainer();
++  if (GetPinnedTabsContainer()->GetBoundsInScreen().Contains(
++          point_in_screen)) {
++    drop_location.target = PersistentTabDropTarget::kFavorite;
++  } else if (pins_container &&
++             point_in_screen.y() <
++                 GetUnpinnedTabsContainer()->GetBoundsInScreen().y()) {
++    drop_location.target = PersistentTabDropTarget::kPin;
++    drop_location =
++        pins_container->GetPersistentDropLocationForDrag(point_in_screen);
++    pins_container->UpdatePersistentTabDragPreview(point_in_screen);
++  } else if (pins_container) {
++    pins_container->ClearPersistentTabDragPreview();
++  }
++  drag_handler_->SetPersistentTabDropTarget(std::move(drop_location));
++}
++
+ void BaseTabStripRegionView::ClearTabStripView(views::View* view) {
+   CHECK(tab_strip_view_);
+   CHECK(tab_strip_view_ == view);
 Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/base_tab_strip_region_view.h
@@ -7929,6 +8863,14 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.h
    UnpinnedTabContainerView* GetUnpinnedTabsContainer();
  
    TabStripCollectionController* GetTabStripCollectionController() {
+@@ -48,6 +50,7 @@ class BaseTabStripRegionView : public Ta
+   }
+ 
+   TabDragTarget* GetTabDragTarget(const gfx::Point& point_in_screen);
++  void UpdateTabDragPoint(const gfx::Point& point_in_screen) override;
+   virtual gfx::Rect GetTabStripDraggableBounds() const = 0;
+ 
+   // TabStripRegionView:
 Index: src/chrome/browser/ui/views/tabs/common/tab_group_view.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/common/tab_group_view.cc
@@ -8060,7 +9002,25 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
  #include "base/trace_event/trace_event.h"
  #include "build/build_config.h"
  #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
-@@ -817,6 +818,11 @@ void TabDragController::SetDragLoopDoneC
+@@ -458,12 +459,15 @@ TabDragController::Liveness TabDragContr
+     ref->detach_behavior_ = DetachBehavior::kNotDetachable;
+   }
+ #endif  // BUILDFLAG(IS_CHROMEOS)
++#endif  // BUILDFLAG(IS_MAC)
++
++  // The drag context owns product-specific detachability rules. Apply them on
++  // every desktop platform; macOS previously skipped this hook entirely.
+   for (TabSlotView* dragging_view : dragging_views) {
+     if (!source_context->IsTabDetachable(dragging_view)) {
+-      ref->detach_behavior_ = DetachBehavior::kNotDetachable;
++      ref->detach_behavior_ = DetachBehavior::kAttachedContextOnly;
+     }
+   }
+-#endif  // BUILDFLAG(IS_MAC)
+ 
+   ref->source_context_emptiness_tracker_ =
+       std::make_unique<SourceTabStripEmptinessTracker>(
+@@ -817,6 +821,11 @@ void TabDragController::SetDragLoopDoneC
    drag_loop_done_callback_ = std::move(callback);
  }
  
@@ -8072,7 +9032,28 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
  std::unique_ptr<tabs::TabModel> TabDragController::DetachTabAtForInsertion(
      int drag_idx) {
    CHECK_EQ(current_state_, DragState::kStopped)
-@@ -1867,6 +1873,14 @@ void TabDragController::EndDragImpl(EndD
+@@ -976,7 +985,7 @@ TabDragController::Liveness TabDragContr
+   DCHECK(attached_context_);
+ 
+   TabDragContext* target_context = source_context_;
+-  if (detach_behavior_ == DetachBehavior::kDetachable) {
++  if (detach_behavior_ != DetachBehavior::kNotDetachable) {
+     auto [alive, context, drop_target] = GetDragTargetForPoint(point_in_screen);
+     if (alive == Liveness::kDeleted) {
+       return Liveness::kDeleted;
+@@ -991,6 +1000,11 @@ TabDragController::Liveness TabDragContr
+       }
+       target_context = delegate_context;
+     }
++    if (detach_behavior_ == DetachBehavior::kAttachedContextOnly &&
++        target_context != attached_context_) {
++      UpdateDragTarget(nullptr, point_in_screen);
++      target_context = attached_context_;
++    }
+   }
+ 
+   if (target_context != attached_context_) {
+@@ -1867,6 +1881,14 @@ void TabDragController::EndDragImpl(EndD
            << " state=" << static_cast<int>(current_state_);
  
    DragState previous_state = current_state_;
@@ -8087,7 +9068,7 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
    current_state_ = DragState::kStopped;
    attached_context_tabs_closed_tracker_.reset();
  
-@@ -1931,6 +1945,10 @@ void TabDragController::EndDragImpl(EndD
+@@ -1931,6 +1953,10 @@ void TabDragController::EndDragImpl(EndD
  
    TabDragContext* owning_context =
        attached_context_ ? attached_context_.get() : source_context_.get();
@@ -8113,7 +9094,20 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h
    // Set a callback to be called when the nested drag loop / system DnD session
    // finishes.
    //
-@@ -674,5 +678,8 @@ class TabDragController : public views::
+@@ -290,7 +294,11 @@ class TabDragController : public views::
+ 
+   // Specifies what should happen when a drag motion exits the tab strip region
+   // in an attempt to detach a tab.
+-  enum class DetachBehavior { kDetachable, kNotDetachable };
++  enum class DetachBehavior {
++    kDetachable,
++    kAttachedContextOnly,
++    kNotDetachable
++  };
+ 
+   // These values are persisted to logs. Entries should not be renumbered and
+   // numeric values should never be reused.
+@@ -674,6 +682,9 @@ class TabDragController : public views::
    // DnD session.
    base::OnceClosure drag_started_callback_;
  
@@ -8122,3 +9116,1028 @@ Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h
 +
    // The tab thumbnail used as the drag icon for system-DnD-based tab dragging.
    gfx::ImageSkia drag_image_;
+ 
+Index: src/chrome/browser/ui/tabs/tab_strip_model_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/tabs/tab_strip_model_unittest.cc
++++ src/chrome/browser/ui/tabs/tab_strip_model_unittest.cc
+@@ -58,6 +58,8 @@
+ #include "components/tabs/public/split_tab_data.h"
+ #include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_group_tab_collection.h"
++#include "components/tabs/public/pin_tab_collection.h"
++#include "components/tabs/public/tab_strip_collection.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "components/web_modal/web_contents_modal_dialog_manager.h"
+ #include "components/web_modal/web_contents_modal_dialog_manager_delegate.h"
+@@ -4459,6 +4461,34 @@ TEST_F(TabStripModelTest, MoveTabPreviou
+   tabstrip()->CloseAllTabs();
+ }
+ 
++TEST_F(TabStripModelTest, MoveTabsAcrossArciumPinCollection) {
++  PrepareTabs(tabstrip(), 3);
++  tabs::TabInterface* tab0 = tabstrip()->GetTabAtIndex(0);
++  tabs::TabInterface* tab1 = tabstrip()->GetTabAtIndex(1);
++  tabs::TabInterface* tab2 = tabstrip()->GetTabAtIndex(2);
++  auto* strip = static_cast<tabs::TabStripCollection*>(
++      const_cast<tabs::TabCollection*>(tabstrip()->Root()));
++
++  tabstrip()->MoveTabToPin(tab1);
++  EXPECT_TRUE(strip->IsPinTab(tab1));
++  EXPECT_EQ(0, tabstrip()->GetIndexOfTab(tab1));
++  EXPECT_EQ(1, tabstrip()->GetIndexOfTab(tab0));
++
++  tabstrip()->MoveTabToPin(tab2, 0);
++  EXPECT_EQ(0, tabstrip()->GetIndexOfTab(tab2));
++  EXPECT_EQ(1, tabstrip()->GetIndexOfTab(tab1));
++
++  tabstrip()->MoveTabToPinCollection(tab1, strip->pin_collection(), 0);
++  EXPECT_EQ(0, tabstrip()->GetIndexOfTab(tab1));
++  EXPECT_EQ(1, tabstrip()->GetIndexOfTab(tab2));
++
++  tabstrip()->MoveTabFromPin(tab1);
++  EXPECT_FALSE(strip->IsPinTab(tab1));
++  EXPECT_EQ(0, tabstrip()->GetIndexOfTab(tab2));
++  EXPECT_EQ(1, tabstrip()->GetIndexOfTab(tab1));
++  EXPECT_EQ(2, tabstrip()->GetIndexOfTab(tab0));
++}
++
+ TEST_F(TabStripModelTest, MoveSelectedTabsTo) {
+   struct TestData {
+     // Number of tabs the tab strip should have.
+Index: src/chrome/browser/ui/helium/helium_persistent_item_model.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/helium/helium_persistent_item_model.cc
+@@ -0,0 +1,526 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium/helium_persistent_item_model.h"
++
++#include <utility>
++
++#include "base/check.h"
++#include "base/strings/utf_string_conversions.h"
++#include "net/base/schemeful_site.h"
++
++namespace helium {
++namespace {
++
++base::Value EncodeNode(const PersistentNode& node) {
++  base::DictValue value;
++  if (const auto* link = std::get_if<PersistentLink>(&node.data)) {
++    value.Set("type", "link");
++    value.Set("id", link->id);
++    value.Set("title", base::UTF16ToUTF8(link->title));
++    value.Set("url", link->url.spec());
++    return base::Value(std::move(value));
++  }
++  const auto& folder = std::get<PersistentFolder>(node.data);
++  base::ListValue children;
++  for (const PersistentNode& child : folder.children) {
++    children.Append(EncodeNode(child));
++  }
++  value.Set("type", "folder");
++  value.Set("id", folder.id);
++  value.Set("title", base::UTF16ToUTF8(folder.title));
++  value.Set("collapsed", folder.collapsed);
++  value.Set("children", std::move(children));
++  return base::Value(std::move(value));
++}
++
++std::optional<PersistentNode> DecodeNode(const base::Value& value,
++                                         bool allow_folders,
++                                         std::set<std::string>* ids) {
++  const base::DictValue* dict = value.GetIfDict();
++  const std::string* type = dict ? dict->FindString("type") : nullptr;
++  const std::string* id = dict ? dict->FindString("id") : nullptr;
++  const std::string* title = dict ? dict->FindString("title") : nullptr;
++  if (!dict || !type || !id || id->empty() || !title ||
++      !ids->insert(*id).second) {
++    return std::nullopt;
++  }
++  if (*type == "link") {
++    if (dict->size() != 4u) {
++      return std::nullopt;
++    }
++    const std::string* spec = dict->FindString("url");
++    GURL url(spec ? *spec : std::string());
++    if (!url.is_valid() || url.is_empty() || url.spec() == "about:blank") {
++      return std::nullopt;
++    }
++    return PersistentNode{.data =
++                              PersistentLink{.id = *id,
++                                             .title = base::UTF8ToUTF16(*title),
++                                             .url = std::move(url)}};
++  }
++  if (*type != "folder" || !allow_folders || dict->size() != 5u) {
++    return std::nullopt;
++  }
++  std::optional<bool> collapsed = dict->FindBool("collapsed");
++  const base::ListValue* encoded = dict->FindList("children");
++  if (!collapsed || !encoded) {
++    return std::nullopt;
++  }
++  PersistentNodes children;
++  for (const base::Value& child_value : *encoded) {
++    auto child = DecodeNode(child_value, true, ids);
++    if (!child) {
++      return std::nullopt;
++    }
++    children.push_back(std::move(*child));
++  }
++  return PersistentNode{.data =
++                            PersistentFolder{.id = *id,
++                                             .title = base::UTF8ToUTF16(*title),
++                                             .collapsed = *collapsed,
++                                             .children = std::move(children)}};
++}
++
++template <typename Nodes>
++auto* FindLinkRecursive(Nodes& nodes, std::string_view id) {
++  for (auto& node : nodes) {
++    if (auto* link = std::get_if<PersistentLink>(&node.data)) {
++      if (link->id == id) {
++        return link;
++      }
++    } else if (auto* found = FindLinkRecursive(
++                   std::get<PersistentFolder>(node.data).children, id)) {
++      return found;
++    }
++  }
++  return static_cast<decltype(std::get_if<PersistentLink>(&nodes[0].data))>(
++      nullptr);
++}
++
++template <typename Nodes>
++auto* FindFolderRecursive(Nodes& nodes, std::string_view id) {
++  for (auto& node : nodes) {
++    auto* folder = std::get_if<PersistentFolder>(&node.data);
++    if (!folder) {
++      continue;
++    }
++    if (folder->id == id) {
++      return folder;
++    }
++    if (auto* found = FindFolderRecursive(folder->children, id)) {
++      return found;
++    }
++  }
++  return static_cast<decltype(std::get_if<PersistentFolder>(&nodes[0].data))>(
++      nullptr);
++}
++
++bool RemoveNodeRecursive(PersistentNodes& nodes, std::string_view id) {
++  for (auto it = nodes.begin(); it != nodes.end(); ++it) {
++    if (const auto* link = std::get_if<PersistentLink>(&it->data)) {
++      if (link->id == id) {
++        nodes.erase(it);
++        return true;
++      }
++      continue;
++    }
++    auto& folder = std::get<PersistentFolder>(it->data);
++    if (folder.id == id) {
++      nodes.erase(it);
++      return true;
++    }
++    if (RemoveNodeRecursive(folder.children, id)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++std::string_view NodeId(const PersistentNode& node) {
++  return std::visit(
++      [](const auto& value) -> std::string_view { return value.id; },
++      node.data);
++}
++
++struct NodePosition {
++  PersistentNodes* siblings;
++  size_t index;
++};
++
++std::optional<NodePosition> FindNodePosition(PersistentNodes& nodes,
++                                             std::string_view id) {
++  for (size_t index = 0; index < nodes.size(); ++index) {
++    if (NodeId(nodes[index]) == id) {
++      return NodePosition{&nodes, index};
++    }
++    if (auto* folder = std::get_if<PersistentFolder>(&nodes[index].data)) {
++      if (auto found = FindNodePosition(folder->children, id)) {
++        return found;
++      }
++    }
++  }
++  return std::nullopt;
++}
++
++bool NodeContains(const PersistentNode& node, std::string_view id) {
++  const auto* folder = std::get_if<PersistentFolder>(&node.data);
++  if (!folder) {
++    return false;
++  }
++  for (const PersistentNode& child : folder->children) {
++    if (NodeId(child) == id || NodeContains(child, id)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++std::optional<PersistentNode> TakeNodeRecursive(PersistentNodes& nodes,
++                                                std::string_view id) {
++  for (auto it = nodes.begin(); it != nodes.end(); ++it) {
++    if (NodeId(*it) == id) {
++      PersistentNode result = std::move(*it);
++      nodes.erase(it);
++      return result;
++    }
++    auto* folder = std::get_if<PersistentFolder>(&it->data);
++    if (folder) {
++      auto result = TakeNodeRecursive(folder->children, id);
++      if (result) {
++        return result;
++      }
++    }
++  }
++  return std::nullopt;
++}
++
++PersistentNodes* FindDestination(PersistentNodes& nodes,
++                                 std::string_view parent_id) {
++  if (parent_id.empty()) {
++    return &nodes;
++  }
++  PersistentFolder* folder = FindFolderRecursive(nodes, parent_id);
++  return folder ? &folder->children : nullptr;
++}
++
++std::optional<size_t> FindDirectIndex(const PersistentNodes& nodes,
++                                      std::string_view id) {
++  for (size_t index = 0; index < nodes.size(); ++index) {
++    if (NodeId(nodes[index]) == id) {
++      return index;
++    }
++  }
++  return std::nullopt;
++}
++
++std::optional<std::string> FindParentIdForSiblings(
++    PersistentNodes& nodes,
++    const PersistentNodes* siblings,
++    std::string_view current_parent = {}) {
++  if (&nodes == siblings) {
++    return std::string(current_parent);
++  }
++  for (PersistentNode& node : nodes) {
++    auto* folder = std::get_if<PersistentFolder>(&node.data);
++    if (!folder) {
++      continue;
++    }
++    if (auto parent = FindParentIdForSiblings(folder->children, siblings,
++                                              folder->id)) {
++      return parent;
++    }
++  }
++  return std::nullopt;
++}
++
++}  // namespace
++
++PersistentLiveCollection LiveCollectionForKind(PersistentRecordKind kind) {
++  return kind == PersistentRecordKind::kFavorite
++             ? PersistentLiveCollection::kPinnedGrid
++             : PersistentLiveCollection::kPinList;
++}
++
++bool ShouldOpenAnchoredNavigationInLittleArc(
++    PersistentNavigationDisposition disposition,
++    bool is_link_transition,
++    bool is_anchored_live_item,
++    const GURL& home_url,
++    const GURL& target_url) {
++  if (disposition != PersistentNavigationDisposition::kCurrentTab ||
++      !is_link_transition || !is_anchored_live_item || !target_url.is_valid() ||
++      !home_url.is_valid()) {
++    return false;
++  }
++  return target_url.GetWithoutRef() != home_url.GetWithoutRef();
++}
++
++std::vector<PersistentGridChild> PackPersistentGridChildren(
++    const std::vector<PersistentGridSlot>& slots) {
++  std::vector<PersistentGridChild> children;
++  children.reserve(slots.size() * 2);
++  for (const PersistentGridSlot& slot : slots) {
++    children.push_back({.id = slot.id,
++                        .kind = slot.live
++                                    ? PersistentGridChildKind::kLiveTab
++                                    : PersistentGridChildKind::kHomeTile});
++  }
++  for (const PersistentGridSlot& slot : slots) {
++    if (slot.live) {
++      children.push_back(
++          {.id = slot.id, .kind = PersistentGridChildKind::kHomeTile});
++    }
++  }
++  return children;
++}
++
++base::ListValue PersistentItemCodec::Encode(const PersistentNodes& nodes) {
++  base::ListValue values;
++  for (const PersistentNode& node : nodes) {
++    values.Append(EncodeNode(node));
++  }
++  return values;
++}
++
++std::optional<PersistentNodes> PersistentItemCodec::Decode(
++    const base::ListValue& values,
++    bool allow_folders) {
++  PersistentNodes nodes;
++  std::set<std::string> ids;
++  for (const base::Value& value : values) {
++    auto node = DecodeNode(value, allow_folders, &ids);
++    if (!node) {
++      return std::nullopt;
++    }
++    nodes.push_back(std::move(*node));
++  }
++  return nodes;
++}
++
++const PersistentLink* PersistentItemCodec::FindLink(
++    const PersistentNodes& nodes,
++    std::string_view id) {
++  return FindLinkRecursive(nodes, id);
++}
++
++PersistentLink* PersistentItemCodec::FindLink(PersistentNodes& nodes,
++                                              std::string_view id) {
++  return FindLinkRecursive(nodes, id);
++}
++
++const PersistentFolder* PersistentItemCodec::FindFolder(
++    const PersistentNodes& nodes,
++    std::string_view id) {
++  return FindFolderRecursive(nodes, id);
++}
++
++PersistentFolder* PersistentItemCodec::FindFolder(PersistentNodes& nodes,
++                                                  std::string_view id) {
++  return FindFolderRecursive(nodes, id);
++}
++
++bool PersistentItemCodec::UpdateLinkHome(PersistentNodes& nodes,
++                                         std::string_view id,
++                                         GURL url,
++                                         std::u16string title) {
++  PersistentLink* link = FindLink(nodes, id);
++  if (!link || !url.is_valid() || url.is_empty() ||
++      url.spec() == "about:blank") {
++    return false;
++  }
++  link->url = std::move(url);
++  link->title = std::move(title);
++  return true;
++}
++
++bool PersistentItemCodec::RemoveNode(PersistentNodes& nodes,
++                                     std::string_view id) {
++  return RemoveNodeRecursive(nodes, id);
++}
++
++bool PersistentItemCodec::MoveNode(PersistentNodes& nodes,
++                                   std::string_view id,
++                                   std::string_view parent_id,
++                                   std::string_view before_id) {
++  if (id.empty() || id == parent_id || id == before_id) {
++    return false;
++  }
++  const auto source = FindNodePosition(nodes, id);
++  PersistentNodes* destination = FindDestination(nodes, parent_id);
++  if (!source || !destination) {
++    return false;
++  }
++  const PersistentNode& source_node = (*source->siblings)[source->index];
++  if (!parent_id.empty() && NodeContains(source_node, parent_id)) {
++    return false;
++  }
++  const std::optional<size_t> requested_index =
++      before_id.empty() ? std::optional<size_t>(destination->size())
++                        : FindDirectIndex(*destination, before_id);
++  if (!requested_index) {
++    return false;
++  }
++  size_t insertion_index = *requested_index;
++  if (source->siblings == destination && source->index < insertion_index) {
++    --insertion_index;
++  }
++  if (source->siblings == destination && source->index == insertion_index) {
++    return false;
++  }
++  std::optional<PersistentNode> moved = TakeNodeRecursive(nodes, id);
++  CHECK(moved);
++  destination = FindDestination(nodes, parent_id);
++  CHECK(destination);
++  destination->insert(destination->begin() + insertion_index,
++                      std::move(*moved));
++  return true;
++}
++
++bool PersistentItemCodec::MoveLinkBefore(PersistentNodes& nodes,
++                                         std::string_view id,
++                                         std::string_view target_id) {
++  if (!FindLink(nodes, id) ||
++      (!target_id.empty() && !FindLink(nodes, target_id))) {
++    return false;
++  }
++  if (target_id.empty()) {
++    return MoveNode(nodes, id, {}, {});
++  }
++  const auto target = FindNodePosition(nodes, target_id);
++  CHECK(target);
++  const auto parent_id = FindParentIdForSiblings(nodes, target->siblings);
++  CHECK(parent_id);
++  return MoveNode(nodes, id, *parent_id, target_id);
++}
++
++bool PersistentItemLifecycle::AddDormant(std::string id) {
++  return !id.empty() && entries_.try_emplace(std::move(id), Entry()).second;
++}
++
++bool PersistentItemLifecycle::Forget(std::string_view id) {
++  auto found = entries_.find(id);
++  if (found == entries_.end()) {
++    return false;
++  }
++  if (found->second.live_tab) {
++    items_by_live_tab_.erase(*found->second.live_tab);
++  }
++  entries_.erase(found);
++  return true;
++}
++
++void PersistentItemLifecycle::RetainOnly(const std::set<std::string>& ids) {
++  for (auto it = entries_.begin(); it != entries_.end();) {
++    if (ids.contains(it->first)) {
++      ++it;
++      continue;
++    }
++    if (it->second.live_tab) {
++      items_by_live_tab_.erase(*it->second.live_tab);
++    }
++    it = entries_.erase(it);
++  }
++}
++
++PersistentItemLifecycle::ActivationDecision
++PersistentItemLifecycle::BeginActivation(std::string_view id) {
++  auto found = entries_.find(id);
++  if (found == entries_.end()) {
++    return {};
++  }
++  if (found->second.state == State::kDormant) {
++    found->second.state = State::kMaterializing;
++    return {.action = ActivationAction::kMaterialize};
++  }
++  if (found->second.state == State::kLive) {
++    return {.action = ActivationAction::kActivateExisting,
++            .live_tab = found->second.live_tab};
++  }
++  return {.action = ActivationAction::kWaitForTransition};
++}
++
++bool PersistentItemLifecycle::DidMaterialize(std::string_view id,
++                                             LiveTabToken token) {
++  auto found = entries_.find(id);
++  if (found == entries_.end() || found->second.state != State::kMaterializing ||
++      items_by_live_tab_.contains(token)) {
++    return false;
++  }
++  found->second = {.state = State::kLive, .live_tab = token};
++  items_by_live_tab_.emplace(token, found->first);
++  return true;
++}
++
++bool PersistentItemLifecycle::CancelMaterialization(std::string_view id) {
++  auto found = entries_.find(id);
++  if (found == entries_.end() || found->second.state != State::kMaterializing) {
++    return false;
++  }
++  found->second.state = State::kDormant;
++  return true;
++}
++
++bool PersistentItemLifecycle::RestoreLive(std::string_view id,
++                                          LiveTabToken token) {
++  auto found = entries_.find(id);
++  if (found == entries_.end() || found->second.state != State::kDormant ||
++      items_by_live_tab_.contains(token)) {
++    return false;
++  }
++  found->second = {.state = State::kLive, .live_tab = token};
++  items_by_live_tab_.emplace(token, found->first);
++  return true;
++}
++
++std::optional<std::string> PersistentItemLifecycle::BeginClose(
++    LiveTabToken token) {
++  auto reverse = items_by_live_tab_.find(token);
++  if (reverse == items_by_live_tab_.end()) {
++    return std::nullopt;
++  }
++  auto found = entries_.find(reverse->second);
++  if (found == entries_.end() || found->second.state != State::kLive) {
++    return std::nullopt;
++  }
++  found->second.state = State::kClosing;
++  return found->first;
++}
++
++bool PersistentItemLifecycle::CompleteClose(LiveTabToken token) {
++  auto reverse = items_by_live_tab_.find(token);
++  if (reverse == items_by_live_tab_.end()) {
++    return false;
++  }
++  auto found = entries_.find(reverse->second);
++  if (found == entries_.end() || found->second.state != State::kClosing) {
++    return false;
++  }
++  found->second = {};
++  items_by_live_tab_.erase(reverse);
++  return true;
++}
++
++std::optional<PersistentItemLifecycle::State> PersistentItemLifecycle::GetState(
++    std::string_view id) const {
++  auto found = entries_.find(id);
++  return found == entries_.end() ? std::nullopt
++                                 : std::optional(found->second.state);
++}
++
++std::optional<PersistentItemLifecycle::LiveTabToken>
++PersistentItemLifecycle::GetLiveTab(std::string_view id) const {
++  auto found = entries_.find(id);
++  return found == entries_.end() ? std::nullopt : found->second.live_tab;
++}
++
++std::optional<std::string_view> PersistentItemLifecycle::GetItemForLiveTab(
++    LiveTabToken token) const {
++  auto found = items_by_live_tab_.find(token);
++  return found == items_by_live_tab_.end()
++             ? std::nullopt
++             : std::optional<std::string_view>(found->second);
++}
++
++}  // namespace helium
+Index: src/chrome/browser/ui/helium/helium_persistent_item_model.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/helium/helium_persistent_item_model.h
+@@ -0,0 +1,157 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_HELIUM_PERSISTENT_ITEM_MODEL_H_
++#define CHROME_BROWSER_UI_HELIUM_HELIUM_PERSISTENT_ITEM_MODEL_H_
++
++#include <cstdint>
++#include <map>
++#include <optional>
++#include <set>
++#include <string>
++#include <string_view>
++#include <variant>
++#include <vector>
++
++#include "base/values.h"
++#include "url/gurl.h"
++
++namespace helium {
++
++enum class PersistentRecordKind { kFavorite, kPin };
++
++// Live Favorites occupy the native PINNED grid. Live Pins occupy the PIN list.
++enum class PersistentLiveCollection { kPinnedGrid, kPinList };
++
++PersistentLiveCollection LiveCollectionForKind(PersistentRecordKind kind);
++
++// CURRENT_TAB link navigations away from a live item's stored home open in
++// Little Arc. Explicit new-tab/window dispositions are left unchanged.
++enum class PersistentNavigationDisposition { kCurrentTab, kExplicitNewTarget };
++
++bool ShouldOpenAnchoredNavigationInLittleArc(
++    PersistentNavigationDisposition disposition,
++    bool is_link_transition,
++    bool is_anchored_live_item,
++    const GURL& home_url,
++    const GURL& target_url);
++
++// Compact Favorite grid children: displayed slots stay in model order at the
++// front, then hidden home tiles for live replacements, also in model order.
++enum class PersistentGridChildKind { kLiveTab, kHomeTile };
++
++struct PersistentGridSlot {
++  std::string id;
++  bool live = false;
++  bool operator==(const PersistentGridSlot&) const = default;
++};
++
++struct PersistentGridChild {
++  std::string id;
++  PersistentGridChildKind kind = PersistentGridChildKind::kHomeTile;
++  bool operator==(const PersistentGridChild&) const = default;
++};
++
++std::vector<PersistentGridChild> PackPersistentGridChildren(
++    const std::vector<PersistentGridSlot>& slots);
++
++struct PersistentLink {
++  std::string id;
++  std::u16string title;
++  GURL url;
++  bool operator==(const PersistentLink&) const = default;
++};
++
++struct PersistentNode;
++
++struct PersistentFolder {
++  std::string id;
++  std::u16string title;
++  bool collapsed = false;
++  std::vector<PersistentNode> children;
++  bool operator==(const PersistentFolder&) const = default;
++};
++
++struct PersistentNode {
++  std::variant<PersistentLink, PersistentFolder> data;
++  bool operator==(const PersistentNode&) const = default;
++};
++
++using PersistentNodes = std::vector<PersistentNode>;
++
++class PersistentItemCodec {
++ public:
++  static base::ListValue Encode(const PersistentNodes& nodes);
++  static std::optional<PersistentNodes> Decode(const base::ListValue& values,
++                                               bool allow_folders);
++  static const PersistentLink* FindLink(const PersistentNodes& nodes,
++                                        std::string_view id);
++  static PersistentLink* FindLink(PersistentNodes& nodes, std::string_view id);
++  static const PersistentFolder* FindFolder(const PersistentNodes& nodes,
++                                            std::string_view id);
++  static PersistentFolder* FindFolder(PersistentNodes& nodes,
++                                      std::string_view id);
++  static bool UpdateLinkHome(PersistentNodes& nodes,
++                             std::string_view id,
++                             GURL url,
++                             std::u16string title);
++  static bool RemoveNode(PersistentNodes& nodes, std::string_view id);
++  // Moves a link or folder to a tree position. An empty parent is the root;
++  // an empty before-id appends to that parent. Folder cycles and before-ids
++  // outside the selected parent are rejected.
++  static bool MoveNode(PersistentNodes& nodes,
++                       std::string_view id,
++                       std::string_view parent_id,
++                       std::string_view before_id);
++  // Moves a link before another visible item while preserving folder
++  // ownership. An empty target moves the link to the end of the root list.
++  static bool MoveLinkBefore(PersistentNodes& nodes,
++                             std::string_view id,
++                             std::string_view target_id);
++};
++
++// Pure lifecycle state. Opaque tokens keep durable records independent from
++// TabInterface and WebContents lifetime.
++class PersistentItemLifecycle {
++ public:
++  using LiveTabToken = uint64_t;
++  enum class State { kDormant, kMaterializing, kLive, kClosing };
++  enum class ActivationAction {
++    kUnknownItem,
++    kMaterialize,
++    kActivateExisting,
++    kWaitForTransition
++  };
++  struct ActivationDecision {
++    ActivationAction action = ActivationAction::kUnknownItem;
++    std::optional<LiveTabToken> live_tab;
++    bool operator==(const ActivationDecision&) const = default;
++  };
++
++  bool AddDormant(std::string id);
++  bool Forget(std::string_view id);
++  void RetainOnly(const std::set<std::string>& ids);
++  ActivationDecision BeginActivation(std::string_view id);
++  bool DidMaterialize(std::string_view id, LiveTabToken live_tab);
++  bool CancelMaterialization(std::string_view id);
++  bool RestoreLive(std::string_view id, LiveTabToken live_tab);
++  std::optional<std::string> BeginClose(LiveTabToken live_tab);
++  bool CompleteClose(LiveTabToken live_tab);
++  std::optional<State> GetState(std::string_view id) const;
++  std::optional<LiveTabToken> GetLiveTab(std::string_view id) const;
++  std::optional<std::string_view> GetItemForLiveTab(
++      LiveTabToken live_tab) const;
++
++ private:
++  struct Entry {
++    State state = State::kDormant;
++    std::optional<LiveTabToken> live_tab;
++  };
++  std::map<std::string, Entry, std::less<>> entries_;
++  std::map<LiveTabToken, std::string> items_by_live_tab_;
++};
++
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_PERSISTENT_ITEM_MODEL_H_
+Index: src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
+@@ -0,0 +1,267 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium/helium_persistent_item_model.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace helium {
++namespace {
++
++PersistentNode Link(std::string id, std::string url) {
++  return {.data = PersistentLink{
++              .id = std::move(id), .title = u"Link", .url = GURL(url)}};
++}
++
++PersistentNodes Tree() {
++  return {Link("top", "https://top.test/"),
++          {.data = PersistentFolder{
++               .id = "outer",
++               .title = u"Outer",
++               .collapsed = true,
++               .children = {Link("nested", "https://nested.test/"),
++                            {.data = PersistentFolder{.id = "empty",
++                                                      .title = u"Empty"}}}}}};
++}
++
++TEST(PersistentItemCodecTest, ExactRoundTripPreservesTreeStateAndOrder) {
++  PersistentNodes original = Tree();
++  auto decoded =
++      PersistentItemCodec::Decode(PersistentItemCodec::Encode(original), true);
++  ASSERT_TRUE(decoded);
++  EXPECT_EQ(original, *decoded);
++  const PersistentFolder* outer =
++      PersistentItemCodec::FindFolder(*decoded, "outer");
++  ASSERT_TRUE(outer);
++  EXPECT_TRUE(outer->collapsed);
++  EXPECT_EQ(2u, outer->children.size());
++  EXPECT_TRUE(PersistentItemCodec::FindFolder(*decoded, "empty"));
++}
++
++TEST(PersistentItemCodecTest, RejectsFoldersDuplicatesAndBlankHomes) {
++  EXPECT_FALSE(
++      PersistentItemCodec::Decode(PersistentItemCodec::Encode(Tree()), false));
++  PersistentNodes duplicates = {Link("same", "https://one.test/"),
++                                Link("same", "https://two.test/")};
++  EXPECT_FALSE(PersistentItemCodec::Decode(
++      PersistentItemCodec::Encode(duplicates), true));
++  EXPECT_FALSE(PersistentItemCodec::Decode(
++      PersistentItemCodec::Encode({Link("blank", "about:blank")}), false));
++}
++
++TEST(PersistentItemLifecycleTest, CloseReturnsLiveItemToDormantForReopen) {
++  PersistentItemLifecycle lifecycle;
++  ASSERT_TRUE(lifecycle.AddDormant("pin"));
++  EXPECT_EQ(PersistentItemLifecycle::ActivationAction::kMaterialize,
++            lifecycle.BeginActivation("pin").action);
++  ASSERT_TRUE(lifecycle.DidMaterialize("pin", 41));
++  EXPECT_EQ(41u, lifecycle.BeginActivation("pin").live_tab);
++  ASSERT_EQ(std::optional<std::string>("pin"), lifecycle.BeginClose(41));
++  EXPECT_EQ(PersistentItemLifecycle::State::kClosing,
++            lifecycle.GetState("pin"));
++  ASSERT_TRUE(lifecycle.CompleteClose(41));
++  EXPECT_EQ(PersistentItemLifecycle::State::kDormant,
++            lifecycle.GetState("pin"));
++  EXPECT_EQ(PersistentItemLifecycle::ActivationAction::kMaterialize,
++            lifecycle.BeginActivation("pin").action);
++}
++
++TEST(PersistentItemLifecycleTest, RejectsDuplicateAndOutOfOrderTransitions) {
++  PersistentItemLifecycle lifecycle;
++  ASSERT_TRUE(lifecycle.AddDormant("first"));
++  ASSERT_TRUE(lifecycle.AddDormant("second"));
++  EXPECT_FALSE(lifecycle.DidMaterialize("first", 1));
++  lifecycle.BeginActivation("first");
++  ASSERT_TRUE(lifecycle.DidMaterialize("first", 1));
++  lifecycle.BeginActivation("second");
++  EXPECT_FALSE(lifecycle.DidMaterialize("second", 1));
++  EXPECT_EQ(PersistentItemLifecycle::ActivationAction::kWaitForTransition,
++            lifecycle.BeginActivation("second").action);
++}
++
++TEST(PersistentItemLifecycleTest, RestoredAssociationCanBeForgotten) {
++  PersistentItemLifecycle lifecycle;
++  ASSERT_TRUE(lifecycle.AddDormant("favorite"));
++  ASSERT_TRUE(lifecycle.RestoreLive("favorite", 9));
++  EXPECT_EQ(std::optional<std::string_view>("favorite"),
++            lifecycle.GetItemForLiveTab(9));
++  EXPECT_TRUE(lifecycle.Forget("favorite"));
++  EXPECT_FALSE(lifecycle.GetItemForLiveTab(9));
++}
++
++TEST(PersistentItemLifecycleTest, ReconcileForgetsRemovedDurableItems) {
++  PersistentItemLifecycle lifecycle;
++  ASSERT_TRUE(lifecycle.AddDormant("kept"));
++  ASSERT_TRUE(lifecycle.AddDormant("removed"));
++  ASSERT_EQ(PersistentItemLifecycle::ActivationAction::kMaterialize,
++            lifecycle.BeginActivation("removed").action);
++  ASSERT_TRUE(lifecycle.DidMaterialize("removed", 7));
++
++  lifecycle.RetainOnly({"kept"});
++
++  EXPECT_EQ(PersistentItemLifecycle::State::kDormant,
++            lifecycle.GetState("kept"));
++  EXPECT_FALSE(lifecycle.GetState("removed"));
++  EXPECT_FALSE(lifecycle.GetItemForLiveTab(7));
++}
++
++TEST(PersistentItemCodecTest, UpdateAndRemovePreserveNestedOrder) {
++  PersistentNodes nodes = Tree();
++  ASSERT_TRUE(PersistentItemCodec::UpdateLinkHome(
++      nodes, "nested", GURL("https://updated.test/path"), u"Updated"));
++  const PersistentLink* nested = PersistentItemCodec::FindLink(nodes, "nested");
++  ASSERT_TRUE(nested);
++  EXPECT_EQ(GURL("https://updated.test/path"), nested->url);
++  EXPECT_EQ(u"Updated", nested->title);
++
++  ASSERT_TRUE(PersistentItemCodec::RemoveNode(nodes, "nested"));
++  EXPECT_FALSE(PersistentItemCodec::FindLink(nodes, "nested"));
++  const PersistentFolder* outer =
++      PersistentItemCodec::FindFolder(nodes, "outer");
++  ASSERT_TRUE(outer);
++  EXPECT_EQ(1u, outer->children.size());
++  EXPECT_TRUE(PersistentItemCodec::FindLink(nodes, "top"));
++}
++
++TEST(PersistentItemCodecTest, MoveLinkPreservesTreeAndSupportsRootEnd) {
++  PersistentNodes nodes = Tree();
++  nodes.push_back(Link("last", "https://last.test/"));
++
++  ASSERT_TRUE(PersistentItemCodec::MoveLinkBefore(nodes, "last", "nested"));
++  const PersistentFolder* outer =
++      PersistentItemCodec::FindFolder(nodes, "outer");
++  ASSERT_TRUE(outer);
++  ASSERT_EQ(3u, outer->children.size());
++  EXPECT_EQ("last",
++            std::get<PersistentLink>(outer->children[0].data).id);
++  EXPECT_EQ("nested",
++            std::get<PersistentLink>(outer->children[1].data).id);
++
++  ASSERT_TRUE(PersistentItemCodec::MoveLinkBefore(nodes, "nested", ""));
++  ASSERT_EQ(3u, nodes.size());
++  EXPECT_EQ("nested", std::get<PersistentLink>(nodes.back().data).id);
++  EXPECT_TRUE(PersistentItemCodec::FindFolder(nodes, "empty"));
++}
++
++TEST(PersistentItemCodecTest, MoveLinkRejectsInvalidOrNoOpTargets) {
++  PersistentNodes nodes = Tree();
++  const PersistentNodes original = nodes;
++  EXPECT_FALSE(PersistentItemCodec::MoveLinkBefore(nodes, "top", "top"));
++  EXPECT_FALSE(PersistentItemCodec::MoveLinkBefore(nodes, "missing", "top"));
++  EXPECT_FALSE(PersistentItemCodec::MoveLinkBefore(nodes, "top", "missing"));
++  EXPECT_EQ(original, nodes);
++}
++
++TEST(PersistentItemCodecTest, MoveNodeSupportsNestedFoldersAndTreePositions) {
++  PersistentNodes nodes = Tree();
++  nodes.push_back(Link("last", "https://last.test/"));
++
++  ASSERT_TRUE(PersistentItemCodec::MoveNode(nodes, "last", "empty", {}));
++  const PersistentFolder* empty =
++      PersistentItemCodec::FindFolder(nodes, "empty");
++  ASSERT_TRUE(empty);
++  ASSERT_EQ(1u, empty->children.size());
++  EXPECT_EQ("last", std::get<PersistentLink>(empty->children[0].data).id);
++
++  ASSERT_TRUE(PersistentItemCodec::MoveNode(nodes, "empty", {}, "outer"));
++  ASSERT_EQ(3u, nodes.size());
++  EXPECT_EQ("empty", std::get<PersistentFolder>(nodes[1].data).id);
++  EXPECT_EQ("outer", std::get<PersistentFolder>(nodes[2].data).id);
++  EXPECT_TRUE(PersistentItemCodec::FindLink(nodes, "last"));
++}
++
++TEST(PersistentItemCodecTest, MoveNodeMovesWholeFolderSubtrees) {
++  PersistentNodes nodes = Tree();
++  nodes.push_back({.data = PersistentFolder{.id = "destination",
++                                            .title = u"Destination"}});
++
++  ASSERT_TRUE(
++      PersistentItemCodec::MoveNode(nodes, "outer", "destination", {}));
++  const PersistentFolder* destination =
++      PersistentItemCodec::FindFolder(nodes, "destination");
++  ASSERT_TRUE(destination);
++  ASSERT_EQ(1u, destination->children.size());
++  EXPECT_EQ("outer",
++            std::get<PersistentFolder>(destination->children[0].data).id);
++  EXPECT_TRUE(PersistentItemCodec::FindLink(nodes, "nested"));
++  EXPECT_TRUE(PersistentItemCodec::FindFolder(nodes, "empty"));
++
++  ASSERT_TRUE(PersistentItemCodec::MoveNode(nodes, "empty", {}, "top"));
++  ASSERT_EQ(3u, nodes.size());
++  EXPECT_EQ("empty", std::get<PersistentFolder>(nodes.front().data).id);
++}
++
++TEST(PersistentItemCodecTest, MoveNodeRejectsCyclesAndForeignBeforeIds) {
++  PersistentNodes nodes = Tree();
++  const PersistentNodes original = nodes;
++
++  EXPECT_FALSE(PersistentItemCodec::MoveNode(nodes, "outer", "empty", {}));
++  EXPECT_FALSE(PersistentItemCodec::MoveNode(nodes, "outer", "outer", {}));
++  EXPECT_FALSE(
++      PersistentItemCodec::MoveNode(nodes, "top", "outer", "top"));
++  EXPECT_FALSE(PersistentItemCodec::MoveNode(nodes, "top", {}, "nested"));
++  EXPECT_EQ(original, nodes);
++}
++
++TEST(PersistentLiveCollectionTest, FavoritesUsePinnedGridAndPinsUsePinList) {
++  EXPECT_EQ(PersistentLiveCollection::kPinnedGrid,
++            LiveCollectionForKind(PersistentRecordKind::kFavorite));
++  EXPECT_EQ(PersistentLiveCollection::kPinList,
++            LiveCollectionForKind(PersistentRecordKind::kPin));
++}
++
++TEST(AnchoredNavigationPolicyTest, OnlyCurrentTabLinksAwayFromHomeDivert) {
++  const GURL home("https://home.test/");
++  const GURL away("https://away.test/");
++  EXPECT_TRUE(ShouldOpenAnchoredNavigationInLittleArc(
++      PersistentNavigationDisposition::kCurrentTab, true, true, home, away));
++  EXPECT_FALSE(ShouldOpenAnchoredNavigationInLittleArc(
++      PersistentNavigationDisposition::kCurrentTab, true, true, home, home));
++  EXPECT_FALSE(ShouldOpenAnchoredNavigationInLittleArc(
++      PersistentNavigationDisposition::kCurrentTab, true, true, home,
++      GURL("https://home.test/#section")));
++  EXPECT_FALSE(ShouldOpenAnchoredNavigationInLittleArc(
++      PersistentNavigationDisposition::kExplicitNewTarget, true, true, home,
++      away));
++  EXPECT_FALSE(ShouldOpenAnchoredNavigationInLittleArc(
++      PersistentNavigationDisposition::kCurrentTab, false, true, home, away));
++  EXPECT_FALSE(ShouldOpenAnchoredNavigationInLittleArc(
++      PersistentNavigationDisposition::kCurrentTab, true, false, home, away));
++}
++
++TEST(PersistentGridPackingTest,
++     PacksDisplayedSlotsThenHiddenHomeTilesInModelOrder) {
++  const std::vector<PersistentGridSlot> dormant = {
++      {.id = "a"}, {.id = "b"}, {.id = "c"}};
++  EXPECT_EQ((std::vector<PersistentGridChild>{
++                {.id = "a", .kind = PersistentGridChildKind::kHomeTile},
++                {.id = "b", .kind = PersistentGridChildKind::kHomeTile},
++                {.id = "c", .kind = PersistentGridChildKind::kHomeTile}}),
++            PackPersistentGridChildren(dormant));
++
++  const std::vector<PersistentGridSlot> mixed = {{.id = "a", .live = true},
++                                                 {.id = "b"},
++                                                 {.id = "c", .live = true},
++                                                 {.id = "d"}};
++  EXPECT_EQ((std::vector<PersistentGridChild>{
++                {.id = "a", .kind = PersistentGridChildKind::kLiveTab},
++                {.id = "b", .kind = PersistentGridChildKind::kHomeTile},
++                {.id = "c", .kind = PersistentGridChildKind::kLiveTab},
++                {.id = "d", .kind = PersistentGridChildKind::kHomeTile},
++                {.id = "a", .kind = PersistentGridChildKind::kHomeTile},
++                {.id = "c", .kind = PersistentGridChildKind::kHomeTile}}),
++            PackPersistentGridChildren(mixed));
++
++  const std::vector<PersistentGridSlot> restored = {
++      {.id = "a"}, {.id = "b"}, {.id = "c"}, {.id = "d"}};
++  EXPECT_EQ((std::vector<PersistentGridChild>{
++                {.id = "a", .kind = PersistentGridChildKind::kHomeTile},
++                {.id = "b", .kind = PersistentGridChildKind::kHomeTile},
++                {.id = "c", .kind = PersistentGridChildKind::kHomeTile},
++                {.id = "d", .kind = PersistentGridChildKind::kHomeTile}}),
++            PackPersistentGridChildren(restored));
++}
++
++}  // namespace
++}  // namespace helium
+Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
++++ src/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
+@@ -45,6 +45,7 @@ enum class PersistentTabDropTarget { kFa
+ // persistent Pin tree, whose visible rows are not all TabCollectionNodes.
+ struct PersistentTabDropLocation {
+   PersistentTabDropTarget target = PersistentTabDropTarget::kTab;
++  std::string parent_id;
+   std::string before_id;
+ };
