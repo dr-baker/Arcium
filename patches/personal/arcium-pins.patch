@@ -6766,7 +6766,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
 +++ src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
-@@ -12,7 +12,10 @@
+@@ -12,13 +12,17 @@
  #include "base/functional/bind.h"
  #include "base/notreached.h"
  #include "base/types/to_address.h"
@@ -6777,7 +6777,14 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
  #include "chrome/browser/ui/ui_features.h"
  #include "chrome/browser/ui/views/frame/browser_view.h"
  #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
-@@ -26,11 +29,13 @@
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_link_drop_handler.h"
++#include "chrome/browser/ui/views/tabs/common/persistent_tab_drag_bridge.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_view.h"
+ #include "chrome/browser/ui/views/tabs/dragging/drag_session_data.h"
+@@ -26,11 +30,13 @@
  #include "chrome/browser/ui/views/tabs/shared/tab_strip_types.h"
  #include "chrome/browser/ui/views/tabs/tab_slot_view.h"
  #include "components/tab_groups/tab_group_id.h"
@@ -6791,7 +6798,13 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
  #include "content/public/browser/web_contents.h"
  #include "ui/base/class_property.h"
  #include "ui/base/clipboard/clipboard_constants.h"
-@@ -53,6 +58,62 @@ namespace {
+@@ -49,10 +55,68 @@ DEFINE_UI_CLASS_PROPERTY_TYPE(gfx::Vecto
+ 
+ namespace {
+ 
++TabDragController* g_active_persistent_tab_drag_controller = nullptr;
++
+ // Stores the offset of the view's initial position to the target position
  // it should be, relative to the source dragged view's origin.
  DEFINE_OWNED_UI_CLASS_PROPERTY_KEY(gfx::Vector2d, kOffsetAtTabDragStart)
  
@@ -6854,7 +6867,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
  // This is a shim around `TabCollectionNode` to make it compatible with the
  // tab dragging logic in `TabDragController`. Longer term, core tab dragging
  // logic will be updated to remove the `TabSlotView` dependency, which
-@@ -124,9 +185,16 @@ gfx::Range GetContainerRange(const TabCo
+@@ -124,9 +188,16 @@ gfx::Range GetContainerRange(const TabCo
        return TabGroupDataFromNode(container_node).ListTabs();
      case TabCollectionNode::Type::PINNED:
        return gfx::Range(0, tab_strip_model.IndexOfFirstNonPinnedTab());
@@ -6872,7 +6885,87 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
      default:
        NOTREACHED();
    }
-@@ -209,6 +277,17 @@ void TabDragHandlerImpl::InitializeDrag(
+@@ -169,6 +240,79 @@ int GetInsertionIndexForNode(const TabCo
+ 
+ }  // namespace
+ 
++ScopedPersistentTabDragController::ScopedPersistentTabDragController(
++    TabDragController* controller)
++    : previous_(g_active_persistent_tab_drag_controller) {
++  g_active_persistent_tab_drag_controller = controller;
++}
++
++ScopedPersistentTabDragController::~ScopedPersistentTabDragController() {
++  g_active_persistent_tab_drag_controller = previous_;
++}
++
++TabDragController* GetActivePersistentTabDragController() {
++  return g_active_persistent_tab_drag_controller;
++}
++
++bool IsDraggingPersistentPinTabs(const TabDragController& drag_controller) {
++  const auto& drag_data = drag_controller.GetSessionData().tab_drag_data_;
++  return std::any_of(
++      drag_data.cbegin(), drag_data.cend(), [](const auto& data) {
++        if (!data.contents) {
++          return false;
++        }
++        const tabs::TabInterface* tab =
++            tabs::TabInterface::GetFromContents(data.contents);
++        return helium::IsPersistentItemTab(tab) && !tab->IsPinned();
++      });
++}
++
++void ConfigurePersistentTabDrop(TabDragController& drag_controller,
++                                const PersistentTabDropLocation& location) {
++  const auto& drag_data = drag_controller.GetSessionData().tab_drag_data_;
++  // Persistent conversion has one durable identity and one tree destination.
++  // Reject multi-selection until the service exposes an atomic batch move;
++  // applying item-by-item can partially convert the selection or reverse it.
++  if (drag_data.size() != 1u) {
++    drag_controller.SetDeferredSuccessfulDropCallback(base::OnceClosure());
++    return;
++  }
++
++  std::vector<PendingPersistentDrop> drops;
++  for (const TabDragData& data : drag_data) {
++    if (!data.contents) {
++      continue;
++    }
++    tabs::TabInterface* tab =
++        tabs::TabInterface::GetFromContents(data.contents);
++    const bool persistent = helium::IsPersistentItemTab(tab);
++    if (location.target == PersistentTabDropTarget::kPin && !persistent) {
++      drops.push_back({PersistentDropAction::kMakePin,
++                       data.contents->GetWeakPtr(), location.parent_id,
++                       location.before_id});
++    } else if (location.target == PersistentTabDropTarget::kPin && persistent &&
++               !tab->IsPinned()) {
++      drops.push_back({PersistentDropAction::kReorderPin,
++                       data.contents->GetWeakPtr(), location.parent_id,
++                       location.before_id});
++    } else if (location.target == PersistentTabDropTarget::kFavorite &&
++               !persistent) {
++      drops.push_back(
++          {PersistentDropAction::kMakeFavorite, data.contents->GetWeakPtr()});
++    } else if (location.target == PersistentTabDropTarget::kTab && persistent) {
++      drops.push_back({PersistentDropAction::kRemove,
++                       data.contents->GetWeakPtr(),
++                       {},
++                       {},
++                       location.tab_index});
++    }
++  }
++
++  drag_controller.SetDeferredSuccessfulDropCallback(
++      drops.empty() ? base::OnceClosure()
++                    : base::BindOnce(&CommitPersistentDrops, std::move(drops)));
++}
++
+ TabDragHandlerImpl::TabDragHandlerImpl(
+     TabStripModel& tab_strip_model,
+     TabCollectionNode& root_node,
+@@ -209,6 +353,17 @@ void TabDragHandlerImpl::InitializeDrag(
                               EventSourceFromEvent(event)) ==
        TabDragController::Liveness::kDeleted) {
      ResetDragState();
@@ -6890,7 +6983,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
    }
  }
  
-@@ -326,6 +405,7 @@ bool TabDragHandlerImpl::ContinueDrag(vi
+@@ -326,6 +481,7 @@ bool TabDragHandlerImpl::ContinueDrag(vi
    }
    gfx::Point screen_location(event.location());
    ConvertPointToScreen(&event_source_view, &screen_location);
@@ -6898,7 +6991,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
  
    // Dragging may start a blocking loop, which may allow this to be destroyed.
    auto ref = weak_factory_.GetWeakPtr();
-@@ -363,6 +443,36 @@ void TabDragHandlerImpl::EndDrag(EndDrag
+@@ -363,6 +519,36 @@ void TabDragHandlerImpl::EndDrag(EndDrag
  void TabDragHandlerImpl::HandleDraggedTabsIntoNode(
      const TabCollectionNode& node) {
    CHECK(drag_controller_);
@@ -6935,76 +7028,27 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
    const auto& drag_session_data = drag_controller_->GetSessionData();
  
    const TabDragData* source_drag_data =
-@@ -453,6 +563,78 @@ bool TabDragHandlerImpl::IsDraggingPinne
+@@ -453,6 +639,29 @@ bool TabDragHandlerImpl::IsDraggingPinne
                       [](const auto& tab_data) { return tab_data.pinned; });
  }
  
 +bool TabDragHandlerImpl::IsDraggingPersistentPinTabs() const {
-+  if (!drag_controller_) {
-+    return false;
-+  }
-+  const auto& drag_data = drag_controller_->GetSessionData().tab_drag_data_;
-+  return std::any_of(
-+      drag_data.cbegin(), drag_data.cend(), [](const auto& data) {
-+        if (!data.contents) {
-+          return false;
-+        }
-+        const tabs::TabInterface* tab =
-+            tabs::TabInterface::GetFromContents(data.contents);
-+        return helium::IsPersistentItemTab(tab) && !tab->IsPinned();
-+      });
++  const TabDragController* controller =
++      drag_controller_ ? drag_controller_.get()
++                       : GetActivePersistentTabDragController();
++  return controller && ::IsDraggingPersistentPinTabs(*controller);
 +}
 +
 +void TabDragHandlerImpl::SetPersistentTabDropTarget(
 +    PersistentTabDropLocation location) {
-+  if (!drag_controller_) {
-+    return;
-+  }
-+
 +  persistent_tab_drop_location_ = location;
-+
-+  const auto& drag_data = drag_controller_->GetSessionData().tab_drag_data_;
-+  // Persistent conversion has one durable identity and one tree destination.
-+  // Reject multi-selection until the service exposes an atomic batch move;
-+  // applying item-by-item can partially convert the selection or reverse it.
-+  if (drag_data.size() != 1u) {
-+    drag_controller_->SetDeferredSuccessfulDropCallback(base::OnceClosure());
++  TabDragController* controller =
++      drag_controller_ ? drag_controller_.get()
++                       : GetActivePersistentTabDragController();
++  if (!controller) {
 +    return;
 +  }
-+
-+  std::vector<PendingPersistentDrop> drops;
-+  for (const TabDragData& data : drag_data) {
-+    if (!data.contents) {
-+      continue;
-+    }
-+    tabs::TabInterface* tab =
-+        tabs::TabInterface::GetFromContents(data.contents);
-+    const bool persistent = helium::IsPersistentItemTab(tab);
-+    if (location.target == PersistentTabDropTarget::kPin && !persistent) {
-+      drops.push_back({PersistentDropAction::kMakePin,
-+                       data.contents->GetWeakPtr(), location.parent_id,
-+                       location.before_id});
-+    } else if (location.target == PersistentTabDropTarget::kPin && persistent &&
-+               !tab->IsPinned()) {
-+      drops.push_back({PersistentDropAction::kReorderPin,
-+                       data.contents->GetWeakPtr(), location.parent_id,
-+                       location.before_id});
-+    } else if (location.target == PersistentTabDropTarget::kFavorite &&
-+               !persistent) {
-+      drops.push_back(
-+          {PersistentDropAction::kMakeFavorite, data.contents->GetWeakPtr()});
-+    } else if (location.target == PersistentTabDropTarget::kTab && persistent) {
-+      drops.push_back({PersistentDropAction::kRemove,
-+                       data.contents->GetWeakPtr(),
-+                       {},
-+                       {},
-+                       location.tab_index});
-+    }
-+  }
-+
-+  drag_controller_->SetDeferredSuccessfulDropCallback(
-+      drops.empty() ? base::OnceClosure()
-+                    : base::BindOnce(&CommitPersistentDrops, std::move(drops)));
++  ConfigurePersistentTabDrop(*controller, location);
 +}
 +
 +PersistentTabDropTarget TabDragHandlerImpl::GetPersistentTabDropTarget() const {
@@ -7014,7 +7058,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
  bool TabDragHandlerImpl::IsDraggingGroups() const {
    if (!drag_controller_) {
      return false;
-@@ -663,7 +845,17 @@ content::WebContents* TabDragHandlerImpl
+@@ -663,7 +872,17 @@ content::WebContents* TabDragHandlerImpl
  }
  
  bool TabDragHandlerImpl::IsTabDetachable(const TabSlotView* view) const {
@@ -7033,7 +7077,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
  }
  
  TabSlotView* TabDragHandlerImpl::GetTabGroupHeader(
-@@ -906,8 +1098,21 @@ void TabDragHandlerImpl::OnNodeWillDestr
+@@ -906,8 +1125,21 @@ void TabDragHandlerImpl::OnNodeWillDestr
  }
  
  void TabDragHandlerImpl::ResetDragState() {
@@ -7055,7 +7099,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
  }
  
  bool TabDragHandlerImpl::HandleDraggedTabsIntoPosition(
-@@ -915,6 +1120,75 @@ bool TabDragHandlerImpl::HandleDraggedTa
+@@ -915,6 +1147,75 @@ bool TabDragHandlerImpl::HandleDraggedTa
      const TabCollectionNode* target) {
    CHECK(drag_controller_);
  
@@ -8987,7 +9031,7 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
  }
  
  void BaseTabStripRegionView::DisableTabStripEditingForTesting() {
-@@ -416,15 +424,74 @@ TabDragTarget* BaseTabStripRegionView::G
+@@ -416,15 +424,76 @@ TabDragTarget* BaseTabStripRegionView::G
      return nullptr;
    }
  
@@ -9031,20 +9075,22 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
 +  }
 +  PersistentTabDropLocation drop_location;
 +  PinTabContainerView* pins_container = GetPinsContainer();
++  if (!pins_container) {
++    return;
++  }
 +  if (GetPinnedTabsContainer()->GetBoundsInScreen().Contains(point_in_screen)) {
 +    if (pins_container) {
 +      pins_container->ClearPersistentTabDragPreview();
 +      GetUnpinnedTabsContainer()->ClearPersistentTabDragPreview();
 +    }
 +    drop_location.target = PersistentTabDropTarget::kFavorite;
-+  } else if (pins_container &&
-+             tab_strip_view_->IsPointInPinsRegion(point_in_screen)) {
++  } else if (tab_strip_view_->IsPointInPinsRegion(point_in_screen)) {
 +    GetUnpinnedTabsContainer()->ClearPersistentTabDragPreview();
 +    drop_location.target = PersistentTabDropTarget::kPin;
 +    drop_location =
 +        pins_container->GetPersistentDropLocationForDrag(point_in_screen);
 +    pins_container->UpdatePersistentTabDragPreview(point_in_screen);
-+  } else if (pins_container) {
++  } else {
 +    pins_container->ClearPersistentTabDragPreview();
 +    if (drag_handler_->IsDraggingPersistentPinTabs()) {
 +      GetUnpinnedTabsContainer()->UpdatePersistentTabDragPreview(
@@ -9059,7 +9105,7 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
 +      drop_location.tab_index = tab_drop->index;
 +    }
 +  }
-+  drag_handler_->SetPersistentTabDropTarget(std::move(drop_location));
++  drag_handler_->SetPersistentTabDropTarget(drop_location);
 +}
 +
  void BaseTabStripRegionView::ClearTabStripView(views::View* view) {
@@ -10494,7 +10540,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
 +++ src/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
-@@ -45,7 +45,9 @@ enum class PersistentTabDropTarget { kFa
+@@ -45,9 +45,18 @@ enum class PersistentTabDropTarget { kFa
  // persistent Pin tree, whose visible rows are not all TabCollectionNodes.
  struct PersistentTabDropLocation {
    PersistentTabDropTarget target = PersistentTabDropTarget::kTab;
@@ -10503,8 +10549,17 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
 +  int tab_index = -1;
  };
  
++// Arms the durable Pin/tab conversion on the TabDragController that actually
++// owns the captured gesture. Vertical tabs can be dragged by either the common
++// collection handler or Chromium's legacy TabStrip drag context.
++void ConfigurePersistentTabDrop(TabDragController& drag_controller,
++                                const PersistentTabDropLocation& location);
++bool IsDraggingPersistentPinTabs(const TabDragController& drag_controller);
++
  // Interface for views to interact with drag handling.
-@@ -96,6 +98,7 @@ class TabDragHandler {
+ class TabDragHandler {
+  public:
+@@ -96,6 +105,7 @@ class TabDragHandler {
    // while TabDragController owns it.
    virtual void SetPersistentTabDropTarget(
        PersistentTabDropLocation location) = 0;
@@ -10512,7 +10567,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
  
    // Returns true if there is an ongoing drag where a group is being moved.
    virtual bool IsDraggingGroups() const = 0;
-@@ -153,8 +156,8 @@ class TabDragHandlerImpl : public TabDra
+@@ -153,8 +163,8 @@ class TabDragHandlerImpl : public TabDra
    bool IsViewDragging(const views::View& view) const override;
    bool IsDraggingPinnedTabs() const override;
    bool IsDraggingPersistentPinTabs() const override;
@@ -10523,3 +10578,108 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
    bool IsDraggingGroups() const override;
    views::View* ViewFromTabSlot(TabSlotView* view) const override;
    std::optional<gfx::Vector2d> GetOffsetFromSourceAtDragStart(
+Index: src/chrome/browser/ui/views/tabs/tab_strip.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/tab_strip.cc
++++ src/chrome/browser/ui/views/tabs/tab_strip.cc
+@@ -15,8 +15,8 @@
+ #include <utility>
+ #include <vector>
+ 
+-#include "base/command_line.h"
+ #include "base/check.h"
++#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+@@ -46,7 +46,9 @@
+ #include "chrome/browser/ui/view_ids.h"
+ #include "chrome/browser/ui/views/frame/browser_frame_view.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/tabs/browser_tab_strip_controller.h"
++#include "chrome/browser/ui/views/tabs/common/persistent_tab_drag_bridge.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_context.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h"
+ #include "chrome/browser/ui/views/tabs/hovercard/tab_hover_card_controller.h"
+@@ -364,6 +366,17 @@ class TabStrip::TabDragContextImpl : pub
+     gfx::Point screen_location(event.location());
+     views::View::ConvertPointToScreen(view, &screen_location);
+ 
++    BrowserWindowInterface* browser_window =
++        tab_strip_->GetBrowserWindowInterface();
++    BrowserView* browser_view =
++        browser_window ? BrowserView::GetBrowserViewForBrowser(browser_window)
++                       : nullptr;
++    ScopedPersistentTabDragController persistent_drag_scope(
++        drag_controller_.get());
++    if (browser_view && browser_view->tab_strip_view()) {
++      browser_view->tab_strip_view()->UpdateTabDragPoint(screen_location);
++    }
++
+     // Note: `tab_strip_` can be destroyed during drag, also destroying `this`.
+     const TabDragController::Liveness drag_controller_alive =
+         drag_controller_->Drag(screen_location);
+@@ -990,9 +1003,10 @@ class TabStrip::TabDragContextImpl : pub
+     }
+ 
+     TabSlotView* const left_tab = GetTabAt(candidate_index - 1);
+-    TabSlotView* const right_tab = tab_strip_->IsValidModelIndex(candidate_index)
+-                               ? GetTabAt(candidate_index)
+-                               : nullptr;
++    TabSlotView* const right_tab =
++        tab_strip_->IsValidModelIndex(candidate_index)
++            ? GetTabAt(candidate_index)
++            : nullptr;
+ 
+     // This might be in the middle of a group, which may or may not be fine.
+     std::optional<tab_groups::TabGroupId> left_group = left_tab->group();
+@@ -1976,8 +1990,12 @@ void TabStrip::OnGroupContentsChanged(co
+ 
+ void TabStrip::UpdateHoverCard(HoverCardAnchorTarget* anchor_target,
+                                HoverCardUpdateType update_type) {
+-  if (base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII("tab-hover-cards") == "tooltip" ||
+-      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII("tab-hover-cards") == "none") return;
++  if (base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          "tab-hover-cards") == "tooltip" ||
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          "tab-hover-cards") == "none") {
++    return;
++  }
+   if (tab_container_) {
+     tab_container_->UpdateHoverCard(anchor_target, update_type);
+   }
+Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_drag_bridge.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/tabs/common/persistent_tab_drag_bridge.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_COMMON_PERSISTENT_TAB_DRAG_BRIDGE_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_COMMON_PERSISTENT_TAB_DRAG_BRIDGE_H_
++
++class TabDragController;
++
++// Exposes the controller that owns the current native tab-drag update to the
++// shared sidebar coordinator. Some vertical-tab gestures are still captured by
++// TabStrip's legacy drag context rather than TabDragHandlerImpl.
++class ScopedPersistentTabDragController {
++ public:
++  explicit ScopedPersistentTabDragController(TabDragController* controller);
++  ~ScopedPersistentTabDragController();
++
++  ScopedPersistentTabDragController(
++      const ScopedPersistentTabDragController&) = delete;
++  ScopedPersistentTabDragController& operator=(
++      const ScopedPersistentTabDragController&) = delete;
++
++ private:
++  TabDragController* previous_ = nullptr;
++};
++
++TabDragController* GetActivePersistentTabDragController();
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_PERSISTENT_TAB_DRAG_BRIDGE_H_
