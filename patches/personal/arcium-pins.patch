@@ -10440,7 +10440,45 @@ Index: src/chrome/browser/ui/startup/startup_browser_creator_impl_unittest.cc
  #include "chrome/browser/ui/startup/startup_tab_provider.h"
  #include "chrome/common/chrome_version.h"
  #include "chrome/common/url_constants.h"
-@@ -286,8 +288,8 @@
+@@ -58,11 +60,21 @@
+   StartupTabs GetPinnedTabs(const base::CommandLine& command_line_,
+                             Profile* profile) const override {
+     StartupTabs tabs;
+     if (options_ & kPinnedTabs) {
+       tabs.emplace_back(GURL("https://pinned"), StartupTab::Type::kPinned);
+     }
+     return tabs;
+   }
+ 
++  StartupTabs GetPersistentTabsForCrashRecovery(
++      const base::CommandLine& command_line,
++      Profile* profile) const override {
++    StartupTabs tabs;
++    if (options_ & kPostCrashTabs) {
++      tabs.emplace_back(GURL("https://pinned"), StartupTab::Type::kPinned);
++    }
++    return tabs;
++  }
++
+   StartupTabs GetPreferencesTabs(const base::CommandLine& command_line_,
+                                  Profile* profile) const override {
+@@ -142,9 +154,15 @@
+   StartupTabs GetPinnedTabs(const base::CommandLine& command_line_,
+                             Profile* profile) const override {
+     StartupTabs tabs;
+     tabs.emplace_back(GURL(kDuplicateUrl), StartupTab::Type::kPinned);
+     return tabs;
+   }
+ 
++  StartupTabs GetPersistentTabsForCrashRecovery(
++      const base::CommandLine& command_line,
++      Profile* profile) const override {
++    return StartupTabs();
++  }
++
+   StartupTabs GetPreferencesTabs(const base::CommandLine& command_line_,
+                                  Profile* profile) const override {
+@@ -286,8 +304,8 @@
    EXPECT_EQ(chrome::ChromeUINewTabURLAsGURL(), output.tabs[0].url);
  }
  
@@ -10451,7 +10489,7 @@ Index: src/chrome/browser/ui/startup/startup_browser_creator_impl_unittest.cc
  TEST_F(StartupBrowserCreatorImplTest, DetermineStartupTabs_Crash) {
    FakeStartupTabProvider provider(kOnboardingTabs | kDistributionFirstRunTabs |
                                    kResetTriggerTabs | kPinnedTabs |
-@@ -305,9 +307,24 @@
+@@ -305,9 +323,24 @@
    EXPECT_EQ(Creator::LaunchResult::kNormally, output.launch_result);
  
    ASSERT_EQ(1U, output.tabs.size());
@@ -10479,7 +10517,7 @@ Index: src/chrome/browser/ui/startup/startup_browser_creator_impl_unittest.cc
    EXPECT_EQ(chrome::ChromeUINewTabURLAsGURL(), output.tabs[0].url);
  }
  
-@@ -374,8 +391,9 @@
+@@ -374,8 +407,9 @@
        /*promotional_tabs_enabled=*/true, /*whats_new_enabled=*/true);
    EXPECT_EQ(LaunchResult::kWithGivenUrls, output.launch_result);
  
@@ -11157,7 +11195,14 @@ Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/base_tab_strip_region_view.h
 +++ src/chrome/browser/ui/views/frame/base_tab_strip_region_view.h
-@@ -25,6 +25,7 @@
+@@ -19,12 +19,14 @@
+ class BrowserView;
+ class HoverTabSelector;
+ class RootTabCollectionNode;
+ class TabDragContext;
++class TabDragController;
+ class TabDragTarget;
+ class TabStripModel;
  class TabStripCollectionController;
  class TabStripView;
  class PinnedTabContainerView;
@@ -17446,3 +17491,167 @@ Index: src/chrome/test/BUILD.gn
        "../browser/ui/incognito_allowed_url_unittest.cc",
        "../browser/ui/intent_picker_tab_helper_unittest.cc",
        "../browser/ui/recently_audible_helper_unittest.cc",
+Index: src/chrome/browser/ui/startup/startup_tab_provider.h
+===================================================================
+--- src.orig/chrome/browser/ui/startup/startup_tab_provider.h
++++ src/chrome/browser/ui/startup/startup_tab_provider.h
+@@ -46,6 +46,11 @@ class StartupTabProvider {
+   virtual StartupTabs GetPinnedTabs(const base::CommandLine& command_line,
+                                     Profile* profile) const = 0;
+ 
++  // Returns persistent tabs that should remain available after a crash.
++  virtual StartupTabs GetPersistentTabsForCrashRecovery(
++      const base::CommandLine& command_line,
++      Profile* profile) const = 0;
++
+   // Returns tabs, if any, specified in the user's preferences as the default
+   // content for a new window.
+   virtual StartupTabs GetPreferencesTabs(const base::CommandLine& command_line,
+@@ -133,6 +138,9 @@ class StartupTabProviderImpl : public St
+   StartupTabs GetResetTriggerTabs(Profile* profile) const override;
+   StartupTabs GetPinnedTabs(const base::CommandLine& command_line,
+                             Profile* profile) const override;
++  StartupTabs GetPersistentTabsForCrashRecovery(
++      const base::CommandLine& command_line,
++      Profile* profile) const override;
+   StartupTabs GetPreferencesTabs(const base::CommandLine& command_line,
+                                  Profile* profile) const override;
+   StartupTabs GetNewTabPageTabs(const base::CommandLine& command_line,
+Index: src/chrome/browser/ui/tabs/pinned_tab_codec.h
+===================================================================
+--- src.orig/chrome/browser/ui/tabs/pinned_tab_codec.h
++++ src/chrome/browser/ui/tabs/pinned_tab_codec.h
+@@ -5,8 +5,10 @@
+ #ifndef CHROME_BROWSER_UI_TABS_PINNED_TAB_CODEC_H_
+ #define CHROME_BROWSER_UI_TABS_PINNED_TAB_CODEC_H_
+ 
++#include "base/values.h"
+ #include "chrome/browser/ui/startup/startup_tab.h"
+ 
++class BrowserWindowInterface;
+ class Profile;
+ 
+ namespace user_prefs {
+@@ -31,12 +33,20 @@ class PinnedTabCodec {
+   // Resets the preferences state.
+   static void WritePinnedTabs(Profile* profile);
+ 
++  // Resets the preferences state from one normal browser window.
++  static void WritePinnedTabs(Profile* profile,
++                              BrowserWindowInterface* browser);
++
+   // Sets the preferences state from the specified tab list.
+   static void WritePinnedTabs(Profile* profile, const StartupTabs& tabs);
+ 
+   // Reads and returns the set of pinned tabs to restore from preferences.
+   static StartupTabs ReadPinnedTabs(Profile* profile);
+ 
++  static base::ListValue EncodeTabs(const StartupTabs& tabs);
++  static StartupTabs DecodeTabs(const base::ListValue& values);
++  static StartupTabs CapturePinnedTabs(BrowserWindowInterface* browser);
++
+  private:
+   PinnedTabCodec();
+   ~PinnedTabCodec();
+Index: src/chrome/browser/ui/views/frame/tab_strip_region_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/tab_strip_region_view.h
++++ src/chrome/browser/ui/views/frame/tab_strip_region_view.h
+@@ -20,6 +20,7 @@ struct TabData;
+ }
+ 
+ class TabDragContext;
++class TabDragController;
+ class TabStripObserver;
+ 
+ class ExpandOnHoverLock {
+@@ -77,6 +78,7 @@ class TabStripRegionView : public views:
+ 
+   // -- Drag and drop --
+   virtual TabDragContext* GetDragContext() = 0;
++  virtual void UpdateTabDragPoint(TabDragController&, const gfx::Point&) {}
+   std::optional<BrowserRootView::DropIndex> GetDropIndex(
+       const ui::DropTargetEvent& event) override = 0;
+   BrowserRootView::DropTarget* GetDropTarget(
+Index: src/chrome/browser/ui/views/tabs/common/dragged_tabs_container.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/dragged_tabs_container.h
++++ src/chrome/browser/ui/views/tabs/common/dragged_tabs_container.h
+@@ -121,6 +121,10 @@ class DraggedTabsContainer : public TabD
+ 
+   tabs::VerticalTabStripCollapseState GetTabStripCollapseState() const;
+ 
++  // Clears product-specific drag presentation when the drag leaves or ends.
++  // Most containers have no additional presentation to clear.
++  virtual void OnTabDragPresentationEnded() {}
++
+  private:
+   // Returns the scroll view for the container.
+   virtual views::ScrollView* GetScrollViewForContainer() const = 0;
+Index: src/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
++++ src/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
+@@ -5,7 +5,15 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TABS_COMMON_PINNED_TAB_CONTAINER_VIEW_H_
+ #define CHROME_BROWSER_UI_VIEWS_TABS_COMMON_PINNED_TAB_CONTAINER_VIEW_H_
+ 
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
+ #include "base/callback_list.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "chrome/browser/ui/views/frame/browser_root_view.h"
+ #include "chrome/browser/ui/views/tabs/common/dragged_tabs_container.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h"
+@@ -15,6 +23,11 @@
+ 
+ class TabCollectionNode;
+ 
++namespace helium {
++class HeliumSpaceService;
++class PersistentItemChange;
++}  // namespace helium
++
+ // The view class that represents the pinned tab region for the
+ // tab strip. It manages the layout of all the pinned tabs and serves
+ // as the drag target for pinned tabs.
+@@ -57,6 +70,20 @@ class PinnedTabContainerView
+   const TabCollectionNode* GetCollectionNodeFromView(
+       const views::View& view) const override;
+ 
++  views::View* AddChildWithoutAnimation(std::unique_ptr<views::View> child);
++  void AttachCollectionChild(std::unique_ptr<views::View> child,
++                             const gfx::Rect& previous_bounds_in_screen);
++  void HideIfPersistentFavorite(views::View* child);
++  void OnPersistentItemsChanged(
++      const helium::PersistentItemChange& change);
++  void ScheduleReconcileFavorites();
++  void ReconcileFavorites();
++
++  struct FavoriteTileSpec;
++  std::vector<FavoriteTileSpec> BuildFavoriteTiles() const;
++  void ActivateFavorite(std::string id);
++  void RemoveFavorite(std::string id);
++
+   // While collapsed, only the y-coordinate is used to determine the drop
+   // index, similar to the unpinned container.
+   std::optional<BrowserRootView::DropIndex> GetLinkDropIndexForCollapsed(
+@@ -71,7 +98,13 @@ class PinnedTabContainerView
+ 
+   raw_ptr<TabCollectionNode> collection_node_;
+   const raw_ref<TabCollectionAnimatingLayoutManager> layout_manager_;
++  raw_ptr<helium::HeliumSpaceService> space_service_ = nullptr;
++  std::map<std::string, raw_ptr<views::View>, std::less<>> favorite_tiles_;
++  std::optional<std::string> pending_replacement_id_;
++  bool reconcile_scheduled_ = false;
+   base::CallbackListSubscription node_destroyed_subscription_;
++  base::CallbackListSubscription items_changed_subscription_;
++  base::WeakPtrFactory<PinnedTabContainerView> weak_ptr_factory_{this};
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_PINNED_TAB_CONTAINER_VIEW_H_
