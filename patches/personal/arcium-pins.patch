@@ -1594,7 +1594,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      return active;
    }
    return spaces_.front().get();
-@@ -97,55 +429,1846 @@ HeliumSpace* HeliumSpaceService::GetSpac
+@@ -97,55 +429,1850 @@ HeliumSpace* HeliumSpaceService::GetSpac
  }
  
  HeliumSpace* HeliumSpaceService::GetOrCreateSpace(std::string id,
@@ -1994,12 +1994,16 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  }
 +
 +  content::WebContents* contents =
-+      chrome::AddAndReturnTabAt(browser, item->url, -1, true);
++      chrome::AddAndReturnTabAt(browser, item->url, -1, false);
 +  tabs::TabInterface* tab = tabs::TabInterface::MaybeGetFromContents(contents);
 +  if (!tab || !AssociateLiveTab(key, kind, id, tab)) {
 +    lifecycle_.CancelMaterialization(key);
 +    return false;
 +  }
++
++  const int index = browser->tab_strip_model()->GetIndexOfTab(tab);
++  CHECK_NE(TabStripModel::kNoTab, index);
++  browser->tab_strip_model()->ActivateTabAt(index);
 +  RecordPersistentItemUsage(key);
 +  NotifyItemsChanged();
 +  return true;
@@ -5911,7 +5915,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
-@@ -0,0 +1,2386 @@
+@@ -0,0 +1,2412 @@
 +// Copyright 2025 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -6437,6 +6441,32 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +    layout_manager_->ResetViewsToTargetLayout({added_child});
 +  }
 +  return added_child;
++}
++
++views::View* PinTabContainerView::GetVisibleRowForTab(
++    const tabs::TabInterface& tab) const {
++  if (!UseSidebarProjection() || !space_service_ || !collection_node_ ||
++      !collection_node_->GetController()) {
++    return nullptr;
++  }
++
++  const std::optional<helium::PersistentRecordKind> kind =
++      space_service_->GetPersistentItemKind(&tab);
++  const std::optional<std::string> id =
++      space_service_->GetPersistentItemId(&tab);
++  BrowserView* const browser_view =
++      collection_node_->GetController()->GetBrowserView();
++  Browser* const browser = browser_view ? browser_view->browser() : nullptr;
++  if (!kind || !id || !browser) {
++    return nullptr;
++  }
++
++  const std::string key = PersistentLinkKey(
++      *kind, space_service_->GetSpaceIdForBrowser(browser), *id);
++  const auto row = persistent_rows_.find(key);
++  return row != persistent_rows_.end() && row->second->GetVisible()
++             ? row->second.get()
++             : nullptr;
 +}
 +
 +std::optional<BrowserRootView::DropIndex> PinTabContainerView::GetLinkDropIndex(
@@ -8302,7 +8332,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
-@@ -0,0 +1,255 @@
+@@ -0,0 +1,260 @@
 +// Copyright 2025 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -8397,6 +8427,11 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +  void ClearPersistentTabDragPreview();
 +
 +  views::View* AddChildWithoutAnimation(std::unique_ptr<views::View> child);
++
++  // Returns the visible durable row that presents `tab` in projection mode.
++  // Live persistent tabs retain hidden TabViews for collection ownership; UI
++  // behaviors such as selection scrolling must target this row instead.
++  views::View* GetVisibleRowForTab(const tabs::TabInterface& tab) const;
 +
 +  // PersistentTabDragDelegate:
 +  bool BeginPersistentTabDrag(PersistentTabView& row,
@@ -9197,8 +9232,17 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
          break;
      }
    }
-@@ -339,20 +482,68 @@ void TabStripView::OnTabChanged(const ta
-   ScrollToView(activated_node->view());
+@@ -339,20 +482,76 @@ void TabStripView::OnTabChanged(const ta
+-  ScrollToView(activated_node->view());
++  views::View* activated_view = activated_node->view();
++  if (pins_container_view_ && activated_view &&
++      pins_container_view_->Contains(activated_view)) {
++    if (views::View* const visible_row =
++            pins_container_view_->GetVisibleRowForTab(*active_tab)) {
++      activated_view = visible_row;
++    }
++  }
++  ScrollToView(activated_view);
  }
  
 +void TabStripView::BeginPersistentRowReplacement(views::View* virtual_row) {
@@ -15380,7 +15424,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_space_service_unittest.cc
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,209 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -15396,6 +15440,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +#include "chrome/browser/ui/helium/helium_space.h"
 +#include "chrome/browser/ui/helium/helium_space_service_factory.h"
 +#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
 +#include "chrome/test/base/browser_with_test_window_test.h"
 +#include "components/prefs/pref_service.h"
 +#include "components/tabs/public/tab_collection.h"
@@ -15406,6 +15451,40 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +
 +namespace helium {
 +namespace {
++
++class PersistentActivationObserver : public TabStripModelObserver {
++ public:
++  PersistentActivationObserver(TabStripModel* model,
++                               HeliumSpaceService* service)
++      : model_(model), service_(service) {
++    model_->AddObserver(this);
++  }
++
++  ~PersistentActivationObserver() override { model_->RemoveObserver(this); }
++
++  void OnTabStripModelChanged(
++      TabStripModel*,
++      const TabStripModelChange&,
++      const TabStripSelectionChange& selection) override {
++    if (!selection.active_tab_changed() || !selection.new_tab) {
++      return;
++    }
++    saw_activation_ = true;
++    was_persistent_at_activation_ =
++        service_->IsPersistentItemTab(selection.new_tab);
++  }
++
++  bool saw_activation() const { return saw_activation_; }
++  bool was_persistent_at_activation() const {
++    return was_persistent_at_activation_;
++  }
++
++ private:
++  raw_ptr<TabStripModel> model_;
++  raw_ptr<HeliumSpaceService> service_;
++  bool saw_activation_ = false;
++  bool was_persistent_at_activation_ = false;
++};
 +
 +class HeliumSpaceServiceTest : public BrowserWithTestWindowTest {
 + protected:
@@ -15456,6 +15535,29 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +  raw_ptr<HeliumSpaceService> service_ = nullptr;
 +  raw_ptr<HeliumSpace> space_ = nullptr;
 +};
++
++TEST_F(HeliumSpaceServiceTest,
++       DormantPinIsAssociatedBeforeActivationNotification) {
++  auto [id, pin_tab] = AddLivePin();
++  ASSERT_TRUE(pin_tab);
++  tabs::TabInterface* ordinary_tab = AddOrdinaryTab("https://ordinary.test/");
++  ASSERT_TRUE(ordinary_tab);
++  ASSERT_TRUE(service_->ClosePersistentItemInstance(
++      browser(), PersistentRecordKind::kPin, id, space_->id()));
++  ASSERT_FALSE(service_->GetLiveTabForPersistentItem(
++      browser(), PersistentRecordKind::kPin, id));
++
++  PersistentActivationObserver observer(browser()->tab_strip_model(), service_);
++  ASSERT_TRUE(service_->ActivatePersistentItem(browser(),
++                                               PersistentRecordKind::kPin, id));
++
++  tabs::TabInterface* live_pin = service_->GetLiveTabForPersistentItem(
++      browser(), PersistentRecordKind::kPin, id);
++  ASSERT_TRUE(live_pin);
++  EXPECT_TRUE(observer.saw_activation());
++  EXPECT_TRUE(observer.was_persistent_at_activation());
++  EXPECT_EQ(live_pin, browser()->tab_strip_model()->GetActiveTab());
++}
 +
 +TEST_F(HeliumSpaceServiceTest, LivePinInvalidatedAfterUnpinRestoresAtomically) {
 +  auto [id, pin_tab] = AddLivePin();
