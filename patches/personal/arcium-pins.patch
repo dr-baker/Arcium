@@ -321,7 +321,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
-@@ -0,0 +1,495 @@
+@@ -0,0 +1,471 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -590,30 +590,6 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +  return service && service->AddPinFromTab(tab);
 +}
 +
-+bool MovePinBefore(tabs::TabInterface* tab, std::string_view target_id) {
-+  HeliumSpaceService* service = GetSpaceService(tab);
-+  BrowserWindowInterface* window =
-+      tab ? tab->GetBrowserWindowInterface() : nullptr;
-+  Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
-+  const std::optional<std::string> id =
-+      service ? service->GetPersistentItemId(tab) : std::nullopt;
-+  return service && browser && id &&
-+         service->MovePinBefore(browser, *id, target_id);
-+}
-+
-+bool MovePin(tabs::TabInterface* tab,
-+             std::string_view parent_id,
-+             std::string_view before_id) {
-+  HeliumSpaceService* service = GetSpaceService(tab);
-+  BrowserWindowInterface* window =
-+      tab ? tab->GetBrowserWindowInterface() : nullptr;
-+  Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
-+  const std::optional<std::string> id =
-+      service ? service->GetPersistentItemId(tab) : std::nullopt;
-+  return service && browser && id &&
-+         service->MovePin(browser, *id, parent_id, before_id);
-+}
-+
 +bool CreatePinFolder(tabs::TabInterface* tab) {
 +  HeliumSpaceService* service = GetSpaceService(tab);
 +  return service && service->CreatePinFolderForTab(tab);
@@ -821,7 +797,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_favorites_and_pins.h
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,67 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -864,10 +840,6 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.h
 +bool IsAnchoredPinnedTabAwayFromHome(const tabs::TabInterface* tab);
 +
 +bool MakePin(tabs::TabInterface* tab);
-+bool MovePinBefore(tabs::TabInterface* tab, std::string_view target_id);
-+bool MovePin(tabs::TabInterface* tab,
-+             std::string_view parent_id,
-+             std::string_view before_id);
 +bool CreatePinFolder(tabs::TabInterface* tab);
 +bool GetAnchoredPinnedTabHome(const tabs::TabInterface* tab,
 +                              GURL* home_url,
@@ -951,7 +923,7 @@ Index: src/chrome/browser/ui/helium/helium_space.cc
  
  HeliumSpace::~HeliumSpace() = default;
  
-@@ -47,25 +52,86 @@ void HeliumSpace::SetName(std::u16string
+@@ -47,25 +52,77 @@ void HeliumSpace::SetName(std::u16string
    name_ = name.empty() ? u"Space" : std::move(name);
    ScopedListPrefUpdate update(profile_->GetPrefs(), kHeliumSpacesPref);
    if (base::DictValue* record = FindSpaceRecord(update.Get(), id_)) {
@@ -983,15 +955,6 @@ Index: src/chrome/browser/ui/helium/helium_space.cc
 +
 +bool HeliumSpace::RemovePin(std::string_view id) {
 +  if (!PersistentItemCodec::RemoveNode(pins_, id)) {
-+    return false;
-+  }
-+  PersistPins();
-+  return true;
-+}
-+
-+bool HeliumSpace::MovePinBefore(std::string_view id,
-+                                std::string_view target_id) {
-+  if (!PersistentItemCodec::MoveLinkBefore(pins_, id, target_id)) {
 +    return false;
 +  }
 +  PersistPins();
@@ -1048,7 +1011,7 @@ Index: src/chrome/browser/ui/helium/helium_space.cc
            match = window;
            return false;
          }
-@@ -76,31 +142,27 @@ BrowserWindowInterface* HeliumSpace::Get
+@@ -76,31 +133,27 @@ BrowserWindowInterface* HeliumSpace::Get
  }
  
  BrowserWindowInterface* HeliumSpace::ActivateOrCreatePrimaryWindow() {
@@ -1091,7 +1054,7 @@ Index: src/chrome/browser/ui/helium/helium_space.h
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/helium_space.h
 +++ src/chrome/browser/ui/helium/helium_space.h
-@@ -6,38 +6,57 @@
+@@ -6,38 +6,56 @@
  #define CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_H_
  
  #include <string>
@@ -1132,7 +1095,6 @@ Index: src/chrome/browser/ui/helium/helium_space.h
 +  void AppendPin(PersistentLink pin);
 +  bool UpdatePinHome(std::string_view id, GURL url, std::u16string title);
 +  bool RemovePin(std::string_view id);
-+  bool MovePinBefore(std::string_view id, std::string_view target_id);
 +  bool MovePin(std::string_view id,
 +               std::string_view parent_id,
 +               std::string_view before_id);
@@ -1159,7 +1121,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/helium_space_service.cc
 +++ src/chrome/browser/ui/helium/helium_space_service.cc
-@@ -4,48 +4,389 @@
+@@ -4,48 +4,450 @@
  
  #include "chrome/browser/ui/helium/helium_space_service.h"
  
@@ -1167,6 +1129,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +#include <set>
 +#include <utility>
 +
++#include "base/check.h"
 +#include "base/functional/bind.h"
 +#include "base/strings/strcat.h"
 +#include "base/strings/string_number_conversions.h"
@@ -1417,22 +1380,82 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +
 +}  // namespace
 +
++PersistentItemChange PersistentItemChange::Favorites() {
++  return PersistentItemChange(PersistentItemChangeScope::kFavorites,
++                              std::string(), std::nullopt);
++}
++
++PersistentItemChange PersistentItemChange::Space(std::string space_id) {
++  CHECK(!space_id.empty());
++  return PersistentItemChange(PersistentItemChangeScope::kSpace,
++                              std::move(space_id), std::nullopt);
++}
++
++PersistentItemChange PersistentItemChange::Global() {
++  return PersistentItemChange(PersistentItemChangeScope::kGlobal,
++                              std::string(), std::nullopt);
++}
++
++PersistentItemChange PersistentItemChange::BrowserAssignment(
++    SessionID browser_session_id) {
++  CHECK(browser_session_id.is_valid());
++  return PersistentItemChange(PersistentItemChangeScope::kBrowserAssignment,
++                              std::string(), browser_session_id);
++}
++
++PersistentItemChange::PersistentItemChange(const PersistentItemChange&) =
++    default;
++PersistentItemChange& PersistentItemChange::operator=(
++    const PersistentItemChange&) = default;
++PersistentItemChange::~PersistentItemChange() = default;
++
++bool PersistentItemChange::AffectsPins(
++    std::string_view space_id,
++    SessionID browser_session_id) const {
++  if (browser_session_id_) {
++    return *browser_session_id_ == browser_session_id;
++  }
++  return scope_ == PersistentItemChangeScope::kGlobal ||
++         (scope_ == PersistentItemChangeScope::kSpace &&
++          space_id_ == space_id);
++}
++
++bool PersistentItemChange::AffectsFavorites(
++    SessionID browser_session_id) const {
++  if (browser_session_id_) {
++    return *browser_session_id_ == browser_session_id;
++  }
++  return scope_ == PersistentItemChangeScope::kGlobal ||
++         scope_ == PersistentItemChangeScope::kFavorites;
++}
++
++PersistentItemChange::PersistentItemChange(
++    PersistentItemChangeScope scope,
++    std::string space_id,
++    std::optional<SessionID> browser_session_id)
++    : scope_(scope),
++      space_id_(std::move(space_id)),
++      browser_session_id_(browser_session_id) {}
++
 +struct HeliumSpaceService::LiveAssociation {
 +  LiveAssociation(uint64_t token,
 +                  std::string key,
 +                  PersistentRecordKind kind,
 +                  std::string item_id,
++                  std::string space_id,
 +                  tabs::TabInterface* tab)
 +      : token(token),
 +        key(std::move(key)),
 +        kind(kind),
 +        item_id(std::move(item_id)),
++        space_id(std::move(space_id)),
 +        tab(tab) {}
 +
 +  uint64_t token;
 +  std::string key;
 +  PersistentRecordKind kind;
 +  std::string item_id;
++  std::string space_id;
 +  raw_ptr<tabs::TabInterface> tab;
 +  base::CallbackListSubscription will_detach_subscription;
 +  base::CallbackListSubscription did_insert_subscription;
@@ -1563,7 +1586,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
    }
  }
  
-@@ -56,16 +397,8 @@ void HeliumSpaceService::EnsureDefaultSp
+@@ -56,16 +458,8 @@ void HeliumSpaceService::EnsureDefaultSp
      }
      return;
    }
@@ -1582,7 +1605,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
  }
  
  HeliumSpace* HeliumSpaceService::GetDefaultSpace() {
-@@ -79,9 +412,8 @@ const HeliumSpace* HeliumSpaceService::G
+@@ -79,9 +473,8 @@ const HeliumSpace* HeliumSpaceService::G
  
  HeliumSpace* HeliumSpaceService::GetActiveSpace() {
    EnsureDefaultSpace();
@@ -1594,7 +1617,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      return active;
    }
    return spaces_.front().get();
-@@ -97,55 +429,1869 @@ HeliumSpace* HeliumSpaceService::GetSpac
+@@ -97,55 +490,1935 @@ HeliumSpace* HeliumSpaceService::GetSpac
  }
  
  HeliumSpace* HeliumSpaceService::GetOrCreateSpace(std::string id,
@@ -1605,7 +1628,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      existing->SetName(std::move(name));
 +    existing->SetPins(std::move(pins));
 +    RegisterDormantItems();
-+    NotifyItemsChanged();
++    NotifyItemsChanged(PersistentItemChange::Global());
      return existing;
    }
 -
@@ -1626,7 +1649,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      SetActiveSpace(spaces_.front()->id());
    }
 +  RegisterDormantItems();
-+  NotifyItemsChanged();
++  NotifyItemsChanged(PersistentItemChange::Global());
    return spaces_.back().get();
  }
  
@@ -1701,13 +1724,13 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    }
 +  }
 +  RegisterDormantItems();
-+  NotifyItemsChanged();
++  NotifyItemsChanged(PersistentItemChange::Global());
 +}
 +
  void HeliumSpaceService::SetActiveSpace(std::string_view id) {
    if (GetSpaceById(id)) {
      profile_->GetPrefs()->SetString(kHeliumActiveSpaceIdPref, std::string(id));
-+    NotifyItemsChanged();
++    NotifyItemsChanged(PersistentItemChange::Global());
 +  }
 +}
 +
@@ -1861,7 +1884,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    return ResolveItem(browser, PersistentRecordKind::kFavorite,
 +                       key.substr(kFavoritePrefix.size()))
 +        .has_value();
-   }
++  }
 +  const std::string pin_prefix =
 +      base::StrCat({"p:", GetSpaceIdForBrowser(browser), ":"});
 +  return key.starts_with(pin_prefix) &&
@@ -1914,7 +1937,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  if (const PersistentLink* link =
 +          PersistentItemCodec::FindLink(space->pins(), id)) {
 +    return *link;
-+  }
+   }
 +  return std::nullopt;
 +}
 +
@@ -1978,7 +2001,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +      live_browser->window()->Show();
 +      live_browser->tab_strip_model()->ActivateTabAt(index);
 +      RecordPersistentItemUsage(key);
-+      NotifyItemsChanged();
++      NotifyItemsChanged(ChangeForItem(browser, kind));
 +      return true;
 +    }
 +    // Heal a stale association instead of permanently wedging the durable
@@ -2005,7 +2028,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  CHECK_NE(TabStripModel::kNoTab, index);
 +  browser->tab_strip_model()->ActivateTabAt(index);
 +  RecordPersistentItemUsage(key);
-+  NotifyItemsChanged();
++  NotifyItemsChanged(ChangeForItem(browser, kind));
 +  return true;
 +}
 +
@@ -2091,6 +2114,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    live_association->key = favorite_key;
 +    live_association->kind = PersistentRecordKind::kFavorite;
 +    live_association->item_id = favorite.id;
++    live_association->space_id.clear();
 +    SeedAnchoredHome(live_tab, favorite);
 +    if (SessionService* sessions =
 +            SessionServiceFactory::GetForProfile(profile_)) {
@@ -2107,7 +2131,9 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    persistent_item_drags_.erase(live_tab);
 +  }
 +
-+  NotifyItemsChanged();
++  NotifyItemsChanged(
++      PersistentItemChange::Space(std::string(source_space_id)));
++  NotifyItemsChanged(PersistentItemChange::Favorites());
 +  return true;
 +}
 +
@@ -2128,7 +2154,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    return false;
 +  }
 +  space->SetPins(std::move(pins));
-+  NotifyItemsChanged();
++  NotifyItemsChanged(PersistentItemChange::Space(space->id()));
 +  return true;
 +}
 +
@@ -2163,10 +2189,10 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  if (!AssociateLiveTab(key, kind, link.id, tab)) {
 +    // The durable record remains valid even if the existing tab cannot be
 +    // associated. Its next activation will materialize from the stored URL.
-+    NotifyItemsChanged();
++    NotifyItemsChanged(ChangeForItem(browser, kind));
 +    return true;
 +  }
-+  NotifyItemsChanged();
++  NotifyItemsChanged(ChangeForItem(browser, kind));
 +  return true;
 +}
 +
@@ -2227,9 +2253,18 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  if (!tab || live_token_by_tab_.contains(tab)) {
 +    return false;
 +  }
++  BrowserWindowInterface* window = tab->GetBrowserWindowInterface();
++  Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
++  const std::string space_id =
++      kind == PersistentRecordKind::kPin
++          ? std::string(GetSpaceIdForBrowser(browser))
++          : std::string();
++  if (kind == PersistentRecordKind::kPin && space_id.empty()) {
++    return false;
++  }
 +  const uint64_t token = next_live_token_++;
-+  auto association =
-+      std::make_unique<LiveAssociation>(token, key, kind, std::string(id), tab);
++  auto association = std::make_unique<LiveAssociation>(
++      token, key, kind, std::string(id), space_id, tab);
 +  association->will_detach_subscription = tab->RegisterWillDetach(
 +      base::BindRepeating(&HeliumSpaceService::OnLiveTabWillDetach,
 +                          weak_factory_.GetWeakPtr(), token));
@@ -2254,7 +2289,6 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  CHECK(inserted_tab_token);
 +  if (SessionService* sessions =
 +          SessionServiceFactory::GetForProfile(profile_)) {
-+    BrowserWindowInterface* window = tab->GetBrowserWindowInterface();
 +    if (window) {
 +      sessions->AddTabExtraData(
 +          window->GetSessionID(),
@@ -2262,8 +2296,6 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +          kHeliumPersistentItemTabExtraDataKey, key);
 +    }
 +  }
-+  BrowserWindowInterface* window = tab->GetBrowserWindowInterface();
-+  Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
 +  if (std::optional<PersistentLink> item = ResolveItem(browser, kind, id)) {
 +    SeedAnchoredHome(tab, *item);
 +  }
@@ -2376,9 +2408,12 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  // dormant. Defer subscription destruction until the insertion callback
 +  // unwinds.
 +  lifecycle_.BeginClose(token);
++  const PersistentItemChange change = ChangeForAssociation(*association->second);
 +  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
-+      FROM_HERE, base::BindOnce(&HeliumSpaceService::CompleteLiveTabClose,
-+                                weak_factory_.GetWeakPtr(), token));
++      FROM_HERE,
++      base::BindOnce(
++          &HeliumSpaceService::CompleteLiveTabCloseIfStillInvalid,
++          weak_factory_.GetWeakPtr(), token, change));
 +}
 +
 +void HeliumSpaceService::SetPersistentItemDragInProgress(
@@ -2417,9 +2452,13 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  // WillDeactivate runs before TabInterface flips its active state. Rebuild
 +  // after the observer callback so collapsed folders expose only the item
 +  // that is actually active once the selection transition has completed.
++  const LiveAssociation* association = FindLiveAssociation(tab);
++  PersistentItemChange change =
++      association ? ChangeForAssociation(*association)
++                  : PersistentItemChange::Global();
 +  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
 +      FROM_HERE, base::BindOnce(&HeliumSpaceService::NotifyItemsChanged,
-+                                weak_factory_.GetWeakPtr()));
++                                weak_factory_.GetWeakPtr(), std::move(change)));
 +}
 +
 +void HeliumSpaceService::CancelLiveTabCloseIfStillAssociated(uint64_t token) {
@@ -2428,13 +2467,36 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +      !lifecycle_.CancelClose(token)) {
 +    return;
 +  }
-+  NotifyItemsChanged();
++  NotifyItemsChanged(ChangeForAssociation(*association->second));
 +}
 +
-+void HeliumSpaceService::CompleteLiveTabClose(uint64_t token) {
++void HeliumSpaceService::CompleteLiveTabCloseIfStillInvalid(
++    uint64_t token,
++    PersistentItemChange change) {
++  auto association = live_associations_.find(token);
++  if (association == live_associations_.end()) {
++    return;
++  }
++  tabs::TabInterface* tab = association->second->tab;
++  BrowserWindowInterface* window =
++      tab ? tab->GetBrowserWindowInterface() : nullptr;
++  Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
++  if (tab &&
++      IsItemKeyVisibleInBrowser(browser, association->second->key) &&
++      IsLiveTabInExpectedCollection(association->second->kind, tab)) {
++    if (lifecycle_.CancelClose(token)) {
++      NotifyItemsChanged(ChangeForAssociation(*association->second));
++    }
++    return;
++  }
++  CompleteLiveTabClose(token, std::move(change));
++}
++
++void HeliumSpaceService::CompleteLiveTabClose(uint64_t token,
++                                              PersistentItemChange change) {
 +  lifecycle_.CompleteClose(token);
 +  EraseLiveAssociation(token);
-+  NotifyItemsChanged();
++  NotifyItemsChanged(std::move(change));
 +}
 +
 +bool HeliumSpaceService::IsPersistentItemLive(Browser* browser,
@@ -2500,17 +2562,21 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    if (TabUIHelper* helper = TabUIHelper::From(tab)) {
 +      helper->ClearAnchoredPinnedTabHome();
 +    }
++    const PersistentItemChange change =
++        ChangeForAssociation(*association->second);
 +    lifecycle_.BeginClose(*token);
 +    EraseLiveAssociation(*token);
 +    lifecycle_.CompleteClose(*token);
-+    NotifyItemsChanged();
++    NotifyItemsChanged(change);
 +    return true;
 +  }
 +  if (!model || index == TabStripModel::kNoTab) {
++    const PersistentItemChange change =
++        ChangeForAssociation(*association->second);
 +    lifecycle_.BeginClose(*token);
 +    EraseLiveAssociation(*token);
 +    lifecycle_.CompleteClose(*token);
-+    NotifyItemsChanged();
++    NotifyItemsChanged(change);
 +    return true;
 +  }
 +
@@ -2568,7 +2634,10 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    return false;
 +  }
 +  ResetAnchoredPinnedTab(association->second->tab.get());
-+  NotifyItemsChanged();
++  NotifyItemsChanged(
++      kind == PersistentRecordKind::kFavorite
++          ? PersistentItemChange::Favorites()
++          : PersistentItemChange::Space(std::string(source_space_id)));
 +  return true;
 +}
 +
@@ -2617,19 +2686,10 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    PersistPersistentItemUsage();
 +  }
 +  RegisterDormantItems();
-+  NotifyItemsChanged();
-+  return true;
-+}
-+
-+bool HeliumSpaceService::MovePinBefore(Browser* browser,
-+                                       std::string_view id,
-+                                       std::string_view target_id) {
-+  HeliumSpace* space =
-+      browser ? GetSpaceById(GetSpaceIdForBrowser(browser)) : nullptr;
-+  if (!space || !space->MovePinBefore(id, target_id)) {
-+    return false;
-+  }
-+  NotifyItemsChanged();
++  NotifyItemsChanged(
++      PersistentItemChange::Space(std::string(source_space_id)));
++  NotifyItemsChanged(
++      PersistentItemChange::Space(std::string(target_space_id)));
 +  return true;
 +}
 +
@@ -2646,7 +2706,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +      !space->MovePin(id, parent_id, before_id)) {
 +    return false;
 +  }
-+  NotifyItemsChanged();
++  NotifyItemsChanged(PersistentItemChange::Space(
++      std::string(source_space_id)));
 +  return true;
 +}
 +
@@ -2715,7 +2776,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    space->SetPins(original_pins);
 +    return std::nullopt;
 +  }
-+  NotifyItemsChanged();
++  NotifyItemsChanged(PersistentItemChange::Space(
++      std::string(source_space_id)));
 +  return id;
 +}
 +
@@ -2840,7 +2902,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +          }
 +        }
 +        RegisterDormantItems();
-+        NotifyItemsChanged();
++        NotifyItemsChanged(PersistentItemChange::Space(
++            std::string(source_space_id)));
 +        return true;
 +      }
 +      if (!rollback_model || !rollback_model->Root() ||
@@ -2899,7 +2962,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +      const bool restored = restore_live_pin();
 +      end_transaction();
 +      if (!restored) {
-+        NotifyItemsChanged();
++        NotifyItemsChanged(PersistentItemChange::Space(
++            std::string(source_space_id)));
 +      }
 +      return false;
 +    }
@@ -2932,7 +2996,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +      const bool restored = restore_live_pin();
 +      end_transaction();
 +      if (!restored) {
-+        NotifyItemsChanged();
++        NotifyItemsChanged(PersistentItemChange::Space(
++            std::string(source_space_id)));
 +      }
 +      return false;
 +    }
@@ -2984,7 +3049,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    }
 +  }
 +  RegisterDormantItems();
-+  NotifyItemsChanged();
++  NotifyItemsChanged(PersistentItemChange::Space(
++      std::string(source_space_id)));
 +  return true;
 +}
 +
@@ -3015,7 +3081,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +          kHeliumFavoritesPref, PersistentItemCodec::Encode(local_favorites_));
 +      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
 +          FROM_HERE, base::BindOnce(&HeliumSpaceService::NotifyItemsChanged,
-+                                    weak_factory_.GetWeakPtr()));
++                                    weak_factory_.GetWeakPtr(),
++                                    PersistentItemChange::Favorites()));
 +      return true;
 +    }
 +
@@ -3040,7 +3107,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +                          PersistentItemCodec::Encode(*favorites));
 +    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
 +        FROM_HERE, base::BindOnce(&HeliumSpaceService::NotifyItemsChanged,
-+                                  weak_factory_.GetWeakPtr()));
++                                  weak_factory_.GetWeakPtr(),
++                                  PersistentItemChange::Global()));
 +    return true;
 +  }
 +
@@ -3053,7 +3121,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  // replaced underneath the same mouse event.
 +  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
 +      FROM_HERE, base::BindOnce(&HeliumSpaceService::NotifyItemsChanged,
-+                                weak_factory_.GetWeakPtr()));
++                                weak_factory_.GetWeakPtr(),
++                                PersistentItemChange::Space(space->id())));
 +  return true;
 +}
 +
@@ -3087,7 +3156,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  SeedAnchoredHome(
 +      tab,
 +      PersistentLink{.id = association->item_id, .title = title, .url = url});
-+  NotifyItemsChanged();
++  NotifyItemsChanged(ChangeForItem(browser, association->kind));
 +  return true;
 +}
 +
@@ -3122,11 +3191,12 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  DisassociateLiveTab(live_tab);
 +  lifecycle_.Forget(key);
 +  RegisterDormantItems();
++  PersistentItemChange change = ChangeForItem(browser, kind);
 +  // Defer the view rebuild. Dormant Remove runs from a menu owned by the
 +  // tile being deleted; destroying that view inside ExecuteCommand is unsafe.
 +  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
 +      FROM_HERE, base::BindOnce(&HeliumSpaceService::NotifyItemsChanged,
-+                                weak_factory_.GetWeakPtr()));
++                                weak_factory_.GetWeakPtr(), std::move(change)));
 +  return true;
 +}
 +
@@ -3329,12 +3399,30 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +}
 +
 +base::CallbackListSubscription HeliumSpaceService::RegisterItemsChanged(
-+    base::RepeatingClosure callback) {
++    base::RepeatingCallback<void(const PersistentItemChange&)> callback) {
 +  return items_changed_callbacks_.Add(std::move(callback));
 +}
 +
-+void HeliumSpaceService::NotifyItemsChanged() {
-+  items_changed_callbacks_.Notify();
++PersistentItemChange HeliumSpaceService::ChangeForItem(
++    Browser* browser,
++    PersistentRecordKind kind) const {
++  if (kind == PersistentRecordKind::kFavorite) {
++    return PersistentItemChange::Favorites();
++  }
++  const std::string_view space_id = GetSpaceIdForBrowser(browser);
++  return space_id.empty() ? PersistentItemChange::Global()
++                          : PersistentItemChange::Space(std::string(space_id));
++}
++
++PersistentItemChange HeliumSpaceService::ChangeForAssociation(
++    const LiveAssociation& association) const {
++  return association.kind == PersistentRecordKind::kFavorite
++             ? PersistentItemChange::Favorites()
++             : PersistentItemChange::Space(association.space_id);
++}
++
++void HeliumSpaceService::NotifyItemsChanged(PersistentItemChange change) {
++  items_changed_callbacks_.Notify(change);
 +}
 +
 +void HeliumSpaceService::RegisterDormantItems() {
@@ -3406,7 +3494,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +      !AssociateLiveTab(found->second, kind, id, tab)) {
 +    return false;
 +  }
-+  NotifyItemsChanged();
++  NotifyItemsChanged(ChangeForItem(browser, kind));
 +  return true;
 +}
 +
@@ -3440,7 +3528,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +      !AssociateLiveTab(key, PersistentRecordKind::kFavorite, match->id, tab)) {
 +    return false;
 +  }
-+  NotifyItemsChanged();
++  NotifyItemsChanged(PersistentItemChange::Favorites());
 +  return true;
  }
  
@@ -3459,7 +3547,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      sessions->AddWindowExtraData(browser->session_id(),
                                   kHeliumSpaceIdWindowExtraDataKey, space_id);
    }
-+  NotifyItemsChanged();
++  NotifyItemsChanged(
++      PersistentItemChange::BrowserAssignment(browser->session_id()));
  }
  
  bool HeliumSpaceService::RestoreSpaceForBrowserFromSession(
@@ -3473,7 +3562,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      return false;
    }
    SetSpaceForBrowser(browser, found->second);
-@@ -158,22 +2304,48 @@ void HeliumSpaceService::AddSpaceToSessi
+@@ -158,22 +2431,48 @@ void HeliumSpaceService::AddSpaceToSessi
    if (!extra_data) {
      return;
    }
@@ -3530,7 +3619,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
  std::vector<HeliumSpace*> HeliumSpaceService::GetSpaces() {
    EnsureDefaultSpace();
    std::vector<HeliumSpace*> result;
-@@ -186,33 +2358,74 @@ std::vector<HeliumSpace*> HeliumSpaceSer
+@@ -186,33 +2485,77 @@ std::vector<HeliumSpace*> HeliumSpaceSer
  
  void HeliumSpaceService::OnBrowserCreated(BrowserWindowInterface* window) {
    Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
@@ -3587,7 +3676,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    const TabStripSelectionChange& selection) {
 +  if (change.type() != TabStripModelChange::kRemoved) {
 +    return;
-   }
++  }
 +  const TabStripModelChange::Remove* remove = change.GetRemove();
 +  CHECK(remove);
 +  for (const TabStripModelChange::RemovedTab& removed : remove->contents) {
@@ -3601,6 +3690,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +      continue;
 +    }
 +    const uint64_t token = association->token;
++    const PersistentItemChange item_change =
++        ChangeForAssociation(*association);
 +    // The model removal is the first authoritative close boundary. Clear the
 +    // reverse lookup while the removed TabInterface is still alive; queued
 +    // bookkeeping can then erase the association without dereference.
@@ -3609,21 +3700,22 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    lifecycle_.BeginClose(token);
 +    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
 +        FROM_HERE, base::BindOnce(&HeliumSpaceService::CompleteLiveTabClose,
-+                                  weak_factory_.GetWeakPtr(), token));
-+  }
-+}
-+
++                                  weak_factory_.GetWeakPtr(), token,
++                                  item_change));
+   }
+ }
+ 
 +void HeliumSpaceService::OnTabStripModelDestroyed(
 +    TabStripModel* tab_strip_model) {
 +  observed_tab_strip_models_.erase(tab_strip_model);
- }
- 
++}
++
  }  // namespace helium
 Index: src/chrome/browser/ui/helium/helium_space_service.h
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/helium_space_service.h
 +++ src/chrome/browser/ui/helium/helium_space_service.h
-@@ -5,47 +5,217 @@
+@@ -5,47 +5,255 @@
  #ifndef CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_SERVICE_H_
  #define CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_SERVICE_H_
  
@@ -3689,9 +3781,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +  int use_count = 0;
 +  int64_t last_used_internal_value = 0;
 +};
- 
--// Profile-scoped owner of ordered Helium Spaces. Profile identity stays an
--// implementation detail; Spaces are the user-facing browsing contexts.
++
 +// Import-neutral snapshot accepted by optional adapters. The caller owns
 +// provenance IDs; the Pins service owns durable replacement and migration.
 +struct ImportedPersistentSpace {
@@ -3703,6 +3793,49 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +enum class PinToTabConversionPhaseForTesting {
 +  kAfterUnpin,
 +  kAfterPlacement,
++};
++
++enum class PersistentItemChangeScope {
++  kFavorites,
++  kSpace,
++  kBrowserAssignment,
++  kGlobal,
++};
++
++// Immutable description of a durable sidebar-model change. Space-scoped
++// changes always carry a Space ID. Browser-assignment changes carry the
++// affected window's session ID because reassignment invalidates both the old
++// and new Space views in that window.
++class PersistentItemChange final {
++ public:
++  static PersistentItemChange Favorites();
++  static PersistentItemChange Space(std::string space_id);
++  static PersistentItemChange Global();
++  static PersistentItemChange BrowserAssignment(SessionID browser_session_id);
++
++  PersistentItemChange(const PersistentItemChange&);
++  PersistentItemChange& operator=(const PersistentItemChange&);
++  ~PersistentItemChange();
++
++  PersistentItemChangeScope scope() const { return scope_; }
++  const std::string& space_id() const { return space_id_; }
++  const std::optional<SessionID>& browser_session_id() const {
++    return browser_session_id_;
++  }
++  bool AffectsPins(std::string_view space_id,
++                   SessionID browser_session_id) const;
++  bool AffectsFavorites(SessionID browser_session_id) const;
+ 
+-// Profile-scoped owner of ordered Helium Spaces. Profile identity stays an
+-// implementation detail; Spaces are the user-facing browsing contexts.
++ private:
++  PersistentItemChange(PersistentItemChangeScope scope,
++                       std::string space_id,
++                       std::optional<SessionID> browser_session_id);
++
++  PersistentItemChangeScope scope_;
++  std::string space_id_;
++  std::optional<SessionID> browser_session_id_;
 +};
 +
 +// Profile-scoped owner of the durable sidebar model and every optional live
@@ -3791,9 +3924,6 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +                      std::string_view id,
 +                      std::string_view source_space_id,
 +                      std::string_view target_space_id);
-+  bool MovePinBefore(Browser* browser,
-+                     std::string_view id,
-+                     std::string_view target_id);
 +  // Atomically moves a Pin tree node within an explicitly qualified Space.
 +  // Empty parent and before ids mean the root and end of that parent,
 +  // respectively. PersistentItemCodec validates every non-empty reference,
@@ -3834,7 +3964,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +                             std::string_view folder_id);
 +
 +  base::CallbackListSubscription RegisterItemsChanged(
-+      base::RepeatingClosure callback);
++      base::RepeatingCallback<void(const PersistentItemChange&)> callback);
 +
 +  void AddPersistentItemToSessionExtraData(
 +      const tabs::TabInterface* tab,
@@ -3847,7 +3977,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
    void SetSpaceForBrowser(Browser* browser, std::string_view id);
    bool RestoreSpaceForBrowserFromSession(
        Browser* browser,
-@@ -53,24 +223,102 @@ class HeliumSpaceService : public KeyedS
+@@ -53,24 +261,110 @@ class HeliumSpaceService : public KeyedS
    void AddSpaceToSessionExtraData(
        Browser* browser,
        std::map<std::string, std::string>* extra_data) const;
@@ -3928,8 +4058,15 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +  void OnLiveTabDidInsert(uint64_t token, tabs::TabInterface* tab);
 +  void OnLiveTabActivationChanged(tabs::TabInterface* tab);
 +  void CancelLiveTabCloseIfStillAssociated(uint64_t token);
-+  void CompleteLiveTabClose(uint64_t token);
-+  void NotifyItemsChanged();
++  void CompleteLiveTabCloseIfStillInvalid(uint64_t token,
++                                          PersistentItemChange change);
++  void CompleteLiveTabClose(uint64_t token, PersistentItemChange change);
++  PersistentItemChange ChangeForItem(Browser* browser,
++                                     PersistentRecordKind kind) const;
++  PersistentItemChange ChangeForAssociation(
++      const LiveAssociation& association) const;
++  void NotifyItemsChanged(
++      PersistentItemChange change = PersistentItemChange::Global());
  
    raw_ptr<Profile> profile_;
 +  PersistentNodes local_favorites_;
@@ -3944,7 +4081,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +  base::RepeatingCallback<void(PinToTabConversionPhaseForTesting)>
 +      pin_to_tab_conversion_hook_for_testing_;
 +  std::map<SessionID, std::string> session_space_ids_;
-+  base::RepeatingClosureList items_changed_callbacks_;
++  base::RepeatingCallbackList<void(const PersistentItemChange&)>
++      items_changed_callbacks_;
    base::ScopedObservation<ProfileBrowserCollection, BrowserCollectionObserver>
        browser_collection_observation_{this};
 +  std::set<raw_ptr<TabStripModel>> observed_tab_strip_models_;
@@ -5963,7 +6101,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
-@@ -0,0 +1,2315 @@
+@@ -0,0 +1,2332 @@
 +// Copyright 2025 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -6240,7 +6378,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +    if (space_service_) {
 +      items_changed_subscription_ =
 +          space_service_->RegisterItemsChanged(base::BindRepeating(
-+              &PinTabContainerView::ScheduleReconcilePersistentRows,
++              &PinTabContainerView::OnPersistentItemsChanged,
 +              base::Unretained(this)));
 +      ReconcilePersistentRows();
 +    }
@@ -6587,6 +6725,23 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +  }
 +  collection_node_ = nullptr;
 +  space_service_ = nullptr;
++}
++
++void PinTabContainerView::OnPersistentItemsChanged(
++    const helium::PersistentItemChange& change) {
++  if (!collection_node_ || !space_service_) {
++    return;
++  }
++  auto* controller = collection_node_->GetController();
++  BrowserView* browser_view =
++      controller ? controller->GetBrowserView() : nullptr;
++  Browser* browser = browser_view ? browser_view->browser() : nullptr;
++  if (!browser ||
++      !change.AffectsPins(space_service_->GetSpaceIdForBrowser(browser),
++                          browser->session_id())) {
++    return;
++  }
++  ScheduleReconcilePersistentRows();
 +}
 +
 +void PinTabContainerView::ScheduleReconcilePersistentRows() {
@@ -8283,7 +8438,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,254 @@
 +// Copyright 2025 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -8324,6 +8479,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +namespace helium {
 +struct PersistentNode;
 +enum class PersistentRecordKind;
++class PersistentItemChange;
 +class HeliumSpaceService;
 +}  // namespace helium
 +
@@ -8413,6 +8569,8 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.h
 +  void OnTabDragPresentationEnded() override;
 +
 +  void ResetCollectionNode();
++  void OnPersistentItemsChanged(
++      const helium::PersistentItemChange& change);
 +  void ScheduleReconcilePersistentRows();
 +  void ReconcilePersistentRows();
 +  void AttachCollectionChild(std::unique_ptr<views::View> child,
@@ -10385,7 +10543,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
 +    if (space_service_) {
 +      items_changed_subscription_ =
 +          space_service_->RegisterItemsChanged(base::BindRepeating(
-+              &PinnedTabContainerView::ScheduleReconcileFavorites,
++              &PinnedTabContainerView::OnPersistentItemsChanged,
 +              base::Unretained(this)));
 +      ReconcileFavorites();
 +    }
@@ -10450,7 +10608,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
  }
  
  views::ScrollView* PinnedTabContainerView::GetScrollViewForContainer() const {
-@@ -347,5 +419,235 @@ const TabCollectionNode* PinnedTabContai
+@@ -347,5 +419,248 @@ const TabCollectionNode* PinnedTabContai
    return nullptr;
  }
  
@@ -10486,6 +10644,19 @@ Index: src/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
 +  if (tab && space_service_->GetPersistentItemKind(*tab) ==
 +                 helium::PersistentRecordKind::kFavorite) {
 +    child->SetVisible(false);
++  }
++}
++
++void PinnedTabContainerView::OnPersistentItemsChanged(
++    const helium::PersistentItemChange& change) {
++  if (!collection_node_ || !collection_node_->GetController()) {
++    return;
++  }
++  BrowserView* browser_view =
++      collection_node_->GetController()->GetBrowserView();
++  Browser* browser = browser_view ? browser_view->browser() : nullptr;
++  if (browser && change.AffectsFavorites(browser->session_id())) {
++    ScheduleReconcileFavorites();
 +  }
 +}
 +
@@ -11660,7 +11831,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_persistent_item_model.cc
-@@ -0,0 +1,577 @@
+@@ -0,0 +1,540 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -11878,26 +12049,6 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.cc
 +  return std::nullopt;
 +}
 +
-+std::optional<std::string> FindParentIdForSiblings(
-+    PersistentNodes& nodes,
-+    const PersistentNodes* siblings,
-+    std::string_view current_parent = {}) {
-+  if (&nodes == siblings) {
-+    return std::string(current_parent);
-+  }
-+  for (PersistentNode& node : nodes) {
-+    auto* folder = std::get_if<PersistentFolder>(&node.data);
-+    if (!folder) {
-+      continue;
-+    }
-+    if (auto parent =
-+            FindParentIdForSiblings(folder->children, siblings, folder->id)) {
-+      return parent;
-+    }
-+  }
-+  return std::nullopt;
-+}
-+
 +}  // namespace
 +
 +PersistentItemCloseAction GetPersistentItemCloseAction(bool has_durable_record,
@@ -12054,23 +12205,6 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.cc
 +  destination->insert(destination->begin() + insertion_index,
 +                      std::move(*moved));
 +  return true;
-+}
-+
-+bool PersistentItemCodec::MoveLinkBefore(PersistentNodes& nodes,
-+                                         std::string_view id,
-+                                         std::string_view target_id) {
-+  if (!FindLink(nodes, id) ||
-+      (!target_id.empty() && !FindLink(nodes, target_id))) {
-+    return false;
-+  }
-+  if (target_id.empty()) {
-+    return MoveNode(nodes, id, {}, {});
-+  }
-+  const auto target = FindNodePosition(nodes, target_id);
-+  CHECK(target);
-+  const auto parent_id = FindParentIdForSiblings(nodes, target->siblings);
-+  CHECK(parent_id);
-+  return MoveNode(nodes, id, *parent_id, target_id);
 +}
 +
 +bool PersistentItemLifecycle::AddDormant(std::string id) {
@@ -12242,7 +12376,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_persistent_item_model.h
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,170 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -12361,11 +12495,6 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model.h
 +                       std::string_view id,
 +                       std::string_view parent_id,
 +                       std::string_view before_id);
-+  // Moves a link before another visible item while preserving folder
-+  // ownership. An empty target moves the link to the end of the root list.
-+  static bool MoveLinkBefore(PersistentNodes& nodes,
-+                             std::string_view id,
-+                             std::string_view target_id);
 +};
 +
 +// Pure lifecycle state. Opaque tokens keep durable records independent from
@@ -12422,7 +12551,7 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
-@@ -0,0 +1,343 @@
+@@ -0,0 +1,316 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -12621,33 +12750,6 @@ Index: src/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
 +  ASSERT_TRUE(outer);
 +  EXPECT_EQ(1u, outer->children.size());
 +  EXPECT_TRUE(PersistentItemCodec::FindLink(nodes, "top"));
-+}
-+
-+TEST(PersistentItemCodecTest, MoveLinkPreservesTreeAndSupportsRootEnd) {
-+  PersistentNodes nodes = Tree();
-+  nodes.push_back(Link("last", "https://last.test/"));
-+
-+  ASSERT_TRUE(PersistentItemCodec::MoveLinkBefore(nodes, "last", "nested"));
-+  const PersistentFolder* outer =
-+      PersistentItemCodec::FindFolder(nodes, "outer");
-+  ASSERT_TRUE(outer);
-+  ASSERT_EQ(3u, outer->children.size());
-+  EXPECT_EQ("last", std::get<PersistentLink>(outer->children[0].data).id);
-+  EXPECT_EQ("nested", std::get<PersistentLink>(outer->children[1].data).id);
-+
-+  ASSERT_TRUE(PersistentItemCodec::MoveLinkBefore(nodes, "nested", ""));
-+  ASSERT_EQ(3u, nodes.size());
-+  EXPECT_EQ("nested", std::get<PersistentLink>(nodes.back().data).id);
-+  EXPECT_TRUE(PersistentItemCodec::FindFolder(nodes, "empty"));
-+}
-+
-+TEST(PersistentItemCodecTest, MoveLinkRejectsInvalidOrNoOpTargets) {
-+  PersistentNodes nodes = Tree();
-+  const PersistentNodes original = nodes;
-+  EXPECT_FALSE(PersistentItemCodec::MoveLinkBefore(nodes, "top", "top"));
-+  EXPECT_FALSE(PersistentItemCodec::MoveLinkBefore(nodes, "missing", "top"));
-+  EXPECT_FALSE(PersistentItemCodec::MoveLinkBefore(nodes, "top", "missing"));
-+  EXPECT_EQ(original, nodes);
 +}
 +
 +TEST(PersistentItemCodecTest, MoveNodeSupportsNestedFoldersAndTreePositions) {
@@ -15436,7 +15538,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_space_service_unittest.cc
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,461 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -15445,6 +15547,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +
 +#include <map>
 +#include <memory>
++#include <vector>
 +
 +#include "base/memory/raw_ptr.h"
 +#include "base/run_loop.h"
@@ -15466,6 +15569,31 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +
 +namespace helium {
 +namespace {
++
++TEST(PersistentItemChangeTest, RoutesOnlyToAffectedSidebarModels) {
++  const SessionID first_browser = SessionID::NewUnique();
++  const SessionID second_browser = SessionID::NewUnique();
++
++  const PersistentItemChange favorites = PersistentItemChange::Favorites();
++  EXPECT_TRUE(favorites.AffectsFavorites(first_browser));
++  EXPECT_FALSE(favorites.AffectsPins("space-a", first_browser));
++
++  const PersistentItemChange space = PersistentItemChange::Space("space-a");
++  EXPECT_TRUE(space.AffectsPins("space-a", first_browser));
++  EXPECT_FALSE(space.AffectsPins("space-b", first_browser));
++  EXPECT_FALSE(space.AffectsFavorites(first_browser));
++
++  const PersistentItemChange global = PersistentItemChange::Global();
++  EXPECT_TRUE(global.AffectsPins("space-a", first_browser));
++  EXPECT_TRUE(global.AffectsFavorites(first_browser));
++
++  const PersistentItemChange assignment =
++      PersistentItemChange::BrowserAssignment(first_browser);
++  EXPECT_TRUE(assignment.AffectsPins("space-a", first_browser));
++  EXPECT_TRUE(assignment.AffectsFavorites(first_browser));
++  EXPECT_FALSE(assignment.AffectsPins("space-a", second_browser));
++  EXPECT_FALSE(assignment.AffectsFavorites(second_browser));
++}
 +
 +class PersistentActivationObserver : public TabStripModelObserver {
 + public:
@@ -15618,6 +15746,39 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +  EXPECT_EQ(live_pin, browser()->tab_strip_model()->GetActiveTab());
 +}
 +
++TEST_F(HeliumSpaceServiceTest, EmitsScopedPersistentItemChanges) {
++  tabs::TabInterface* favorite_tab =
++      AddOrdinaryTab("https://favorite-change.test/");
++  ASSERT_TRUE(favorite_tab);
++  std::vector<PersistentItemChange> changes;
++  base::CallbackListSubscription subscription =
++      service_->RegisterItemsChanged(base::BindLambdaForTesting(
++          [&changes](const PersistentItemChange& change) {
++            changes.push_back(change);
++          }));
++
++  ASSERT_TRUE(service_->AddFavoriteFromTab(favorite_tab));
++  ASSERT_FALSE(changes.empty());
++  EXPECT_EQ(PersistentItemChangeScope::kFavorites, changes.back().scope());
++
++  tabs::TabInterface* pin_tab = AddOrdinaryTab("https://pin-change.test/");
++  ASSERT_TRUE(pin_tab);
++  changes.clear();
++  ASSERT_TRUE(service_->ConvertTabToPinInSpace(
++      browser(), space_->id(), pin_tab, /*parent_id=*/{}, /*before_id=*/{}));
++  ASSERT_FALSE(changes.empty());
++  EXPECT_EQ(PersistentItemChangeScope::kSpace, changes.back().scope());
++  EXPECT_EQ(space_->id(), changes.back().space_id());
++
++  changes.clear();
++  service_->SetSpaceForBrowser(browser(), space_->id());
++  ASSERT_FALSE(changes.empty());
++  EXPECT_EQ(PersistentItemChangeScope::kBrowserAssignment,
++            changes.back().scope());
++  ASSERT_TRUE(changes.back().browser_session_id());
++  EXPECT_EQ(browser()->session_id(), *changes.back().browser_session_id());
++}
++
 +TEST_F(HeliumSpaceServiceTest,
 +       UnassignedBrowserDoesNotSerializeEffectiveSpaceFallback) {
 +  HeliumSpace* other_space =
@@ -15696,6 +15857,72 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +  EXPECT_EQ(id, service_->GetPersistentItemId(rematerialized));
 +  EXPECT_TRUE(service_->IsPersistentItemLive(
 +      browser(), PersistentRecordKind::kPin, id));
++}
++
++TEST_F(HeliumSpaceServiceTest,
++       LivePinReturningBeforeDeferredCloseRemainsAssociated) {
++  auto [id, pin_tab] = AddLivePin();
++  ASSERT_TRUE(pin_tab);
++  TabStripModel* model = browser()->tab_strip_model();
++  auto* strip = static_cast<tabs::TabStripCollection*>(
++      const_cast<tabs::TabCollection*>(model->Root()));
++  ASSERT_TRUE(strip->IsPinTab(pin_tab));
++
++  model->MoveTabFromPin(pin_tab);
++  ASSERT_FALSE(strip->IsPinTab(pin_tab));
++  model->MoveTabToPin(pin_tab);
++  ASSERT_TRUE(strip->IsPinTab(pin_tab));
++
++  base::RunLoop().RunUntilIdle();
++
++  EXPECT_EQ(pin_tab, service_->GetLiveTabForPersistentItem(
++                         browser(), PersistentRecordKind::kPin, id));
++  EXPECT_TRUE(service_->IsPersistentItemLive(
++      browser(), PersistentRecordKind::kPin, id));
++  EXPECT_EQ(id, service_->GetPersistentItemId(pin_tab));
++}
++
++TEST_F(HeliumSpaceServiceTest,
++       LivePinActivationChangeUsesAssociationSpace) {
++  auto [id, pin_tab] = AddLivePin();
++  ASSERT_TRUE(pin_tab);
++  HeliumSpace* other_space =
++      service_->GetOrCreateSpace("other-space", u"Other Space");
++  ASSERT_TRUE(other_space);
++  std::unique_ptr<Browser> other_browser =
++      CreateBrowser(profile(), Browser::TYPE_NORMAL, /*hosted_app=*/false);
++  ASSERT_TRUE(other_browser);
++  service_->SetSpaceForBrowser(other_browser.get(), other_space->id());
++  AddTab(other_browser.get(), GURL("https://other-space.test/"));
++
++  std::vector<PersistentItemChange> changes;
++  base::CallbackListSubscription subscription =
++      service_->RegisterItemsChanged(base::BindLambdaForTesting(
++          [&changes](const PersistentItemChange& change) {
++            changes.push_back(change);
++          }));
++
++  TabStripModel* source_model = browser()->tab_strip_model();
++  const int source_index = source_model->GetIndexOfTab(pin_tab);
++  ASSERT_NE(TabStripModel::kNoTab, source_index);
++  std::unique_ptr<tabs::TabModel> detached_pin =
++      source_model->DetachTabAtForInsertion(source_index);
++  TabStripModel* target_model = other_browser->tab_strip_model();
++  const int target_index = target_model->InsertDetachedTabAt(
++      target_model->count(), std::move(detached_pin), AddTabTypes::ADD_NONE);
++  target_model->ActivateTabAt(target_index);
++
++  base::RunLoop().RunUntilIdle();
++
++  bool saw_association_space = false;
++  for (const PersistentItemChange& change : changes) {
++    if (change.scope() != PersistentItemChangeScope::kSpace) {
++      continue;
++    }
++    saw_association_space |= change.space_id() == space_->id();
++    EXPECT_NE(other_space->id(), change.space_id());
++  }
++  EXPECT_TRUE(saw_association_space);
 +}
 +
 +TEST_F(HeliumSpaceServiceTest, LivePinInvalidatedAfterUnpinRestoresAtomically) {
