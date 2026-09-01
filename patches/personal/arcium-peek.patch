@@ -15,20 +15,23 @@ Index: src/chrome/app/generated_resources.grd
 ===================================================================
 --- src.orig/chrome/app/generated_resources.grd
 +++ src/chrome/app/generated_resources.grd
-@@ -632,6 +632,12 @@ are declared in tools/grit/grit_args.gni
+@@ -632,6 +632,15 @@ are declared in tools/grit/grit_args.gni
          <message name="IDS_CONTENT_CONTEXT_SAVE_TO_MEMORY_BANKS" desc="The name of the Save to Memory Banks command in the context menu">
            Save to Memory
          </message>
 +        <message name="IDS_HELIUM_PEEK_CLOSE" desc="The label of the button that closes an attached Peek preview">
 +          Close
 +        </message>
-+        <message name="IDS_HELIUM_PEEK_OPEN_IN_TAB" desc="The label of the button that promotes an attached Peek preview to a browser tab">
-+          Open in tab
++        <message name="IDS_HELIUM_PEEK_OPEN_IN_TAB" desc="Tooltip for the button that promotes an attached Peek preview to the active browser tab">
++          Open in tab (Command-O)
++        </message>
++        <message name="IDS_HELIUM_PEEK_OPEN_IN_SIDEBAR" desc="Tooltip for the button that moves an attached Peek preview into the tab sidebar without switching tabs">
++          Open in sidebar
 +        </message>
          <message name="IDS_CONTENT_CONTEXT_ACCESSIBILITY_LABELS_DIALOG_TITLE" desc="The title of a dialog that asks whether to integrate the accessibility image labeling service of Google to Chrome.">
            Get image descriptions from Google?
          </message>
-@@ -717,6 +723,9 @@ are declared in tools/grit/grit_args.gni
+@@ -717,6 +726,9 @@ are declared in tools/grit/grit_args.gni
            <message name="IDS_CONTENT_CONTEXT_OPENLINKNEWTAB" desc="The name of the Open Link in New Tab command in the content area context menu">
              Open link in new &amp;tab
            </message>
@@ -38,7 +41,7 @@ Index: src/chrome/app/generated_resources.grd
            <message name="IDS_CONTENT_CONTEXT_OPENLINKNEWWINDOW" desc="The name of the Open Link in New Window command in the content area context menu">
              Open link in new &amp;window
            </message>
-@@ -1064,6 +1073,9 @@ are declared in tools/grit/grit_args.gni
+@@ -1064,6 +1076,9 @@ are declared in tools/grit/grit_args.gni
            <message name="IDS_CONTENT_CONTEXT_OPENLINKNEWTAB" desc="In Title Case: The name of the Open Link in New Tab command in the content area context menu">
              Open Link in New &amp;Tab
            </message>
@@ -317,7 +320,7 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/helium/peek_controller.cc
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,299 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -340,46 +343,66 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.cc
 +#include "content/public/browser/web_contents.h"
 +#include "third_party/skia/include/core/SkColor.h"
 +#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/models/image_model.h"
 +#include "ui/base/page_transition_types.h"
 +#include "ui/color/color_id.h"
 +#include "ui/compositor/layer.h"
 +#include "ui/events/event.h"
 +#include "ui/gfx/geometry/insets.h"
 +#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/rounded_corners_f.h"
 +#include "ui/gfx/geometry/size.h"
 +#include "ui/views/background.h"
-+#include "ui/views/border.h"
-+#include "ui/views/controls/button/label_button.h"
++#include "ui/views/controls/button/image_button.h"
++#include "ui/views/controls/button/image_button_factory.h"
++#include "ui/views/controls/highlight_path_generator.h"
 +#include "ui/views/controls/webview/webview.h"
 +#include "ui/views/view.h"
++#include "ui/views/vector_icons.h"
 +
 +namespace helium {
 +namespace {
 +
-+constexpr int kCardMargin = 32;
-+constexpr int kCardMaximumWidth = 1100;
-+constexpr int kCardMaximumHeight = 760;
-+constexpr int kHeaderHeight = 48;
-+constexpr int kCardCornerRadius = 14;
++constexpr int kOverlayInset = 20;
++constexpr int kCardMaximumWidth = 1240;
++constexpr int kCardMaximumHeight = 840;
++constexpr int kCardCornerRadius = 16;
++constexpr int kControlSize = 40;
++constexpr int kControlIconSize = 20;
++constexpr int kControlGap = 10;
++constexpr int kControlRailGap = 14;
++
++std::unique_ptr<views::ImageButton> CreatePeekActionButton(
++    views::Button::PressedCallback callback,
++    const gfx::VectorIcon& icon,
++    const std::u16string& accessible_name) {
++  auto button = std::make_unique<views::ImageButton>(std::move(callback));
++  views::ConfigureVectorImageButton(button.get());
++  views::InstallCircleHighlightPathGenerator(button.get());
++  button->SetPreferredSize(gfx::Size(kControlSize, kControlSize));
++  button->SetImageModel(
++      views::Button::STATE_NORMAL,
++      ui::ImageModel::FromVectorIcon(icon, ui::kColorSysOnSurface,
++                                     kControlIconSize));
++  button->SetBackground(views::CreateRoundedRectBackground(
++      ui::kColorSysSurface, kControlSize / 2));
++  button->SetTooltipText(accessible_name);
++  button->GetViewAccessibility().SetName(accessible_name);
++  button->SetFocusBehavior(views::View::FocusBehavior::ALWAYS);
++  return button;
++}
 +
 +class PeekCardView : public views::View {
 + public:
-+  PeekCardView(Profile* profile,
-+               base::RepeatingClosure close_callback,
-+               base::RepeatingClosure open_in_tab_callback) {
++  explicit PeekCardView(Profile* profile) {
 +    SetPaintToLayer();
 +    layer()->SetFillsBoundsOpaquely(false);
++    layer()->SetRoundedCornerRadius(
++        gfx::RoundedCornersF(kCardCornerRadius));
++    layer()->SetIsFastRoundedCorner(true);
++    layer()->SetMasksToBounds(true);
 +    SetBackground(views::CreateRoundedRectBackground(
-+        ui::kColorDialogBackground, kCardCornerRadius));
-+    SetBorder(views::CreateRoundedRectBorder(
-+        1, kCardCornerRadius, ui::kColorSeparator));
-+
-+    close_button_ = AddChildView(std::make_unique<views::LabelButton>(
-+        std::move(close_callback),
-+        l10n_util::GetStringUTF16(IDS_HELIUM_PEEK_CLOSE)));
-+    open_in_tab_button_ = AddChildView(std::make_unique<views::LabelButton>(
-+        std::move(open_in_tab_callback),
-+        l10n_util::GetStringUTF16(IDS_HELIUM_PEEK_OPEN_IN_TAB)));
++        ui::kColorSysSurface, kCardCornerRadius));
 +    web_view_ = AddChildView(std::make_unique<views::WebView>(profile));
 +  }
 +
@@ -389,21 +412,9 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.cc
 +  bool OnMousePressed(const ui::MouseEvent&) override { return true; }
 +
 +  void Layout(PassKey) override {
-+    const gfx::Rect bounds = GetContentsBounds();
-+    const int button_height = 32;
-+    const int close_width = close_button_->GetPreferredSize().width();
-+    const int open_width = open_in_tab_button_->GetPreferredSize().width();
-+    close_button_->SetBounds(12, (kHeaderHeight - button_height) / 2,
-+                             close_width, button_height);
-+    open_in_tab_button_->SetBounds(
-+        std::max(12, bounds.width() - open_width - 12),
-+        (kHeaderHeight - button_height) / 2, open_width, button_height);
-+    web_view_->SetBounds(1, kHeaderHeight, std::max(0, bounds.width() - 2),
-+                         std::max(0, bounds.height() - kHeaderHeight - 1));
++    web_view_->SetBoundsRect(GetContentsBounds());
 +  }
 +
-+  raw_ptr<views::LabelButton> close_button_ = nullptr;
-+  raw_ptr<views::LabelButton> open_in_tab_button_ = nullptr;
 +  raw_ptr<views::WebView> web_view_ = nullptr;
 +};
 +
@@ -411,33 +422,59 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.cc
 + public:
 +  PeekOverlayView(Profile* profile,
 +                  base::RepeatingClosure close_callback,
-+                  base::RepeatingClosure open_in_tab_callback)
++                  base::RepeatingClosure open_in_tab_callback,
++                  base::RepeatingClosure open_in_sidebar_callback)
 +      : close_callback_(close_callback) {
 +    SetPaintToLayer();
 +    layer()->SetFillsBoundsOpaquely(false);
-+    SetBackground(views::CreateSolidBackground(SkColorSetARGB(128, 0, 0, 0)));
-+    auto card = std::make_unique<PeekCardView>(
-+        profile, std::move(close_callback),
-+        std::move(open_in_tab_callback));
++    auto card = std::make_unique<PeekCardView>(profile);
 +    card_ = card.get();
 +    AddChildView(std::unique_ptr<views::View>(std::move(card)));
++
++    close_button_ = AddChildView(CreatePeekActionButton(
++        std::move(close_callback), views::kCloseIcon,
++        l10n_util::GetStringUTF16(IDS_HELIUM_PEEK_CLOSE)));
++    open_in_tab_button_ = AddChildView(CreatePeekActionButton(
++        std::move(open_in_tab_callback), views::kOpenInNewIcon,
++        l10n_util::GetStringUTF16(IDS_HELIUM_PEEK_OPEN_IN_TAB)));
++    open_in_sidebar_button_ = AddChildView(CreatePeekActionButton(
++        std::move(open_in_sidebar_callback), views::kTabIcon,
++        l10n_util::GetStringUTF16(IDS_HELIUM_PEEK_OPEN_IN_SIDEBAR)));
 +  }
 +
 +  views::WebView* web_view() const { return card_->web_view(); }
 +
 + private:
++  void OnThemeChanged() override {
++    views::View::OnThemeChanged();
++    const SkColor tint =
++        GetColorProvider()->GetColor(ui::kColorSysSurfaceVariant);
++    SetBackground(
++        views::CreateSolidBackground(SkColorSetA(tint, 184)));
++  }
++
 +  void Layout(PassKey) override {
-+    gfx::Rect card_bounds = GetContentsBounds();
-+    card_bounds.Inset(gfx::Insets(kCardMargin));
-+    if (card_bounds.width() > kCardMaximumWidth) {
-+      card_bounds.ClampToCenteredSize(
-+          gfx::Size(kCardMaximumWidth, card_bounds.height()));
-+    }
-+    if (card_bounds.height() > kCardMaximumHeight) {
-+      card_bounds.ClampToCenteredSize(
-+          gfx::Size(card_bounds.width(), kCardMaximumHeight));
-+    }
++    gfx::Rect available = GetContentsBounds();
++    available.Inset(gfx::Insets(kOverlayInset));
++    const int card_width = std::min(
++        kCardMaximumWidth,
++        std::max(0, available.width() - kControlRailGap - kControlSize));
++    const int card_height = std::min(kCardMaximumHeight, available.height());
++    const int group_width = card_width + kControlRailGap + kControlSize;
++    const int group_x = available.x() + (available.width() - group_width) / 2;
++    const int group_y = available.y() + (available.height() - card_height) / 2;
++    gfx::Rect card_bounds(group_x, group_y, card_width, card_height);
 +    card_->SetBoundsRect(card_bounds);
++
++    const int controls_x = card_bounds.right() + kControlRailGap;
++    close_button_->SetBounds(controls_x, card_bounds.y(), kControlSize,
++                             kControlSize);
++    open_in_tab_button_->SetBounds(
++        controls_x, close_button_->bounds().bottom() + kControlGap,
++        kControlSize, kControlSize);
++    open_in_sidebar_button_->SetBounds(
++        controls_x, open_in_tab_button_->bounds().bottom() + kControlGap,
++        kControlSize, kControlSize);
 +  }
 +
 +  bool OnMousePressed(const ui::MouseEvent&) override {
@@ -446,6 +483,9 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.cc
 +  }
 +
 +  raw_ptr<PeekCardView> card_ = nullptr;
++  raw_ptr<views::ImageButton> close_button_ = nullptr;
++  raw_ptr<views::ImageButton> open_in_tab_button_ = nullptr;
++  raw_ptr<views::ImageButton> open_in_sidebar_button_ = nullptr;
 +  base::RepeatingClosure close_callback_;
 +};
 +
@@ -499,6 +539,8 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.cc
 +      browser_view_->browser()->profile(),
 +      base::BindRepeating(&PeekController::Close, base::Unretained(this)),
 +      base::BindRepeating(&PeekController::OpenInTab,
++                          base::Unretained(this)),
++      base::BindRepeating(&PeekController::OpenInSidebar,
 +                          base::Unretained(this)));
 +  PeekOverlayView* const overlay_ptr = overlay.get();
 +  views::WebView* const web_view = overlay_ptr->web_view();
@@ -524,45 +566,57 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.cc
 +}
 +
 +void PeekController::Close() {
++  base::WeakPtr<content::WebContents> source_contents = source_contents_;
++  DetachPreview().reset();
++  if (source_contents) {
++    source_contents->RestoreFocus();
++  }
++}
++
++std::unique_ptr<content::WebContents> PeekController::DetachPreview() {
 +  scoped_ignore_input_events_.reset();
 +  if (web_view_) {
 +    web_view_->SetWebContents(nullptr);
 +  }
 +  web_view_ = nullptr;
-+  web_contents_.reset();
++  std::unique_ptr<content::WebContents> web_contents =
++      std::move(web_contents_);
 +  if (contents_container_ && overlay_view_) {
 +    contents_container_->peek_overlay_view()->RemoveChildViewT(overlay_view_);
 +    contents_container_->peek_overlay_view()->SetVisible(false);
 +  }
 +  overlay_view_ = nullptr;
 +  contents_container_ = nullptr;
-+  if (source_contents_) {
-+    source_contents_->RestoreFocus();
-+  }
 +  source_contents_.reset();
++  return web_contents;
 +}
 +
 +void PeekController::OpenInTab() {
 +  if (!web_contents_ || !browser_view_) {
 +    return;
 +  }
-+  scoped_ignore_input_events_.reset();
-+  if (web_view_) {
-+    web_view_->SetWebContents(nullptr);
-+  }
-+  web_view_ = nullptr;
-+  if (contents_container_ && overlay_view_) {
-+    contents_container_->peek_overlay_view()->RemoveChildViewT(overlay_view_);
-+    contents_container_->peek_overlay_view()->SetVisible(false);
-+  }
-+  overlay_view_ = nullptr;
-+  contents_container_ = nullptr;
-+  source_contents_.reset();
 +
 +  Browser* const browser = browser_view_->browser();
++  std::unique_ptr<content::WebContents> web_contents = DetachPreview();
 +  browser->tab_strip_model()->AddWebContents(
-+      std::move(web_contents_), browser->tab_strip_model()->active_index() + 1,
++      std::move(web_contents), browser->tab_strip_model()->active_index() + 1,
 +      ui::PAGE_TRANSITION_LINK, AddTabTypes::ADD_ACTIVE);
++}
++
++void PeekController::OpenInSidebar() {
++  if (!web_contents_ || !browser_view_) {
++    return;
++  }
++
++  base::WeakPtr<content::WebContents> source_contents = source_contents_;
++  Browser* const browser = browser_view_->browser();
++  std::unique_ptr<content::WebContents> web_contents = DetachPreview();
++  browser->tab_strip_model()->AddWebContents(
++      std::move(web_contents), browser->tab_strip_model()->active_index() + 1,
++      ui::PAGE_TRANSITION_LINK, AddTabTypes::ADD_NONE);
++  if (source_contents) {
++    source_contents->RestoreFocus();
++  }
 +}
 +
 +}  // namespace helium
@@ -570,7 +624,7 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/helium/peek_controller.h
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,69 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -616,6 +670,7 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.h
 +  bool Show(const GURL& url, content::WebContents* source_contents);
 +  void Close();
 +  void OpenInTab();
++  void OpenInSidebar();
 +
 +  bool is_showing() const { return web_contents_ != nullptr; }
 +  content::WebContents* web_contents_for_testing() const {
@@ -624,6 +679,8 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.h
 +  views::View* overlay_view_for_testing() const { return overlay_view_; }
 +
 + private:
++  std::unique_ptr<content::WebContents> DetachPreview();
++
 +  raw_ptr<BrowserView> browser_view_;
 +  raw_ptr<ContentsContainerView> contents_container_ = nullptr;
 +  raw_ptr<views::View> overlay_view_ = nullptr;
@@ -641,14 +698,16 @@ Index: src/chrome/browser/ui/views/helium/peek_controller_browsertest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/helium/peek_controller_browsertest.cc
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,76 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "chrome/browser/ui/views/helium/peek_controller.h"
 +
++#include "chrome/app/chrome_command_ids.h"
 +#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_commands.h"
 +#include "chrome/browser/ui/tabs/tab_strip_model.h"
 +#include "chrome/browser/ui/views/frame/browser_view.h"
 +#include "chrome/test/base/in_process_browser_test.h"
@@ -662,7 +721,7 @@ Index: src/chrome/browser/ui/views/helium/peek_controller_browsertest.cc
 +class PeekControllerBrowserTest : public InProcessBrowserTest {};
 +
 +IN_PROC_BROWSER_TEST_F(PeekControllerBrowserTest,
-+                       ShowCloseAndPromoteLiveContents) {
++                       CloseAndTransferLiveContents) {
 +  ASSERT_TRUE(embedded_test_server()->Start());
 +  const GURL url = embedded_test_server()->GetURL("/empty.html");
 +  BrowserView* const browser_view =
@@ -691,11 +750,26 @@ Index: src/chrome/browser/ui/views/helium/peek_controller_browsertest.cc
 +      controller->web_contents_for_testing();
 +  ASSERT_TRUE(content::WaitForLoadStop(preview_contents));
 +  const int old_count = browser()->tab_strip_model()->count();
-+  controller->OpenInTab();
++  const int source_index = browser()->tab_strip_model()->active_index();
++  controller->OpenInSidebar();
 +
 +  EXPECT_FALSE(controller->is_showing());
 +  EXPECT_EQ(old_count + 1, browser()->tab_strip_model()->count());
++  EXPECT_EQ(source,
++            browser()->tab_strip_model()->GetActiveWebContents());
 +  EXPECT_EQ(preview_contents,
++            browser()->tab_strip_model()->GetWebContentsAt(source_index + 1));
++  EXPECT_FALSE(source->ShouldIgnoreInputEventsForTesting());
++
++  ASSERT_TRUE(controller->Show(url, source));
++  content::WebContents* const command_preview_contents =
++      controller->web_contents_for_testing();
++  ASSERT_TRUE(content::WaitForLoadStop(command_preview_contents));
++  EXPECT_TRUE(chrome::ExecuteCommand(browser(), IDC_OPEN_FILE));
++
++  EXPECT_FALSE(controller->is_showing());
++  EXPECT_EQ(old_count + 2, browser()->tab_strip_model()->count());
++  EXPECT_EQ(command_preview_contents,
 +            browser()->tab_strip_model()->GetActiveWebContents());
 +  EXPECT_FALSE(source->ShouldIgnoreInputEventsForTesting());
 +}
@@ -733,3 +807,29 @@ Index: src/tools/metrics/histograms/metadata/ui/enums.xml
  </enum>
  
  <!-- LINT.ThenChange(//chrome/browser/renderer_context_menu/render_view_context_menu.cc:RenderViewContextMenuItem) -->
+Index: src/chrome/browser/ui/browser_command_controller.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_command_controller.cc
++++ src/chrome/browser/ui/browser_command_controller.cc
+@@ -96,6 +96,7 @@
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/download/bubble/download_toolbar_ui_controller.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/helium/peek_controller.h"
+ #include "chrome/browser/ui/views/side_panel/tabs_from_other_devices/tabs_from_other_devices_side_panel_coordinator.h"
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/browser/ui/web_applications/web_app_dialog_utils.h"
+@@ -1123,6 +1124,13 @@ void BrowserCommandController::HandleCom
+ 
+     // Show various bits of UI
+     case IDC_OPEN_FILE:
++      if (BrowserView* browser_view =
++              BrowserView::GetBrowserViewForBrowser(browser_);
++          browser_view && browser_view->peek_controller() &&
++          browser_view->peek_controller()->is_showing()) {
++        browser_view->peek_controller()->OpenInTab();
++        break;
++      }
+       browser_->GetFeatures()
+           .browser_select_file_dialog_controller()
+           ->OpenFile();
