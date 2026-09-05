@@ -2,7 +2,7 @@ Index: src/chrome/browser/ui/BUILD.gn
 ===================================================================
 --- src.orig/chrome/browser/ui/BUILD.gn
 +++ src/chrome/browser/ui/BUILD.gn
-@@ -3578,6 +3578,7 @@
+@@ -3578,6 +3578,7 @@ static_library("ui") {
        "views/frame/immersive_mode_controller_mac.mm",
        "views/frame/immersive_mode_overlay_views_mac.h",
        "views/frame/immersive_mode_overlay_views_mac.mm",
@@ -22,9 +22,30 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  #include "chrome/browser/ui/web_applications/web_app_dialog_utils.h"
  #include "chrome/browser/ui/web_applications/web_app_launch_utils.h"
  #include "chrome/browser/ui/web_applications/web_app_tabbed_utils.h"
-@@ -4235,14 +4236,13 @@
+@@ -769,6 +770,10 @@ tabs::TabModel* TabStripModel::GetActive
  
- void TabStripModel::SelectMRUTab(TabRelativeDirection direction,
+ void TabStripModel::OnChange(const TabStripModelChange& change,
+                              const TabStripSelectionChange& selection) {
++  if (change.type() != TabStripModelChange::kSelectionOnly ||
++      selection.active_tab_changed()) {
++    StopMRUCycling();
++  }
+   CompleteModelUpdateTransaction();
+   OnActiveTabChanged(selection);
+ 
+@@ -4227,51 +4232,103 @@ void TabStripModel::SelectRelativeTabCyc
+       profile_->GetPrefs()->GetBoolean(prefs::kTabCyclingMRU);
+ 
+   if (enable_mru) {
+-    SelectMRUTab(direction, detail);
++    SelectMRUTab(direction, detail, false);
+   } else {
+     SelectRelativeTab(direction, detail);
+   }
+ }
+ 
+-void TabStripModel::SelectMRUTab(TabRelativeDirection direction,
++void TabStripModel::PreviewMRUTab(TabRelativeDirection direction,
                                   TabStripUserGestureDetails detail) {
 -  if (mru_cycle_list_.empty()) {
 -    BrowserWindowInterface* browser =
@@ -33,35 +54,78 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
 -    if (!browser) {
 -      return;
 -    }
++  SelectMRUTab(direction, detail, true);
++}
+ 
++void TabStripModel::SelectMRUTab(TabRelativeDirection direction,
++                                 TabStripUserGestureDetails detail,
++                                 bool preview_only) {
++  if (!preview_only) {
++    StopMRUCycling();
++  }
 +  if (count() < 2) {
 +    return;
 +  }
- 
-+  std::vector<content::WebContents*> starting_tabs;
++
 +  const bool starting_cycle = mru_cycle_list_.empty();
-+  if (mru_cycle_list_.empty()) {
++  if (starting_cycle) {
      for (int i = 0; i < count(); ++i) {
-       mru_cycle_list_.push_back(i);
+-      mru_cycle_list_.push_back(i);
++      mru_cycle_list_.push_back(GetTabAtIndex(i)->GetHandle());
      }
-@@ -4253,9 +4253,9 @@
-                        GetWebContentsAt(b)->GetLastActiveTimeTicks();
-               });
  
+-    std::sort(mru_cycle_list_.begin(), mru_cycle_list_.end(),
+-              [this](int a, int b) {
+-                return GetWebContentsAt(a)->GetLastActiveTimeTicks() >
+-                       GetWebContentsAt(b)->GetLastActiveTimeTicks();
+-              });
+-
 -    if (BrowserView* browser_view =
 -            BrowserView::GetBrowserViewForBrowser(browser)) {
 -      browser_view->StartTabCycling();
-+    starting_tabs.reserve(mru_cycle_list_.size());
-+    for (int index : mru_cycle_list_) {
-+      starting_tabs.push_back(GetWebContentsAt(index));
-     }
+-    }
++    const auto active = GetActiveTab()->GetHandle();
++    std::stable_sort(
++        mru_cycle_list_.begin(), mru_cycle_list_.end(),
++        [active](tabs::TabHandle a, tabs::TabHandle b) {
++          if (a == active || b == active) {
++            return a == active && b != active;
++          }
++          return a.Get()->GetContents()->GetLastActiveTimeTicks() >
++                 b.Get()->GetContents()->GetLastActiveTimeTicks();
++        });
++    mru_cycle_index_ = 0;
    }
  
-@@ -4268,6 +4268,21 @@
-   }
- 
-   ActivateTabAt(mru_cycle_list_[0], detail);
+   if (direction == TabRelativeDirection::kNext) {
+-    std::rotate(mru_cycle_list_.begin(), mru_cycle_list_.begin() + 1,
+-                mru_cycle_list_.end());
++    mru_cycle_index_ = (mru_cycle_index_ + 1) % mru_cycle_list_.size();
+   } else {
+-    std::rotate(mru_cycle_list_.rbegin(), mru_cycle_list_.rbegin() + 1,
+-                mru_cycle_list_.rend());
++    mru_cycle_index_ =
++        (mru_cycle_index_ + mru_cycle_list_.size() - 1) % mru_cycle_list_.size();
++  }
++  mru_cycle_gesture_ = detail;
 +
-+  content::WebContents* selected = GetWebContentsAt(mru_cycle_list_[0]);
++  if (!preview_only) {
++    CommitMRUCycling();
++    return;
+   }
+ 
+-  ActivateTabAt(mru_cycle_list_[0], detail);
++  std::vector<content::WebContents*> preview_tabs;
++  preview_tabs.reserve(mru_cycle_list_.size());
++  for (auto handle : mru_cycle_list_) {
++    auto* tab = handle.Get();
++    if (!tab || GetIndexOfTab(tab) == kNoTab) {
++      StopMRUCycling();
++      return;
++    }
++    preview_tabs.push_back(tab->GetContents());
++  }
++  content::WebContents* selected = preview_tabs[mru_cycle_index_];
 +  BrowserWindowInterface* browser =
 +      GlobalBrowserCollection::GetInstance()->FindBrowserWithTab(selected);
 +  if (!browser) {
@@ -73,11 +137,31 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
 +    if (starting_cycle) {
 +      browser_view->StartTabCycling();
 +    }
-+    UpdateMRUTabSwitcherVisualizer(browser_view, starting_tabs, selected);
++    UpdateMRUTabSwitcherVisualizer(browser_view, preview_tabs, selected);
++  }
++}
++
++void TabStripModel::CommitMRUCycling() {
++  if (mru_cycle_list_.empty()) {
++    return;
++  }
++  auto* tab = mru_cycle_list_[mru_cycle_index_].Get();
++  const int index = tab ? GetIndexOfTab(tab) : kNoTab;
++  const auto gesture = mru_cycle_gesture_;
++  // Clear the session before activation notifies observers or starts loading.
++  StopMRUCycling();
++  if (index != kNoTab && gesture) {
++    ActivateTabAt(index, *gesture);
 +  }
  }
  
  void TabStripModel::StopMRUCycling() {
+   mru_cycle_list_.clear();
++  mru_cycle_index_ = 0;
++  mru_cycle_gesture_.reset();
+ }
+ 
+ void TabStripModel::SelectRelativeTab(TabRelativeDirection direction,
 Index: src/chrome/browser/ui/views/frame/browser_view.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/browser_view.cc
@@ -162,7 +246,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  #include "ui/views/view.h"
  #include "ui/views/view_class_properties.h"
  #include "ui/views/view_utils.h"
-@@ -891,6 +905,307 @@
+@@ -891,6 +905,307 @@ class BrowserView::PipExclusionObserverI
  };
  #endif
  
@@ -470,7 +554,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  // Handles events during MRU tab cycling to start/stop tab cycling.
  class TabCyclingEventHandler : public ui::EventObserver,
                                 public views::WidgetObserver {
-@@ -900,7 +1215,7 @@
+@@ -900,7 +1215,7 @@ class TabCyclingEventHandler : public ui
      Start();
    }
  
@@ -479,7 +563,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  
    TabCyclingEventHandler(const TabCyclingEventHandler&) = delete;
    TabCyclingEventHandler& operator=(const TabCyclingEventHandler&) = delete;
-@@ -908,15 +1223,21 @@
+@@ -908,15 +1223,22 @@ class TabCyclingEventHandler : public ui
   private:
    // ui::EventObserver overrides:
    void OnEvent(const ui::Event& event) override {
@@ -491,9 +575,11 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +
      if (event.type() == ui::EventType::kKeyReleased &&
          event.AsKeyEvent()->key_code() == ui::VKEY_CONTROL) {
-       // Ctrl key was released, stop the tab cycling.
+-      // Ctrl key was released, stop the tab cycling.
 -      Stop();
-+      StopCycling();
++      StopMonitoring();
++      // This destroys the handler. Do not access members after committing.
++      browser_view_->CommitTabCycling();
        return;
      }
  
@@ -503,7 +589,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
      }
    }
  
-@@ -924,12 +1245,12 @@
+@@ -924,12 +1246,12 @@ class TabCyclingEventHandler : public ui
    void OnWidgetActivationChanged(views::Widget* widget, bool active) override {
      // We should stop cycling if other application gets active state.
      if (!active) {
@@ -518,7 +604,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  
    void Start() {
      // Add the event handler.
-@@ -937,33 +1258,68 @@
+@@ -937,37 +1259,79 @@ class TabCyclingEventHandler : public ui
      if (widget->GetNativeWindow()) {
        monitor_ = views::EventMonitor::CreateWindowMonitor(
            this, widget->GetNativeWindow(),
@@ -590,15 +676,95 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    tab_cycling_event_handler_.reset();
    browser()->tab_strip_model()->StopMRUCycling();
  }
-@@ -1210,6 +1566,8 @@
+ 
++void BrowserView::CommitTabCycling() {
++  // Remove the overlay and event observers before activation changes focus.
++  StopMRUTabSwitcherVisualizer(this);
++  tab_cycling_event_handler_.reset();
++  browser()->tab_strip_model()->CommitMRUCycling();
++}
++
+ ///////////////////////////////////////////////////////////////////////////////
+ // BrowserView, public:
+ 
+@@ -1210,6 +1574,8 @@ BrowserView::BrowserView(Browser* browse
  }
  
  BrowserView::~BrowserView() {
-+  StopMRUTabSwitcherVisualizer(this);
++  StopTabCycling();
 +
    if (browser_shortcut_service_) {
      browser_shortcut_service_->RemoveObserver(this);
      browser_shortcut_service_ = nullptr;
+@@ -4103,10 +4469,20 @@ void BrowserView::OnTabChangedAt(tabs::T
+   UpdateAccessibleURLForRootView(contents->GetURL());
+ }
+ 
++void BrowserView::OnTabWillBeRemoved(tabs::TabInterface* tab, int index) {
++  // Drop thumbnail observers and raw preview pointers before tab destruction.
++  StopTabCycling();
++}
++
+ void BrowserView::OnTabStripModelChanged(
+     TabStripModel* tab_strip_model,
+     const TabStripModelChange& change,
+     const TabStripSelectionChange& selection) {
++  if (tab_cycling_event_handler_ &&
++      (change.type() != TabStripModelChange::kSelectionOnly ||
++       selection.active_tab_changed())) {
++    StopTabCycling();
++  }
+   // When the active tab changes, elements in the omnibox can change, which
+   // can change its preferred size. Re-lay-out the toolbar to reflect the
+   // possible change.
+@@ -5812,6 +6188,26 @@ bool BrowserView::AcceleratorPressed(con
+ 
+   UpdateAcceleratorMetrics(accelerator, command_id);
+ 
++  // Only Ctrl+Tab holds a pending selection until Control is released. Menu,
++  // wheel, and other next/previous-tab shortcuts must activate immediately.
++  const bool next_tab = command_id == IDC_SELECT_NEXT_TAB;
++  const bool previous_tab = command_id == IDC_SELECT_PREVIOUS_TAB;
++  const bool global_mru =
++      next_tab && base::FeatureList::IsEnabled(features::kCtrlTabMru) &&
++      browser_->profile()->GetPrefs()->GetBoolean(prefs::kCtrlTabMru);
++  if ((next_tab || previous_tab) && !global_mru &&
++      accelerator.key_code() == ui::VKEY_TAB && accelerator.IsCtrlDown() &&
++      browser_->profile()->GetPrefs()->GetBoolean(prefs::kTabCyclingMRU) &&
++      chrome::IsCommandEnabled(browser_.get(), command_id)) {
++    browser_->tab_strip_model()->PreviewMRUTab(
++        next_tab ? TabStripModel::TabRelativeDirection::kNext
++                 : TabStripModel::TabRelativeDirection::kPrevious,
++        TabStripUserGestureDetails(
++            TabStripUserGestureDetails::GestureType::kKeyboard,
++            accelerator.time_stamp()));
++    return true;
++  }
++
+   if (command_id == IDC_CLEAR_BROWSING_DATA) {
+     views::ElementTrackerViews::GetInstance()->NotifyCustomEvent(
+         browsing_data_important_sites_util::
+@@ -6235,8 +6631,18 @@ void BrowserView::LoadAccelerators() {
+     accelerator_table_[accelerator] = entry.command_id;
+ 
+     if (!already_registered) {
+-      focus_manager->RegisterAccelerator(
+-          accelerator, ui::AcceleratorManager::kNormalPriority, this);
++      auto priority = ui::AcceleratorManager::kNormalPriority;
++#if BUILDFLAG(IS_MAC)
++      // Cocoa otherwise dispatches Ctrl+Tab straight to the menu command,
++      // bypassing AcceleratorPressed and its modifier-held MRU preview.
++      if (entry.keycode == ui::VKEY_TAB &&
++          (entry.modifiers & ui::EF_CONTROL_DOWN) &&
++          (entry.command_id == IDC_SELECT_NEXT_TAB ||
++           entry.command_id == IDC_SELECT_PREVIOUS_TAB)) {
++        priority = ui::AcceleratorManager::kHighPriority;
++      }
++#endif
++      focus_manager->RegisterAccelerator(accelerator, priority, this);
+     }
+   }
+ 
 Index: src/chrome/browser/ui/views/frame/browser_view_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/browser_view_unittest.cc
@@ -611,7 +777,23 @@ Index: src/chrome/browser/ui/views/frame/browser_view_unittest.cc
  #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
  #include "chrome/browser/ui/views/frame/test_with_browser_view.h"
  #include "chrome/browser/ui/views/frame/top_container_view.h"
-@@ -168,6 +169,18 @@
+@@ -48,6 +49,7 @@
+ #include "chrome/grit/branded_strings.h"
+ #include "chrome/test/base/browser_with_test_window_test.h"
+ #include "chrome/test/base/testing_profile_manager.h"
++#include "components/prefs/pref_service.h"
+ #include "components/vector_icons/vector_icons.h"
+ #include "components/version_info/channel.h"
+ #include "content/public/test/navigation_simulator.h"
+@@ -64,6 +66,7 @@
+ #include "ui/views/bubble/bubble_dialog_delegate_view.h"
+ #include "ui/views/bubble/bubble_dialog_model_host.h"
+ #include "ui/views/controls/webview/webview.h"
++#include "ui/views/focus/focus_manager.h"
+ #include "ui/views/interaction/element_tracker_views.h"
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+@@ -168,6 +171,72 @@ TEST_F(BrowserViewTest, BrowserView) {
    EXPECT_EQ(customize_chrome_action->GetEnabled(), true);
  }
  
@@ -624,6 +806,60 @@ Index: src/chrome/browser/ui/views/frame/browser_view_unittest.cc
 +  browser_view()->StartTabCycling();
 +  UpdateMRUTabSwitcherVisualizer(browser_view(), {active}, active);
 +  browser_view()->browser_widget()->OnNativeWidgetActivationChanged(false);
++  content::RunAllTasksUntilIdle();
++}
++
++TEST_F(BrowserViewTest, MRUTabPreviewCommitsOnlyWhenAccepted) {
++#if BUILDFLAG(IS_MAC)
++  EXPECT_TRUE(browser_view()->GetFocusManager()->HasPriorityHandler(
++      ui::Accelerator(ui::VKEY_TAB, ui::EF_CONTROL_DOWN)));
++  EXPECT_TRUE(browser_view()->GetFocusManager()->HasPriorityHandler(
++      ui::Accelerator(ui::VKEY_TAB, ui::EF_CONTROL_DOWN | ui::EF_SHIFT_DOWN)));
++  EXPECT_FALSE(browser_view()->GetFocusManager()->HasPriorityHandler(
++      ui::Accelerator(ui::VKEY_L, ui::EF_COMMAND_DOWN)));
++#endif
++  AddTab(browser(), GURL("https://first.test/"));
++  auto* candidate = browser()->tab_strip_model()->GetActiveWebContents();
++  AddTab(browser(), GURL("https://second.test/"));
++  auto* model = browser()->tab_strip_model();
++  browser()->profile()->GetPrefs()->SetBoolean(prefs::kTabCyclingMRU, true);
++  auto* original = model->GetActiveWebContents();
++  EXPECT_TRUE(browser_view()->AcceleratorPressed(
++      ui::Accelerator(ui::VKEY_TAB, ui::EF_CONTROL_DOWN)));
++  EXPECT_EQ(original, model->GetActiveWebContents());
++  browser_view()->CommitTabCycling();
++  EXPECT_EQ(candidate, model->GetActiveWebContents());
++}
++
++TEST_F(BrowserViewTest, MRUTabPreviewCancellationDoesNotActivateCandidate) {
++  AddTab(browser(), GURL("https://first.test/"));
++  AddTab(browser(), GURL("https://second.test/"));
++  auto* model = browser()->tab_strip_model();
++  browser()->profile()->GetPrefs()->SetBoolean(prefs::kTabCyclingMRU, true);
++  auto* original = model->GetActiveWebContents();
++  model->PreviewMRUTab(TabStripModel::TabRelativeDirection::kNext);
++  browser_view()->StopTabCycling();
++  browser_view()->CommitTabCycling();
++  EXPECT_EQ(original, model->GetActiveWebContents());
++
++  model->PreviewMRUTab(TabStripModel::TabRelativeDirection::kNext);
++  browser_view()->browser_widget()->OnNativeWidgetActivationChanged(false);
++  browser_view()->CommitTabCycling();
++  EXPECT_EQ(original, model->GetActiveWebContents());
++}
++
++TEST_F(BrowserViewTest, MRUTabPreviewClosesSafelyWhenCandidateIsRemoved) {
++  AddTab(browser(), GURL("https://first.test/"));
++  auto* candidate = browser()->tab_strip_model()->GetActiveWebContents();
++  AddTab(browser(), GURL("https://second.test/"));
++  auto* model = browser()->tab_strip_model();
++  browser()->profile()->GetPrefs()->SetBoolean(prefs::kTabCyclingMRU, true);
++  auto* original = model->GetActiveWebContents();
++  model->PreviewMRUTab(TabStripModel::TabRelativeDirection::kNext);
++  model->CloseWebContentsAt(model->GetIndexOfWebContents(candidate),
++                           TabCloseTypes::CLOSE_NONE);
++  browser_view()->CommitTabCycling();
++  EXPECT_EQ(original, model->GetActiveWebContents());
 +  content::RunAllTasksUntilIdle();
 +}
 +
@@ -729,46 +965,138 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/tabs/tab_strip_model_unittest.cc
 +++ src/chrome/browser/ui/tabs/tab_strip_model_unittest.cc
-@@ -47,6 +47,7 @@
+@@ -47,8 +47,10 @@
  #include "chrome/browser/ui/tabs/test_tab_strip_model_delegate.h"
  #include "chrome/browser/ui/ui_features.h"
  #include "chrome/common/chrome_features.h"
 +#include "chrome/common/pref_names.h"
  #include "chrome/test/base/browser_with_test_window_test.h"
  #include "chrome/test/base/testing_profile.h"
++#include "components/prefs/pref_service.h"
  #include "components/commerce/core/commerce_utils.h"
-@@ -788,6 +789,36 @@
+ #include "components/content_settings/core/browser/host_content_settings_map.h"
+ #include "components/split_tabs/split_tab_id.h"
+@@ -788,6 +790,125 @@ TEST_F(TabStripModelTest, TestBasicAPI)
    tabstrip()->RemoveObserver(observer());
  }
  
-+TEST_F(TabStripModelTest, SelectRelativeTabCycleUsesLastActiveTimeTicks) {
-+  PrepareTabs(tabstrip(), 3);
-+  ASSERT_EQ(2, tabstrip()->active_index());
++class MRUTabCyclingTest : public TabStripModelTest {
++ public:
++  void PreviewNext() {
++    tabstrip()->PreviewMRUTab(TabStripModel::TabRelativeDirection::kNext);
++  }
++  void PreviewPrevious() {
++    tabstrip()->PreviewMRUTab(TabStripModel::TabRelativeDirection::kPrevious);
++  }
++  void SetUp() override {
++    TabStripModelTest::SetUp();
++    PrepareTabs(tabstrip(), 3);
++    profile()->GetPrefs()->SetBoolean(prefs::kTabCyclingMRU, true);
++    const auto now = base::TimeTicks::Now();
++    for (int i = 0; i < 3; ++i) {
++      content::WebContentsTester::For(tabstrip()->GetWebContentsAt(i))
++          ->SetLastActiveTimeTicks(now - base::Seconds(2 - i));
++    }
++  }
++};
 +
-+  profile()->GetPrefs()->SetBoolean(prefs::kTabCyclingMRU, true);
++TEST_F(MRUTabCyclingTest, PreviewDoesNotActivateOrChangeRecency) {
++  const auto previous_recency =
++      tabstrip()->GetWebContentsAt(1)->GetLastActiveTimeTicks();
++  PreviewNext();
++  EXPECT_EQ(2, tabstrip()->active_index());
++  EXPECT_EQ(previous_recency,
++            tabstrip()->GetWebContentsAt(1)->GetLastActiveTimeTicks());
++  PreviewNext();
++  EXPECT_EQ(2, tabstrip()->active_index());
++  tabstrip()->CommitMRUCycling();
++  EXPECT_EQ(0, tabstrip()->active_index());
++  tabstrip()->CommitMRUCycling();
++  EXPECT_EQ(0, tabstrip()->active_index());
++}
 +
-+  const base::TimeTicks now = base::TimeTicks::Now();
-+  auto set_last_active_time = [&](int index, base::TimeTicks time) {
-+    content::WebContentsTester::For(tabstrip()->GetWebContentsAt(index))
-+        ->SetLastActiveTimeTicks(time);
-+  };
-+  set_last_active_time(2, now);
-+  set_last_active_time(1, now - base::Seconds(1));
-+  set_last_active_time(0, now - base::Seconds(2));
++TEST_F(MRUTabCyclingTest, ReversePreviewCommitsLeastRecentTab) {
++  PreviewPrevious();
++  EXPECT_EQ(2, tabstrip()->active_index());
++  tabstrip()->CommitMRUCycling();
++  EXPECT_EQ(0, tabstrip()->active_index());
++}
 +
++TEST_F(MRUTabCyclingTest, CancelLeavesOriginalTabAndStartsFreshSnapshot) {
++  PreviewNext();
++  PreviewNext();
++  tabstrip()->StopMRUCycling();
++  tabstrip()->CommitMRUCycling();
++  EXPECT_EQ(2, tabstrip()->active_index());
++  PreviewNext();
++  tabstrip()->CommitMRUCycling();
++  EXPECT_EQ(1, tabstrip()->active_index());
++}
++
++TEST_F(MRUTabCyclingTest, PreviewWrapsAndReversesWithoutActivation) {
++  for (int i = 0; i < 4; ++i) {
++    PreviewNext();
++    EXPECT_EQ(2, tabstrip()->active_index());
++  }
++  PreviewPrevious();
++  tabstrip()->CommitMRUCycling();
++  EXPECT_EQ(2, tabstrip()->active_index());
++}
++
++TEST_F(MRUTabCyclingTest, ClosingPreviewCancelsPendingActivation) {
++  auto* original = tabstrip()->GetActiveWebContents();
++  PreviewNext();
++  tabstrip()->CloseWebContentsAt(1, TabCloseTypes::CLOSE_NONE);
++  tabstrip()->CommitMRUCycling();
++  EXPECT_EQ(original, tabstrip()->GetActiveWebContents());
++  PreviewNext();
++  tabstrip()->CommitMRUCycling();
++  EXPECT_EQ(0, tabstrip()->active_index());
++}
++
++TEST_F(MRUTabCyclingTest, MovingTabsCancelsPendingActivation) {
++  auto* original = tabstrip()->GetActiveWebContents();
++  PreviewNext();
++  tabstrip()->MoveWebContentsAt(0, 1, false);
++  tabstrip()->CommitMRUCycling();
++  EXPECT_EQ(original, tabstrip()->GetActiveWebContents());
++}
++
++TEST_F(MRUTabCyclingTest, InsertingTabCancelsPendingActivation) {
++  auto* original = tabstrip()->GetActiveWebContents();
++  PreviewNext();
++  tabstrip()->AppendWebContents(CreateWebContentsWithID(3), false);
++  tabstrip()->CommitMRUCycling();
++  EXPECT_EQ(original, tabstrip()->GetActiveWebContents());
++}
++
++TEST_F(MRUTabCyclingTest, ReplacingPreviewCancelsPendingActivation) {
++  auto* original = tabstrip()->GetActiveWebContents();
++  PreviewNext();
++  auto replaced =
++      tabstrip()->DiscardWebContentsAt(1, CreateWebContentsWithID(3));
++  tabstrip()->CommitMRUCycling();
++  EXPECT_EQ(original, tabstrip()->GetActiveWebContents());
++}
++
++TEST_F(MRUTabCyclingTest, ExternalActivationCancelsPendingSelection) {
++  PreviewNext();
++  tabstrip()->ActivateTabAt(0);
++  tabstrip()->CommitMRUCycling();
++  EXPECT_EQ(0, tabstrip()->active_index());
++}
++
++TEST_F(MRUTabCyclingTest, OrdinaryMRUCommandsActivateImmediately) {
 +  tabstrip()->SelectNextTab();
 +  EXPECT_EQ(1, tabstrip()->active_index());
++}
 +
++TEST_F(MRUTabCyclingTest, DisabledMRUStillActivatesImmediately) {
++  profile()->GetPrefs()->SetBoolean(prefs::kTabCyclingMRU, false);
++  tabstrip()->SelectNextTab();
++  EXPECT_EQ(0, tabstrip()->active_index());
 +  tabstrip()->SelectPreviousTab();
 +  EXPECT_EQ(2, tabstrip()->active_index());
-+
-+  tabstrip()->StopMRUCycling();
-+  set_last_active_time(2, now);
-+  set_last_active_time(1, now - base::Seconds(1));
-+  set_last_active_time(0, now - base::Seconds(2));
-+
-+  tabstrip()->SelectPreviousTab();
-+  EXPECT_EQ(0, tabstrip()->active_index());
 +}
 +
  TEST_F(TabStripModelTest, TestTabHandlesStaticTabstrip) {
@@ -778,7 +1106,7 @@ Index: src/chrome/browser/ui/thumbnails/thumbnail_tab_helper.h
 ===================================================================
 --- src.orig/chrome/browser/ui/thumbnails/thumbnail_tab_helper.h
 +++ src/chrome/browser/ui/thumbnails/thumbnail_tab_helper.h
-@@ -38,6 +38,10 @@
+@@ -38,6 +38,10 @@ class ThumbnailTabHelper
    // active tab.
    void CaptureThumbnailOnTabBackgrounded();
  
@@ -793,7 +1121,7 @@ Index: src/chrome/browser/ui/thumbnails/thumbnail_tab_helper.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/thumbnails/thumbnail_tab_helper.cc
 +++ src/chrome/browser/ui/thumbnails/thumbnail_tab_helper.cc
-@@ -271,6 +271,46 @@
+@@ -271,6 +271,46 @@ void ThumbnailTabHelper::CaptureThumbnai
                       time_of_call));
  }
  
@@ -852,7 +1180,7 @@ Index: src/chrome/browser/ui/views/tabs/hovercard/tab_hover_card_thumbnail_obser
  
  #include "base/callback_list.h"
  #include "chrome/browser/ui/thumbnails/thumbnail_image.h"
-@@ -26,6 +27,8 @@
+@@ -26,6 +27,8 @@ class TabHoverCardThumbnailObserver {
    // retrieve a valid thumbnail.
    void Observe(scoped_refptr<ThumbnailImage> thumbnail_image);
  
@@ -861,7 +1189,7 @@ Index: src/chrome/browser/ui/views/tabs/hovercard/tab_hover_card_thumbnail_obser
    // Returns the current (most recent) thumbnail being watched.
    const scoped_refptr<ThumbnailImage>& current_image() const {
      return current_image_;
-@@ -39,6 +42,7 @@
+@@ -39,6 +42,7 @@ class TabHoverCardThumbnailObserver {
  
    scoped_refptr<ThumbnailImage> current_image_;
    std::unique_ptr<ThumbnailImage::Subscription> subscription_;
@@ -873,7 +1201,7 @@ Index: src/chrome/browser/ui/views/tabs/hovercard/tab_hover_card_thumbnail_obser
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/hovercard/tab_hover_card_thumbnail_observer.cc
 +++ src/chrome/browser/ui/views/tabs/hovercard/tab_hover_card_thumbnail_observer.cc
-@@ -27,7 +27,8 @@
+@@ -27,7 +27,8 @@ void TabHoverCardThumbnailObserver::Obse
      return;
    }
  
@@ -883,7 +1211,7 @@ Index: src/chrome/browser/ui/views/tabs/hovercard/tab_hover_card_thumbnail_obser
    subscription_->SetUncompressedImageCallback(base::BindRepeating(
        &TabHoverCardThumbnailObserver::ThumbnailImageCallback,
        base::Unretained(this), base::Unretained(current_image_.get())));
-@@ -35,6 +36,11 @@
+@@ -35,6 +36,11 @@ void TabHoverCardThumbnailObserver::Obse
    current_image_->RequestThumbnailImage();
  }
  
@@ -895,3 +1223,87 @@ Index: src/chrome/browser/ui/views/tabs/hovercard/tab_hover_card_thumbnail_obser
  base::CallbackListSubscription TabHoverCardThumbnailObserver::AddCallback(
      Callback callback) {
    return callback_list_.Add(callback);
+Index: src/chrome/browser/ui/tabs/tab_strip_model.h
+===================================================================
+--- src.orig/chrome/browser/ui/tabs/tab_strip_model.h
++++ src/chrome/browser/ui/tabs/tab_strip_model.h
+@@ -617,8 +617,18 @@ class TabStripModel {
+       TabStripUserGestureDetails detail = TabStripUserGestureDetails(
+           TabStripUserGestureDetails::GestureType::kOther));
+ 
+-  // Stops cycling through tabs in MRU order when Ctrl is released.
+-  // Used in BrowserView::StopTabCycling().
++  enum class TabRelativeDirection { kNext, kPrevious };
++
++  // Advances a pending MRU selection without activating it. Only modifier-held
++  // switcher gestures use this; ordinary tab commands still activate at once.
++  void PreviewMRUTab(TabRelativeDirection direction,
++                     TabStripUserGestureDetails detail = TabStripUserGestureDetails(
++                         TabStripUserGestureDetails::GestureType::kKeyboard));
++
++  // Activates the pending MRU preview once, when Ctrl is released.
++  void CommitMRUCycling();
++
++  // Cancels the pending MRU preview without changing the active tab.
+   void StopMRUCycling();
+ 
+   // Moves the active in the specified direction. Respects group boundaries.
+@@ -1194,14 +1204,6 @@ class TabStripModel {
+   // Close all tabs in the given |group| at once.
+   void CloseAllTabsInGroupImpl(const tab_groups::TabGroupId& group);
+ 
+-  // Direction of relative tab movements or selections. kNext indicates moving
+-  // forward (positive increment) in the tab strip. kPrevious indicates
+-  // backward (negative increment).
+-  enum class TabRelativeDirection {
+-    kNext,
+-    kPrevious,
+-  };
+-
+   // Selects either the next tab or the previous tab.
+   // Uses MRU order if the user prefers it.
+   void SelectRelativeTabCycle(TabRelativeDirection direction,
+@@ -1210,7 +1212,8 @@ class TabStripModel {
+   // Selects either the most recently used tab
+   // or the least recently used tab.
+   void SelectMRUTab(TabRelativeDirection direction,
+-                    TabStripUserGestureDetails detail);
++                    TabStripUserGestureDetails detail,
++                    bool preview_only);
+ 
+   // Selects either the next tab (kNext), or the previous tab (kPrevious).
+   void SelectRelativeTab(TabRelativeDirection direction,
+@@ -1511,8 +1514,11 @@ class TabStripModel {
+   // The focused group. If no group is focused, this is nullopt.
+   std::optional<tab_groups::TabGroupId> focused_group_;
+ 
+-  // List of tabs for MRU cycling
+-  std::vector<int> mru_cycle_list_;
++  // Stable MRU snapshot. Previewing does not activate a tab or update recency.
++  // Structural changes and external activation cancel the snapshot.
++  std::vector<tabs::TabHandle> mru_cycle_list_;
++  size_t mru_cycle_index_ = 0;
++  std::optional<TabStripUserGestureDetails> mru_cycle_gesture_;
+ 
+   base::WeakPtrFactory<TabStripModel> weak_factory_{this};
+ };
+Index: src/chrome/browser/ui/views/frame/browser_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_view.h
++++ src/chrome/browser/ui/views/frame/browser_view.h
+@@ -597,6 +597,7 @@ class BrowserView : public BrowserWindow
+   BrowserView* AsBrowserView() override;
+   void ShowUpdateChromeDialog() override;
+   void StartTabCycling();
++  void CommitTabCycling();
+   void StopTabCycling();
+   void ShowIntentPickerBubble(
+       std::vector<IntentPickerBubbleView::AppInfo> app_info,
+@@ -668,6 +669,7 @@ class BrowserView : public BrowserWindow
+       bool is_tab_modal_popup_deprecated) override;
+ 
+   // TabStripModelObserver:
++  void OnTabWillBeRemoved(tabs::TabInterface* tab, int index) override;
+   void OnTabStripModelChanged(
+       TabStripModel* tab_strip_model,
+       const TabStripModelChange& change,
