@@ -1,0 +1,484 @@
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn
++++ src/chrome/browser/ui/BUILD.gn
+@@ -4174,6 +4174,8 @@
+       "views/global_error_bubble_view.h",
+       "views/helium/frame_corner_radius.cc",
+       "views/helium/frame_corner_radius.h",
++      "views/helium/glass_surface.cc",
++      "views/helium/glass_surface.h",
+       "views/helium/native_frame_materials.cc",
+       "views/helium/native_frame_materials.h",
+       "views/hung_renderer_view.cc",
+Index: src/chrome/browser/ui/views/frame/browser_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_view.cc
++++ src/chrome/browser/ui/views/frame/browser_view.cc
+@@ -172,6 +172,8 @@
+ #include "chrome/browser/ui/views/frame/multi_contents_view_delegate.h"
+ #include "chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller.h"
+ #include "chrome/browser/ui/views/frame/mru_tab_switcher_visualizer.h"
++#include "chrome/browser/ui/views/helium/glass_surface.h"
++#include "chrome/browser/ui/views/helium/native_frame_materials.h"
+ #include "chrome/browser/ui/views/frame/scrim_view.h"
+ #include "chrome/browser/ui/views/frame/shadow_overlay_view.h"
+ #include "chrome/browser/ui/views/frame/tab_modal_dialog_host.h"
+@@ -937,9 +939,10 @@
+  private:
+   class BubbleView : public views::View {
+    public:
+-    explicit BubbleView(BrowserView* browser_view)
++    BubbleView(BrowserView* browser_view, bool use_glass_surface)
+         : browser_view_(browser_view),
+-          preview_size_(CalculatePreviewSize(browser_view)) {
++          preview_size_(CalculatePreviewSize(browser_view)),
++          use_glass_surface_(use_glass_surface) {
+       GetViewAccessibility().SetRole(ax::mojom::Role::kGroup);
+       GetViewAccessibility().SetName(
+           l10n_util::GetStringUTF16(IDS_RECENT_TABS_MENU));
+@@ -947,17 +950,44 @@
+           gfx::Size(preview_size_.width() + 2 * kHorizontalInset,
+                     preview_size_.height() + kOverlayChromeHeight));
+ 
+-      SetLayoutManager(std::make_unique<views::BoxLayout>(
+-          views::BoxLayout::Orientation::kVertical,
+-          gfx::Insets::VH(kVerticalInset, kHorizontalInset), kElementSpacing));
++      if (use_glass_surface_) {
++        helium::GlassSurfaceParams glass_params;
++        glass_params.preset = helium::GlassSurfacePreset::kGlassmorphic;
++        glass_params.tint_color = SK_ColorWHITE;
++        glass_params.tint_strength = 0.08f;
++        glass_params.opacity = 1.0f;
++        glass_params.corner_radii = gfx::RoundedCornersF(kPreviewCornerRadius);
++        glass_surface_ = AddChildView(
++            std::make_unique<helium::GlassSurfaceView>(glass_params));
++      } else {
++        SetBackground(views::CreateRoundedRectBackground(
++            SkColorSetARGB(184, 28, 28, 30), kPreviewCornerRadius));
++        SetBorder(views::CreateRoundedRectBorder(
++            1, kPreviewCornerRadius, SkColorSetARGB(64, 255, 255, 255)));
++      }
++
++      SetLayoutManager(std::make_unique<views::FillLayout>());
++      auto content = std::make_unique<views::View>();
++      auto* content_view = AddChildView(std::move(content));
++      // Keep the content in a sibling layer so the glass layer can stay below
++      // it while still sampling the page behind the bubble.
++      content_view->SetPaintToLayer();
++      content_view->layer()->SetFillsBoundsOpaquely(false);
++      auto* layout = content_view->SetLayoutManager(
++          std::make_unique<views::BoxLayout>(
++              views::BoxLayout::Orientation::kVertical,
++              gfx::Insets::VH(kVerticalInset, kHorizontalInset),
++              kElementSpacing));
+ 
+-      title_label_ = AddChildView(std::make_unique<views::Label>());
++      title_label_ =
++          content_view->AddChildView(std::make_unique<views::Label>());
+       title_label_->SetTextStyle(views::style::STYLE_EMPHASIZED);
+       title_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+       title_label_->SetElideBehavior(gfx::ELIDE_TAIL);
+       title_label_->SetMaximumWidthSingleLine(preview_size_.width());
+ 
+-      domain_label_ = AddChildView(std::make_unique<views::Label>());
++      domain_label_ =
++          content_view->AddChildView(std::make_unique<views::Label>());
+       domain_label_->SetTextStyle(views::style::STYLE_SECONDARY);
+       domain_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+       domain_label_->SetElideBehavior(gfx::ELIDE_TAIL);
+@@ -979,9 +1009,9 @@
+           preview_container->AddChildView(std::make_unique<views::ImageView>());
+       placeholder_icon_->SetImageSize(kPlaceholderIconSize);
+ 
+-      AddChildView(std::move(preview_container));
++      content_view->AddChildView(std::move(preview_container));
+ 
+-      icon_strip_ = AddChildView(std::make_unique<views::View>());
++      icon_strip_ = content_view->AddChildView(std::make_unique<views::View>());
+       icon_strip_->SetPreferredSize(
+           gfx::Size(preview_size_.width(), kIconChipSize));
+       auto* strip_layout =
+@@ -991,7 +1021,8 @@
+       strip_layout->set_main_axis_alignment(
+           views::BoxLayout::MainAxisAlignment::kCenter);
+ 
+-      position_label_ = AddChildView(std::make_unique<views::Label>());
++      position_label_ =
++          content_view->AddChildView(std::make_unique<views::Label>());
+       position_label_->SetTextStyle(views::style::STYLE_SECONDARY);
+       position_label_->SetHorizontalAlignment(gfx::ALIGN_CENTER);
+ 
+@@ -1148,6 +1179,8 @@
+     raw_ptr<views::Label> position_label_ = nullptr;
+     raw_ptr<content::WebContents> selected_contents_ = nullptr;
+     const gfx::Size preview_size_;
++    const bool use_glass_surface_;
++    raw_ptr<helium::GlassSurfaceView> glass_surface_ = nullptr;
+     gfx::Size desired_capture_size_;
+     bool high_resolution_requested_ = false;
+     TabHoverCardThumbnailObserver thumbnail_observer_;
+@@ -1172,7 +1205,16 @@
+     delegate_->SetTitle(l10n_util::GetStringUTF16(IDS_RECENT_TABS_MENU));
+     delegate_->SetShowTitle(false);
+ 
+-    auto bubble = std::make_unique<BubbleView>(browser_view_);
++    bool use_glass_surface = true;
++#if BUILDFLAG(IS_MAC)
++    // Reduce Transparency is an explicit accessibility choice. Keep the
++    // existing opaque panel when the system asks for reduced transparency or
++    // when native frame materials own the browser chrome.
++    use_glass_surface = IsMRUTransparencyAllowed() &&
++                        !helium::ShouldUseNativeFrameMaterials(browser_view_);
++#endif
++    auto bubble =
++        std::make_unique<BubbleView>(browser_view_, use_glass_surface);
+     bubble_ = bubble.get();
+     delegate_->SetContentsView(std::move(bubble));
+     widget_ = views::BubbleDialogDelegate::CreateBubble(
+Index: src/chrome/browser/ui/views/frame/mru_tab_switcher_visualizer.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/mru_tab_switcher_visualizer.h
++++ src/chrome/browser/ui/views/frame/mru_tab_switcher_visualizer.h
+@@ -24,6 +24,8 @@
+ void StopMRUTabSwitcherVisualizer(BrowserView* browser_view);
+ 
+ #if BUILDFLAG(IS_MAC)
++bool IsMRUTransparencyAllowed();
++
+ class MRUTabSwitcherApplicationObserver {
+  public:
+   virtual ~MRUTabSwitcherApplicationObserver() = default;
+Index: src/chrome/browser/ui/views/frame/mru_tab_switcher_visualizer_mac.mm
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/mru_tab_switcher_visualizer_mac.mm
++++ src/chrome/browser/ui/views/frame/mru_tab_switcher_visualizer_mac.mm
+@@ -42,6 +42,14 @@
+ 
+ }  // namespace
+ 
++bool IsMRUTransparencyAllowed() {
++  if (@available(macOS 26.0, *)) {
++    return !NSWorkspace.sharedWorkspace
++                .accessibilityDisplayShouldReduceTransparency;
++  }
++  return true;
++}
++
+ std::unique_ptr<MRUTabSwitcherApplicationObserver>
+ CreateMRUTabSwitcherApplicationObserver(base::RepeatingClosure callback) {
+   return std::make_unique<MRUTabSwitcherApplicationObserverMac>(
+Index: src/chrome/browser/ui/views/helium/glass_surface.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/glass_surface.cc
++++ src/chrome/browser/ui/views/helium/glass_surface.cc
+@@ -1 +1,232 @@
+-// placeholder
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license found in the LICENSE file.
++
++#include "chrome/browser/ui/views/helium/glass_surface.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++
++#include "base/notreached.h"
++#include "cc/paint/paint_flags.h"
++#include "third_party/skia/include/core/SkCanvas.h"
++#include "third_party/skia/include/core/SkRRect.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/compositor/layer.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/geometry/skia_conversions.h"
++
++namespace helium {
++
++namespace {
++
++struct MaterialTuning {
++  float blur_sigma;
++  int fill_alpha;
++  int rim_alpha;
++  int highlight_alpha;
++  int grain_alpha;
++  int grain_dots;
++};
++
++constexpr MaterialTuning kBasicTuning = {
++    .blur_sigma = 18.0f,
++    .fill_alpha = 184,
++    .rim_alpha = 48,
++    .highlight_alpha = 22,
++    .grain_alpha = 4,
++    .grain_dots = 36,
++};
++
++constexpr MaterialTuning kGlassmorphicTuning = {
++    .blur_sigma = 30.0f,
++    .fill_alpha = 156,
++    .rim_alpha = 72,
++    .highlight_alpha = 40,
++    .grain_alpha = 7,
++    .grain_dots = 64,
++};
++
++constexpr float kBackdropFilterQuality = 1.0f;
++
++const MaterialTuning& GetMaterialTuning(GlassSurfacePreset preset) {
++  switch (preset) {
++    case GlassSurfacePreset::kBasic:
++      return kBasicTuning;
++    case GlassSurfacePreset::kGlassmorphic:
++      return kGlassmorphicTuning;
++  }
++  NOTREACHED();
++}
++
++float ClampUnit(float value) {
++  return std::clamp(value, 0.0f, 1.0f);
++}
++
++uint8_t MixChannel(uint8_t tint_channel, float strength, int base) {
++  const float channel = static_cast<float>(base) +
++                        (static_cast<float>(tint_channel) - base) * strength;
++  return static_cast<uint8_t>(std::clamp(std::lround(channel), 0l, 255l));
++}
++
++SkColor MixTint(SkColor tint, float strength) {
++  // Keep the panel dark enough for the existing MRU foreground while allowing
++  // a caller-supplied tint to move the material toward its theme color.
++  return SkColorSetRGB(
++      MixChannel(SkColorGetR(tint), strength, 28),
++      MixChannel(SkColorGetG(tint), strength, 31),
++      MixChannel(SkColorGetB(tint), strength, 38));
++}
++
++SkRRect MakeRRect(const gfx::Rect& bounds,
++                  const gfx::RoundedCornersF& corner_radii) {
++  const SkVector radii[4] = {
++      {corner_radii.upper_left(), corner_radii.upper_left()},
++      {corner_radii.upper_right(), corner_radii.upper_right()},
++      {corner_radii.lower_right(), corner_radii.lower_right()},
++      {corner_radii.lower_left(), corner_radii.lower_left()},
++  };
++  return SkRRect::MakeRectRadii(gfx::RectToSkRect(bounds), radii);
++}
++
++void SetPaintStyle(cc::PaintFlags* flags, SkColor color) {
++  flags->setAntiAlias(true);
++  flags->setColor(color);
++}
++
++}  // namespace
++
++GlassSurfaceView::GlassSurfaceView(const GlassSurfaceParams& params)
++    : preset_(params.preset),
++      tint_color_(params.tint_color),
++      tint_strength_(ClampUnit(params.tint_strength)),
++      opacity_(ClampUnit(params.opacity)),
++      corner_radii_(params.corner_radii) {
++  SetCanProcessEventsWithinSubtree(false);
++  SetPaintToLayer();
++  UpdateLayer();
++}
++
++GlassSurfaceView::~GlassSurfaceView() = default;
++
++void GlassSurfaceView::SetPreset(GlassSurfacePreset preset) {
++  if (preset_ == preset) {
++    return;
++  }
++  preset_ = preset;
++  UpdateLayer();
++}
++
++void GlassSurfaceView::SetTintColor(SkColor tint_color) {
++  if (tint_color_ == tint_color) {
++    return;
++  }
++  tint_color_ = tint_color;
++  SchedulePaint();
++}
++
++void GlassSurfaceView::SetTintStrength(float tint_strength) {
++  tint_strength = ClampUnit(tint_strength);
++  if (tint_strength_ == tint_strength) {
++    return;
++  }
++  tint_strength_ = tint_strength;
++  SchedulePaint();
++}
++
++void GlassSurfaceView::SetOpacity(float opacity) {
++  opacity = ClampUnit(opacity);
++  if (opacity_ == opacity) {
++    return;
++  }
++  opacity_ = opacity;
++  UpdateLayer();
++}
++
++void GlassSurfaceView::SetCornerRadii(
++    const gfx::RoundedCornersF& corner_radii) {
++  if (corner_radii_ == corner_radii) {
++    return;
++  }
++  corner_radii_ = corner_radii;
++  UpdateLayer();
++}
++
++void GlassSurfaceView::UpdateLayer() {
++  if (!layer()) {
++    return;
++  }
++
++  const MaterialTuning& tuning = GetMaterialTuning(preset_);
++  layer()->SetFillsBoundsOpaquely(false);
++  // Layer opacity blends the filtered backdrop and the surface treatment as a
++  // unit. At zero, remove the backdrop filter as well so this view is truly a
++  // no-op rather than a transparent layer that still changes the backdrop.
++  layer()->SetOpacity(opacity_);
++  layer()->SetBackgroundBlur(opacity_ > 0.0f ? tuning.blur_sigma : 0.0f);
++  layer()->SetBackdropFilterQuality(kBackdropFilterQuality);
++  layer()->SetRoundedCornerRadius(corner_radii_);
++  layer()->SetIsFastRoundedCorner(!corner_radii_.IsEmpty());
++  SchedulePaint();
++}
++
++void GlassSurfaceView::OnPaint(gfx::Canvas* canvas) {
++  if (opacity_ <= 0.0f || GetLocalBounds().IsEmpty()) {
++    return;
++  }
++
++  const MaterialTuning& tuning = GetMaterialTuning(preset_);
++  const gfx::Rect bounds = GetLocalBounds();
++  const SkRRect rrect = MakeRRect(bounds, corner_radii_);
++  cc::PaintCanvas* paint_canvas = canvas->sk_canvas();
++
++  cc::PaintFlags fill;
++  SetPaintStyle(
++      &fill,
++      SkColorSetA(MixTint(tint_color_, tint_strength_), tuning.fill_alpha));
++  paint_canvas->drawRRect(rrect, fill);
++
++  // A broad, clipped highlight gives the panel the soft milky edge seen in
++  // the OverShifted reference without pretending that it refracts live page
++  // pixels at the Views layer.
++  paint_canvas->save();
++  paint_canvas->clipRRect(rrect, SkClipOp::kIntersect, true);
++  cc::PaintFlags highlight;
++  SetPaintStyle(&highlight,
++                SkColorSetA(SK_ColorWHITE, tuning.highlight_alpha));
++  const SkRect sk_bounds = gfx::RectToSkRect(bounds);
++  paint_canvas->drawOval(
++      SkRect::MakeLTRB(sk_bounds.left() - sk_bounds.width() * 0.35f,
++                       sk_bounds.top() - sk_bounds.height() * 0.55f,
++                       sk_bounds.left() + sk_bounds.width() * 0.82f,
++                       sk_bounds.top() + sk_bounds.height() * 0.80f),
++      highlight);
++  paint_canvas->restore();
++
++  cc::PaintFlags rim;
++  SetPaintStyle(&rim, SkColorSetA(SK_ColorWHITE, tuning.rim_alpha));
++  rim.setStyle(cc::PaintFlags::kStroke_Style);
++  rim.setStrokeWidth(1.0f);
++  paint_canvas->drawRRect(rrect, rim);
++
++  cc::PaintFlags grain;
++  SetPaintStyle(&grain, SkColorSetA(SK_ColorWHITE, tuning.grain_alpha));
++  const float width = sk_bounds.width();
++  const float height = sk_bounds.height();
++  for (int index = 0; index < tuning.grain_dots; ++index) {
++    const float x = std::fmod(0.13f + index * 0.75487766f, 1.0f);
++    const float y = std::fmod(0.37f + index * 0.5698403f, 1.0f);
++    const float center_x = sk_bounds.left() + x * width;
++    const float center_y = sk_bounds.top() + y * height;
++    paint_canvas->drawOval(
++        SkRect::MakeLTRB(center_x - 0.55f, center_y - 0.55f,
++                         center_x + 0.55f, center_y + 0.55f),
++        grain);
++  }
++}
++
++BEGIN_METADATA(GlassSurfaceView)
++END_METADATA
++
++}  // namespace helium
+Index: src/chrome/browser/ui/views/helium/glass_surface.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/glass_surface.h
++++ src/chrome/browser/ui/views/helium/glass_surface.h
+@@ -1 +1,70 @@
+-// placeholder
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_HELIUM_GLASS_SURFACE_H_
++#define CHROME_BROWSER_UI_VIEWS_HELIUM_GLASS_SURFACE_H_
++
++#include "third_party/skia/include/core/SkColor.h"
++#include "ui/gfx/geometry/rounded_corners_f.h"
++#include "ui/views/view.h"
++
++namespace helium {
++
++// Fixed, reviewed materials for browser chrome. The shader lab exposes more
++// knobs, but product code intentionally selects a material rather than
++// tuning its implementation details per component.
++enum class GlassSurfacePreset {
++  kBasic,
++  kGlassmorphic,
++};
++
++struct GlassSurfaceParams {
++  GlassSurfacePreset preset = GlassSurfacePreset::kBasic;
++  SkColor tint_color = SK_ColorWHITE;
++  float tint_strength = 0.0f;
++  float opacity = 1.0f;
++  gfx::RoundedCornersF corner_radii = gfx::RoundedCornersF();
++};
++
++// A reusable Views surface for translucent browser chrome.
++//
++// The surface owns a compositor backdrop blur and paints a small amount of
++// deterministic material treatment (tint, rim, highlight, and grain). It
++// deliberately does not claim live displacement: Views does not provide the
++// pixels behind a layer as a child shader to a paint-time SkRuntimeEffect.
++class GlassSurfaceView : public views::View {
++  METADATA_HEADER(GlassSurfaceView, views::View)
++
++ public:
++  explicit GlassSurfaceView(const GlassSurfaceParams& params);
++  GlassSurfaceView(const GlassSurfaceView&) = delete;
++  GlassSurfaceView& operator=(const GlassSurfaceView&) = delete;
++  ~GlassSurfaceView() override;
++
++  void SetPreset(GlassSurfacePreset preset);
++  void SetTintColor(SkColor tint_color);
++  void SetTintStrength(float tint_strength);
++  void SetOpacity(float opacity);
++  void SetCornerRadii(const gfx::RoundedCornersF& corner_radii);
++
++  GlassSurfacePreset preset() const { return preset_; }
++  SkColor tint_color() const { return tint_color_; }
++  float tint_strength() const { return tint_strength_; }
++  float opacity() const { return opacity_; }
++  const gfx::RoundedCornersF& corner_radii() const { return corner_radii_; }
++
++ private:
++  void UpdateLayer();
++  void OnPaint(gfx::Canvas* canvas) override;
++
++  GlassSurfacePreset preset_;
++  SkColor tint_color_;
++  float tint_strength_;
++  float opacity_;
++  gfx::RoundedCornersF corner_radii_;
++};
++
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_UI_VIEWS_HELIUM_GLASS_SURFACE_H_
