@@ -10,12 +10,14 @@ Index: src/chrome/browser/ui/BUILD.gn
        "views/helium/frame_corner_radius_mac.mm",
        "views/helium/native_frame_materials_mac.h",
        "views/helium/native_frame_materials_mac.mm",
-@@ -4080,6 +4081,8 @@ static_library("ui") {
+@@ -4080,6 +4081,10 @@ static_library("ui") {
        "views/frame/browser_root_view.cc",
        "views/frame/browser_view.cc",
        "views/frame/browser_view.h",
 +      "views/frame/mru_tab_preview_cache.cc",
 +      "views/frame/mru_tab_preview_cache.h",
++      "views/frame/mru_tab_preview_rail.cc",
++      "views/frame/mru_tab_preview_rail.h",
        "views/frame/browser_widget.cc",
        "views/frame/browser_widget.h",
        "views/frame/browser_window_factory.cc",
@@ -215,11 +217,12 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  #include "chrome/browser/ui/tabs/vertical_tab_strip_metrics.h"
  #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
  #include "chrome/browser/ui/toasts/toast_view.h"
-@@ -162,9 +167,11 @@
+@@ -162,9 +167,12 @@
  #include "chrome/browser/ui/views/frame/layout/browser_view_layout.h"
  #include "chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.h"
  #include "chrome/browser/ui/views/frame/main_background_region_view.h"
 +#include "chrome/browser/ui/views/frame/mru_tab_preview_cache.h"
++#include "chrome/browser/ui/views/frame/mru_tab_preview_rail.h"
  #include "chrome/browser/ui/views/frame/multi_contents_view.h"
  #include "chrome/browser/ui/views/frame/multi_contents_view_delegate.h"
  #include "chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller.h"
@@ -227,7 +230,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  #include "chrome/browser/ui/views/frame/scrim_view.h"
  #include "chrome/browser/ui/views/frame/shadow_overlay_view.h"
  #include "chrome/browser/ui/views/frame/tab_modal_dialog_host.h"
-@@ -349,14 +356,20 @@
+@@ -349,14 +357,20 @@
  #include "ui/views/accessibility/view_accessibility.h"
  #include "ui/views/accessibility/view_accessibility_utils.h"
  #include "ui/views/animation/compositor_animation_runner.h"
@@ -248,7 +251,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  #include "ui/views/view.h"
  #include "ui/views/view_class_properties.h"
  #include "ui/views/view_utils.h"
-@@ -891,6 +904,312 @@ class BrowserView::PipExclusionObserverI
+@@ -891,6 +905,122 @@ class BrowserView::PipExclusionObserverI
  };
  #endif
  
@@ -290,6 +293,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +
 +    EnsureWidget();
 +    bubble_->Update(tabs_, selected - tabs_.begin());
++    delegate_->SizeToContents();
 +    if (!widget_->IsVisible()) {
 +      widget_->ShowInactive();
 +    }
@@ -298,212 +302,21 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 + private:
 +  class BubbleView : public views::View {
 +   public:
-+    explicit BubbleView(BrowserView* browser_view)
-+        : browser_view_(browser_view),
-+          preview_size_(CalculatePreviewSize(browser_view)) {
++    explicit BubbleView(BrowserView* browser_view) {
 +      GetViewAccessibility().SetRole(ax::mojom::Role::kGroup);
 +      GetViewAccessibility().SetName(
 +          l10n_util::GetStringUTF16(IDS_RECENT_TABS_MENU));
-+      SetPreferredSize(
-+          gfx::Size(preview_size_.width() + 2 * kHorizontalInset,
-+                    preview_size_.height() + kOverlayChromeHeight));
-+
-+      SetLayoutManager(std::make_unique<views::BoxLayout>(
-+          views::BoxLayout::Orientation::kVertical,
-+          gfx::Insets::VH(kVerticalInset, kHorizontalInset), kElementSpacing));
-+
-+      title_label_ = AddChildView(std::make_unique<views::Label>());
-+      title_label_->SetTextStyle(views::style::STYLE_EMPHASIZED);
-+      title_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
-+      title_label_->SetElideBehavior(gfx::ELIDE_TAIL);
-+      title_label_->SetMaximumWidthSingleLine(preview_size_.width());
-+
-+      domain_label_ = AddChildView(std::make_unique<views::Label>());
-+      domain_label_->SetTextStyle(views::style::STYLE_SECONDARY);
-+      domain_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
-+      domain_label_->SetElideBehavior(gfx::ELIDE_TAIL);
-+      domain_label_->SetMaximumWidthSingleLine(preview_size_.width());
-+
-+      auto preview_container = std::make_unique<views::View>();
-+      preview_container->SetPreferredSize(preview_size_);
-+      preview_container->SetBackground(views::CreateRoundedRectBackground(
-+          kColorTabHoverCardBackground, kPreviewCornerRadius));
-+      preview_container->SetLayoutManager(
-+          std::make_unique<views::FillLayout>());
-+
-+      preview_image_ =
-+          preview_container->AddChildView(std::make_unique<views::ImageView>());
-+      preview_image_->SetImageSize(preview_size_);
-+      preview_image_->SetCornerRadius(kPreviewCornerRadius);
-+
-+      placeholder_icon_ =
-+          preview_container->AddChildView(std::make_unique<views::ImageView>());
-+      placeholder_icon_->SetImageSize(kPlaceholderIconSize);
-+
-+      AddChildView(std::move(preview_container));
-+
-+      icon_strip_ = AddChildView(std::make_unique<views::View>());
-+      icon_strip_->SetPreferredSize(
-+          gfx::Size(preview_size_.width(), kIconChipSize));
-+      auto* strip_layout =
-+          icon_strip_->SetLayoutManager(std::make_unique<views::BoxLayout>(
-+              views::BoxLayout::Orientation::kHorizontal, gfx::Insets(),
-+              kIconSpacing));
-+      strip_layout->set_main_axis_alignment(
-+          views::BoxLayout::MainAxisAlignment::kCenter);
-+
-+      position_label_ = AddChildView(std::make_unique<views::Label>());
-+      position_label_->SetTextStyle(views::style::STYLE_SECONDARY);
-+      position_label_->SetHorizontalAlignment(gfx::ALIGN_CENTER);
-+
-+    }
-+
-+    BubbleView(const BubbleView&) = delete;
-+    BubbleView& operator=(const BubbleView&) = delete;
-+    ~BubbleView() override {
-+      browser_view_->mru_preview_cache().CancelPendingRequests();
++      SetLayoutManager(std::make_unique<views::FillLayout>());
++      rail_ = AddChildView(std::make_unique<MRUTabPreviewRail>(browser_view));
 +    }
 +
 +    void Update(const std::vector<content::WebContents*>& tabs,
 +                size_t selected_index) {
-+      if (tabs.empty() || selected_index >= tabs.size()) {
-+        return;
-+      }
-+
-+      content::WebContents* selected = tabs[selected_index];
-+      TabUIHelper* selected_helper = GetTabUIHelper(selected);
-+      title_label_->SetText(selected_helper ? selected_helper->GetTitle()
-+                                            : selected->GetTitle());
-+      domain_label_->SetText(
-+          base::UTF8ToUTF16(selected->GetVisibleURL().host()));
-+      position_label_->SetText(base::NumberToString16(selected_index + 1) +
-+                               u" / " + base::NumberToString16(tabs.size()));
-+
-+      auto& cache = browser_view_->mru_preview_cache();
-+      weak_factory_.InvalidateWeakPtrs();
-+      cache.CancelPendingRequests();
-+      auto* model = browser_view_->browser()->tab_strip_model();
-+      const int tab_index = model->GetIndexOfWebContents(selected);
-+      if (tab_index == TabStripModel::kNoTab) {
-+        return;
-+      }
-+      const auto handle = model->GetTabAtIndex(tab_index)->GetHandle();
-+      const gfx::ImageSkia cached = cache.Get(handle);
-+      preview_image_->SetImage(cached.isNull()
-+                                   ? ui::ImageModel()
-+                                   : ui::ImageModel::FromImageSkia(cached));
-+      placeholder_icon_->SetVisible(cached.isNull());
-+      placeholder_icon_->SetImage(
-+          selected_helper ? selected_helper->GetFavicon() : ui::ImageModel());
-+      float destination_scale = 1.0f;
-+      if (views::Widget* widget = browser_view_->GetWidget();
-+          widget && widget->GetNativeWindow()) {
-+        destination_scale =
-+            display::Screen::Get()
-+                ->GetDisplayNearestWindow(widget->GetNativeWindow())
-+                .device_scale_factor();
-+      }
-+      const gfx::Size desired_capture_size = gfx::ScaleToCeiledSize(
-+          preview_size_, std::clamp(destination_scale, 1.0f, 2.0f));
-+      cache.Request(handle, desired_capture_size,
-+                    base::BindOnce(&BubbleView::OnThumbnailAvailable,
-+                                   weak_factory_.GetWeakPtr()));
-+      // Decode only the immediate neighbours. This never observes a thumbnail
-+      // or asks a background page to load/render.
-+      for (const size_t neighbour :
-+           {(selected_index + 1) % tabs.size(),
-+            (selected_index + tabs.size() - 1) % tabs.size()}) {
-+        const int index = model->GetIndexOfWebContents(tabs[neighbour]);
-+        if (index != TabStripModel::kNoTab && neighbour != selected_index) {
-+          cache.Prefetch(model->GetTabAtIndex(index)->GetHandle(),
-+                         desired_capture_size);
-+        }
-+      }
-+
-+      RebuildIconStrip(tabs, selected_index);
++      rail_->Update(tabs, selected_index);
 +    }
 +
 +   private:
-+    static constexpr gfx::Size kPlaceholderIconSize = gfx::Size(32, 32);
-+    static constexpr int kHorizontalInset = 20;
-+    static constexpr int kVerticalInset = 16;
-+    static constexpr int kElementSpacing = 8;
-+    static constexpr int kPreviewCornerRadius = 12;
-+    static constexpr int kOverlayChromeHeight = 160;
-+    static constexpr int kIconChipSize = 36;
-+    static constexpr int kIconSize = 20;
-+    static constexpr int kIconSpacing = 8;
-+    static constexpr size_t kMaxVisibleIcons = 9;
-+
-+    static gfx::Size CalculatePreviewSize(BrowserView* browser_view) {
-+      return CalculateMRUPreviewSize(browser_view);
-+    }
-+
-+    TabUIHelper* GetTabUIHelper(content::WebContents* contents) const {
-+      TabStripModel* model = browser_view_->browser()->tab_strip_model();
-+      const int index = model->GetIndexOfWebContents(contents);
-+      return index == TabStripModel::kNoTab
-+                 ? nullptr
-+                 : TabUIHelper::From(model->GetTabAtIndex(index));
-+    }
-+
-+    void RebuildIconStrip(const std::vector<content::WebContents*>& tabs,
-+                          size_t selected_index) {
-+      icon_strip_->RemoveAllChildViews();
-+
-+      const size_t visible_count = std::min(kMaxVisibleIcons, tabs.size());
-+      size_t first_visible = 0;
-+      if (tabs.size() > visible_count) {
-+        const size_t half = visible_count / 2;
-+        first_visible = selected_index > half ? selected_index - half : 0;
-+        first_visible = std::min(first_visible, tabs.size() - visible_count);
-+      }
-+
-+      for (size_t offset = 0; offset < visible_count; ++offset) {
-+        const size_t index = first_visible + offset;
-+        TabUIHelper* helper = GetTabUIHelper(tabs[index]);
-+
-+        auto chip = std::make_unique<views::View>();
-+        chip->SetPreferredSize(gfx::Size(kIconChipSize, kIconChipSize));
-+        chip->SetBorder(
-+            index == selected_index
-+                ? views::CreateRoundedRectBorder(2, kIconChipSize / 2,
-+                                                 kColorTabHoverCardForeground)
-+                : views::CreateEmptyBorder(2));
-+        chip->SetLayoutManager(std::make_unique<views::FillLayout>());
-+
-+        auto icon = std::make_unique<views::ImageView>();
-+        icon->SetImage(helper ? helper->GetFavicon() : ui::ImageModel());
-+        icon->SetImageSize(gfx::Size(kIconSize, kIconSize));
-+        const std::u16string title =
-+            helper ? helper->GetTitle() : tabs[index]->GetTitle();
-+        icon->SetTooltipText(title);
-+        chip->SetTooltipText(title);
-+        chip->AddChildView(std::move(icon));
-+        icon_strip_->AddChildView(std::move(chip));
-+      }
-+
-+      icon_strip_->InvalidateLayout();
-+    }
-+
-+    void OnThumbnailAvailable(gfx::ImageSkia thumbnail) {
-+      if (thumbnail.isNull()) {
-+        return;
-+      }
-+      preview_image_->SetImage(
-+          ui::ImageModel::FromImageSkia(std::move(thumbnail)));
-+      placeholder_icon_->SetVisible(false);
-+    }
-+
-+    const raw_ptr<BrowserView> browser_view_;
-+    raw_ptr<views::Label> title_label_ = nullptr;
-+    raw_ptr<views::Label> domain_label_ = nullptr;
-+    raw_ptr<views::ImageView> preview_image_ = nullptr;
-+    raw_ptr<views::ImageView> placeholder_icon_ = nullptr;
-+    raw_ptr<views::View> icon_strip_ = nullptr;
-+    raw_ptr<views::Label> position_label_ = nullptr;
-+    const gfx::Size preview_size_;
-+    base::WeakPtrFactory<BubbleView> weak_factory_{this};
++    raw_ptr<MRUTabPreviewRail> rail_ = nullptr;
 +  };
 +
 +  void EnsureWidget() {
@@ -561,7 +374,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  // Handles events during MRU tab cycling to start/stop tab cycling.
  class TabCyclingEventHandler : public ui::EventObserver,
                                 public views::WidgetObserver {
-@@ -900,7 +1219,7 @@ class TabCyclingEventHandler : public ui
+@@ -900,7 +1030,7 @@ class TabCyclingEventHandler : public ui
      Start();
    }
  
@@ -570,7 +383,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  
    TabCyclingEventHandler(const TabCyclingEventHandler&) = delete;
    TabCyclingEventHandler& operator=(const TabCyclingEventHandler&) = delete;
-@@ -908,15 +1227,22 @@ class TabCyclingEventHandler : public ui
+@@ -908,15 +1038,22 @@ class TabCyclingEventHandler : public ui
   private:
    // ui::EventObserver overrides:
    void OnEvent(const ui::Event& event) override {
@@ -596,7 +409,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
      }
    }
  
-@@ -924,12 +1250,12 @@ class TabCyclingEventHandler : public ui
+@@ -924,12 +1061,12 @@ class TabCyclingEventHandler : public ui
    void OnWidgetActivationChanged(views::Widget* widget, bool active) override {
      // We should stop cycling if other application gets active state.
      if (!active) {
@@ -611,7 +424,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  
    void Start() {
      // Add the event handler.
-@@ -937,37 +1263,79 @@ class TabCyclingEventHandler : public ui
+@@ -937,37 +1074,79 @@ class TabCyclingEventHandler : public ui
      if (widget->GetNativeWindow()) {
        monitor_ = views::EventMonitor::CreateWindowMonitor(
            this, widget->GetNativeWindow(),
@@ -694,7 +507,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  ///////////////////////////////////////////////////////////////////////////////
  // BrowserView, public:
  
-@@ -1015,6 +1383,27 @@ BrowserView::BrowserView(Browser* browse
+@@ -1015,6 +1194,27 @@ BrowserView::BrowserView(Browser* browse
    zen_side_chrome_animation_.Reset(1);
  
    browser_->tab_strip_model()->AddObserver(this);
@@ -722,7 +535,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  
    main_background_region_ =
        AddChildView(std::make_unique<MainBackgroundRegionView>(*this));
-@@ -1210,6 +1599,9 @@ BrowserView::BrowserView(Browser* browse
+@@ -1210,6 +1410,9 @@ BrowserView::BrowserView(Browser* browse
  }
  
  BrowserView::~BrowserView() {
@@ -732,7 +545,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    if (browser_shortcut_service_) {
      browser_shortcut_service_->RemoveObserver(this);
      browser_shortcut_service_ = nullptr;
-@@ -4103,10 +4495,20 @@ void BrowserView::OnTabChangedAt(tabs::T
+@@ -4103,10 +4306,20 @@ void BrowserView::OnTabChangedAt(tabs::T
    UpdateAccessibleURLForRootView(contents->GetURL());
  }
  
@@ -753,7 +566,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    // When the active tab changes, elements in the omnibox can change, which
    // can change its preferred size. Re-lay-out the toolbar to reflect the
    // possible change.
-@@ -5812,6 +6214,26 @@ bool BrowserView::AcceleratorPressed(con
+@@ -5812,6 +6025,26 @@ bool BrowserView::AcceleratorPressed(con
  
    UpdateAcceleratorMetrics(accelerator, command_id);
  
@@ -780,7 +593,24 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    if (command_id == IDC_CLEAR_BROWSING_DATA) {
      views::ElementTrackerViews::GetInstance()->NotifyCustomEvent(
          browsing_data_important_sites_util::
-@@ -6235,8 +6657,18 @@ void BrowserView::LoadAccelerators() {
+@@ -6192,6 +6425,16 @@ void BrowserView::LoadAccelerators() {
+       browser_->GetProfile()->GetOTRProfileID().IsCaptivePortal();
+ #endif
+   std::vector<AcceleratorMapping> accelerator_list(GetAcceleratorList());
++#if BUILDFLAG(IS_MAC)
++  // The shared accelerator list omits macOS menu shortcuts. Register these
++  // locally so Cocoa's priority-accelerator dispatch reaches the modifier-held
++  // preview path instead of executing the next/previous-tab menu command.
++  accelerator_list.push_back(
++      {ui::VKEY_TAB, ui::EF_CONTROL_DOWN, IDC_SELECT_NEXT_TAB});
++  accelerator_list.push_back({ui::VKEY_TAB,
++                              ui::EF_CONTROL_DOWN | ui::EF_SHIFT_DOWN,
++                              IDC_SELECT_PREVIOUS_TAB});
++#endif
+   if (browser_shortcut_service_ &&
+       base::FeatureList::IsEnabled(features::kCustomizableBrowserShortcuts)) {
+     std::erase_if(accelerator_list, [this](const AcceleratorMapping& entry) {
+@@ -6235,8 +6478,18 @@ void BrowserView::LoadAccelerators() {
      accelerator_table_[accelerator] = entry.command_id;
  
      if (!already_registered) {
@@ -829,7 +659,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view_unittest.cc
  #include "ui/views/interaction/element_tracker_views.h"
  
  #if BUILDFLAG(IS_CHROMEOS)
-@@ -168,6 +171,72 @@ TEST_F(BrowserViewTest, BrowserView) {
+@@ -168,6 +171,82 @@ TEST_F(BrowserViewTest, BrowserView) {
    EXPECT_EQ(customize_chrome_action->GetEnabled(), true);
  }
  
@@ -860,11 +690,21 @@ Index: src/chrome/browser/ui/views/frame/browser_view_unittest.cc
 +  auto* model = browser()->tab_strip_model();
 +  browser()->profile()->GetPrefs()->SetBoolean(prefs::kTabCyclingMRU, true);
 +  auto* original = model->GetActiveWebContents();
-+  EXPECT_TRUE(browser_view()->AcceleratorPressed(
-+      ui::Accelerator(ui::VKEY_TAB, ui::EF_CONTROL_DOWN)));
++  auto* focus_manager = browser_view()->GetFocusManager();
++  const ui::Accelerator next(ui::VKEY_TAB, ui::EF_CONTROL_DOWN);
++  const ui::Accelerator previous(ui::VKEY_TAB,
++                                 ui::EF_CONTROL_DOWN | ui::EF_SHIFT_DOWN);
++  ASSERT_TRUE(focus_manager->IsAcceleratorRegistered(next));
++  ASSERT_TRUE(focus_manager->IsAcceleratorRegistered(previous));
++  EXPECT_TRUE(focus_manager->ProcessAccelerator(next));
 +  EXPECT_EQ(original, model->GetActiveWebContents());
 +  browser_view()->CommitTabCycling();
 +  EXPECT_EQ(candidate, model->GetActiveWebContents());
++
++  EXPECT_TRUE(focus_manager->ProcessAccelerator(previous));
++  EXPECT_EQ(candidate, model->GetActiveWebContents());
++  browser_view()->CommitTabCycling();
++  EXPECT_EQ(original, model->GetActiveWebContents());
 +}
 +
 +TEST_F(BrowserViewTest, MRUTabPreviewCancellationDoesNotActivateCandidate) {
@@ -1514,7 +1354,7 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,394 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1578,7 +1418,7 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
 +
 +void MRUTabPreviewCache::Request(tabs::TabHandle handle,
 +                                 gfx::Size size,
-+                                 ImageCallback callback) {
++                                 ImageCallback callback, bool high_priority) {
 +  auto image = Get(handle);
 +  if (!image.isNull()) {
 +    auto* tab = handle.Get();
@@ -1590,7 +1430,7 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
 +      return;
 +    }
 +  }
-+  Enqueue(handle, size, std::move(callback));
++  Enqueue(handle, size, std::move(callback), high_priority);
 +}
 +
 +void MRUTabPreviewCache::Prefetch(tabs::TabHandle handle, gfx::Size size) {
@@ -1602,12 +1442,12 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
 +      return;
 +    }
 +  }
-+  Enqueue(handle, size, {});
++  Enqueue(handle, size, {}, false);
 +}
 +
 +void MRUTabPreviewCache::Enqueue(tabs::TabHandle handle,
 +                                 gfx::Size size,
-+                                 ImageCallback callback) {
++                                 ImageCallback callback, bool high_priority) {
 +  size = BoundCaptureSize(size, size);
 +  if (!enabled_.Run() || !budget_ || size.IsEmpty()) {
 +    if (callback) {
@@ -1631,11 +1471,14 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
 +                                  std::vector<ImageCallback>(), nullptr);
 +  if (callback) {
 +    job->callbacks.push_back(std::move(callback));
-+    if (queued_.size() >= 4) {
++  }
++  // Keep a full five-card rail queued even while two stale decodes finish.
++  if (high_priority) {
++    if (queued_.size() >= 5) {
 +      queued_.pop_back();
 +    }
 +    queued_.push_front(job);
-+  } else if (queued_.size() < 4) {
++  } else if (queued_.size() < 5) {
 +    queued_.push_back(job);
 +  }
 +  Pump();
@@ -1910,7 +1753,7 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/frame/mru_tab_preview_cache.h
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,101 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1949,7 +1792,8 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache.h
 +                    base::RepeatingCallback<bool()> enabled);
 +  ~MRUTabPreviewCache() override;
 +  gfx::ImageSkia Get(tabs::TabHandle handle);
-+  void Request(tabs::TabHandle handle, gfx::Size size, ImageCallback callback);
++  void Request(tabs::TabHandle handle, gfx::Size size, ImageCallback callback,
++               bool high_priority = true);
 +  void Prefetch(tabs::TabHandle handle, gfx::Size size);
 +  void CancelPendingRequests();
 +
@@ -1973,7 +1817,8 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache.h
 +    std::vector<ImageCallback> callbacks;
 +    scoped_refptr<ThumbnailImage> thumbnail;
 +  };
-+  void Enqueue(tabs::TabHandle handle, gfx::Size size, ImageCallback callback);
++  void Enqueue(tabs::TabHandle handle, gfx::Size size, ImageCallback callback,
++               bool high_priority);
 +  void Pump();
 +  void Decoded(std::shared_ptr<Job> job,
 +               base::WeakPtr<content::WebContents> contents,
@@ -2014,7 +1859,7 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/frame/mru_tab_preview_cache_unittest.cc
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,259 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -2070,6 +1915,10 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache_unittest.cc
 +    content::RunAllTasksUntilIdle();
 +  }
 +  size_t Running(const MRUTabPreviewCache& cache) { return cache.running_.size(); }
++  size_t Queued(const MRUTabPreviewCache& cache) { return cache.queued_.size(); }
++  tabs::TabHandle NextQueued(const MRUTabPreviewCache& cache) {
++    return cache.queued_.front()->handle;
++  }
 +  bool ReadyToCapture(content::WebContents* contents) {
 +    return MRUTabPreviewCache::IsPageReadyForCapture(contents);
 +  }
@@ -2082,6 +1931,37 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache_unittest.cc
 +  void DidStartLoading() override { ++loads; }
 +  int loads = 0;
 +};
++
++TEST_F(MRUTabPreviewCacheTest, FiveVisibleCardsWaitBehindStaleDecodes) {
++  std::vector<tabs::TabHandle> handles;
++  for (int i = 0; i < 7; ++i) {
++    handles.push_back(AddHandle());
++    SeedThumbnail(handles.back());
++  }
++  auto cache = MakeCache(true);
++  const gfx::Size size(160, 90);
++  int obsolete_callbacks = 0;
++  for (size_t i = 0; i < 2; ++i) {
++    cache->Request(handles[i], size, base::BindOnce(
++        [](int* count, gfx::ImageSkia) { ++*count; }, &obsolete_callbacks));
++  }
++  ASSERT_EQ(Running(*cache), 2u);
++  cache->CancelPendingRequests();
++  int visible_callbacks = 0;
++  for (size_t i = 2; i < handles.size(); ++i) {
++    cache->Request(handles[i], size, base::BindOnce(
++        [](int* count, gfx::ImageSkia image) {
++          EXPECT_FALSE(image.isNull());
++          ++*count;
++        }, &visible_callbacks), i == 2);
++  }
++  EXPECT_EQ(Running(*cache), 2u);
++  EXPECT_EQ(Queued(*cache), 5u);
++  EXPECT_EQ(NextQueued(*cache), handles[2]);
++  content::RunAllTasksUntilIdle();
++  EXPECT_EQ(obsolete_callbacks, 0);
++  EXPECT_EQ(visible_callbacks, 5);
++}
 +
 +TEST_F(MRUTabPreviewCacheTest, CaptureRequiresPaintAndRejectsPendingNavigation) {
 +  auto handle = AddHandle();
@@ -2251,3 +2131,257 @@ Index: src/chrome/test/BUILD.gn
        "../browser/ui/views/frame/layout/browser_view_layout_params_unittest.cc",
        "../browser/ui/views/frame/multi_contents_drop_target_view_unittest.cc",
        "../browser/ui/views/frame/multi_contents_view_drop_target_controller_unittest.cc",
+Index: src/chrome/browser/ui/views/frame/mru_tab_preview_rail.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/frame/mru_tab_preview_rail.cc
+@@ -0,0 +1,194 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/frame/mru_tab_preview_rail.h"
++
++#include <algorithm>
++#include <memory>
++
++#include "base/functional/bind.h"
++#include "base/strings/string_number_conversions.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tab_ui_helper.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/mru_tab_preview_cache.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/color/color_provider.h"
++#include "ui/display/screen.h"
++#include "ui/gfx/color_utils.h"
++#include "ui/gfx/geometry/size_conversions.h"
++#include "ui/gfx/shadow_value.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/background.h"
++#include "ui/views/border.h"
++#include "ui/views/controls/image_view.h"
++#include "ui/views/controls/label.h"
++#include "ui/views/layout/box_layout.h"
++#include "ui/views/layout/fill_layout.h"
++#include "ui/views/widget/widget.h"
++
++namespace {
++constexpr int kPanelInset = 12;
++constexpr int kCardInset = 8;
++constexpr int kCardGap = 8;
++constexpr int kMetadataHeight = 24;
++constexpr int kIconSize = 16;
++constexpr int kCornerRadius = 12;
++constexpr size_t kMaxCards = 5;
++}  // namespace
++
++MRUTabPreviewRail::MRUTabPreviewRail(BrowserView* browser_view)
++    : browser_view_(browser_view) {
++  SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kVertical, gfx::Insets(kPanelInset), 8));
++  cards_view_ = AddChildView(std::make_unique<views::View>());
++  cards_view_->SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kHorizontal, gfx::Insets(), kCardGap));
++  position_ = AddChildView(std::make_unique<views::Label>());
++  position_->SetSubpixelRenderingEnabled(false);
++  position_->SetHorizontalAlignment(gfx::ALIGN_CENTER);
++}
++
++MRUTabPreviewRail::~MRUTabPreviewRail() {
++  browser_view_->mru_preview_cache().CancelPendingRequests();
++}
++
++void MRUTabPreviewRail::Update(
++    const std::vector<content::WebContents*>& tabs, size_t selected) {
++  if (tabs.empty() || selected >= tabs.size()) {
++    return;
++  }
++  // A five-card viewport becomes narrower/fewer cards on small windows rather
++  // than overflowing or shrinking the title into an unreadable strip.
++  const int available = std::max(120, browser_view_->width() - 48);
++  const size_t count = std::min({kMaxCards, tabs.size(),
++      static_cast<size_t>(std::max(1, (available - 2 * kPanelInset + kCardGap) /
++                                         (140 + kCardGap)))});
++  const int card_width = std::min(256,
++      (available - 2 * kPanelInset - (static_cast<int>(count) - 1) * kCardGap) /
++          static_cast<int>(count));
++  const int preview_width = std::max(1, card_width - 2 * kCardInset - 4);
++  const gfx::Size preview_size(preview_width, preview_width * 9 / 16);
++  const size_t first = std::min(selected > count / 2 ? selected - count / 2 : 0,
++                                tabs.size() - count);
++  auto& cache = browser_view_->mru_preview_cache();
++  weak_factory_.InvalidateWeakPtrs();
++  cache.CancelPendingRequests();
++  cards_.clear();
++  cards_view_->RemoveAllChildViews();
++  std::vector<tabs::TabHandle> handles;
++  auto* model = browser_view_->browser()->tab_strip_model();
++  for (size_t offset = 0; offset < count; ++offset) {
++    const size_t index = first + offset;
++    const int model_index = model->GetIndexOfWebContents(tabs[index]);
++    if (model_index == TabStripModel::kNoTab) {
++      return;
++    }
++    auto* tab = model->GetTabAtIndex(model_index);
++    auto* helper = TabUIHelper::From(tab);
++    handles.push_back(tab->GetHandle());
++    const auto favicon = helper ? helper->GetFavicon() : ui::ImageModel();
++    const auto title = helper ? helper->GetTitle() : tabs[index]->GetTitle();
++    auto* card = cards_view_->AddChildView(std::make_unique<views::View>());
++    card->SetPreferredSize(gfx::Size(card_width,
++        preview_size.height() + 2 * kCardInset + 4 + 8 + kMetadataHeight));
++    card->SetLayoutManager(std::make_unique<views::BoxLayout>(
++        views::BoxLayout::Orientation::kVertical, gfx::Insets(kCardInset), 8));
++    card->SetTooltipText(title);
++    card->GetViewAccessibility().SetRole(ax::mojom::Role::kGroup);
++    card->GetViewAccessibility().SetName(title);
++    auto* preview = card->AddChildView(std::make_unique<views::View>());
++    preview->SetPreferredSize(preview_size);
++    preview->SetBackground(views::CreateRoundedRectBackground(
++        SkColorSetARGB(32, 127, 127, 127), 8));
++    preview->SetLayoutManager(std::make_unique<views::FillLayout>());
++    auto* image = preview->AddChildView(std::make_unique<views::ImageView>());
++    image->SetImageSize(preview_size);
++    image->SetCornerRadius(8);
++    auto* placeholder = preview->AddChildView(std::make_unique<views::ImageView>());
++    placeholder->SetImageSize(gfx::Size(32, 32));
++    placeholder->SetImage(favicon);
++    auto* metadata = card->AddChildView(std::make_unique<views::View>());
++    metadata->SetPreferredSize(gfx::Size(preview_width, kMetadataHeight));
++    auto* row = metadata->SetLayoutManager(std::make_unique<views::BoxLayout>(
++        views::BoxLayout::Orientation::kHorizontal, gfx::Insets(), 8));
++    row->set_cross_axis_alignment(views::BoxLayout::CrossAxisAlignment::kCenter);
++    auto* icon = metadata->AddChildView(std::make_unique<views::ImageView>());
++    icon->SetImage(favicon);
++    icon->SetImageSize(gfx::Size(kIconSize, kIconSize));
++    auto* label = metadata->AddChildView(std::make_unique<views::Label>(title));
++    label->SetSubpixelRenderingEnabled(false);
++    label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++    label->SetElideBehavior(gfx::ELIDE_TAIL);
++    label->SetMaximumWidthSingleLine(std::max(1, preview_width - kIconSize - 8));
++    row->SetFlexForView(label, 1);
++    cards_.push_back({card, image, placeholder, label, index == selected});
++    const auto cached = cache.Get(handles.back());
++    if (!cached.isNull()) {
++      OnThumbnail(offset, cached);
++    }
++  }
++  position_->SetText(base::NumberToString16(selected + 1) + u" / " +
++                     base::NumberToString16(tabs.size()));
++  position_->SetVisible(tabs.size() > count);
++  SetLabelContrast(background_, shadow_);
++  float scale = 1.0f;
++  if (auto* widget = browser_view_->GetWidget(); widget && widget->GetNativeWindow()) {
++    scale = display::Screen::Get()->GetDisplayNearestWindow(
++        widget->GetNativeWindow()).device_scale_factor();
++  }
++  const auto capture_size = gfx::ScaleToCeiledSize(preview_size,
++                                                 std::clamp(scale, 1.0f, 2.0f));
++  const size_t selected_card = selected - first;
++  auto request = [&](size_t i, bool priority) {
++    cache.Request(handles[i], capture_size,
++        base::BindOnce(&MRUTabPreviewRail::OnThumbnail,
++                       weak_factory_.GetWeakPtr(), i), priority);
++  };
++  request(selected_card, true);
++  for (size_t i = 0; i < count; ++i) {
++    if (i != selected_card) {
++      request(i, false);
++    }
++  }
++  InvalidateLayout();
++  PreferredSizeChanged();
++}
++
++void MRUTabPreviewRail::OnThumbnail(size_t card, gfx::ImageSkia image) {
++  if (image.isNull() || card >= cards_.size()) {
++    return;
++  }
++  cards_[card].preview->SetImage(ui::ImageModel::FromImageSkia(image));
++  cards_[card].placeholder->SetVisible(false);
++}
++
++void MRUTabPreviewRail::SetLabelContrast(SkColor background, bool shadow) {
++  background_ = background;
++  shadow_ = shadow;
++  const SkColor foreground = color_utils::GetColorWithMaxContrast(background);
++  auto style = [&](views::Label* label) {
++    label->SetBackgroundColor(background);
++    label->SetEnabledColor(foreground);
++    label->SetShadows(shadow ? gfx::ShadowValues{gfx::ShadowValue(
++        gfx::Vector2d(0, 1), 2, SkColorSetA(
++            color_utils::GetColorWithMaxContrast(foreground), 0x99))}
++                            : gfx::ShadowValues());
++  };
++  style(position_);
++  for (auto& card : cards_) {
++    style(card.title);
++    card.container->SetBackground(card.selected
++        ? views::CreateRoundedRectBackground(SkColorSetA(foreground, 36), kCornerRadius)
++        : nullptr);
++    card.container->SetBorder(card.selected
++        ? views::CreateRoundedRectBorder(2, kCornerRadius, SkColorSetA(foreground, 160))
++        : views::CreateEmptyBorder(2));
++  }
++}
++
++BEGIN_METADATA(MRUTabPreviewRail)
++END_METADATA
+Index: src/chrome/browser/ui/views/frame/mru_tab_preview_rail.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/frame/mru_tab_preview_rail.h
+@@ -0,0 +1,50 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_FRAME_MRU_TAB_PREVIEW_RAIL_H_
++#define CHROME_BROWSER_UI_VIEWS_FRAME_MRU_TAB_PREVIEW_RAIL_H_
++
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/views/view.h"
++
++class BrowserView;
++namespace content { class WebContents; }
++namespace gfx { class ImageSkia; }
++namespace views { class ImageView; class Label; }
++
++// The MRU feature owns card layout and cached images. The hosting overlay owns
++// glass/materials and event handling.
++class MRUTabPreviewRail : public views::View {
++  METADATA_HEADER(MRUTabPreviewRail, views::View)
++
++ public:
++  explicit MRUTabPreviewRail(BrowserView* browser_view);
++  ~MRUTabPreviewRail() override;
++  void Update(const std::vector<content::WebContents*>& tabs, size_t selected);
++  void SetLabelContrast(SkColor background, bool shadow);
++
++ private:
++  struct Card {
++    raw_ptr<views::View> container;
++    raw_ptr<views::ImageView> preview;
++    raw_ptr<views::ImageView> placeholder;
++    raw_ptr<views::Label> title;
++    bool selected;
++  };
++  void OnThumbnail(size_t card, gfx::ImageSkia image);
++  const raw_ptr<BrowserView> browser_view_;
++  raw_ptr<views::View> cards_view_;
++  raw_ptr<views::Label> position_;
++  std::vector<Card> cards_;
++  SkColor background_ = SkColorSetRGB(28, 28, 30);
++  bool shadow_ = false;
++  base::WeakPtrFactory<MRUTabPreviewRail> weak_factory_{this};
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_FRAME_MRU_TAB_PREVIEW_RAIL_H_

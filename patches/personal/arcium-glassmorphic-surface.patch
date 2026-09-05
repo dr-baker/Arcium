@@ -2,7 +2,7 @@ Index: src/chrome/browser/ui/BUILD.gn
 ===================================================================
 --- src.orig/chrome/browser/ui/BUILD.gn
 +++ src/chrome/browser/ui/BUILD.gn
-@@ -4174,6 +4174,8 @@ static_library("ui") {
+@@ -4178,6 +4178,8 @@ static_library("ui") {
        "views/global_error_bubble_view.h",
        "views/helium/frame_corner_radius.cc",
        "views/helium/frame_corner_radius.h",
@@ -15,33 +15,18 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/browser_view.cc
 +++ src/chrome/browser/ui/views/frame/browser_view.cc
-@@ -172,6 +172,8 @@
- #include "chrome/browser/ui/views/frame/multi_contents_view_delegate.h"
- #include "chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller.h"
- #include "chrome/browser/ui/views/frame/mru_tab_switcher_visualizer.h"
+@@ -169,6 +169,10 @@
+ #include "chrome/browser/ui/views/frame/main_background_region_view.h"
+ #include "chrome/browser/ui/views/frame/mru_tab_preview_cache.h"
+ #include "chrome/browser/ui/views/frame/mru_tab_preview_rail.h"
 +#include "chrome/browser/ui/views/helium/glass_surface.h"
 +#include "chrome/browser/ui/views/helium/native_frame_materials.h"
- #include "chrome/browser/ui/views/frame/scrim_view.h"
- #include "chrome/browser/ui/views/frame/shadow_overlay_view.h"
- #include "chrome/browser/ui/views/frame/tab_modal_dialog_host.h"
-@@ -354,6 +356,7 @@
- #include "ui/gfx/geometry/size.h"
- #include "ui/gfx/scoped_canvas.h"
- #include "ui/gfx/scrollbar_size.h"
-+#include "ui/gfx/shadow_value.h"
- #include "ui/views/accessibility/view_accessibility.h"
- #include "ui/views/accessibility/view_accessibility_utils.h"
- #include "ui/views/animation/compositor_animation_runner.h"
-@@ -373,6 +376,8 @@
- #include "ui/views/style/typography.h"
- #include "ui/views/view.h"
- #include "ui/views/view_class_properties.h"
 +#include "ui/views/view_observer.h"
 +#include "ui/views/view_shadow.h"
- #include "ui/views/view_utils.h"
- #include "ui/views/views_features.h"
- #include "ui/views/widget/native_widget.h"
-@@ -908,14 +913,23 @@ class BrowserView::PipExclusionObserverI
+ #include "chrome/browser/ui/views/frame/multi_contents_view.h"
+ #include "chrome/browser/ui/views/frame/multi_contents_view_delegate.h"
+ #include "chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller.h"
+@@ -922,14 +926,22 @@ gfx::Size CalculateMRUPreviewSize(Browse
  }
  
  // Displays the selected tab while Ctrl+Tab walks a stable MRU snapshot.
@@ -50,10 +35,10 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
   public:
    explicit MRUTabSwitcherOverlay(BrowserView* browser_view)
 -      : browser_view_(browser_view) {}
+-
 +      : browser_view_(browser_view) {
 +    browser_view_->AddObserver(this);
 +  }
- 
    MRUTabSwitcherOverlay(const MRUTabSwitcherOverlay&) = delete;
    MRUTabSwitcherOverlay& operator=(const MRUTabSwitcherOverlay&) = delete;
 -  ~MRUTabSwitcherOverlay() { bubble_ = nullptr; }
@@ -68,184 +53,112 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  
    void Update(const std::vector<content::WebContents*>& starting_tabs,
                content::WebContents* selected_tab) {
-@@ -927,19 +941,26 @@ class MRUTabSwitcherOverlay {
+@@ -940,77 +952,108 @@ class MRUTabSwitcherOverlay {
+     if (selected == tabs_.end()) {
        return;
      }
- 
+-
 -    EnsureWidget();
-+    EnsureView();
-     bubble_->Update(tabs_, selected - tabs_.begin());
+-    bubble_->Update(tabs_, selected - tabs_.begin());
+-    delegate_->SizeToContents();
 -    if (!widget_->IsVisible()) {
 -      widget_->ShowInactive();
 -    }
++    selected_index_ = selected - tabs_.begin();
++    EnsureView();
++    bubble_->Update(tabs_, selected_index_);
 +    PositionView();
 +    bubble_->SetVisible(true);
    }
  
-  private:
-+  void OnViewBoundsChanged(views::View* observed_view) override {
-+    PositionView();
-+  }
-+
-+ public:
+- private:
    class BubbleView : public views::View {
 +    METADATA_HEADER(BubbleView, views::View)
 +
     public:
--    explicit BubbleView(BrowserView* browser_view)
-+    BubbleView(BrowserView* browser_view, bool use_glass_surface)
-         : browser_view_(browser_view),
--          preview_size_(CalculatePreviewSize(browser_view)) {
-+          preview_size_(CalculatePreviewSize(browser_view)),
-+          use_glass_surface_(use_glass_surface) {
+-    explicit BubbleView(BrowserView* browser_view) {
++    BubbleView(BrowserView* browser_view, bool use_glass)
++        : browser_view_(browser_view), use_glass_(use_glass) {
        GetViewAccessibility().SetRole(ax::mojom::Role::kGroup);
        GetViewAccessibility().SetName(
            l10n_util::GetStringUTF16(IDS_RECENT_TABS_MENU));
-@@ -947,17 +968,49 @@ class MRUTabSwitcherOverlay {
-           gfx::Size(preview_size_.width() + 2 * kHorizontalInset,
-                     preview_size_.height() + kOverlayChromeHeight));
- 
--      SetLayoutManager(std::make_unique<views::BoxLayout>(
--          views::BoxLayout::Orientation::kVertical,
--          gfx::Insets::VH(kVerticalInset, kHorizontalInset), kElementSpacing));
-+      view_shadow_ = std::make_unique<views::ViewShadow>(this, 2);
-+      view_shadow_->SetRoundedCornerRadius(kPreviewCornerRadius);
- 
--      title_label_ = AddChildView(std::make_unique<views::Label>());
-+      if (use_glass_surface_) {
-+        helium::GlassSurfaceParams glass_params;
-+        glass_params.preset = helium::GlassSurfacePreset::kGlassmorphic;
-+        glass_params.tint_color = SK_ColorWHITE;
-+        glass_params.tint_strength = 0.0f;
-+        glass_params.opacity = 1.0f;
-+        glass_params.corner_radii = gfx::RoundedCornersF(kPreviewCornerRadius);
-+        glass_surface_ = AddChildView(
-+            std::make_unique<helium::GlassSurfaceView>(glass_params));
+       SetLayoutManager(std::make_unique<views::FillLayout>());
++      shadow_ = std::make_unique<views::ViewShadow>(this, 2);
++      shadow_->SetRoundedCornerRadius(12);
++      if (use_glass_) {
++        helium::GlassSurfaceParams params;
++        params.preset = helium::GlassSurfacePreset::kGlassmorphic;
++        params.tint_color = SK_ColorWHITE;
++        params.tint_strength = 0.0f;
++        params.opacity = 1.0f;
++        params.corner_radii = gfx::RoundedCornersF(12);
++        AddChildView(std::make_unique<helium::GlassSurfaceView>(params));
 +      } else {
 +        SetBackground(views::CreateRoundedRectBackground(
-+            SkColorSetRGB(28, 28, 30), kPreviewCornerRadius));
-+        SetBorder(views::CreateRoundedRectBorder(
-+            1, kPreviewCornerRadius, SkColorSetARGB(64, 255, 255, 255)));
++            SkColorSetRGB(28, 28, 30), 12));
 +      }
+       rail_ = AddChildView(std::make_unique<MRUTabPreviewRail>(browser_view));
+-    }
+-
+-    void Update(const std::vector<content::WebContents*>& tabs,
+-                size_t selected_index) {
+-      rail_->Update(tabs, selected_index);
++      // Keep card content above the glass layer, in the browser's render pass.
++      rail_->SetPaintToLayer();
++      rail_->layer()->SetFillsBoundsOpaquely(false);
++    }
 +
-+      SetLayoutManager(std::make_unique<views::FillLayout>());
-+      auto content = std::make_unique<views::View>();
-+      auto* content_view = AddChildView(std::move(content));
-+      // Keep the content in a sibling layer so the glass layer can stay below
-+      // it while still sampling the page behind the bubble.
-+      content_view->SetPaintToLayer();
-+      content_view->layer()->SetFillsBoundsOpaquely(false);
-+      content_view->SetLayoutManager(
-+          std::make_unique<views::BoxLayout>(
-+              views::BoxLayout::Orientation::kVertical,
-+              gfx::Insets::VH(kVerticalInset, kHorizontalInset),
-+              kElementSpacing));
-+
-+      title_label_ =
-+          content_view->AddChildView(std::make_unique<views::Label>());
-+      title_label_->SetSubpixelRenderingEnabled(false);
-       title_label_->SetTextStyle(views::style::STYLE_EMPHASIZED);
-       title_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
-       title_label_->SetElideBehavior(gfx::ELIDE_TAIL);
-       title_label_->SetMaximumWidthSingleLine(preview_size_.width());
- 
--      domain_label_ = AddChildView(std::make_unique<views::Label>());
-+      domain_label_ =
-+          content_view->AddChildView(std::make_unique<views::Label>());
-+      domain_label_->SetSubpixelRenderingEnabled(false);
-       domain_label_->SetTextStyle(views::style::STYLE_SECONDARY);
-       domain_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
-       domain_label_->SetElideBehavior(gfx::ELIDE_TAIL);
-@@ -979,9 +1032,9 @@ class MRUTabSwitcherOverlay {
-           preview_container->AddChildView(std::make_unique<views::ImageView>());
-       placeholder_icon_->SetImageSize(kPlaceholderIconSize);
- 
--      AddChildView(std::move(preview_container));
-+      content_view->AddChildView(std::move(preview_container));
- 
--      icon_strip_ = AddChildView(std::make_unique<views::View>());
-+      icon_strip_ = content_view->AddChildView(std::make_unique<views::View>());
-       icon_strip_->SetPreferredSize(
-           gfx::Size(preview_size_.width(), kIconChipSize));
-       auto* strip_layout =
-@@ -991,7 +1044,9 @@ class MRUTabSwitcherOverlay {
-       strip_layout->set_main_axis_alignment(
-           views::BoxLayout::MainAxisAlignment::kCenter);
- 
--      position_label_ = AddChildView(std::make_unique<views::Label>());
-+      position_label_ =
-+          content_view->AddChildView(std::make_unique<views::Label>());
-+      position_label_->SetSubpixelRenderingEnabled(false);
-       position_label_->SetTextStyle(views::style::STYLE_SECONDARY);
-       position_label_->SetHorizontalAlignment(gfx::ALIGN_CENTER);
- 
-@@ -1019,6 +1074,7 @@ class MRUTabSwitcherOverlay {
-           base::UTF8ToUTF16(selected->GetVisibleURL().host()));
-       position_label_->SetText(base::NumberToString16(selected_index + 1) +
-                                u" / " + base::NumberToString16(tabs.size()));
-+      UpdateLabelContrast();
- 
-       auto& cache = browser_view_->mru_preview_cache();
-       weak_factory_.InvalidateWeakPtrs();
-@@ -1057,6 +1113,42 @@ class MRUTabSwitcherOverlay {
-     static constexpr int kIconSpacing = 8;
-     static constexpr size_t kMaxVisibleIcons = 9;
- 
-+    void UpdateLabelContrast() {
++    void Update(const std::vector<content::WebContents*>& tabs, size_t selected) {
++      rail_->Update(tabs, selected);
 +      SkColor background = SkColorSetRGB(28, 28, 30);
-+      if (use_glass_surface_) {
++      if (use_glass_) {
 +        background = browser_view_->GetColorProvider()->GetColor(
 +            kColorTabHoverCardBackground);
-+        // Preview selection can differ from the page behind the glass.
-+        auto* backdrop = browser_view_->GetActiveWebContents();
-+        auto* host_view = backdrop ? backdrop->GetRenderWidgetHostView() : nullptr;
-+        if (host_view) {
-+          if (auto page_background = host_view->GetBackgroundColor()) {
-+            background = color_utils::GetResultingPaintColor(
-+                *page_background, background);
++        auto* page = browser_view_->GetActiveWebContents();
++        auto* host = page ? page->GetRenderWidgetHostView() : nullptr;
++        if (host) {
++          if (auto color = host->GetBackgroundColor()) {
++            background = color_utils::GetResultingPaintColor(*color, background);
 +          }
 +        }
 +      }
-+      // This is the renderer's root background hint, not a pixel sample of
-+      // the glass. Choose strong ink from it and keep a small opposing shadow
-+      // for imagery or gradients that differ from the reported background.
-+      const SkColor foreground =
-+          color_utils::GetColorWithMaxContrast(background);
-+      const gfx::ShadowValues text_shadow = {
-+          gfx::ShadowValue(gfx::Vector2d(0, 1), 2,
-+                           SkColorSetA(color_utils::GetColorWithMaxContrast(
-+                                           foreground),
-+                                       0x99))};
-+      for (auto* label : {title_label_.get(), domain_label_.get(),
-+                          position_label_.get()}) {
-+        // Label uses this for contrast only; it does not paint a backing.
-+        label->SetBackgroundColor(background);
-+        label->SetEnabledColor(foreground);
-+        if (use_glass_surface_) {
-+          label->SetShadows(text_shadow);
-+        }
-+      }
-+    }
-+
-     static gfx::Size CalculatePreviewSize(BrowserView* browser_view) {
-       return CalculateMRUPreviewSize(browser_view);
++      rail_->SetLabelContrast(background, use_glass_);
      }
-@@ -1148,50 +1240,56 @@ class MRUTabSwitcherOverlay {
-     raw_ptr<views::Label> position_label_ = nullptr;
-     const gfx::Size preview_size_;
-+    const bool use_glass_surface_;
-+    raw_ptr<helium::GlassSurfaceView> glass_surface_ = nullptr;
-+    std::unique_ptr<views::ViewShadow> view_shadow_;
-     base::WeakPtrFactory<BubbleView> weak_factory_{this};
+ 
+    private:
++    const raw_ptr<BrowserView> browser_view_;
++    const bool use_glass_;
+     raw_ptr<MRUTabPreviewRail> rail_ = nullptr;
++    std::unique_ptr<views::ViewShadow> shadow_;
    };
  
 -  void EnsureWidget() {
 -    if (widget_) {
 + private:
++  void OnViewBoundsChanged(views::View*) override {
++    if (bubble_) {
++      bubble_->Update(tabs_, selected_index_);
++      PositionView();
++    }
++  }
++
 +  void EnsureView() {
 +    if (bubble_) {
        return;
      }
++    bool use_glass = true;
++#if BUILDFLAG(IS_MAC)
++    use_glass = IsMRUTransparencyAllowed() &&
++                !helium::ShouldUseNativeFrameMaterials(browser_view_);
++#endif
++    auto bubble = std::make_unique<BubbleView>(browser_view_, use_glass);
++    bubble->SetProperty(views::kViewIgnoredByLayoutKey, true);
++    bubble->SetCanProcessEventsWithinSubtree(false);
++    bubble->SetVisible(false);
++    bubble->SetPaintToLayer();
++    bubble->layer()->SetFillsBoundsOpaquely(false);
++    bubble_ = browser_view_->AddChildView(std::move(bubble));
++  }
  
 -    delegate_ = std::make_unique<views::BubbleDialogDelegate>(
 -        browser_view_, views::BubbleBorder::FLOAT,
@@ -273,30 +186,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 -    bubble_ = nullptr;
 -    widget_.reset();
 -    delegate_.reset();
-+    bool use_glass_surface = true;
-+#if BUILDFLAG(IS_MAC)
-+    // Reduce Transparency is an explicit accessibility choice. Keep the
-+    // existing opaque panel when the system asks for reduced transparency or
-+    // when native frame materials own the browser chrome.
-+    use_glass_surface = IsMRUTransparencyAllowed() &&
-+                        !helium::ShouldUseNativeFrameMaterials(browser_view_);
-+#endif
-+    auto bubble =
-+        std::make_unique<BubbleView>(browser_view_, use_glass_surface);
-+    bubble->SetProperty(views::kViewIgnoredByLayoutKey, true);
-+    bubble->SetCanProcessEventsWithinSubtree(false);
-+    bubble->SetVisible(false);
-+    bubble->SetPaintToLayer();
-+    bubble->layer()->SetFillsBoundsOpaquely(false);
-+    // A separate bubble widget owns a separate native window and render pass.
-+    // Keep the glass and browser content under the browser widget instead.
-+    bubble_ = browser_view_->AddChildView(std::move(bubble));
-+  }
-+
 +  void PositionView() {
-+    if (!bubble_) {
-+      return;
-+    }
 +    gfx::Rect bounds = browser_view_->GetLocalBounds();
 +    bounds.ClampToCenteredSize(bubble_->GetPreferredSize());
 +    bubble_->SetBoundsRect(bounds);
@@ -305,8 +195,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    const raw_ptr<BrowserView> browser_view_;
    std::vector<content::WebContents*> tabs_;
 -  // Owned by the widget delegate after EnsureWidget().
-+  // BrowserView owns the view. Its destructor stops the visualizer before
-+  // destroying child views, and stopping a cycle removes this child.
++  size_t selected_index_ = 0;
    raw_ptr<BubbleView> bubble_ = nullptr;
 -  std::unique_ptr<views::BubbleDialogDelegate> delegate_;
 -  std::unique_ptr<views::Widget> widget_;
@@ -1019,7 +908,15 @@ Index: src/chrome/browser/ui/views/frame/browser_view_unittest.cc
  
  #include "base/byte_size.h"
  #include "base/memory/scoped_refptr.h"
-@@ -60,9 +61,11 @@
+@@ -37,6 +38,7 @@
+ #include "chrome/browser/ui/views/frame/browser_widget.h"
+ #include "chrome/browser/ui/views/frame/layout/browser_view_layout.h"
+ #include "chrome/browser/ui/views/frame/mru_tab_switcher_visualizer.h"
++#include "chrome/browser/ui/views/frame/mru_tab_preview_rail.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/frame/test_with_browser_view.h"
+ #include "chrome/browser/ui/views/frame/top_container_view.h"
+@@ -61,9 +63,11 @@
  #include "ui/base/models/dialog_model.h"
  #include "ui/base/text/bytes_formatting.h"
  #include "ui/base/ui_base_features.h"
@@ -1031,7 +928,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view_unittest.cc
  #include "ui/views/bubble/bubble_dialog_model_host.h"
  #include "ui/views/controls/webview/webview.h"
  #include "ui/views/focus/focus_manager.h"
-@@ -169,16 +172,60 @@ TEST_F(BrowserViewTest, BrowserView) {
+@@ -171,16 +175,89 @@ TEST_F(BrowserViewTest, BrowserView) {
    EXPECT_EQ(customize_chrome_action->GetEnabled(), true);
  }
  
@@ -1066,7 +963,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view_unittest.cc
 +    descendants.insert(descendants.end(), view->children().begin(),
 +                       view->children().end());
 +  }
-+  EXPECT_EQ(label_count, 3u);
++  EXPECT_EQ(label_count, 2u);
 +
 +  browser_view()->SetSize(gfx::Size(1200, 900));
 +  EXPECT_EQ(overlay->bounds().CenterPoint(),
@@ -1074,6 +971,35 @@ Index: src/chrome/browser/ui/views/frame/browser_view_unittest.cc
 +
 +  StopMRUTabSwitcherVisualizer(browser_view());
 +  EXPECT_EQ(browser_view()->children().size(), original_child_count);
++}
++
++TEST_F(BrowserViewTest, MRURailKeepsFiveCardsAndFitsNarrowWindows) {
++  std::vector<content::WebContents*> tabs;
++  for (int i = 0; i < 7; ++i) {
++    AddTab(browser(), GURL("https://rail.test/"));
++    tabs.push_back(browser()->tab_strip_model()->GetActiveWebContents());
++  }
++  auto* active = browser()->tab_strip_model()->GetActiveWebContents();
++  browser_view()->SetSize(gfx::Size(1200, 800));
++  UpdateMRUTabSwitcherVisualizer(browser_view(), tabs, tabs[1]);
++  views::View* overlay = browser_view()->children().back();
++  MRUTabPreviewRail* rail = nullptr;
++  for (views::View* child : overlay->children()) {
++    if (auto* candidate = views::AsViewClass<MRUTabPreviewRail>(child)) {
++      rail = candidate;
++    }
++  }
++  ASSERT_TRUE(rail);
++  EXPECT_EQ(rail->children().front()->children().size(), 5u);
++  UpdateMRUTabSwitcherVisualizer(browser_view(), {}, tabs[6]);
++  EXPECT_EQ(rail->children().front()->children().size(), 5u);
++  EXPECT_EQ(active, browser()->tab_strip_model()->GetActiveWebContents());
++  browser_view()->SetSize(gfx::Size(400, 600));
++  EXPECT_EQ(rail->children().front()->children().size(), 2u);
++  EXPECT_LE(overlay->width(), browser_view()->width());
++  EXPECT_EQ(overlay->bounds().CenterPoint(),
++            browser_view()->GetLocalBounds().CenterPoint());
++  StopMRUTabSwitcherVisualizer(browser_view());
 +}
 +
  TEST_F(BrowserViewTest,
