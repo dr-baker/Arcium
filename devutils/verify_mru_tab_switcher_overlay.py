@@ -25,20 +25,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "utils"))
 from _common import parse_series # pylint: disable=wrong-import-position
 
 
+def _target_path(patched_file) -> Path:
+    path = Path(patched_file.target_file)
+    if path.parts[:1] in {("a",), ("b",), ("src",)}:
+        return Path(*path.parts[1:])
+    return path
+
+
 def _patch_paths(patch_path: Path) -> tuple[set[Path], set[Path]]:
     paths = set()
     added_paths = set()
     for patched_file in PatchSet.from_filename(str(patch_path)):
-        paths.add(Path(patched_file.path))
+        target_path = _target_path(patched_file)
+        paths.add(target_path)
         if patched_file.is_added_file:
-            added_paths.add(Path(patched_file.path))
+            added_paths.add(target_path)
     return paths, added_paths
 
 
 def _write_filtered_patch(patch_path: Path, target_paths: set[Path], output: Path) -> int:
     selected = []
     for patched_file in PatchSet.from_filename(str(patch_path)):
-        if Path(patched_file.path) in target_paths:
+        if _target_path(patched_file) in target_paths:
             selected.append(str(patched_file).rstrip("\n"))
     if not selected:
         return 0
@@ -184,7 +192,7 @@ def main() -> int:
     parser.add_argument(
         "--patch",
         type=Path,
-        default=root / "patches/personal/mru-tab-switcher-visualizer.patch",
+        default=root / "patches/personal/arcium-mru-tab-switcher.patch",
     )
     parser.add_argument(
         "--series",
