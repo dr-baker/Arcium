@@ -2,7 +2,7 @@ Index: src/chrome/browser/ui/BUILD.gn
 ===================================================================
 --- src.orig/chrome/browser/ui/BUILD.gn
 +++ src/chrome/browser/ui/BUILD.gn
-@@ -4174,6 +4174,8 @@
+@@ -4174,6 +4174,8 @@ static_library("ui") {
        "views/global_error_bubble_view.h",
        "views/helium/frame_corner_radius.cc",
        "views/helium/frame_corner_radius.h",
@@ -24,9 +24,73 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  #include "chrome/browser/ui/views/frame/scrim_view.h"
  #include "chrome/browser/ui/views/frame/shadow_overlay_view.h"
  #include "chrome/browser/ui/views/frame/tab_modal_dialog_host.h"
-@@ -937,9 +939,10 @@
+@@ -354,6 +356,7 @@
+ #include "ui/gfx/geometry/size.h"
+ #include "ui/gfx/scoped_canvas.h"
+ #include "ui/gfx/scrollbar_size.h"
++#include "ui/gfx/shadow_value.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/accessibility/view_accessibility_utils.h"
+ #include "ui/views/animation/compositor_animation_runner.h"
+@@ -373,6 +376,8 @@
+ #include "ui/views/style/typography.h"
+ #include "ui/views/view.h"
+ #include "ui/views/view_class_properties.h"
++#include "ui/views/view_observer.h"
++#include "ui/views/view_shadow.h"
+ #include "ui/views/view_utils.h"
+ #include "ui/views/views_features.h"
+ #include "ui/views/widget/native_widget.h"
+@@ -908,14 +913,23 @@ class BrowserView::PipExclusionObserverI
+ namespace {
+ 
+ // Displays the selected tab while Ctrl+Tab walks a stable MRU snapshot.
+-class MRUTabSwitcherOverlay {
++class MRUTabSwitcherOverlay : public views::ViewObserver {
+  public:
+   explicit MRUTabSwitcherOverlay(BrowserView* browser_view)
+-      : browser_view_(browser_view) {}
++      : browser_view_(browser_view) {
++    browser_view_->AddObserver(this);
++  }
+ 
+   MRUTabSwitcherOverlay(const MRUTabSwitcherOverlay&) = delete;
+   MRUTabSwitcherOverlay& operator=(const MRUTabSwitcherOverlay&) = delete;
+-  ~MRUTabSwitcherOverlay() { bubble_ = nullptr; }
++  ~MRUTabSwitcherOverlay() override {
++    browser_view_->RemoveObserver(this);
++    if (bubble_) {
++      auto* bubble = bubble_.get();
++      bubble_ = nullptr;
++      browser_view_->RemoveChildViewT(bubble);
++    }
++  }
+ 
+   void Update(const std::vector<content::WebContents*>& starting_tabs,
+               content::WebContents* selected_tab) {
+@@ -927,19 +941,26 @@ class MRUTabSwitcherOverlay {
+       return;
+     }
+ 
+-    EnsureWidget();
++    EnsureView();
+     bubble_->Update(tabs_, selected - tabs_.begin());
+-    if (!widget_->IsVisible()) {
+-      widget_->ShowInactive();
+-    }
++    PositionView();
++    bubble_->SetVisible(true);
+   }
+ 
   private:
++  void OnViewBoundsChanged(views::View* observed_view) override {
++    PositionView();
++  }
++
++ public:
    class BubbleView : public views::View {
++    METADATA_HEADER(BubbleView, views::View)
++
     public:
 -    explicit BubbleView(BrowserView* browser_view)
 +    BubbleView(BrowserView* browser_view, bool use_glass_surface)
@@ -37,25 +101,29 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
        GetViewAccessibility().SetRole(ax::mojom::Role::kGroup);
        GetViewAccessibility().SetName(
            l10n_util::GetStringUTF16(IDS_RECENT_TABS_MENU));
-@@ -947,17 +950,44 @@
+@@ -947,17 +968,49 @@ class MRUTabSwitcherOverlay {
            gfx::Size(preview_size_.width() + 2 * kHorizontalInset,
                      preview_size_.height() + kOverlayChromeHeight));
  
 -      SetLayoutManager(std::make_unique<views::BoxLayout>(
 -          views::BoxLayout::Orientation::kVertical,
 -          gfx::Insets::VH(kVerticalInset, kHorizontalInset), kElementSpacing));
++      view_shadow_ = std::make_unique<views::ViewShadow>(this, 2);
++      view_shadow_->SetRoundedCornerRadius(kPreviewCornerRadius);
+ 
+-      title_label_ = AddChildView(std::make_unique<views::Label>());
 +      if (use_glass_surface_) {
 +        helium::GlassSurfaceParams glass_params;
 +        glass_params.preset = helium::GlassSurfacePreset::kGlassmorphic;
 +        glass_params.tint_color = SK_ColorWHITE;
-+        glass_params.tint_strength = 0.08f;
++        glass_params.tint_strength = 0.0f;
 +        glass_params.opacity = 1.0f;
 +        glass_params.corner_radii = gfx::RoundedCornersF(kPreviewCornerRadius);
 +        glass_surface_ = AddChildView(
 +            std::make_unique<helium::GlassSurfaceView>(glass_params));
 +      } else {
 +        SetBackground(views::CreateRoundedRectBackground(
-+            SkColorSetARGB(184, 28, 28, 30), kPreviewCornerRadius));
++            SkColorSetRGB(28, 28, 30), kPreviewCornerRadius));
 +        SetBorder(views::CreateRoundedRectBorder(
 +            1, kPreviewCornerRadius, SkColorSetARGB(64, 255, 255, 255)));
 +      }
@@ -67,15 +135,15 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +      // it while still sampling the page behind the bubble.
 +      content_view->SetPaintToLayer();
 +      content_view->layer()->SetFillsBoundsOpaquely(false);
-+      auto* layout = content_view->SetLayoutManager(
++      content_view->SetLayoutManager(
 +          std::make_unique<views::BoxLayout>(
 +              views::BoxLayout::Orientation::kVertical,
 +              gfx::Insets::VH(kVerticalInset, kHorizontalInset),
 +              kElementSpacing));
- 
--      title_label_ = AddChildView(std::make_unique<views::Label>());
++
 +      title_label_ =
 +          content_view->AddChildView(std::make_unique<views::Label>());
++      title_label_->SetSubpixelRenderingEnabled(false);
        title_label_->SetTextStyle(views::style::STYLE_EMPHASIZED);
        title_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
        title_label_->SetElideBehavior(gfx::ELIDE_TAIL);
@@ -84,10 +152,11 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 -      domain_label_ = AddChildView(std::make_unique<views::Label>());
 +      domain_label_ =
 +          content_view->AddChildView(std::make_unique<views::Label>());
++      domain_label_->SetSubpixelRenderingEnabled(false);
        domain_label_->SetTextStyle(views::style::STYLE_SECONDARY);
        domain_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
        domain_label_->SetElideBehavior(gfx::ELIDE_TAIL);
-@@ -979,9 +1009,9 @@
+@@ -979,9 +1032,9 @@ class MRUTabSwitcherOverlay {
            preview_container->AddChildView(std::make_unique<views::ImageView>());
        placeholder_icon_->SetImageSize(kPlaceholderIconSize);
  
@@ -99,30 +168,112 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
        icon_strip_->SetPreferredSize(
            gfx::Size(preview_size_.width(), kIconChipSize));
        auto* strip_layout =
-@@ -991,7 +1021,8 @@
+@@ -991,7 +1044,9 @@ class MRUTabSwitcherOverlay {
        strip_layout->set_main_axis_alignment(
            views::BoxLayout::MainAxisAlignment::kCenter);
  
 -      position_label_ = AddChildView(std::make_unique<views::Label>());
 +      position_label_ =
 +          content_view->AddChildView(std::make_unique<views::Label>());
++      position_label_->SetSubpixelRenderingEnabled(false);
        position_label_->SetTextStyle(views::style::STYLE_SECONDARY);
        position_label_->SetHorizontalAlignment(gfx::ALIGN_CENTER);
  
-@@ -1148,6 +1179,8 @@
+@@ -1019,6 +1074,7 @@ class MRUTabSwitcherOverlay {
+           base::UTF8ToUTF16(selected->GetVisibleURL().host()));
+       position_label_->SetText(base::NumberToString16(selected_index + 1) +
+                                u" / " + base::NumberToString16(tabs.size()));
++      UpdateLabelContrast(selected);
+ 
+       preview_image_->SetImage(ui::ImageModel());
+       placeholder_icon_->SetImage(
+@@ -1057,6 +1113,39 @@ class MRUTabSwitcherOverlay {
+     static constexpr int kIconSpacing = 8;
+     static constexpr size_t kMaxVisibleIcons = 9;
+ 
++    void UpdateLabelContrast(content::WebContents* selected) {
++      SkColor background = SkColorSetRGB(28, 28, 30);
++      if (use_glass_surface_) {
++        background = browser_view_->GetColorProvider()->GetColor(
++            kColorTabHoverCardBackground);
++        if (auto* host_view = selected->GetRenderWidgetHostView()) {
++          if (auto page_background = host_view->GetBackgroundColor()) {
++            background = color_utils::GetResultingPaintColor(
++                *page_background, background);
++          }
++        }
++      }
++      // This is the renderer's root background hint, not a pixel sample of
++      // the glass. Choose strong ink from it and keep a small opposing shadow
++      // for imagery or gradients that differ from the reported background.
++      const SkColor foreground =
++          color_utils::GetColorWithMaxContrast(background);
++      const gfx::ShadowValues text_shadow = {
++          gfx::ShadowValue(gfx::Vector2d(0, 1), 2,
++                           SkColorSetA(color_utils::GetColorWithMaxContrast(
++                                           foreground),
++                                       0x99))};
++      for (auto* label : {title_label_.get(), domain_label_.get(),
++                          position_label_.get()}) {
++        // Label uses this for contrast only; it does not paint a backing.
++        label->SetBackgroundColor(background);
++        label->SetEnabledColor(foreground);
++        if (use_glass_surface_) {
++          label->SetShadows(text_shadow);
++        }
++      }
++    }
++
+     static gfx::Size CalculatePreviewSize(BrowserView* browser_view) {
+       const int available_width = std::max(browser_view->width(), 640);
+       const int available_height = std::max(browser_view->height(), 480);
+@@ -1148,54 +1237,60 @@ class MRUTabSwitcherOverlay {
      raw_ptr<views::Label> position_label_ = nullptr;
      raw_ptr<content::WebContents> selected_contents_ = nullptr;
      const gfx::Size preview_size_;
 +    const bool use_glass_surface_;
 +    raw_ptr<helium::GlassSurfaceView> glass_surface_ = nullptr;
++    std::unique_ptr<views::ViewShadow> view_shadow_;
      gfx::Size desired_capture_size_;
      bool high_resolution_requested_ = false;
      TabHoverCardThumbnailObserver thumbnail_observer_;
-@@ -1172,7 +1205,16 @@
-     delegate_->SetTitle(l10n_util::GetStringUTF16(IDS_RECENT_TABS_MENU));
-     delegate_->SetShowTitle(false);
+     base::CallbackListSubscription thumbnail_subscription_;
+   };
  
+-  void EnsureWidget() {
+-    if (widget_) {
++ private:
++  void EnsureView() {
++    if (bubble_) {
+       return;
+     }
+ 
+-    delegate_ = std::make_unique<views::BubbleDialogDelegate>(
+-        browser_view_, views::BubbleBorder::FLOAT,
+-        views::BubbleBorder::DIALOG_SHADOW,
+-        /*autosize=*/false);
+-    delegate_->SetButtons(static_cast<int>(ui::mojom::DialogButton::kNone));
+-    delegate_->SetCanActivate(false);
+-    delegate_->set_accept_events(false);
+-    delegate_->set_close_on_deactivate(true);
+-    delegate_->set_focus_traversable_from_anchor_view(false);
+-    delegate_->set_highlight_button_when_shown(false);
+-    delegate_->SetTitle(l10n_util::GetStringUTF16(IDS_RECENT_TABS_MENU));
+-    delegate_->SetShowTitle(false);
+-
 -    auto bubble = std::make_unique<BubbleView>(browser_view_);
+-    bubble_ = bubble.get();
+-    delegate_->SetContentsView(std::move(bubble));
+-    widget_ = views::BubbleDialogDelegate::CreateBubble(
+-        delegate_.get(),
+-        base::BindOnce(&MRUTabSwitcherOverlay::OnWidgetClosed,
+-                       weak_factory_.GetWeakPtr()));
+-  }
+-
+-  void OnWidgetClosed(views::Widget::ClosedReason) {
+-    bubble_ = nullptr;
+-    widget_.reset();
+-    delegate_.reset();
 +    bool use_glass_surface = true;
 +#if BUILDFLAG(IS_MAC)
 +    // Reduce Transparency is an explicit accessibility choice. Keep the
@@ -133,14 +284,47 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +#endif
 +    auto bubble =
 +        std::make_unique<BubbleView>(browser_view_, use_glass_surface);
-     bubble_ = bubble.get();
-     delegate_->SetContentsView(std::move(bubble));
-     widget_ = views::BubbleDialogDelegate::CreateBubble(
++    bubble->SetProperty(views::kViewIgnoredByLayoutKey, true);
++    bubble->SetCanProcessEventsWithinSubtree(false);
++    bubble->SetVisible(false);
++    bubble->SetPaintToLayer();
++    bubble->layer()->SetFillsBoundsOpaquely(false);
++    // A separate bubble widget owns a separate native window and render pass.
++    // Keep the glass and browser content under the browser widget instead.
++    bubble_ = browser_view_->AddChildView(std::move(bubble));
++  }
++
++  void PositionView() {
++    if (!bubble_) {
++      return;
++    }
++    gfx::Rect bounds = browser_view_->GetLocalBounds();
++    bounds.ClampToCenteredSize(bubble_->GetPreferredSize());
++    bubble_->SetBoundsRect(bounds);
+   }
+ 
+   const raw_ptr<BrowserView> browser_view_;
+   std::vector<content::WebContents*> tabs_;
+-  // Owned by the widget delegate after EnsureWidget().
++  // BrowserView owns the view. Its destructor stops the visualizer before
++  // destroying child views, and stopping a cycle removes this child.
+   raw_ptr<BubbleView> bubble_ = nullptr;
+-  std::unique_ptr<views::BubbleDialogDelegate> delegate_;
+-  std::unique_ptr<views::Widget> widget_;
+-  base::WeakPtrFactory<MRUTabSwitcherOverlay> weak_factory_{this};
+ };
+ 
++BEGIN_METADATA(MRUTabSwitcherOverlay, BubbleView)
++END_METADATA
++
+ using MRUTabSwitcherVisualizerMap =
+     base::flat_map<BrowserView*, std::unique_ptr<MRUTabSwitcherOverlay>>;
+ 
 Index: src/chrome/browser/ui/views/frame/mru_tab_switcher_visualizer.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/mru_tab_switcher_visualizer.h
 +++ src/chrome/browser/ui/views/frame/mru_tab_switcher_visualizer.h
-@@ -24,6 +24,8 @@
+@@ -24,6 +24,8 @@ void UpdateMRUTabSwitcherVisualizer(
  void StopMRUTabSwitcherVisualizer(BrowserView* browser_view);
  
  #if BUILDFLAG(IS_MAC)
@@ -153,7 +337,7 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_switcher_visualizer_mac.mm
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/mru_tab_switcher_visualizer_mac.mm
 +++ src/chrome/browser/ui/views/frame/mru_tab_switcher_visualizer_mac.mm
-@@ -42,6 +42,14 @@
+@@ -42,6 +42,14 @@ class MRUTabSwitcherApplicationObserverM
  
  }  // namespace
  
@@ -172,7 +356,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/helium/glass_surface.cc
 +++ src/chrome/browser/ui/views/helium/glass_surface.cc
-@@ -1 +1,232 @@
+@@ -1 +1,168 @@
 -// placeholder
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
@@ -181,50 +365,45 @@ Index: src/chrome/browser/ui/views/helium/glass_surface.cc
 +#include "chrome/browser/ui/views/helium/glass_surface.h"
 +
 +#include <algorithm>
-+#include <cmath>
-+#include <cstdint>
-+
 +#include "base/notreached.h"
-+#include "cc/paint/paint_flags.h"
-+#include "third_party/skia/include/core/SkCanvas.h"
-+#include "third_party/skia/include/core/SkRRect.h"
++#include "cc/paint/filter_operation.h"
++#include "cc/paint/filter_operations.h"
++#include "cc/paint/paint_filter.h"
 +#include "ui/base/metadata/metadata_impl_macros.h"
 +#include "ui/compositor/layer.h"
-+#include "ui/gfx/canvas.h"
-+#include "ui/gfx/geometry/skia_conversions.h"
 +
 +namespace helium {
 +
 +namespace {
 +
 +struct MaterialTuning {
-+  float blur_sigma;
-+  int fill_alpha;
-+  int rim_alpha;
-+  int highlight_alpha;
-+  int grain_alpha;
-+  int grain_dots;
++  float blur_radius;
++  float edge_width;
++  float refraction;
++  float dispersion;
++  float tint_strength;
++  float saturation;
++  float specular;
++  float grain;
++  SkColor4f tint;
 +};
 +
 +constexpr MaterialTuning kBasicTuning = {
-+    .blur_sigma = 18.0f,
-+    .fill_alpha = 184,
-+    .rim_alpha = 48,
-+    .highlight_alpha = 22,
-+    .grain_alpha = 4,
-+    .grain_dots = 36,
++    .blur_radius = 13.0f, .edge_width = 28.0f, .refraction = 0.6f,
++    .dispersion = 0.0f, .tint_strength = 0.10f, .saturation = 1.03f,
++    .specular = 0.08f, .grain = 0.004f,
++    .tint = {0.76f, 0.84f, 1.0f, 1.0f},
 +};
 +
 +constexpr MaterialTuning kGlassmorphicTuning = {
-+    .blur_sigma = 30.0f,
-+    .fill_alpha = 156,
-+    .rim_alpha = 72,
-+    .highlight_alpha = 40,
-+    .grain_alpha = 7,
-+    .grain_dots = 64,
++    .blur_radius = 10.0f, .edge_width = 18.0f, .refraction = 7.0f,
++    .dispersion = 0.15f, .tint_strength = 0.12f, .saturation = 1.10f,
++    .specular = 0.26f, .grain = 0.008f,
++    .tint = {0.50f, 0.69f, 1.0f, 1.0f},
 +};
 +
 +constexpr float kBackdropFilterQuality = 1.0f;
++constexpr float kMaxSampleRadius = 20.0f;
 +
 +const MaterialTuning& GetMaterialTuning(GlassSurfacePreset preset) {
 +  switch (preset) {
@@ -240,37 +419,6 @@ Index: src/chrome/browser/ui/views/helium/glass_surface.cc
 +  return std::clamp(value, 0.0f, 1.0f);
 +}
 +
-+uint8_t MixChannel(uint8_t tint_channel, float strength, int base) {
-+  const float channel = static_cast<float>(base) +
-+                        (static_cast<float>(tint_channel) - base) * strength;
-+  return static_cast<uint8_t>(std::clamp(std::lround(channel), 0l, 255l));
-+}
-+
-+SkColor MixTint(SkColor tint, float strength) {
-+  // Keep the panel dark enough for the existing MRU foreground while allowing
-+  // a caller-supplied tint to move the material toward its theme color.
-+  return SkColorSetRGB(
-+      MixChannel(SkColorGetR(tint), strength, 28),
-+      MixChannel(SkColorGetG(tint), strength, 31),
-+      MixChannel(SkColorGetB(tint), strength, 38));
-+}
-+
-+SkRRect MakeRRect(const gfx::Rect& bounds,
-+                  const gfx::RoundedCornersF& corner_radii) {
-+  const SkVector radii[4] = {
-+      {corner_radii.upper_left(), corner_radii.upper_left()},
-+      {corner_radii.upper_right(), corner_radii.upper_right()},
-+      {corner_radii.lower_right(), corner_radii.lower_right()},
-+      {corner_radii.lower_left(), corner_radii.lower_left()},
-+  };
-+  return SkRRect::MakeRectRadii(gfx::RectToSkRect(bounds), radii);
-+}
-+
-+void SetPaintStyle(cc::PaintFlags* flags, SkColor color) {
-+  flags->setAntiAlias(true);
-+  flags->setColor(color);
-+}
-+
 +}  // namespace
 +
 +GlassSurfaceView::GlassSurfaceView(const GlassSurfaceParams& params)
@@ -280,7 +428,9 @@ Index: src/chrome/browser/ui/views/helium/glass_surface.cc
 +      opacity_(ClampUnit(params.opacity)),
 +      corner_radii_(params.corner_radii) {
 +  SetCanProcessEventsWithinSubtree(false);
-+  SetPaintToLayer();
++  // A transparent solid layer supplies drawable bounds for backdrop filtering.
++  SetPaintToLayer(ui::LAYER_SOLID_COLOR);
++  layer()->SetColor(SK_ColorTRANSPARENT);
 +  UpdateLayer();
 +}
 +
@@ -299,7 +449,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface.cc
 +    return;
 +  }
 +  tint_color_ = tint_color;
-+  SchedulePaint();
++  UpdateLayer();
 +}
 +
 +void GlassSurfaceView::SetTintStrength(float tint_strength) {
@@ -308,7 +458,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface.cc
 +    return;
 +  }
 +  tint_strength_ = tint_strength;
-+  SchedulePaint();
++  UpdateLayer();
 +}
 +
 +void GlassSurfaceView::SetOpacity(float opacity) {
@@ -335,71 +485,41 @@ Index: src/chrome/browser/ui/views/helium/glass_surface.cc
 +  }
 +
 +  const MaterialTuning& tuning = GetMaterialTuning(preset_);
-+  layer()->SetFillsBoundsOpaquely(false);
-+  // Layer opacity blends the filtered backdrop and the surface treatment as a
-+  // unit. At zero, remove the backdrop filter as well so this view is truly a
-+  // no-op rather than a transparent layer that still changes the backdrop.
-+  layer()->SetOpacity(opacity_);
-+  layer()->SetBackgroundBlur(opacity_ > 0.0f ? tuning.blur_sigma : 0.0f);
++  layer()->SetOpacity(1.0f);
++  layer()->SetBackgroundBlur(0.0f);
 +  layer()->SetBackdropFilterQuality(kBackdropFilterQuality);
 +  layer()->SetRoundedCornerRadius(corner_radii_);
 +  layer()->SetIsFastRoundedCorner(!corner_radii_.IsEmpty());
-+  SchedulePaint();
++  cc::FilterOperations filters;
++  const gfx::Size size = GetLocalBounds().size();
++  if (opacity_ > 0.0f && !size.IsEmpty()) {
++    cc::GlassmorphicFilterParams params;
++    params.resolution = SkSize::Make(size.width(), size.height());
++    params.panel_size = params.resolution;
++    params.corner_radius = corner_radii_.upper_left();
++    params.blur_radius = tuning.blur_radius;
++    params.opacity = opacity_;
++    params.edge_width = tuning.edge_width;
++    params.refraction = tuning.refraction;
++    params.dispersion = tuning.dispersion;
++    params.tint_strength = ClampUnit(tuning.tint_strength + tint_strength_);
++    params.saturation = tuning.saturation;
++    params.specular = tuning.specular;
++    params.grain = tuning.grain;
++    const SkColor4f external = SkColor4f::FromColor(tint_color_);
++    params.tint = {tuning.tint.fR * external.fR,
++                   tuning.tint.fG * external.fG,
++                   tuning.tint.fB * external.fB, 1.0f};
++    const SkRect crop = SkRect::MakeWH(size.width(), size.height());
++    filters.Append(cc::FilterOperation::CreateReferenceFilter(
++        sk_make_sp<cc::GlassmorphicPaintFilter>(params, kMaxSampleRadius,
++                                                &crop)));
++  }
++  layer()->SetCustomBackdropFilters(filters);
 +}
 +
-+void GlassSurfaceView::OnPaint(gfx::Canvas* canvas) {
-+  if (opacity_ <= 0.0f || GetLocalBounds().IsEmpty()) {
-+    return;
-+  }
-+
-+  const MaterialTuning& tuning = GetMaterialTuning(preset_);
-+  const gfx::Rect bounds = GetLocalBounds();
-+  const SkRRect rrect = MakeRRect(bounds, corner_radii_);
-+  cc::PaintCanvas* paint_canvas = canvas->sk_canvas();
-+
-+  cc::PaintFlags fill;
-+  SetPaintStyle(
-+      &fill,
-+      SkColorSetA(MixTint(tint_color_, tint_strength_), tuning.fill_alpha));
-+  paint_canvas->drawRRect(rrect, fill);
-+
-+  // A broad, clipped highlight gives the panel the soft milky edge seen in
-+  // the OverShifted reference without pretending that it refracts live page
-+  // pixels at the Views layer.
-+  paint_canvas->save();
-+  paint_canvas->clipRRect(rrect, SkClipOp::kIntersect, true);
-+  cc::PaintFlags highlight;
-+  SetPaintStyle(&highlight,
-+                SkColorSetA(SK_ColorWHITE, tuning.highlight_alpha));
-+  const SkRect sk_bounds = gfx::RectToSkRect(bounds);
-+  paint_canvas->drawOval(
-+      SkRect::MakeLTRB(sk_bounds.left() - sk_bounds.width() * 0.35f,
-+                       sk_bounds.top() - sk_bounds.height() * 0.55f,
-+                       sk_bounds.left() + sk_bounds.width() * 0.82f,
-+                       sk_bounds.top() + sk_bounds.height() * 0.80f),
-+      highlight);
-+  paint_canvas->restore();
-+
-+  cc::PaintFlags rim;
-+  SetPaintStyle(&rim, SkColorSetA(SK_ColorWHITE, tuning.rim_alpha));
-+  rim.setStyle(cc::PaintFlags::kStroke_Style);
-+  rim.setStrokeWidth(1.0f);
-+  paint_canvas->drawRRect(rrect, rim);
-+
-+  cc::PaintFlags grain;
-+  SetPaintStyle(&grain, SkColorSetA(SK_ColorWHITE, tuning.grain_alpha));
-+  const float width = sk_bounds.width();
-+  const float height = sk_bounds.height();
-+  for (int index = 0; index < tuning.grain_dots; ++index) {
-+    const float x = std::fmod(0.13f + index * 0.75487766f, 1.0f);
-+    const float y = std::fmod(0.37f + index * 0.5698403f, 1.0f);
-+    const float center_x = sk_bounds.left() + x * width;
-+    const float center_y = sk_bounds.top() + y * height;
-+    paint_canvas->drawOval(
-+        SkRect::MakeLTRB(center_x - 0.55f, center_y - 0.55f,
-+                         center_x + 0.55f, center_y + 0.55f),
-+        grain);
-+  }
++void GlassSurfaceView::OnBoundsChanged(const gfx::Rect& previous_bounds) {
++  UpdateLayer();
 +}
 +
 +BEGIN_METADATA(GlassSurfaceView)
@@ -410,7 +530,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/helium/glass_surface.h
 +++ src/chrome/browser/ui/views/helium/glass_surface.h
-@@ -1 +1,70 @@
+@@ -1 +1,65 @@
 -// placeholder
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
@@ -441,12 +561,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface.h
 +  gfx::RoundedCornersF corner_radii = gfx::RoundedCornersF();
 +};
 +
-+// A reusable Views surface for translucent browser chrome.
-+//
-+// The surface owns a compositor backdrop blur and paints a small amount of
-+// deterministic material treatment (tint, rim, highlight, and grain). It
-+// deliberately does not claim live displacement: Views does not provide the
-+// pixels behind a layer as a child shader to a paint-time SkRuntimeEffect.
++// A reusable Views surface backed by Arcium's live-backdrop refraction shader.
 +class GlassSurfaceView : public views::View {
 +  METADATA_HEADER(GlassSurfaceView, views::View)
 +
@@ -470,7 +585,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface.h
 +
 + private:
 +  void UpdateLayer();
-+  void OnPaint(gfx::Canvas* canvas) override;
++  void OnBoundsChanged(const gfx::Rect& previous_bounds) override;
 +
 +  GlassSurfacePreset preset_;
 +  SkColor tint_color_;
@@ -482,3 +597,711 @@ Index: src/chrome/browser/ui/views/helium/glass_surface.h
 +}  // namespace helium
 +
 +#endif  // CHROME_BROWSER_UI_VIEWS_HELIUM_GLASS_SURFACE_H_
+Index: src/cc/paint/paint_filter.cc
+===================================================================
+--- src.orig/cc/paint/paint_filter.cc
++++ src/cc/paint/paint_filter.cc
+@@ -5,11 +5,13 @@
+ #include "cc/paint/paint_filter.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <string>
+ #include <utility>
+ #include <vector>
+ 
+ #include "base/containers/span.h"
++#include "base/logging.h"
+ #include "base/memory/values_equivalent.h"
+ #include "base/no_destructor.h"
+ #include "base/notreached.h"
+@@ -17,6 +19,7 @@
+ #include "build/build_config.h"
+ #include "cc/paint/draw_image.h"
+ #include "cc/paint/filter_operations.h"
++#include "cc/paint/glassmorphic_paint_filter.h"
+ #include "cc/paint/image_provider.h"
+ #include "cc/paint/paint_image_builder.h"
+ #include "cc/paint/paint_op_writer.h"
+@@ -73,6 +76,30 @@ sk_sp<PaintFilter> Snapshot(const sk_sp<
+   return filter->SnapshotWithImages(image_provider);
+ }
+ 
++constexpr char kGlassmorphicSkSL[] = R"SKSL(
++uniform shader backdrop;
++uniform shader softenedBackdrop;
++uniform float4 uLocalTransform;
++uniform float2 uResolution; uniform float2 uPanelOrigin; uniform float2 uPanelSize;
++uniform float uCornerRadius; uniform float uShapePower;
++uniform float uOpacity; uniform float uEdgeWidth; uniform float uRefraction;
++uniform float uBulge; uniform float uDispersion; uniform float uTintStrength;
++uniform float uSaturation; uniform float uSpecular; uniform float uGrain;
++uniform float4 uTint; uniform float2 uLightXY; uniform float uLightElevation;
++uniform float uLightIntensity;
++float roundedBoxDistance(float2 p,float2 h,float r){float2 q=abs(p)-h+r;return length(max(q,0.0))+min(max(q.x,q.y),0.0)-r;}
++float superellipseDistance(float2 p,float2 h,float power){float2 n=abs(p)/h;float x=pow(n.x,power)+pow(n.y,power)-1.0;float2 g=float2(power*pow(max(n.x,0.0001),power-1.0)/h.x,power*pow(max(n.y,0.0001),power-1.0)/h.y);return x/max(length(g),0.0001);}
++float panelDistance(float2 p,float2 h,float r){return uShapePower>1.0?superellipseDistance(p,h,uShapePower):roundedBoxDistance(p,h,r);}
++float2 panelNormal(float2 p,float2 h,float r){float2 x=float2(1,0),y=float2(0,1);float2 g=float2(panelDistance(p+x,h,r)-panelDistance(p-x,h,r),panelDistance(p+y,h,r)-panelDistance(p-y,h,r));return g/max(length(g),0.0001);}
++half4 childSample(float2 p){return backdrop.eval(p*uLocalTransform.xy+uLocalTransform.zw);}
++float3 blurBackdrop(float2 p, float2 offset) {
++  return softenedBackdrop.eval(
++      (p + offset) * uLocalTransform.xy + uLocalTransform.zw).rgb;
++}
++float grainAt(float2 p){float2 c=floor(p);return fract(sin(dot(c,float2(12.9898,78.233)))*43758.5453);}
++half4 main(float2 layerPosition){float2 position=(layerPosition-uLocalTransform.zw)/uLocalTransform.xy;float2 center=uPanelOrigin+uPanelSize*.5;float2 local=position-center;float2 halfSize=uPanelSize*.5;float d=panelDistance(local,halfSize,uCornerRadius);half4 source=childSample(position);float coverage=1-smoothstep(-1,1,d);if(coverage<=0)return source;float edge=smoothstep(-uEdgeWidth,0,d);float2 normal=panelNormal(local,halfSize,uCornerRadius);float radial=clamp(length(local/halfSize),0,1);float2 bulged=center+local*(1-pow(radial,2.2)*uBulge);float2 bend=normal*uRefraction*edge;float3 softened=blurBackdrop(bulged,bend);float2 spectralBend=bend*uDispersion;half4 rs=childSample(bulged+bend+spectralBend),gs=childSample(bulged+bend),bs=childSample(bulged+bend-spectralBend);float3 spectral=float3(rs.r,gs.g,bs.b);float3 color=mix(softened,spectral,.42+edge*.38);float luminance=dot(color,float3(.2126,.7152,.0722));color=mix(float3(luminance),color,uSaturation);color=mix(color,color*uTint.rgb+uTint.rgb*.22,uTintStrength);float3 light=normalize(float3(uLightXY,max(uLightElevation,.01)));float spec=pow(max(dot(normal,light.xy),0),4);color+=float3(.82,.92,1)*spec*uSpecular*edge*1.55*uLightIntensity;color+=uTint.rgb*edge*uSpecular*.045;color+=(grainAt(position)-.5)*uGrain;half4 complete=half4(clamp(color,0,1),source.a);return half4(mix(source.rgb,complete.rgb,clamp(uOpacity,0,1)*coverage),source.a);}
++)SKSL";
++
+ }  // namespace
+ 
+ PaintFilter::PaintFilter(Type type,
+@@ -134,6 +161,8 @@ std::string PaintFilter::TypeToString(Ty
+       return "kLightingPoint";
+     case Type::kLightingSpot:
+       return "kLightingSpot";
++    case Type::kGlassmorphic:
++      return "kGlassmorphic";
+   }
+   NOTREACHED();
+ }
+@@ -233,6 +262,8 @@ bool PaintFilter::EqualsForTesting(const
+       return AreEqualForTesting<LightingPointPaintFilter>(*this, other);
+     case Type::kLightingSpot:
+       return AreEqualForTesting<LightingSpotPaintFilter>(*this, other);
++    case Type::kGlassmorphic:
++      return AreEqualForTesting<GlassmorphicPaintFilter>(*this, other);
+   }
+   NOTREACHED();
+ }
+@@ -1471,4 +1502,101 @@ bool LightingSpotPaintFilter::EqualsForT
+          kconstant_ == other.kconstant_ && shininess_ == other.shininess_;
+ }
+ 
++GlassmorphicPaintFilter::GlassmorphicPaintFilter(
++    const GlassmorphicFilterParams& params,
++    SkScalar max_sample_radius,
++    const CropRect* crop_rect)
++    : PaintFilter(kType, crop_rect, kHasNoDiscardableImages),
++      params_(params),
++      max_sample_radius_(max_sample_radius) {
++  cached_sk_filter_ = MakeGlassmorphicImageFilter(*this, SkMatrix::I());
++}
++
++sk_sp<SkImageFilter> MakeGlassmorphicImageFilter(
++    const GlassmorphicPaintFilter& paint_filter,
++    const SkMatrix& local_matrix) {
++  if (!local_matrix.isScaleTranslate() || !local_matrix.isFinite() ||
++      local_matrix.getScaleX() == 0 || local_matrix.getScaleY() == 0) {
++    return nullptr;
++  }
++  static const base::NoDestructor<SkRuntimeEffect::Result> result(
++      SkRuntimeEffect::MakeForShader(SkString(kGlassmorphicSkSL)));
++  if (!result->effect) {
++    LOG(ERROR) << "Glassmorphic shader compilation failed: "
++               << result->errorText.c_str();
++    return nullptr;
++  }
++  SkRuntimeShaderBuilder builder(result->effect);
++  const float transform[] = {local_matrix.getScaleX(), local_matrix.getScaleY(),
++                             local_matrix.getTranslateX(),
++                             local_matrix.getTranslateY()};
++  builder.uniform("uLocalTransform").set(transform, 4);
++  const auto& params = paint_filter.params();
++  builder.uniform("uResolution") = params.resolution;
++  builder.uniform("uPanelOrigin") = params.panel_origin;
++  builder.uniform("uPanelSize") = params.panel_size;
++  builder.uniform("uCornerRadius") = params.corner_radius;
++  builder.uniform("uShapePower") = params.shape_power;
++  builder.uniform("uOpacity") = params.opacity;
++  builder.uniform("uEdgeWidth") = params.edge_width;
++  builder.uniform("uRefraction") = params.refraction;
++  builder.uniform("uBulge") = params.bulge;
++  builder.uniform("uDispersion") = params.dispersion;
++  builder.uniform("uTintStrength") = params.tint_strength;
++  builder.uniform("uSaturation") = params.saturation;
++  builder.uniform("uSpecular") = params.specular;
++  builder.uniform("uGrain") = params.grain;
++  builder.uniform("uTint") = params.tint;
++  builder.uniform("uLightXY") = params.light_xy;
++  builder.uniform("uLightElevation") = params.light_elevation;
++  builder.uniform("uLightIntensity") = params.light_intensity;
++  const float sample_scale =
++      std::max(SkScalarAbs(local_matrix.getScaleX()),
++               SkScalarAbs(local_matrix.getScaleY()));
++  // Match the variance of the lab's nine-tap kernel without its separated
++  // copies of sharp edges. Keep the raw backdrop for clear refraction and
++  // dispersion, and let Skia evaluate a continuous Gaussian for the soft part.
++  // Both children belong to this filter, preserving the glass-specific matrix
++  // handling in Viz instead of wrapping it in a generic composed filter.
++  const float sigma = std::max(0.0f, params.blur_radius) * std::sqrt(0.6f);
++  std::string_view child_names[] = {"backdrop", "softenedBackdrop"};
++  const sk_sp<SkImageFilter> inputs[] = {
++      nullptr,
++      SkImageFilters::Blur(sigma * SkScalarAbs(local_matrix.getScaleX()),
++                          sigma * SkScalarAbs(local_matrix.getScaleY()),
++                          SkTileMode::kClamp, nullptr)};
++  auto filter = SkImageFilters::RuntimeShader(
++      builder, paint_filter.max_sample_radius() * sample_scale, child_names,
++      inputs, 2);
++  if (const auto* crop_rect = paint_filter.GetCropRect(); crop_rect && filter) {
++    filter = SkImageFilters::Crop(local_matrix.mapRect(*crop_rect),
++                                  SkTileMode::kDecal, std::move(filter));
++  }
++  return filter;
++}
++
++GlassmorphicPaintFilter::~GlassmorphicPaintFilter() = default;
++
++size_t GlassmorphicPaintFilter::SerializedSize() const {
++  base::CheckedNumeric<size_t> total_size = BaseSerializedSize();
++  total_size += PaintOpWriter::SerializedSize(params_);
++  total_size += PaintOpWriter::SerializedSize(max_sample_radius_);
++  return total_size.ValueOrDefault(0u);
++}
++
++bool GlassmorphicPaintFilter::EqualsForTesting(
++    const GlassmorphicPaintFilter& other) const {
++  return params_ == other.params_ &&
++         max_sample_radius_ == other.max_sample_radius_;
++}
++
++gfx::ContentColorUsage GlassmorphicPaintFilter::GetContentColorUsage() const {
++  return gfx::ContentColorUsage::kSRGB;
++}
++
++sk_sp<PaintFilter> GlassmorphicPaintFilter::SnapshotWithImagesInternal(
++    ImageProvider* image_provider) const {
++  return sk_ref_sp<PaintFilter>(this);
++}
++
+ }  // namespace cc
+Index: src/cc/paint/paint_filter.h
+===================================================================
+--- src.orig/cc/paint/paint_filter.h
++++ src/cc/paint/paint_filter.h
+@@ -61,8 +61,9 @@ class CC_PAINT_EXPORT PaintFilter : publ
+     kLightingDistant,
+     kLightingPoint,
+     kLightingSpot,
+-    // Update the following if kLightingSpot is not the max anymore.
+-    kMaxValue = kLightingSpot
++    kGlassmorphic,
++    // Update the following if kGlassmorphic is not the max anymore.
++    kMaxValue = kGlassmorphic
+   };
+   enum class LightingType {
+     kDiffuse,
+@@ -907,6 +908,55 @@ class CC_PAINT_EXPORT LightingSpotPaintF
+   SkScalar shininess_;
+ };
+ 
++// The reviewed parameter block for Arcium's built-in glass material. The SkSL
++// source is fixed in cc/paint; only these bounded numeric values cross IPC.
++struct CC_PAINT_EXPORT GlassmorphicFilterParams {
++  SkSize resolution = {0, 0};
++  SkPoint panel_origin = {0, 0};
++  SkSize panel_size = {0, 0};
++  SkScalar corner_radius = 0;
++  SkScalar shape_power = 0;
++  SkScalar blur_radius = 10;
++  SkScalar opacity = 1;
++  SkScalar edge_width = 30;
++  SkScalar refraction = 7;
++  SkScalar bulge = 0;
++  SkScalar dispersion = 0.15f;
++  SkScalar tint_strength = 0.17f;
++  SkScalar saturation = 1.1f;
++  SkScalar specular = 0.42f;
++  SkScalar grain = 0.012f;
++  SkColor4f tint = {0.5f, 0.69f, 1.f, 1.f};
++  SkPoint light_xy = {-0.65f, -0.75f};
++  SkScalar light_elevation = 0.85f;
++  SkScalar light_intensity = 1.f;
++
++  bool operator==(const GlassmorphicFilterParams&) const = default;
++};
++
++class CC_PAINT_EXPORT GlassmorphicPaintFilter final : public PaintFilter {
++ public:
++  static constexpr Type kType = Type::kGlassmorphic;
++  GlassmorphicPaintFilter(const GlassmorphicFilterParams& params,
++                          SkScalar max_sample_radius,
++                          const CropRect* crop_rect = nullptr);
++  ~GlassmorphicPaintFilter() override;
++
++  const GlassmorphicFilterParams& params() const { return params_; }
++  SkScalar max_sample_radius() const { return max_sample_radius_; }
++  size_t SerializedSize() const override;
++  bool EqualsForTesting(const GlassmorphicPaintFilter& other) const;
++  gfx::ContentColorUsage GetContentColorUsage() const override;
++
++ protected:
++  sk_sp<PaintFilter> SnapshotWithImagesInternal(
++      ImageProvider* image_provider) const override;
++
++ private:
++  GlassmorphicFilterParams params_;
++  SkScalar max_sample_radius_;
++};
++
+ }  // namespace cc
+ 
+ #endif  // CC_PAINT_PAINT_FILTER_H_
+Index: src/cc/paint/paint_op_reader.cc
+===================================================================
+--- src.orig/cc/paint/paint_op_reader.cc
++++ src/cc/paint/paint_op_reader.cc
+@@ -1231,7 +1231,26 @@ void PaintOpReader::Read(sk_sp<PaintFilt
+     case PaintFilter::Type::kLightingSpot:
+       ReadLightingSpotPaintFilter(filter, crop_rect);
+       break;
++    case PaintFilter::Type::kGlassmorphic:
++      ReadGlassmorphicPaintFilter(filter, crop_rect);
++      break;
++  }
++}
++
++void PaintOpReader::ReadGlassmorphicPaintFilter(
++    sk_sp<PaintFilter>* filter,
++    const std::optional<PaintFilter::CropRect>& crop_rect) {
++  GlassmorphicFilterParams params;
++  SkScalar max_sample_radius = 0;
++  ReadSimple(&params);
++  ReadSimple(&max_sample_radius);
++  if (!valid_ || !SkIsFinite(max_sample_radius) || max_sample_radius < 0 ||
++      max_sample_radius > 128) {
++    SetInvalid(DeserializationError::kInvalidPaintShader);
++    return;
+   }
++  filter->reset(new GlassmorphicPaintFilter(
++      params, max_sample_radius, base::OptionalToPtr(crop_rect)));
+ }
+ 
+ void PaintOpReader::ReadColorFilterPaintFilter(
+Index: src/cc/paint/paint_op_reader.h
+===================================================================
+--- src.orig/cc/paint/paint_op_reader.h
++++ src/cc/paint/paint_op_reader.h
+@@ -358,6 +358,9 @@ class CC_PAINT_EXPORT PaintOpReader {
+   void ReadLightingSpotPaintFilter(
+       sk_sp<PaintFilter>* filter,
+       const std::optional<PaintFilter::CropRect>& crop_rect);
++  void ReadGlassmorphicPaintFilter(
++      sk_sp<PaintFilter>* filter,
++      const std::optional<PaintFilter::CropRect>& crop_rect);
+ 
+   // Returns the size of the read record, 0 if error.
+   size_t Read(std::optional<PaintRecord>* record);
+Index: src/cc/paint/paint_op_writer.cc
+===================================================================
+--- src.orig/cc/paint/paint_op_writer.cc
++++ src/cc/paint/paint_op_writer.cc
+@@ -990,6 +990,9 @@ void PaintOpWriter::Write(const PaintFil
+     case PaintFilter::Type::kLightingSpot:
+       Write(static_cast<const LightingSpotPaintFilter&>(*filter), current_ctm);
+       break;
++    case PaintFilter::Type::kGlassmorphic:
++      Write(static_cast<const GlassmorphicPaintFilter&>(*filter), current_ctm);
++      break;
+   }
+ }
+ 
+@@ -1224,6 +1227,12 @@ void PaintOpWriter::Write(const Lighting
+   Write(filter.input().get(), current_ctm);
+ }
+ 
++void PaintOpWriter::Write(const GlassmorphicPaintFilter& filter,
++                          const SkM44& current_ctm) {
++  WriteSimple(filter.params());
++  WriteSimple(filter.max_sample_radius());
++}
++
+ void PaintOpWriter::Write(const PaintRecord& record,
+                           const gfx::Rect& playback_rect,
+                           const gfx::SizeF& post_scale) {
+Index: src/cc/paint/paint_op_writer.h
+===================================================================
+--- src.orig/cc/paint/paint_op_writer.h
++++ src/cc/paint/paint_op_writer.h
+@@ -450,6 +450,7 @@ class CC_PAINT_EXPORT PaintOpWriter {
+              const SkM44& current_ctm);
+   void Write(const LightingPointPaintFilter& filter, const SkM44& current_ctm);
+   void Write(const LightingSpotPaintFilter& filter, const SkM44& current_ctm);
++  void Write(const GlassmorphicPaintFilter& filter, const SkM44& current_ctm);
+ 
+   void Write(const PaintRecord& record,
+              const gfx::Rect& playback_rect,
+Index: src/ui/compositor/layer.cc
+===================================================================
+--- src.orig/ui/compositor/layer.cc
++++ src/ui/compositor/layer.cc
+@@ -259,6 +259,7 @@ std::unique_ptr<Layer> Layer::Clone() co
+   clone->SetBackgroundBlur(background_blur_sigma_);
+   clone->SetBackgroundInverted(background_inverted_);
+   clone->SetBackgroundZoom(zoom_, zoom_inset_);
++  clone->SetCustomBackdropFilters(custom_backdrop_filters_);
+   clone->SetBackdropFilterQuality(backdrop_filter_quality_);
+   if (has_explicit_backdrop_filter_bounds_) {
+     auto backdrop_filter_bounds = cc_layer_->backdrop_filter_bounds();
+@@ -813,6 +814,10 @@ void Layer::SetLayerBackgroundFilters()
+     filters.Append(cc::FilterOperation::CreateZoomFilter(zoom_, zoom_inset_));
+   }
+ 
++  for (const auto& filter : custom_backdrop_filters_.operations()) {
++    filters.Append(filter);
++  }
++
+   cc_layer_->SetBackdropFilters(filters);
+   RecomputeBackdropFilterBounds();
+ }
+@@ -824,7 +829,8 @@ void Layer::RecomputeBackdropFilterBound
+   }
+ 
+   // Only set bounds when backdrop filters are active.
+-  if (!background_blur_sigma_ && zoom_ == 1 && !background_inverted_) {
++  if (!background_blur_sigma_ && zoom_ == 1 && !background_inverted_ &&
++      custom_backdrop_filters_.IsEmpty()) {
+     cc_layer_->ClearBackdropFilterBounds();
+     return;
+   }
+@@ -844,6 +850,14 @@ void Layer::RecomputeBackdropFilterBound
+       gfx::RRectF(gfx::RectF(gfx::SizeF(size)), 0));
+ }
+ 
++void Layer::SetCustomBackdropFilters(const cc::FilterOperations& filters) {
++  if (custom_backdrop_filters_ == filters) {
++    return;
++  }
++  custom_backdrop_filters_ = filters;
++  SetLayerBackgroundFilters();
++}
++
+ float Layer::GetTargetOpacity() const {
+   if (animator_ && animator_->IsAnimatingProperty(
+       LayerAnimationElement::OPACITY))
+Index: src/ui/compositor/layer.h
+===================================================================
+--- src.orig/ui/compositor/layer.h
++++ src/ui/compositor/layer.h
+@@ -22,6 +22,7 @@
+ #include "cc/layers/surface_layer.h"
+ #include "cc/layers/texture_layer_client.h"
+ #include "cc/paint/filter_operation.h"
++#include "cc/paint/filter_operations.h"
+ #include "components/viz/common/resources/transferable_resource.h"
+ #include "components/viz/common/surfaces/subtree_capture_id.h"
+ #include "third_party/skia/include/core/SkColor.h"
+@@ -347,6 +348,9 @@ class COMPOSITOR_EXPORT Layer : public L
+   // computation from the layer's size and rounded corners.
+   void SetBackdropFilterBounds(const SkPath& backdrop_filter_bounds);
+   void SetBackdropFilterBounds(const gfx::RRectF& backdrop_filter_bounds);
++  // Installs a reviewed custom backdrop effect after the standard backdrop
++  // controls. The filter list is retained across underlying cc::Layer swaps.
++  void SetCustomBackdropFilters(const cc::FilterOperations& filters);
+   // Clears any explicitly set backdrop filter bounds and re-enables automatic
+   // bounds computation from the layer's size and rounded corners.
+   void ClearBackdropFilterBounds();
+@@ -825,6 +829,7 @@ class COMPOSITOR_EXPORT Layer : public L
+   cc::Region paint_region_;
+ 
+   float background_blur_sigma_;
++  cc::FilterOperations custom_backdrop_filters_;
+ 
+   bool background_inverted_ = false;
+ 
+Index: src/chrome/browser/ui/views/frame/browser_view_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_view_unittest.cc
++++ src/chrome/browser/ui/views/frame/browser_view_unittest.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <memory>
+ #include <string_view>
++#include <vector>
+ 
+ #include "base/byte_size.h"
+ #include "base/memory/scoped_refptr.h"
+@@ -60,9 +61,11 @@
+ #include "ui/base/models/dialog_model.h"
+ #include "ui/base/text/bytes_formatting.h"
+ #include "ui/base/ui_base_features.h"
++#include "ui/gfx/color_utils.h"
+ #include "ui/gfx/scrollbar_size.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/bubble/bubble_dialog_delegate_view.h"
++#include "ui/views/controls/label.h"
+ #include "ui/views/bubble/bubble_dialog_model_host.h"
+ #include "ui/views/controls/webview/webview.h"
+ #include "ui/views/interaction/element_tracker_views.h"
+@@ -169,16 +172,60 @@ TEST_F(BrowserViewTest, BrowserView) {
+   EXPECT_EQ(customize_chrome_action->GetEnabled(), true);
+ }
+ 
++TEST_F(BrowserViewTest, MRUTabSwitcherSharesBrowserWidget) {
++  content::WebContents* active =
++      browser()->tab_strip_model()->GetActiveWebContents();
++  ASSERT_TRUE(active);
++  browser_view()->SetSize(gfx::Size(1000, 800));
++  const size_t original_child_count = browser_view()->children().size();
++
++  UpdateMRUTabSwitcherVisualizer(browser_view(), {active}, active);
++  ASSERT_EQ(browser_view()->children().size(), original_child_count + 1);
++  views::View* overlay = browser_view()->children().back();
++  EXPECT_EQ(overlay->GetWidget(), browser_view()->GetWidget());
++  EXPECT_FALSE(overlay->GetCanProcessEventsWithinSubtree());
++  EXPECT_FALSE(overlay->bounds().IsEmpty());
++  EXPECT_EQ(overlay->bounds().CenterPoint(),
++            browser_view()->GetLocalBounds().CenterPoint());
++
++  size_t label_count = 0;
++  std::vector<views::View*> descendants{overlay};
++  while (!descendants.empty()) {
++    views::View* view = descendants.back();
++    descendants.pop_back();
++    if (auto* label = views::AsViewClass<views::Label>(view)) {
++      ++label_count;
++      EXPECT_FALSE(label->GetSubpixelRenderingEnabled());
++      EXPECT_GE(color_utils::GetContrastRatio(label->GetEnabledColor(),
++                                              label->GetBackgroundColor()),
++                4.5f);
++    }
++    descendants.insert(descendants.end(), view->children().begin(),
++                       view->children().end());
++  }
++  EXPECT_EQ(label_count, 3u);
++
++  browser_view()->SetSize(gfx::Size(1200, 900));
++  EXPECT_EQ(overlay->bounds().CenterPoint(),
++            browser_view()->GetLocalBounds().CenterPoint());
++
++  StopMRUTabSwitcherVisualizer(browser_view());
++  EXPECT_EQ(browser_view()->children().size(), original_child_count);
++}
++
+ TEST_F(BrowserViewTest,
+        MRUTabSwitcherVisualizerStopsOnWindowDeactivation) {
+   content::WebContents* active =
+       browser()->tab_strip_model()->GetActiveWebContents();
+   ASSERT_TRUE(active);
++  const size_t original_child_count = browser_view()->children().size();
+ 
+   browser_view()->StartTabCycling();
+   UpdateMRUTabSwitcherVisualizer(browser_view(), {active}, active);
++  EXPECT_EQ(browser_view()->children().size(), original_child_count + 1);
+   browser_view()->browser_widget()->OnNativeWidgetActivationChanged(false);
+   content::RunAllTasksUntilIdle();
++  EXPECT_EQ(browser_view()->children().size(), original_child_count);
+ }
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+Index: src/components/viz/service/display/skia_renderer.cc
+===================================================================
+--- src.orig/components/viz/service/display/skia_renderer.cc
++++ src/components/viz/service/display/skia_renderer.cc
+@@ -34,6 +34,7 @@
+ #include "build/build_config.h"
+ #include "cc/base/math_util.h"
+ #include "cc/debug/debug_colors.h"
++#include "cc/paint/glassmorphic_paint_filter.h"
+ #include "cc/paint/render_surface_filters.h"
+ #include "cc/paint/tone_map_util.h"
+ #include "components/viz/common/display/renderer_settings.h"
+@@ -3158,6 +3159,12 @@ SkiaRenderer::DrawRPDQParams SkiaRendere
+   auto to_sk_image_filter =
+       [](sk_sp<cc::PaintFilter> paint_filter,
+          const SkMatrix& local_matrix) -> sk_sp<SkImageFilter> {
++    if (paint_filter &&
++        paint_filter->type() == cc::PaintFilter::Type::kGlassmorphic) {
++      return cc::MakeGlassmorphicImageFilter(
++          *static_cast<cc::GlassmorphicPaintFilter*>(paint_filter.get()),
++          local_matrix);
++    }
+     if (paint_filter && paint_filter->cached_sk_filter_) {
+       return paint_filter->cached_sk_filter_->makeWithLocalMatrix(local_matrix);
+     } else {
+Index: src/cc/paint/paint_filter_unittest.cc
+===================================================================
+--- src.orig/cc/paint/paint_filter_unittest.cc
++++ src/cc/paint/paint_filter_unittest.cc
+@@ -3,11 +3,14 @@
+ // found in the LICENSE file.
+ 
+ #include "cc/paint/paint_filter.h"
++#include "cc/paint/glassmorphic_paint_filter.h"
+ 
+ #include "cc/paint/image_provider.h"
+ #include "cc/paint/paint_op.h"
+ #include "cc/test/skia_common.h"
+ #include "testing/gtest/include/gtest/gtest.h"
++#include "third_party/skia/include/core/SkCanvas.h"
++#include "third_party/skia/include/core/SkSurface.h"
+ #include "third_party/skia/include/effects/SkLumaColorFilter.h"
+ 
+ namespace cc {
+@@ -132,6 +135,11 @@ sk_sp<PaintFilter> CreateTestFilter(Pain
+           PaintFilter::LightingType::kDiffuse, SkPoint3::Make(0.1f, 0.2f, 0.3f),
+           SkPoint3::Make(0.4f, 0.5f, 0.6f), 0.1f, 0.2f, SkColors::kWhite, 0.4f,
+           0.5f, 0.6f, image_filter, &crop_rect);
++    case PaintFilter::Type::kGlassmorphic: {
++      GlassmorphicFilterParams params;
++      params.resolution = params.panel_size = SkSize::Make(100, 100);
++      return sk_make_sp<GlassmorphicPaintFilter>(params, 20, &crop_rect);
++    }
+   }
+   NOTREACHED();
+ }
+@@ -149,11 +157,13 @@ INSTANTIATE_TEST_SUITE_P(
+     P,
+     PaintFilterTest,
+     ::testing::Range(static_cast<uint8_t>(PaintFilter::Type::kColorFilter),
+-                     static_cast<uint8_t>(PaintFilter::Type::kMaxValue)));
++                     static_cast<uint8_t>(
++                         static_cast<uint8_t>(PaintFilter::Type::kMaxValue) + 1)));
+ 
+ TEST_P(PaintFilterTest, HasDiscardableImagesYes) {
+-  // TurbulencePaintFilter can not embed images.
+-  if (GetParamType() == PaintFilter::Type::kTurbulence)
++  // These filters do not embed images.
++  if (GetParamType() == PaintFilter::Type::kTurbulence ||
++      GetParamType() == PaintFilter::Type::kGlassmorphic)
+     return;
+ 
+   EXPECT_TRUE(CreateTestFilter(GetParamType(), true)->has_discardable_images())
+@@ -170,8 +180,9 @@ TEST_P(PaintFilterTest, SnapshotWithImag
+   auto filter = CreateTestFilter(GetParamType(), true);
+   MockImageProvider image_provider;
+   auto snapshot_filter = filter->SnapshotWithImages(&image_provider);
+-  if (GetParamType() != PaintFilter::Type::kTurbulence) {
+-    // TurbulencePaintFilter can not embed images.
++  if (GetParamType() != PaintFilter::Type::kTurbulence &&
++      GetParamType() != PaintFilter::Type::kGlassmorphic) {
++    // These filters can embed images.
+     EXPECT_GT(image_provider.image_count_, 0)
+         << PaintFilter::TypeToString(GetParamType());
+   }
+@@ -190,4 +201,86 @@ TEST(PaintFilterTest, ImageAnalysisState
+             ImageAnalysisState::kNoAnimatedImages);
+ }
+ 
++TEST(PaintFilterTest, GlassmorphicBackdropAtDisplayScale) {
++  GlassmorphicFilterParams params;
++  params.resolution = params.panel_size = SkSize::Make(32, 32);
++  params.corner_radius = 4;
++  const SkRect crop = SkRect::MakeWH(32, 32);
++  GlassmorphicPaintFilter filter(params, 20, &crop);
++  for (float scale : {1.f, 1.5f, 2.f}) {
++    const SkMatrix matrix = SkMatrix::Scale(scale, scale);
++    auto scaled_filter = MakeGlassmorphicImageFilter(filter, matrix);
++    ASSERT_TRUE(scaled_filter);
++    auto surface = SkSurfaces::Raster(SkImageInfo::MakeN32Premul(128, 128));
++    ASSERT_TRUE(surface);
++    constexpr SkColor background = SkColorSetRGB(70, 90, 120);
++    auto* canvas = surface->getCanvas();
++    canvas->clear(background);
++    canvas->save();
++    canvas->translate(24, 24);
++    const SkRect bounds = matrix.mapRect(crop);
++    canvas->clipRect(bounds);
++    canvas->saveLayer(SkCanvas::SaveLayerRec(
++        &bounds, nullptr, scaled_filter.get(), 0));
++    canvas->restore();
++    canvas->restore();
++    SkPixmap pixels;
++    ASSERT_TRUE(surface->peekPixels(&pixels));
++    const int center = 24 + static_cast<int>(16 * scale);
++    EXPECT_NE(background, pixels.getColor(center, center)) << scale;
++    EXPECT_EQ(background, pixels.getColor(0, 0)) << scale;
++  }
++  EXPECT_FALSE(MakeGlassmorphicImageFilter(filter, SkMatrix::Scale(0, 2)));
++  EXPECT_FALSE(MakeGlassmorphicImageFilter(filter, SkMatrix::RotateDeg(30)));
++}
++
++TEST(PaintFilterTest, GlassmorphicBlurDoesNotDuplicateSharpLines) {
++  GlassmorphicFilterParams params;
++  params.resolution = params.panel_size = SkSize::Make(96, 96);
++  params.blur_radius = 10;
++  params.refraction = 0;
++  params.bulge = 0;
++  params.tint_strength = 0;
++  params.saturation = 1;
++  params.specular = 0;
++  params.grain = 0;
++  const SkRect crop = SkRect::MakeWH(96, 96);
++  GlassmorphicPaintFilter filter(params, 20, &crop);
++  for (float scale : {1.f, 1.5f, 2.f}) {
++    auto mapped = MakeGlassmorphicImageFilter(
++        filter, SkMatrix::Scale(scale, scale));
++    ASSERT_TRUE(mapped);
++    auto surface = SkSurfaces::Raster(SkImageInfo::MakeN32Premul(256, 256));
++    ASSERT_TRUE(surface);
++    auto* canvas = surface->getCanvas();
++    canvas->clear(SK_ColorBLACK);
++    const int center = 24 + static_cast<int>(48 * scale);
++    SkPaint line;
++    line.setColor(SK_ColorWHITE);
++    canvas->drawRect(SkRect::MakeXYWH(center, 0, 1, 256), line);
++    canvas->save();
++    canvas->translate(24, 24);
++    const SkRect bounds = SkRect::MakeWH(96 * scale, 96 * scale);
++    canvas->clipRect(bounds);
++    canvas->saveLayer(SkCanvas::SaveLayerRec(
++        &bounds, nullptr, mapped.get(), 0));
++    canvas->restore();
++    canvas->restore();
++    SkPixmap pixels;
++    ASSERT_TRUE(surface->peekPixels(&pixels));
++    // A single line must soften continuously, without bright satellite lines
++    // at the old sparse-kernel offsets of +/- blur_radius.
++    for (int direction : {-1, 1}) {
++      int previous = 255;
++      for (int distance = 0; distance <= 24 * scale; ++distance) {
++        const int value = SkColorGetR(
++            pixels.getColor(center + direction * distance, center));
++        EXPECT_LE(value, previous) << scale << ": " << distance;
++        previous = value;
++      }
++    }
++    EXPECT_GT(SkColorGetR(pixels.getColor(center + 2, center)), 0u);
++  }
++}
++
+ }  // namespace cc
+Index: src/cc/paint/BUILD.gn
+===================================================================
+--- src.orig/cc/paint/BUILD.gn
++++ src/cc/paint/BUILD.gn
+@@ -47,6 +47,7 @@ cc_component("paint") {
+     "paint_canvas.h",
+     "paint_export.h",
+     "paint_filter.cc",
++    "glassmorphic_paint_filter.h",
+     "paint_filter.h",
+     "paint_flags.cc",
+     "paint_flags.h",
+Index: src/cc/paint/glassmorphic_paint_filter.h
+===================================================================
+--- /dev/null
++++ src/cc/paint/glassmorphic_paint_filter.h
+@@ -0,0 +1,23 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by the GPL-3.0 license.
++
++#ifndef CC_PAINT_GLASSMORPHIC_PAINT_FILTER_H_
++#define CC_PAINT_GLASSMORPHIC_PAINT_FILTER_H_
++
++#include "cc/paint/paint_export.h"
++#include "third_party/skia/include/core/SkRefCnt.h"
++
++class SkImageFilter;
++class SkMatrix;
++
++namespace cc {
++class GlassmorphicPaintFilter;
++
++// Runtime image filters reject Skia's scaled local-matrix wrapper. Map the
++// compositor coordinates in the shader, keeping material units in DIP.
++CC_PAINT_EXPORT sk_sp<SkImageFilter> MakeGlassmorphicImageFilter(
++    const GlassmorphicPaintFilter& paint_filter,
++    const SkMatrix& local_matrix);
++}  // namespace cc
++
++#endif  // CC_PAINT_GLASSMORPHIC_PAINT_FILTER_H_
