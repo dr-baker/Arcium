@@ -65,7 +65,7 @@
      return nullptr;
 --- a/chrome/browser/ui/BUILD.gn
 +++ b/chrome/browser/ui/BUILD.gn
-@@ -4083,6 +4083,8 @@ static_library("ui") {
+@@ -4085,6 +4085,8 @@ static_library("ui") {
        "views/frame/browser_view.h",
        "views/frame/mru_tab_preview_cache.cc",
        "views/frame/mru_tab_preview_cache.h",
@@ -92,7 +92,7 @@
  #include "chrome/browser/ui/tabs/vertical_tab_strip_metrics.h"
  #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
  #include "chrome/browser/ui/toasts/toast_view.h"
-@@ -167,16 +167,13 @@
+@@ -167,11 +167,9 @@
  #include "chrome/browser/ui/views/frame/layout/browser_view_layout.h"
  #include "chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.h"
  #include "chrome/browser/ui/views/frame/main_background_region_view.h"
@@ -100,27 +100,20 @@
  #include "chrome/browser/ui/views/frame/mru_tab_preview_cache.h"
  #include "chrome/browser/ui/views/frame/mru_tab_preview_rail.h"
 -#include "chrome/browser/ui/views/helium/glass_surface.h"
--#include "chrome/browser/ui/views/helium/native_frame_materials.h"
 -#include "ui/views/view_observer.h"
 -#include "ui/views/view_shadow.h"
-+#include "chrome/browser/ui/views/frame/mru_tab_switcher_visualizer.h"
  #include "chrome/browser/ui/views/frame/multi_contents_view.h"
  #include "chrome/browser/ui/views/frame/multi_contents_view_delegate.h"
  #include "chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller.h"
--#include "chrome/browser/ui/views/frame/mru_tab_switcher_visualizer.h"
- #include "chrome/browser/ui/views/frame/scrim_view.h"
- #include "chrome/browser/ui/views/frame/shadow_overlay_view.h"
- #include "chrome/browser/ui/views/frame/tab_modal_dialog_host.h"
-@@ -189,6 +186,8 @@
+@@ -188,6 +186,7 @@
  #include "chrome/browser/ui/views/glic/glic_button_interface.h"
  #include "chrome/browser/ui/views/global_media_controls/media_toolbar_button_view.h"
  #include "chrome/browser/ui/views/hats/hats_next_web_dialog.h"
 +#include "chrome/browser/ui/views/helium/glass_surface.h"
-+#include "chrome/browser/ui/views/helium/native_frame_materials.h"
  #include "chrome/browser/ui/views/incognito_clear_browsing_data_dialog_coordinator.h"
  #include "chrome/browser/ui/views/infobars/infobar_container_view.h"
  #include "chrome/browser/ui/views/interaction/browser_elements_views.h"
-@@ -377,6 +376,8 @@
+@@ -376,6 +375,8 @@
  #include "ui/views/style/typography.h"
  #include "ui/views/view.h"
  #include "ui/views/view_class_properties.h"
@@ -129,7 +122,7 @@
  #include "ui/views/view_utils.h"
  #include "ui/views/views_features.h"
  #include "ui/views/widget/native_widget.h"
-@@ -937,6 +938,8 @@ class MRUTabSwitcherOverlay : public vie
+@@ -936,6 +937,8 @@ class MRUTabSwitcherOverlay : public vie
    ~MRUTabSwitcherOverlay() override {
      browser_view_->RemoveObserver(this);
      if (bubble_) {
@@ -138,7 +131,7 @@
        auto* bubble = bubble_.get();
        bubble_ = nullptr;
        browser_view_->RemoveChildViewT(bubble);
-@@ -945,6 +948,9 @@ class MRUTabSwitcherOverlay : public vie
+@@ -944,6 +947,9 @@ class MRUTabSwitcherOverlay : public vie
  
    void Update(const std::vector<content::WebContents*>& starting_tabs,
                content::WebContents* selected_tab) {
@@ -148,7 +141,7 @@
      if (!starting_tabs.empty()) {
        tabs_ = starting_tabs;
      }
-@@ -957,6 +963,11 @@ class MRUTabSwitcherOverlay : public vie
+@@ -956,6 +962,11 @@ class MRUTabSwitcherOverlay : public vie
      bubble_->Update(tabs_, selected_index_);
      PositionView();
      bubble_->SetVisible(true);
@@ -160,7 +153,20 @@
    }
  
    class BubbleView : public views::View {
-@@ -1014,6 +1025,10 @@ class MRUTabSwitcherOverlay : public vie
+@@ -1005,7 +1016,11 @@ class MRUTabSwitcherOverlay : public vie
+       rail_->SetLabelContrast(background, uses_backdrop);
+     }
+ 
+-    private:
++    bool UsesBackdrop() const {
++      return glass_surface_->backend() == helium::GlassBackend::kChromium;
++    }
++
++   private:
+     const raw_ptr<BrowserView> browser_view_;
+     raw_ptr<helium::GlassSurfaceView> glass_surface_ = nullptr;
+     raw_ptr<MRUTabPreviewRail> rail_ = nullptr;
+@@ -1013,6 +1028,10 @@ class MRUTabSwitcherOverlay : public vie
    };
  
   private:
@@ -171,18 +177,14 @@
    void OnViewBoundsChanged(views::View*) override {
      if (bubble_) {
        bubble_->Update(tabs_, selected_index_);
-@@ -1030,6 +1045,10 @@ class MRUTabSwitcherOverlay : public vie
-     use_glass = IsMRUTransparencyAllowed() &&
-                 !helium::ShouldUseNativeFrameMaterials(browser_view_);
+@@ -1031,12 +1050,15 @@ class MRUTabSwitcherOverlay : public vie
+     }
  #endif
-+    // Diagnostic comparison control. Never overrides accessibility policy.
-+    use_glass &=
-+        !base::CommandLine::ForCurrentProcess()->HasSwitch("arcium-mru-opaque");
-+    use_glass_ = use_glass;
-     auto bubble = std::make_unique<BubbleView>(browser_view_, use_glass);
+     auto bubble = std::make_unique<BubbleView>(browser_view_, backend);
++    use_glass_ = bubble->UsesBackdrop();
      bubble->SetProperty(views::kViewIgnoredByLayoutKey, true);
      bubble->SetCanProcessEventsWithinSubtree(false);
-@@ -1037,6 +1056,8 @@ class MRUTabSwitcherOverlay : public vie
+     bubble->SetVisible(false);
      bubble->SetPaintToLayer();
      bubble->layer()->SetFillsBoundsOpaquely(false);
      bubble_ = browser_view_->AddChildView(std::move(bubble));
@@ -191,7 +193,7 @@
    }
  
    void PositionView() {
-@@ -1049,6 +1070,9 @@ class MRUTabSwitcherOverlay : public vie
+@@ -1049,6 +1071,9 @@ class MRUTabSwitcherOverlay : public vie
    std::vector<content::WebContents*> tabs_;
    size_t selected_index_ = 0;
    raw_ptr<BubbleView> bubble_ = nullptr;
@@ -235,24 +237,30 @@
  #include "ui/views/controls/webview/webview.h"
  #include "ui/views/focus/focus_manager.h"
  #include "ui/views/interaction/element_tracker_views.h"
-@@ -216,6 +218,23 @@ TEST_F(BrowserViewTest, MRUTabSwitcherSh
+@@ -216,6 +218,29 @@ TEST_F(BrowserViewTest, MRUTabSwitcherSh
    EXPECT_EQ(browser_view()->children().size(), original_child_count);
  }
  
-+TEST_F(BrowserViewTest, MRUDiagnosticOpaqueModeOmitsGlassLayer) {
++TEST_F(BrowserViewTest, MRUGlobalOpaqueBackendUsesFallback) {
 +  base::test::ScopedCommandLine command_line;
-+  command_line.GetProcessCommandLine()->AppendSwitch("arcium-mru-opaque");
++  command_line.GetProcessCommandLine()->AppendSwitchASCII(
++      helium::kArciumGlassBackendSwitch, "opaque");
 +  auto* active = browser()->tab_strip_model()->GetActiveWebContents();
 +  browser_view()->SetSize(gfx::Size(1000, 800));
 +  UpdateMRUTabSwitcherVisualizer(browser_view(), {active}, active);
++  helium::GlassSurfaceView* surface = nullptr;
 +  std::vector<views::View*> descendants{browser_view()->children().back()};
 +  while (!descendants.empty()) {
 +    auto* view = descendants.back();
 +    descendants.pop_back();
-+    EXPECT_FALSE(views::AsViewClass<helium::GlassSurfaceView>(view));
++    if (auto* candidate = views::AsViewClass<helium::GlassSurfaceView>(view)) {
++      surface = candidate;
++    }
 +    descendants.insert(descendants.end(), view->children().begin(),
 +                       view->children().end());
 +  }
++  ASSERT_TRUE(surface);
++  EXPECT_EQ(helium::GlassBackend::kOpaque, surface->backend());
 +  StopMRUTabSwitcherVisualizer(browser_view());
 +}
 +
@@ -514,17 +522,15 @@
    auto cache = MakeCache();
 --- a/chrome/browser/ui/views/helium/glass_surface.cc
 +++ b/chrome/browser/ui/views/helium/glass_surface.cc
-@@ -5,7 +5,9 @@
- #include "chrome/browser/ui/views/helium/glass_surface.h"
+@@ -9,6 +9,7 @@
  
- #include <algorithm>
-+
+ #include "base/command_line.h"
  #include "base/notreached.h"
 +#include "base/trace_event/trace_event.h"
  #include "cc/paint/filter_operation.h"
  #include "cc/paint/filter_operations.h"
  #include "cc/paint/paint_filter.h"
-@@ -120,6 +122,8 @@ void GlassSurfaceView::SetCornerRadii(
+@@ -196,6 +197,8 @@ void GlassSurfaceView::SetCornerRadii(
  }
  
  void GlassSurfaceView::UpdateLayer() {
@@ -593,7 +599,7 @@
 +}
 --- a/chrome/test/BUILD.gn
 +++ b/chrome/test/BUILD.gn
-@@ -10653,6 +10653,21 @@ if (!is_android && !is_chromeos_device)
+@@ -10654,6 +10654,21 @@ if (!is_android && !is_chromeos_device)
    }
  }
  
