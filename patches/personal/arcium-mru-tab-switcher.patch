@@ -254,7 +254,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  #include "ui/views/view.h"
  #include "ui/views/view_class_properties.h"
  #include "ui/views/view_utils.h"
-@@ -891,6 +908,162 @@ class BrowserView::PipExclusionObserverI
+@@ -891,6 +908,154 @@ class BrowserView::PipExclusionObserverI
  };
  #endif
  
@@ -312,7 +312,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +    METADATA_HEADER(BubbleView, views::View)
 +
 +   public:
-+    BubbleView(BrowserView* browser_view, helium::GlassBackend backend)
++    explicit BubbleView(BrowserView* browser_view)
 +        : browser_view_(browser_view) {
 +      GetViewAccessibility().SetRole(ax::mojom::Role::kGroup);
 +      GetViewAccessibility().SetName(
@@ -321,7 +321,6 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +      shadow_ = std::make_unique<views::ViewShadow>(this, 2);
 +      shadow_->SetRoundedCornerRadius(12);
 +      helium::GlassSurfaceParams params;
-+      params.backend = backend;
 +      params.preset = helium::GlassSurfacePreset::kGlassmorphic;
 +      params.tint_color = SK_ColorWHITE;
 +      params.tint_strength = 0.0f;
@@ -339,8 +338,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +    void Update(const std::vector<content::WebContents*>& tabs, size_t selected) {
 +      rail_->Update(tabs, selected);
 +      SkColor background = SkColorSetRGB(28, 28, 30);
-+      const bool uses_backdrop =
-+          glass_surface_->backend() == helium::GlassBackend::kChromium;
++      const bool uses_backdrop = glass_surface_->uses_backdrop();
 +      if (uses_backdrop) {
 +        background = browser_view_->GetColorProvider()->GetColor(
 +            kColorTabHoverCardBackground);
@@ -374,13 +372,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +    if (bubble_) {
 +      return;
 +    }
-+    helium::GlassBackend backend = helium::GetRequestedGlassBackend();
-+#if BUILDFLAG(IS_MAC)
-+    if (!IsMRUTransparencyAllowed()) {
-+      backend = helium::GlassBackend::kOpaque;
-+    }
-+#endif
-+    auto bubble = std::make_unique<BubbleView>(browser_view_, backend);
++    auto bubble = std::make_unique<BubbleView>(browser_view_);
 +    bubble->SetProperty(views::kViewIgnoredByLayoutKey, true);
 +    bubble->SetCanProcessEventsWithinSubtree(false);
 +    bubble->SetVisible(false);
@@ -417,7 +409,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  // Handles events during MRU tab cycling to start/stop tab cycling.
  class TabCyclingEventHandler : public ui::EventObserver,
                                 public views::WidgetObserver {
-@@ -900,7 +1073,7 @@ class TabCyclingEventHandler : public ui
+@@ -900,7 +1065,7 @@ class TabCyclingEventHandler : public ui
      Start();
    }
  
@@ -426,7 +418,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  
    TabCyclingEventHandler(const TabCyclingEventHandler&) = delete;
    TabCyclingEventHandler& operator=(const TabCyclingEventHandler&) = delete;
-@@ -908,15 +1081,22 @@ class TabCyclingEventHandler : public ui
+@@ -908,15 +1073,22 @@ class TabCyclingEventHandler : public ui
   private:
    // ui::EventObserver overrides:
    void OnEvent(const ui::Event& event) override {
@@ -452,7 +444,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
      }
    }
  
-@@ -924,12 +1104,12 @@ class TabCyclingEventHandler : public ui
+@@ -924,12 +1096,12 @@ class TabCyclingEventHandler : public ui
    void OnWidgetActivationChanged(views::Widget* widget, bool active) override {
      // We should stop cycling if other application gets active state.
      if (!active) {
@@ -467,7 +459,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  
    void Start() {
      // Add the event handler.
-@@ -937,37 +1117,80 @@ class TabCyclingEventHandler : public ui
+@@ -937,37 +1109,80 @@ class TabCyclingEventHandler : public ui
      if (widget->GetNativeWindow()) {
        monitor_ = views::EventMonitor::CreateWindowMonitor(
            this, widget->GetNativeWindow(),
@@ -551,7 +543,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  ///////////////////////////////////////////////////////////////////////////////
  // BrowserView, public:
  
-@@ -1015,6 +1238,27 @@ BrowserView::BrowserView(Browser* browse
+@@ -1015,6 +1230,27 @@ BrowserView::BrowserView(Browser* browse
    zen_side_chrome_animation_.Reset(1);
  
    browser_->tab_strip_model()->AddObserver(this);
@@ -579,7 +571,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  
    main_background_region_ =
        AddChildView(std::make_unique<MainBackgroundRegionView>(*this));
-@@ -1210,6 +1454,9 @@ BrowserView::BrowserView(Browser* browse
+@@ -1210,6 +1446,9 @@ BrowserView::BrowserView(Browser* browse
  }
  
  BrowserView::~BrowserView() {
@@ -589,7 +581,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    if (browser_shortcut_service_) {
      browser_shortcut_service_->RemoveObserver(this);
      browser_shortcut_service_ = nullptr;
-@@ -4103,10 +4350,20 @@ void BrowserView::OnTabChangedAt(tabs::T
+@@ -4103,10 +4342,20 @@ void BrowserView::OnTabChangedAt(tabs::T
    UpdateAccessibleURLForRootView(contents->GetURL());
  }
  
@@ -610,7 +602,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    // When the active tab changes, elements in the omnibox can change, which
    // can change its preferred size. Re-lay-out the toolbar to reflect the
    // possible change.
-@@ -5812,6 +6069,26 @@ bool BrowserView::AcceleratorPressed(con
+@@ -5812,6 +6061,26 @@ bool BrowserView::AcceleratorPressed(con
  
    UpdateAcceleratorMetrics(accelerator, command_id);
  
@@ -637,7 +629,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    if (command_id == IDC_CLEAR_BROWSING_DATA) {
      views::ElementTrackerViews::GetInstance()->NotifyCustomEvent(
          browsing_data_important_sites_util::
-@@ -6192,6 +6469,16 @@ void BrowserView::LoadAccelerators() {
+@@ -6192,6 +6461,16 @@ void BrowserView::LoadAccelerators() {
        browser_->GetProfile()->GetOTRProfileID().IsCaptivePortal();
  #endif
    std::vector<AcceleratorMapping> accelerator_list(GetAcceleratorList());
@@ -654,7 +646,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    if (browser_shortcut_service_ &&
        base::FeatureList::IsEnabled(features::kCustomizableBrowserShortcuts)) {
      std::erase_if(accelerator_list, [this](const AcceleratorMapping& entry) {
-@@ -6235,8 +6522,18 @@ void BrowserView::LoadAccelerators() {
+@@ -6235,8 +6514,18 @@ void BrowserView::LoadAccelerators() {
      accelerator_table_[accelerator] = entry.command_id;
  
      if (!already_registered) {
@@ -879,7 +871,7 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_switcher_visualizer.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/frame/mru_tab_switcher_visualizer.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,36 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -906,8 +898,6 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_switcher_visualizer.h
 +void StopMRUTabSwitcherVisualizer(BrowserView* browser_view);
 +
 +#if BUILDFLAG(IS_MAC)
-+bool IsMRUTransparencyAllowed();
-+
 +class MRUTabSwitcherApplicationObserver {
 + public:
 +  virtual ~MRUTabSwitcherApplicationObserver() = default;
@@ -922,7 +912,7 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_switcher_visualizer_mac.mm
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/frame/mru_tab_switcher_visualizer_mac.mm
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,49 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -966,14 +956,6 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_switcher_visualizer_mac.mm
 +};
 +
 +}  // namespace
-+
-+bool IsMRUTransparencyAllowed() {
-+  if (@available(macOS 26.0, *)) {
-+    return !NSWorkspace.sharedWorkspace
-+                .accessibilityDisplayShouldReduceTransparency;
-+  }
-+  return true;
-+}
 +
 +std::unique_ptr<MRUTabSwitcherApplicationObserver>
 +CreateMRUTabSwitcherApplicationObserver(base::RepeatingClosure callback) {
