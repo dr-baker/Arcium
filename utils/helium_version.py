@@ -23,16 +23,14 @@ def get_version_part(path):
         return int(file.readline().split(".")[0].strip())
 
 
-def append_version(file, name, version):
-    """Appends a version part to the chromium VERSION file"""
-    file.write(f"{name}={version}\n")
-
-
-def check_existing_version(path):
-    """Verifies that the version has not yet been added to the build tree"""
-    with open(path, "r", encoding="utf-8") as file:
-        if "HELIUM" in file.read():
-            raise ValueError("file already contains helium versioning")
+def refresh_version(path, version_parts):
+    """Replace generated Helium fields while preserving Chromium fields."""
+    original = path.read_text(encoding="utf-8")
+    lines = [line for line in original.splitlines() if not line.startswith("HELIUM_")]
+    lines.extend(f"{name}={version}" for name, version in version_parts.items())
+    updated = "\n".join(lines) + "\n"
+    if updated != original:
+        path.write_text(updated, encoding="utf-8")
 
 
 def parse_args():
@@ -73,10 +71,7 @@ def main():
         print('.'.join(version_parts.values()))
     else:
         chrome_version_path = chromium_tree / "chrome/VERSION"
-        check_existing_version(chrome_version_path)
-        with open(chrome_version_path, "a", encoding="utf-8") as file:
-            for name, version in version_parts.items():
-                append_version(file, name, version)
+        refresh_version(chrome_version_path, version_parts)
 
 
 if __name__ == "__main__":
