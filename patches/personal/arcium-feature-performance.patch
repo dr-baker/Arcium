@@ -267,9 +267,9 @@
  TEST_F(BrowserViewTest, MRURailKeepsFiveCardsAndFitsNarrowWindows) {
    std::vector<content::WebContents*> tabs;
    for (int i = 0; i < 7; ++i) {
---- a/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
-+++ b/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
-@@ -9,9 +9,11 @@
+--- src.orig/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
++++ src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
+@@ -9,12 +9,15 @@
  #include <utility>
  
  #include "base/functional/bind.h"
@@ -281,7 +281,11 @@
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
  #include "chrome/browser/ui/thumbnails/thumbnail_image.h"
  #include "chrome/browser/ui/thumbnails/thumbnail_tab_helper.h"
-@@ -61,18 +63,23 @@ gfx::ImageSkia MRUTabPreviewCache::Get(t
++#include "components/tabs/public/temporary_tab.h"
+ #include "components/viz/common/frame_sinks/copy_output_result.h"
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/render_widget_host_view.h"
+@@ -61,18 +64,23 @@
  
  void MRUTabPreviewCache::Request(tabs::TabHandle handle,
                                   gfx::Size size,
@@ -307,7 +311,7 @@
    Enqueue(handle, size, std::move(callback), high_priority);
  }
  
-@@ -118,11 +125,14 @@ void MRUTabPreviewCache::Enqueue(tabs::T
+@@ -118,11 +126,14 @@
    // Keep a full five-card rail queued even while two stale decodes finish.
    if (high_priority) {
      if (queued_.size() >= 5) {
@@ -322,7 +326,7 @@
    }
    Pump();
  }
-@@ -149,6 +159,9 @@ void MRUTabPreviewCache::Pump() {
+@@ -149,6 +160,9 @@
      }
      running_.push_back(job);
      job->thumbnail = helper->thumbnail();
@@ -332,7 +336,7 @@
      auto alive = weak_factory_.GetWeakPtr();
      job->thumbnail->RequestCachedImage(
          job->size,
-@@ -166,17 +179,24 @@ bool MRUTabPreviewCache::IsCurrent(
+@@ -166,17 +180,24 @@
      base::WeakPtr<content::WebContents> contents,
      const content::WeakDocumentPtr& document) const {
    auto* tab = handle.Get();
@@ -364,7 +368,7 @@
    std::erase(running_, job);
    job->thumbnail.reset();
    if (job->generation == generation_) {
-@@ -214,8 +234,10 @@ void MRUTabPreviewCache::CancelPendingRe
+@@ -214,8 +235,10 @@
    // Running tasks still count toward the concurrency cap until they finish.
  }
  
@@ -376,7 +380,7 @@
    auto* tab = handle.Get();
    if (!tab || model_->GetIndexOfTab(tab) == TabStripModel::kNoTab ||
        !tab->GetContents()->GetPrimaryMainFrame()) {
-@@ -260,18 +282,25 @@ void MRUTabPreviewCache::Store(tabs::Tab
+@@ -260,18 +283,25 @@
    }
    auto* contents = tab->GetContents();
    auto* helper = ThumbnailTabHelper::FromWebContents(contents);
@@ -406,7 +410,17 @@
    }
  }
  
-@@ -352,6 +381,9 @@ void MRUTabPreviewCache::CaptureDepartin
+@@ -312,7 +342,8 @@
+ }
+ 
+ bool MRUTabPreviewCache::IsPageReadyForCapture(content::WebContents* contents) {
+-  if (!contents || contents->IsBeingDestroyed() ||
++  if (!contents || tabs::TemporaryTab::IsTemporary(contents) ||
++      contents->IsBeingDestroyed() ||
+       !contents->CompletedFirstVisuallyNonEmptyPaint()) {
+     return false;
+   }
+@@ -352,6 +383,9 @@
      return;
    }
    capture_running_ = true;
@@ -416,7 +430,7 @@
    const gfx::Rect source_rect((source_size.width() - crop_width) / 2, 0,
                                crop_width, crop_height);
    view->CopyFromSurface(
-@@ -364,11 +396,13 @@ void MRUTabPreviewCache::CaptureDepartin
+@@ -364,11 +398,13 @@
              if (!self) {
                return;
              }
@@ -435,7 +449,7 @@
            contents->GetPrimaryMainFrame()->GetWeakDocumentPtr(),
            capture_generation_)));
  }
-@@ -381,6 +415,14 @@ void MRUTabPreviewCache::Captured(
+@@ -381,6 +417,14 @@
    const bool valid = generation == capture_generation_ && !image.isNull() &&
                       IsCurrent(handle, contents, document) &&
                       IsPageReadyForCapture(contents.get());
