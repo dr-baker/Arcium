@@ -65,7 +65,7 @@ Index: src/chrome/browser/renderer_context_menu/render_view_context_menu.cc
  #include "chrome/browser/user_education/user_education_service.h"
  #include "chrome/browser/user_education/user_education_service_factory.h"
  #include "chrome/browser/web_applications/mojom/user_display_mode.mojom.h"
-@@ -626,13 +629,15 @@ const std::map<int, int>& GetIdcToUmaMap
+@@ -626,13 +629,15 @@
         {IDC_SPELLCHECK_REMOVE_FROM_DICTIONARY, 167},
         {IDC_CONTENT_CONTEXT_SAVE_TO_MEMORY_BANKS, 168},
         {IDC_CONTENT_CONTEXT_FORCE_PASTE, 169},
@@ -82,7 +82,7 @@ Index: src/chrome/browser/renderer_context_menu/render_view_context_menu.cc
    // LINT.ThenChange(//tools/metrics/histograms/metadata/ui/enums.xml:RenderViewContextMenuItem)
  
    // LINT.IfChange(ContextMenuOptionDesktop)
-@@ -672,13 +677,15 @@ const std::map<int, int>& GetIdcToUmaMap
+@@ -672,13 +677,15 @@
         {IDC_CONTENT_CONTEXT_OPENLINKSPLITVIEW, 31},
         {IDC_CONTENT_CONTEXT_GLICSHAREIMAGE, 32},
         {IDC_SPELLCHECK_REMOVE_FROM_DICTIONARY, 33},
@@ -99,7 +99,7 @@ Index: src/chrome/browser/renderer_context_menu/render_view_context_menu.cc
    // LINT.ThenChange(//tools/metrics/histograms/metadata/ui/enums.xml:ContextMenuOptionDesktop)
  
    return *(type == UmaEnumIdLookupType::GeneralEnumId ? kGeneralMap
-@@ -741,6 +748,7 @@ int FindUMAEnumValueForCommand(int id, U
+@@ -741,6 +748,7 @@
  // Returns true if the command id is for opening a link.
  bool IsCommandForOpenLink(int id) {
    return id == IDC_CONTENT_CONTEXT_OPENLINKNEWTAB ||
@@ -107,47 +107,51 @@ Index: src/chrome/browser/renderer_context_menu/render_view_context_menu.cc
           id == IDC_CONTENT_CONTEXT_OPENLINKNEWWINDOW ||
           id == IDC_CONTENT_CONTEXT_OPENLINKOFFTHERECORD ||
           id == IDC_CONTENT_CONTEXT_OPENLINKSPLITVIEW ||
-@@ -1899,6 +1907,13 @@ void RenderViewContextMenu::AppendLinkIt
+@@ -1898,6 +1906,14 @@
+           in_app ? IDS_CONTENT_CONTEXT_OPENLINKNEWTAB_INAPP
                   : IDS_CONTENT_CONTEXT_OPENLINKNEWTAB);
      }
- 
++
 +#if !BUILDFLAG(IS_ANDROID)
-+    if (params_.link_url.SchemeIsHTTPOrHTTPS()) {
++    if (helium::IsPeekEnabled(GetProfile()) &&
++        params_.link_url.SchemeIsHTTPOrHTTPS()) {
 +      menu_model_.AddItemWithStringId(IDC_CONTENT_CONTEXT_OPENLINKPEEK,
 +                                      IDS_CONTENT_CONTEXT_OPENLINKPEEK);
 +    }
 +#endif
-+
+ 
      if (show_open_in_new_window) {
        AddItemWithOptionalIcon(IDC_CONTENT_CONTEXT_OPENLINKNEWWINDOW,
-                               IDS_CONTENT_CONTEXT_OPENLINKNEWWINDOW,
-@@ -3305,6 +3320,12 @@ bool RenderViewContextMenu::IsCommandIdE
+@@ -3305,6 +3321,13 @@
        return navigation_allowed && params_.link_url.is_valid() &&
               IsOpenLinkAllowedByDlp(params_.link_url);
  
 +#if !BUILDFLAG(IS_ANDROID)
 +    case IDC_CONTENT_CONTEXT_OPENLINKPEEK:
-+      return navigation_allowed && params_.link_url.SchemeIsHTTPOrHTTPS() &&
++      return navigation_allowed && helium::IsPeekEnabled(GetProfile()) &&
++             params_.link_url.SchemeIsHTTPOrHTTPS() &&
 +             IsOpenLinkAllowedByDlp(params_.link_url);
 +#endif
 +
      case IDC_CONTENT_CONTEXT_OPENLINKSPLITVIEW:
        return navigation_allowed && params_.link_url.is_valid() &&
               params_.link_url.IsStandard() &&
-@@ -3625,6 +3646,21 @@ void RenderViewContextMenu::ExecuteComma
+@@ -3625,6 +3648,23 @@
    }
  
    switch (id) {
 +#if !BUILDFLAG(IS_ANDROID)
 +    case IDC_CONTENT_CONTEXT_OPENLINKPEEK: {
-+      if (helium::ShowPeekForLink(source_web_contents_, params_.link_url)) {
-+        break;
-+      }
-+
 +      OpenURLParams open_params = GetOpenURLParamsWithExtraHeaders(
 +          params_.link_url, params_.frame_url, params_.frame_origin,
 +          WindowOpenDisposition::NEW_FOREGROUND_TAB, ui::PAGE_TRANSITION_LINK,
 +          /*extra_headers=*/std::string(), /*started_from_context_menu=*/true);
++      if (helium::ShowPeekForLink(
++              source_web_contents_,
++              content::NavigationController::LoadURLParams(open_params))) {
++        break;
++      }
++
 +      source_web_contents_->OpenURL(open_params,
 +                                    /*navigation_handle_callback=*/{});
 +      break;
@@ -160,7 +164,7 @@ Index: src/chrome/browser/renderer_context_menu/render_view_context_menu_unittes
 ===================================================================
 --- src.orig/chrome/browser/renderer_context_menu/render_view_context_menu_unittest.cc
 +++ src/chrome/browser/renderer_context_menu/render_view_context_menu_unittest.cc
-@@ -2077,6 +2077,31 @@ TEST_F(RenderViewContextMenuPrefsTest,
+@@ -2077,6 +2077,48 @@
    EXPECT_TRUE(menu.IsItemPresent(IDC_CONTENT_CONTEXT_INSPECTELEMENT));
  }
  
@@ -186,6 +190,23 @@ Index: src/chrome/browser/renderer_context_menu/render_view_context_menu_unittes
 +  file_menu.set_protocol_handler_registry(&registry);
 +  file_menu.Init();
 +  EXPECT_FALSE(file_menu.IsItemPresent(IDC_CONTENT_CONTEXT_OPENLINKPEEK));
++}
++
++TEST_F(RenderViewContextMenuPrefsTest, PeekCanBeDisabled) {
++  profile()->GetPrefs()->SetBoolean(prefs::kHeliumPeekEnabled, false);
++  content::ContextMenuParams params = CreateParams(MenuItem::LINK);
++  params.link_url = GURL("https://peek.example/page");
++  params.unfiltered_link_url = params.link_url;
++
++  TestRenderViewContextMenu menu(*web_contents()->GetPrimaryMainFrame(),
++                                 params);
++  custom_handlers::ProtocolHandlerRegistry registry(profile()->GetPrefs(),
++                                                    nullptr);
++  menu.set_protocol_handler_registry(&registry);
++  menu.Init();
++
++  EXPECT_FALSE(menu.IsItemPresent(IDC_CONTENT_CONTEXT_OPENLINKPEEK));
++  EXPECT_FALSE(menu.IsCommandIdEnabled(IDC_CONTENT_CONTEXT_OPENLINKPEEK));
 +}
 +#endif
 +
@@ -269,29 +290,71 @@ Index: src/chrome/browser/ui/views/frame/contents_container_view.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/contents_container_view.cc
 +++ src/chrome/browser/ui/views/frame/contents_container_view.cc
-@@ -165,6 +165,14 @@ ContentsContainerView::ContentsContainer
+@@ -31,6 +31,7 @@
+ #include "chrome/browser/ui/views/frame/tab_modal_dialog_host.h"
+ #include "chrome/browser/ui/views/frame/top_container_view.h"
+ #include "chrome/browser/ui/views/helium/frame_corner_radius.h"
++#include "chrome/browser/ui/views/helium/peek_controller.h"
+ #include "chrome/browser/ui/views/indigo/indigo_toolbar.h"
+ #include "chrome/browser/ui/views/new_tab_footer/footer_web_view.h"
+ #include "chrome/common/chrome_features.h"
+@@ -164,6 +165,16 @@
+ 
    container_outline_ =
        AddChildView(std::make_unique<ContentsContainerOutline>(nullptr));
- 
-+  // Peek covers the content outline, while the capture border intentionally
-+  // remains the highest-z-order child.
++
++  // Peek's passive source and controls sit behind the ordinary active contents
++  // view. The preview itself stays in that view, with normal modal scrims
++  // above.
 +  peek_overlay_view_ = AddChildView(std::make_unique<views::View>());
 +  peek_overlay_view_->SetVisible(false);
 +  peek_overlay_view_->SetLayoutManager(std::make_unique<views::FillLayout>());
 +  peek_overlay_view_->SetPaintToLayer();
 +  peek_overlay_view_->layer()->SetFillsBoundsOpaquely(false);
-+
++  ReorderChildView(peek_overlay_view_, GetIndexOf(devtools_web_view_).value());
+ 
    capture_contents_border_view_ =
        AddChildView(std::make_unique<ContentsCaptureBorderView>(nullptr));
+@@ -333,7 +344,20 @@
+   }
+ }
  
-@@ -668,6 +676,11 @@ views::ProposedLayout ContentsContainerV
++void ContentsContainerView::SetPeekPresentation(bool peek_presentation) {
++  if (peek_presentation_ == peek_presentation) {
++    return;
++  }
++  peek_presentation_ = peek_presentation;
++  UpdateBorderRoundedCorners();
++  InvalidateLayout();
++}
++
+ void ContentsContainerView::UpdateBorderRoundedCorners() {
++  if (peek_presentation_) {
++    SetBorderRoundedCornersFrom(gfx::RoundedCornersF(16));
++    return;
++  }
+   if (!should_round_contents_) {
+     SetBorderRoundedCornersFrom(rounded_corner_radii_);
+     return;
+@@ -543,7 +567,10 @@
+   // |new_tab_footer_view_|, etc).
+   gfx::Rect non_devtools_contents_bounds;
+ 
+-  ApplyDevToolsContentsResizingStrategy(strategy_, full_contents_bounds,
++  const gfx::Rect presented_contents_bounds =
++      peek_presentation_ ? helium::GetPeekCardBounds(full_contents_bounds)
++                         : full_contents_bounds;
++  ApplyDevToolsContentsResizingStrategy(strategy_, presented_contents_bounds,
+                                         &devtools_bounds,
+                                         &non_devtools_contents_bounds);
+   gfx::Rect contents_view_bounds = non_devtools_contents_bounds;
+@@ -668,6 +695,10 @@
                                         gfx::Rect(0, 0, width, height));
    }
  
 +  layouts.child_layouts.emplace_back(
 +      peek_overlay_view_.get(), peek_overlay_view_->GetVisible(),
-+      non_devtools_contents_bounds,
-+      views::SizeBounds(non_devtools_contents_bounds.size()));
++      full_contents_bounds, views::SizeBounds(full_contents_bounds.size()));
 +
    if (capture_contents_border_view_) {
      gfx::Rect rect;
@@ -300,15 +363,24 @@ Index: src/chrome/browser/ui/views/frame/contents_container_view.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/contents_container_view.h
 +++ src/chrome/browser/ui/views/frame/contents_container_view.h
-@@ -103,6 +103,7 @@ class ContentsContainerView : public vie
+@@ -103,6 +103,8 @@
    }
  
    views::View* indigo_overlay_view() { return indigo_overlay_view_; }
 +  views::View* peek_overlay_view() { return peek_overlay_view_; }
++  void SetPeekPresentation(bool peek_presentation);
  
    // Sets the contents resizing strategy.
    void SetContentsResizingStrategy(
-@@ -218,6 +219,7 @@ class ContentsContainerView : public vie
+@@ -168,6 +170,7 @@
+   views::ProposedLayout CalculateProposedLayout(
+       const views::SizeBounds& size_bounds) const override;
+ 
++  bool peek_presentation_ = false;
+   bool is_in_split_ = false;
+   bool should_round_contents_ = false;
+   bool round_top_left_window_corner_ = false;
+@@ -218,6 +221,7 @@
    // The view that contains the Glic Actor Overlay. The Actor Overlay is a UI
    // overlay that is shown on top of the web contents.
    raw_ptr<ActorOverlayWebView> actor_overlay_web_view_ = nullptr;
@@ -318,9 +390,9 @@ Index: src/chrome/browser/ui/views/frame/contents_container_view.h
    // of the WebContents and is drawn on top of the WebContents.
 Index: src/chrome/browser/ui/views/helium/peek_controller.cc
 ===================================================================
---- /dev/null
+--- src.orig/chrome/browser/ui/views/helium/peek_controller.cc
 +++ src/chrome/browser/ui/views/helium/peek_controller.cc
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,630 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -331,18 +403,26 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.cc
 +#include <utility>
 +
 +#include "base/functional/bind.h"
++#include "base/task/single_thread_task_runner.h"
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/ui/browser.h"
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/tab_model.h"
 +#include "chrome/browser/ui/tabs/tab_strip_model.h"
 +#include "chrome/browser/ui/views/frame/browser_view.h"
 +#include "chrome/browser/ui/views/frame/contents_container_view.h"
++#include "chrome/browser/ui/views/frame/contents_web_view.h"
++#include "chrome/common/pref_names.h"
 +#include "chrome/grit/generated_resources.h"
++#include "components/prefs/pref_service.h"
 +#include "components/tabs/public/tab_interface.h"
++#include "components/tabs/public/temporary_tab.h"
 +#include "content/public/browser/navigation_controller.h"
 +#include "content/public/browser/web_contents.h"
 +#include "third_party/skia/include/core/SkColor.h"
 +#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
 +#include "ui/base/models/image_model.h"
 +#include "ui/base/page_transition_types.h"
 +#include "ui/color/color_id.h"
@@ -357,8 +437,8 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.cc
 +#include "ui/views/controls/button/image_button_factory.h"
 +#include "ui/views/controls/highlight_path_generator.h"
 +#include "ui/views/controls/webview/webview.h"
-+#include "ui/views/view.h"
 +#include "ui/views/vector_icons.h"
++#include "ui/views/view.h"
 +
 +namespace helium {
 +namespace {
@@ -366,7 +446,6 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.cc
 +constexpr int kOverlayInset = 20;
 +constexpr int kCardMaximumWidth = 1240;
 +constexpr int kCardMaximumHeight = 840;
-+constexpr int kCardCornerRadius = 16;
 +constexpr int kControlSize = 40;
 +constexpr int kControlIconSize = 20;
 +constexpr int kControlGap = 10;
@@ -380,57 +459,32 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.cc
 +  views::ConfigureVectorImageButton(button.get());
 +  views::InstallCircleHighlightPathGenerator(button.get());
 +  button->SetPreferredSize(gfx::Size(kControlSize, kControlSize));
-+  button->SetImageModel(
-+      views::Button::STATE_NORMAL,
-+      ui::ImageModel::FromVectorIcon(icon, ui::kColorSysOnSurface,
-+                                     kControlIconSize));
-+  button->SetBackground(views::CreateRoundedRectBackground(
-+      ui::kColorSysSurface, kControlSize / 2));
++  button->SetImageModel(views::Button::STATE_NORMAL,
++                        ui::ImageModel::FromVectorIcon(
++                            icon, ui::kColorSysOnSurface, kControlIconSize));
++  button->SetBackground(views::CreateRoundedRectBackground(ui::kColorSysSurface,
++                                                           kControlSize / 2));
 +  button->SetTooltipText(accessible_name);
 +  button->GetViewAccessibility().SetName(accessible_name);
 +  button->SetFocusBehavior(views::View::FocusBehavior::ALWAYS);
 +  return button;
 +}
 +
-+class PeekCardView : public views::View {
-+ public:
-+  explicit PeekCardView(Profile* profile) {
-+    SetPaintToLayer();
-+    layer()->SetFillsBoundsOpaquely(false);
-+    layer()->SetRoundedCornerRadius(
-+        gfx::RoundedCornersF(kCardCornerRadius));
-+    layer()->SetIsFastRoundedCorner(true);
-+    layer()->SetMasksToBounds(true);
-+    SetBackground(views::CreateRoundedRectBackground(
-+        ui::kColorSysSurface, kCardCornerRadius));
-+    web_view_ = AddChildView(std::make_unique<views::WebView>(profile));
-+  }
-+
-+  views::WebView* web_view() const { return web_view_; }
-+
-+ private:
-+  bool OnMousePressed(const ui::MouseEvent&) override { return true; }
-+
-+  void Layout(PassKey) override {
-+    web_view_->SetBoundsRect(GetContentsBounds());
-+  }
-+
-+  raw_ptr<views::WebView> web_view_ = nullptr;
-+};
-+
++// This backdrop hosts only the inactive source. The live preview remains in
++// the browser's normal ContentsWebView above this view.
 +class PeekOverlayView : public views::View {
++  METADATA_HEADER(PeekOverlayView, views::View)
++
 + public:
 +  PeekOverlayView(Profile* profile,
 +                  base::RepeatingClosure close_callback,
 +                  base::RepeatingClosure open_in_tab_callback,
 +                  base::RepeatingClosure open_in_sidebar_callback)
 +      : close_callback_(close_callback) {
-+    SetPaintToLayer();
-+    layer()->SetFillsBoundsOpaquely(false);
-+    auto card = std::make_unique<PeekCardView>(profile);
-+    card_ = card.get();
-+    AddChildView(std::unique_ptr<views::View>(std::move(card)));
-+
++    backdrop_view_ = AddChildView(std::make_unique<views::WebView>(profile));
++    backdrop_view_->SetCanProcessEventsWithinSubtree(false);
++    scrim_ = AddChildView(std::make_unique<views::View>());
++    scrim_->SetCanProcessEventsWithinSubtree(false);
 +    close_button_ = AddChildView(CreatePeekActionButton(
 +        std::move(close_callback), views::kCloseIcon,
 +        l10n_util::GetStringUTF16(IDS_HELIUM_PEEK_CLOSE)));
@@ -442,33 +496,23 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.cc
 +        l10n_util::GetStringUTF16(IDS_HELIUM_PEEK_OPEN_IN_SIDEBAR)));
 +  }
 +
-+  views::WebView* web_view() const { return card_->web_view(); }
++  views::WebView* backdrop_view() const { return backdrop_view_; }
 +
 + private:
 +  void OnThemeChanged() override {
 +    views::View::OnThemeChanged();
 +    const SkColor tint =
 +        GetColorProvider()->GetColor(ui::kColorSysSurfaceVariant);
-+    SetBackground(
-+        views::CreateSolidBackground(SkColorSetA(tint, 184)));
++    scrim_->SetBackground(views::CreateSolidBackground(SkColorSetA(tint, 184)));
 +  }
 +
 +  void Layout(PassKey) override {
-+    gfx::Rect available = GetContentsBounds();
-+    available.Inset(gfx::Insets(kOverlayInset));
-+    const int card_width = std::min(
-+        kCardMaximumWidth,
-+        std::max(0, available.width() - kControlRailGap - kControlSize));
-+    const int card_height = std::min(kCardMaximumHeight, available.height());
-+    const int group_width = card_width + kControlRailGap + kControlSize;
-+    const int group_x = available.x() + (available.width() - group_width) / 2;
-+    const int group_y = available.y() + (available.height() - card_height) / 2;
-+    gfx::Rect card_bounds(group_x, group_y, card_width, card_height);
-+    card_->SetBoundsRect(card_bounds);
-+
-+    const int controls_x = card_bounds.right() + kControlRailGap;
-+    close_button_->SetBounds(controls_x, card_bounds.y(), kControlSize,
-+                             kControlSize);
++    const gfx::Rect bounds = GetContentsBounds();
++    backdrop_view_->SetBoundsRect(bounds);
++    scrim_->SetBoundsRect(bounds);
++    const gfx::Rect card = GetPeekCardBounds(bounds);
++    const int controls_x = card.right() + kControlRailGap;
++    close_button_->SetBounds(controls_x, card.y(), kControlSize, kControlSize);
 +    open_in_tab_button_->SetBounds(
 +        controls_x, close_button_->bounds().bottom() + kControlGap,
 +        kControlSize, kControlSize);
@@ -482,16 +526,25 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.cc
 +    return true;
 +  }
 +
-+  raw_ptr<PeekCardView> card_ = nullptr;
++  raw_ptr<views::WebView> backdrop_view_ = nullptr;
++  raw_ptr<views::View> scrim_ = nullptr;
 +  raw_ptr<views::ImageButton> close_button_ = nullptr;
 +  raw_ptr<views::ImageButton> open_in_tab_button_ = nullptr;
 +  raw_ptr<views::ImageButton> open_in_sidebar_button_ = nullptr;
 +  base::RepeatingClosure close_callback_;
 +};
 +
++BEGIN_METADATA(PeekOverlayView)
++END_METADATA
++
 +}  // namespace
 +
-+bool ShowPeekForLink(content::WebContents* source_contents, const GURL& url) {
++bool IsPeekEnabled(Profile* profile) {
++  return profile && profile->GetPrefs()->GetBoolean(prefs::kHeliumPeekEnabled);
++}
++
++bool ShowPeekForLink(content::WebContents* source_contents,
++                     content::NavigationController::LoadURLParams params) {
 +  tabs::TabInterface* const tab =
 +      source_contents
 +          ? tabs::TabInterface::MaybeGetFromContents(source_contents)
@@ -503,128 +556,478 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.cc
 +  BrowserView* const browser_view =
 +      browser ? BrowserView::GetBrowserViewForBrowser(browser) : nullptr;
 +  return browser_view && browser_view->peek_controller() &&
-+         browser_view->peek_controller()->Show(url, source_contents);
++         browser_view->peek_controller()->Show(std::move(params),
++                                               source_contents);
++}
++
++gfx::Rect GetPeekCardBounds(gfx::Rect bounds) {
++  bounds.Inset(gfx::Insets(kOverlayInset));
++  const int card_width =
++      std::min(kCardMaximumWidth,
++               std::max(0, bounds.width() - kControlRailGap - kControlSize));
++  const int card_height = std::min(kCardMaximumHeight, bounds.height());
++  const int group_width = card_width + kControlRailGap + kControlSize;
++  return gfx::Rect(bounds.x() + (bounds.width() - group_width) / 2,
++                   bounds.y() + (bounds.height() - card_height) / 2, card_width,
++                   card_height);
 +}
 +
 +PeekController::PeekController(BrowserView* browser_view)
-+    : browser_view_(browser_view) {}
-+
-+PeekController::~PeekController() {
-+  Close();
++    : browser_view_(browser_view),
++      tab_strip_model_(browser_view->browser()->tab_strip_model()) {
++  tab_strip_model_->AddObserver(this);
++  pref_change_registrar_.Init(browser_view_->browser()->profile()->GetPrefs());
++  pref_change_registrar_.Add(
++      prefs::kHeliumPeekEnabled,
++      base::BindRepeating(&PeekController::OnPeekEnabledChanged,
++                          weak_factory_.GetWeakPtr()));
 +}
 +
-+bool PeekController::Show(const GURL& url,
++PeekController::~PeekController() {
++  ClearPresentation();
++  ResetPreviewState();
++}
++
++bool PeekController::Show(content::NavigationController::LoadURLParams params,
 +                          content::WebContents* source_contents) {
-+  if (!url.SchemeIsHTTPOrHTTPS() || !source_contents || !browser_view_ ||
-+      source_contents->GetBrowserContext() !=
-+          browser_view_->browser()->profile()) {
++  Browser* const browser = browser_view_->browser();
++  if (!tab_strip_model_ || tab_strip_model_->closing_all() ||
++      !IsPeekEnabled(browser->profile()) || !params.url.SchemeIsHTTPOrHTTPS() ||
++      !source_contents ||
++      source_contents->GetBrowserContext() != browser->profile() ||
++      tabs::TemporaryTab::IsTemporary(source_contents) ||
++      tab_strip_model_->GetIndexOfWebContents(source_contents) ==
++          TabStripModel::kNoTab) {
 +    return false;
 +  }
-+
-+  ContentsContainerView* const contents_container =
-+      browser_view_->GetContentsContainerViewFor(source_contents);
-+  if (!contents_container || !contents_container->peek_overlay_view()) {
++  // Validate the source host before changing selection, then reacquire the
++  // preview's actual host after activation. Split activation changes hosts.
++  if (!browser_view_->GetContentsContainerViewFor(source_contents)) {
 +    return false;
 +  }
-+
 +  Close();
-+  auto web_contents = content::WebContents::Create(
-+      content::WebContents::CreateParams(browser_view_->browser()->profile()));
-+  if (!web_contents) {
++  if (preview_contents_) {
 +    return false;
 +  }
-+  web_contents->SetDelegate(browser_view_->browser());
 +
-+  auto overlay = std::make_unique<PeekOverlayView>(
-+      browser_view_->browser()->profile(),
-+      base::BindRepeating(&PeekController::Close, base::Unretained(this)),
-+      base::BindRepeating(&PeekController::OpenInTab,
-+                          base::Unretained(this)),
-+      base::BindRepeating(&PeekController::OpenInSidebar,
-+                          base::Unretained(this)));
-+  PeekOverlayView* const overlay_ptr = overlay.get();
-+  views::WebView* const web_view = overlay_ptr->web_view();
-+  web_view->SetWebContents(web_contents.get());
-+
-+  contents_container_ = contents_container;
-+  contents_container_->peek_overlay_view()->AddChildView(
-+      std::unique_ptr<views::View>(std::move(overlay)));
-+  overlay_view_ = overlay_ptr;
-+  web_view_ = web_view;
-+  web_contents_ = std::move(web_contents);
-+  scoped_ignore_input_events_ =
-+      source_contents->IgnoreInputEvents(std::nullopt);
++  auto contents = content::WebContents::Create(
++      content::WebContents::CreateParams(browser->profile()));
++  tabs::TemporaryTab::CreateForWebContents(contents.get(), source_contents);
++  auto tab =
++      std::make_unique<tabs::TabModel>(std::move(contents), tab_strip_model_);
++  preview_contents_ = tab->GetContents()->GetWeakPtr();
++  Observe(preview_contents_.get());
 +  source_contents_ = source_contents->GetWeakPtr();
-+  contents_container_->peek_overlay_view()->SetVisible(true);
-+  contents_container_->peek_overlay_view()->InvalidateLayout();
++  preview_will_deactivate_subscription_ = tab->RegisterWillDeactivate(
++      base::BindRepeating(&PeekController::OnPreviewWillDeactivate,
++                          weak_factory_.GetWeakPtr()));
++  preview_did_activate_subscription_ =
++      tab->RegisterDidActivate(base::BindRepeating(
++          &PeekController::OnPreviewDidActivate, weak_factory_.GetWeakPtr()));
++  preview_will_detach_subscription_ =
++      tab->RegisterWillDetach(base::BindRepeating(
++          &PeekController::OnPreviewWillDetach, weak_factory_.GetWeakPtr()));
++  preview_will_discard_subscription_ =
++      tab->RegisterWillDiscardContents(base::BindRepeating(
++          &PeekController::OnPreviewWillDiscard, weak_factory_.GetWeakPtr()));
++  tabs::TabInterface* source_tab =
++      tabs::TabInterface::GetFromContents(source_contents);
++  source_will_detach_subscription_ =
++      source_tab->RegisterWillDetach(base::BindRepeating(
++          &PeekController::OnSourceWillDetach, weak_factory_.GetWeakPtr()));
++  source_will_discard_subscription_ =
++      source_tab->RegisterWillDiscardContents(base::BindRepeating(
++          &PeekController::OnSourceWillDiscard, weak_factory_.GetWeakPtr()));
++  const int source_index =
++      tab_strip_model_->GetIndexOfWebContents(source_contents);
++  // Detached insertion inside a split removes the split. Keep the temporary
++  // tab outside it so closing Peek restores the source's existing layout.
++  int insertion_index = source_index + 1;
++  const auto source_split = source_tab->GetSplit();
++  while (source_split && tab_strip_model_->ContainsIndex(insertion_index) &&
++         tab_strip_model_->GetSplitForTab(insertion_index) == source_split) {
++    ++insertion_index;
++  }
++  tab_strip_model_->InsertDetachedTabAt(insertion_index, std::move(tab),
++                                        AddTabTypes::ADD_ACTIVE);
++  if (!AttachPresentation()) {
++    // Insertion used a fully initialized normal tab. If its host is
++    // unavailable, close the still-empty temporary tab and let the original
++    // request proceed.
++    Close();
++    return false;
++  }
 +
-+  content::NavigationController::LoadURLParams load_params(url);
-+  load_params.transition_type = ui::PAGE_TRANSITION_LINK;
-+  web_contents_->GetController().LoadURLWithParams(load_params);
-+  web_view_->RequestFocus();
++  // Retarget the destination frame while preserving the initiating frame,
++  // origin, referrer, user gesture and request context copied by upstream APIs.
++  params.frame_tree_node_id = content::FrameTreeNodeId();
++  preview_contents_->GetController().LoadURLWithParams(params);
++  contents_container_->contents_view()->RequestFocus();
 +  return true;
 +}
 +
-+void PeekController::Close() {
-+  base::WeakPtr<content::WebContents> source_contents = source_contents_;
-+  DetachPreview().reset();
-+  if (source_contents) {
-+    source_contents->RestoreFocus();
++bool PeekController::AttachPresentation() {
++  if (overlay_view_) {
++    return true;
 +  }
++  if (!preview_contents_ || !source_contents_ || !tab_strip_model_ ||
++      !IsPeekEnabled(browser_view_->browser()->profile()) ||
++      tab_strip_model_->GetActiveWebContents() != preview_contents_.get()) {
++    return false;
++  }
++  ContentsContainerView* const container =
++      browser_view_->GetContentsContainerViewFor(preview_contents_.get());
++  if (!container ||
++      container->contents_view()->web_contents() != preview_contents_.get()) {
++    return false;
++  }
++  for (ContentsContainerView* host :
++       browser_view_->GetContentsContainerViews()) {
++    if (host->contents_view()->web_contents() == source_contents_.get()) {
++      return false;
++    }
++  }
++  auto overlay = std::make_unique<PeekOverlayView>(
++      browser_view_->browser()->profile(),
++      base::BindRepeating(&PeekController::Close, weak_factory_.GetWeakPtr()),
++      base::BindRepeating(&PeekController::OpenInTab,
++                          weak_factory_.GetWeakPtr()),
++      base::BindRepeating(&PeekController::OpenInSidebar,
++                          weak_factory_.GetWeakPtr()));
++  backdrop_view_ = overlay->backdrop_view();
++  overlay_view_ = overlay.get();
++  contents_container_ = container;
++  // Browser activation has already detached the source from its normal view.
++  backdrop_view_->SetWebContents(source_contents_.get());
++  scoped_ignore_input_events_ =
++      source_contents_->IgnoreInputEvents(std::nullopt);
++  container->peek_overlay_view()->AddChildView(std::move(overlay));
++  container->peek_overlay_view()->SetVisible(true);
++  container->SetPeekPresentation(true);
++  return true;
 +}
 +
-+std::unique_ptr<content::WebContents> PeekController::DetachPreview() {
-+  scoped_ignore_input_events_.reset();
-+  if (web_view_) {
-+    web_view_->SetWebContents(nullptr);
++void PeekController::ClearPresentation() {
++  if (backdrop_view_) {
++    backdrop_view_->SetWebContents(nullptr);
 +  }
-+  web_view_ = nullptr;
-+  std::unique_ptr<content::WebContents> web_contents =
-+      std::move(web_contents_);
-+  if (contents_container_ && overlay_view_) {
-+    contents_container_->peek_overlay_view()->RemoveChildViewT(overlay_view_);
++  backdrop_view_ = nullptr;
++  scoped_ignore_input_events_.reset();
++  if (contents_container_) {
++    contents_container_->SetPeekPresentation(false);
++    if (overlay_view_) {
++      contents_container_->peek_overlay_view()->RemoveChildViewT(overlay_view_);
++    }
 +    contents_container_->peek_overlay_view()->SetVisible(false);
 +  }
 +  overlay_view_ = nullptr;
 +  contents_container_ = nullptr;
++}
++
++void PeekController::ResetPreviewState() {
++  Observe(nullptr);
++  preview_will_deactivate_subscription_ = {};
++  preview_did_activate_subscription_ = {};
++  preview_will_detach_subscription_ = {};
++  preview_will_discard_subscription_ = {};
++  source_will_detach_subscription_ = {};
++  source_will_discard_subscription_ = {};
++  preview_contents_.reset();
 +  source_contents_.reset();
-+  return web_contents;
++  close_pending_ = false;
++  close_scheduled_ = false;
++  restore_source_on_close_ = false;
++}
++
++void PeekController::Close() {
++  if (!preview_contents_) {
++    ClearPresentation();
++    ResetPreviewState();
++    return;
++  }
++  restore_source_on_close_ = true;
++  ClearPresentation();
++  if (close_pending_) {
++    return;
++  }
++  close_pending_ = true;
++  FinishClose(preview_contents_);
++}
++
++void PeekController::ScheduleClose(bool restore_source) {
++  restore_source_on_close_ = restore_source;
++  if (close_pending_ || closing_all_ || !tab_strip_model_ ||
++      tab_strip_model_->closing_all()) {
++    return;
++  }
++  close_pending_ = true;
++  close_scheduled_ = true;
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&PeekController::FinishScheduledClose,
++                                weak_factory_.GetWeakPtr(), preview_contents_));
++}
++
++void PeekController::FinishScheduledClose(
++    base::WeakPtr<content::WebContents> expected_contents) {
++  if (!close_scheduled_ || expected_contents.get() != preview_contents_.get()) {
++    return;
++  }
++  close_scheduled_ = false;
++  FinishClose(expected_contents);
++}
++
++void PeekController::FinishClose(
++    base::WeakPtr<content::WebContents> expected_contents) {
++  if (!expected_contents ||
++      expected_contents.get() != preview_contents_.get() || !tab_strip_model_ ||
++      closing_all_ || tab_strip_model_->closing_all()) {
++    return;
++  }
++  ClearPresentation();
++  const int index =
++      tab_strip_model_->GetIndexOfWebContents(preview_contents_.get());
++  if (index != TabStripModel::kNoTab) {
++    tab_strip_model_->CloseWebContentsAt(index, TabCloseTypes::CLOSE_NONE);
++  }
++}
++
++void PeekController::RestoreSourceFocus(
++    base::WeakPtr<content::WebContents> source_contents) {
++  if (preview_contents_ || !source_contents || !tab_strip_model_ ||
++      closing_all_ || tab_strip_model_->closing_all()) {
++    return;
++  }
++  const int index =
++      tab_strip_model_->GetIndexOfWebContents(source_contents.get());
++  if (index != TabStripModel::kNoTab) {
++    tab_strip_model_->ActivateTabAt(index);
++    source_contents->RestoreFocus();
++  }
++}
++
++void PeekController::OnPreviewWillDeactivate(tabs::TabInterface* tab) {
++  // Clear the passive source before normal selection can attach that source
++  // to a ContentsWebView. Never double-host the source during tab activation.
++  ClearPresentation();
++  if (!close_pending_) {
++    ScheduleClose(/*restore_source=*/false);
++  }
++}
++
++void PeekController::OnPreviewDidActivate(tabs::TabInterface* tab) {
++  if (!close_pending_ && !closing_all_) {
++    AttachPresentation();
++  }
++}
++
++void PeekController::OnPreviewWillDetach(
++    tabs::TabInterface* tab,
++    tabs::TabInterface::DetachReason reason) {
++  ClearPresentation();
++  if (reason == tabs::TabInterface::DetachReason::kDelete) {
++    // This notification precedes the beforeunload response. Retain observation
++    // and ownership until confirmed removal or the user's cancellation.
++    // The model already started closing; discard a queued duplicate request.
++    close_pending_ = true;
++    close_scheduled_ = false;
++    return;
++  }
++  // Moving a document to another window is an explicit retention action.
++  tabs::TemporaryTab::FromWebContents(tab->GetContents())->Promote();
++  ResetPreviewState();
++}
++
++void PeekController::OnPreviewWillDiscard(tabs::TabInterface* tab,
++                                          content::WebContents* old_contents,
++                                          content::WebContents* new_contents) {
++  ClearPresentation();
++  preview_contents_ = new_contents->GetWeakPtr();
++  Observe(new_contents);
++  if (close_pending_) {
++    // The earlier task refers to the discarded contents. Retry against the
++    // replacement after the model has completed its replacement notification.
++    close_pending_ = false;
++    ScheduleClose(restore_source_on_close_);
++  }
++}
++
++void PeekController::OnTabStripModelChanged(
++    TabStripModel* model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  if (change.type() == TabStripModelChange::kRemoved && preview_contents_) {
++    bool preview_removed = false;
++    bool source_removed = false;
++    for (const auto& removed : change.GetRemove()->contents) {
++      preview_removed |= removed.contents == preview_contents_.get();
++      source_removed |= removed.contents == source_contents_.get();
++    }
++    const auto source = source_contents_;
++    const bool restore = preview_removed && restore_source_on_close_ &&
++                         !closing_all_;
++    if (preview_removed) {
++      ClearPresentation();
++      ResetPreviewState();
++    } else if (source_removed) {
++      ClearPresentation();
++      source_contents_.reset();
++      source_will_detach_subscription_ = {};
++      source_will_discard_subscription_ = {};
++      ScheduleClose(/*restore_source=*/false);
++    }
++    if (restore && source) {
++      const auto selected = selection.new_contents
++                                ? selection.new_contents->GetWeakPtr()
++                                : base::WeakPtr<content::WebContents>();
++      base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE,
++          base::BindOnce(
++              [](base::WeakPtr<PeekController> controller,
++                 base::WeakPtr<content::WebContents> source,
++                 base::WeakPtr<content::WebContents> selected) {
++                if (controller && controller->tab_strip_model_ &&
++                    controller->tab_strip_model_->GetActiveWebContents() ==
++                        selected.get()) {
++                  controller->RestoreSourceFocus(source);
++                }
++              },
++              weak_factory_.GetWeakPtr(), source, selected));
++    }
++  }
++  if (change.type() == TabStripModelChange::kReplaced && preview_contents_ &&
++      change.GetReplace()->new_contents == preview_contents_.get() &&
++      !close_pending_ && !closing_all_) {
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(
++                       [](base::WeakPtr<PeekController> controller) {
++                         if (controller) {
++                           controller->AttachPresentation();
++                         }
++                       },
++                       weak_factory_.GetWeakPtr()));
++  }
++}
++
++void PeekController::OnSourceWillDetach(
++    tabs::TabInterface* tab,
++    tabs::TabInterface::DetachReason reason) {
++  ClearPresentation();
++  if (reason == tabs::TabInterface::DetachReason::kDelete) {
++    // A close attempt can be cancelled. Close Peek after actual removal.
++    return;
++  }
++  source_contents_.reset();
++  ScheduleClose(/*restore_source=*/false);
++}
++
++void PeekController::OnSourceWillDiscard(tabs::TabInterface* tab,
++                                         content::WebContents* old_contents,
++                                         content::WebContents* new_contents) {
++  ClearPresentation();
++  source_contents_.reset();
++  ScheduleClose(/*restore_source=*/false);
++}
++
++void PeekController::OnTabCloseCancelled(const tabs::TabInterface* tab) {
++  if (preview_contents_ && tab->GetContents() == preview_contents_.get()) {
++    // The model can report an oracle rejection inside a guarded bulk operation.
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(&PeekController::HandlePreviewCloseCancelled,
++                       weak_factory_.GetWeakPtr(), preview_contents_));
++  }
++}
++
++void PeekController::BeforeUnloadFired(bool proceed) {
++  if (!proceed && close_pending_) {
++    // Observe actual renderer cancellation. The model's close-cancel signal
++    // covers only oracle rejection, not the beforeunload dialog's answer.
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(&PeekController::HandlePreviewCloseCancelled,
++                       weak_factory_.GetWeakPtr(), preview_contents_));
++  }
++}
++
++void PeekController::HandlePreviewCloseCancelled(
++    base::WeakPtr<content::WebContents> expected_contents) {
++  if (!expected_contents ||
++      expected_contents.get() != preview_contents_.get() || !close_pending_ ||
++      !tab_strip_model_ ||
++      tab_strip_model_->GetIndexOfWebContents(expected_contents.get()) ==
++          TabStripModel::kNoTab) {
++    return;
++  }
++  closing_all_ = false;
++  close_pending_ = false;
++  close_scheduled_ = false;
++  restore_source_on_close_ = false;
++  if (!source_contents_ ||
++      !IsPeekEnabled(browser_view_->browser()->profile())) {
++    // The user chose to retain this document. If its preview host is gone,
++    // make it an ordinary reachable tab rather than leaving a hidden survivor.
++    OpenInTab();
++    return;
++  }
++  const int index =
++      tab_strip_model_->GetIndexOfWebContents(preview_contents_.get());
++  if (index != TabStripModel::kNoTab) {
++    tab_strip_model_->ActivateTabAt(index);
++    AttachPresentation();
++  }
++}
++
++void PeekController::WillCloseAllTabs(TabStripModel* model) {
++  closing_all_ = true;
++  ClearPresentation();
++}
++
++void PeekController::CloseAllTabsStopped(TabStripModel* model,
++                                         CloseAllStoppedReason reason) {
++  closing_all_ = false;
++  if (!preview_contents_) {
++    ResetPreviewState();
++  } else if (reason == kCloseAllCanceled && !close_pending_) {
++    // This also fires when closing pauses for a beforeunload response. Actual
++    // cancellation is handled by BeforeUnloadFired after the user's answer.
++    AttachPresentation();
++  }
++}
++
++void PeekController::OnTabStripModelDestroyed(TabStripModel* model) {
++  ClearPresentation();
++  ResetPreviewState();
++  tab_strip_model_ = nullptr;
++}
++
++void PeekController::OnPeekEnabledChanged() {
++  if (!IsPeekEnabled(browser_view_->browser()->profile())) {
++    Close();
++  }
 +}
 +
 +void PeekController::OpenInTab() {
-+  if (!web_contents_ || !browser_view_) {
++  if (!preview_contents_) {
 +    return;
 +  }
-+
-+  Browser* const browser = browser_view_->browser();
-+  std::unique_ptr<content::WebContents> web_contents = DetachPreview();
-+  browser->tab_strip_model()->AddWebContents(
-+      std::move(web_contents), browser->tab_strip_model()->active_index() + 1,
-+      ui::PAGE_TRANSITION_LINK, AddTabTypes::ADD_ACTIVE);
++  content::WebContents* const contents = preview_contents_.get();
++  ClearPresentation();
++  ResetPreviewState();
++  tabs::TemporaryTab::FromWebContents(contents)->Promote();
 +}
 +
 +void PeekController::OpenInSidebar() {
-+  if (!web_contents_ || !browser_view_) {
-+    return;
-+  }
-+
-+  base::WeakPtr<content::WebContents> source_contents = source_contents_;
-+  Browser* const browser = browser_view_->browser();
-+  std::unique_ptr<content::WebContents> web_contents = DetachPreview();
-+  browser->tab_strip_model()->AddWebContents(
-+      std::move(web_contents), browser->tab_strip_model()->active_index() + 1,
-+      ui::PAGE_TRANSITION_LINK, AddTabTypes::ADD_NONE);
-+  if (source_contents) {
-+    source_contents->RestoreFocus();
-+  }
++  const auto source = source_contents_;
++  OpenInTab();
++  RestoreSourceFocus(source);
 +}
 +
 +}  // namespace helium
 Index: src/chrome/browser/ui/views/helium/peek_controller.h
 ===================================================================
---- /dev/null
+--- src.orig/chrome/browser/ui/views/helium/peek_controller.h
 +++ src/chrome/browser/ui/views/helium/peek_controller.h
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,128 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -632,16 +1035,23 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.h
 +#ifndef CHROME_BROWSER_UI_VIEWS_HELIUM_PEEK_CONTROLLER_H_
 +#define CHROME_BROWSER_UI_VIEWS_HELIUM_PEEK_CONTROLLER_H_
 +
-+#include <memory>
 +#include <optional>
 +
++#include "base/callback_list.h"
 +#include "base/memory/raw_ptr.h"
 +#include "base/memory/weak_ptr.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
 +#include "content/public/browser/web_contents.h"
-+#include "url/gurl.h"
++#include "content/public/browser/web_contents_observer.h"
++#include "ui/gfx/geometry/rect.h"
 +
 +class BrowserView;
 +class ContentsContainerView;
++class Profile;
++class TabStripModel;
 +
 +namespace views {
 +class View;
@@ -650,45 +1060,97 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.h
 +
 +namespace helium {
 +
-+// Opens `url` in the Peek controller owned by `source_contents`' browser
-+// window. Returns false without changing the source tab when no attached Peek
-+// host is available.
-+bool ShowPeekForLink(content::WebContents* source_contents, const GURL& url);
++bool IsPeekEnabled(Profile* profile);
++gfx::Rect GetPeekCardBounds(gfx::Rect bounds);
 +
-+// Owns the attached Peek surface for one browser window. Peek deliberately has
-+// no dependency on Spaces or Pins; those features may call Show() when present.
-+class PeekController {
++// Opens the complete request in the source's browser. Failure leaves the source
++// navigation intact so callers can use their normal fallback.
++bool ShowPeekForLink(content::WebContents* source_contents,
++                     content::NavigationController::LoadURLParams params);
++
++// Presents a temporary, active browser-owned tab as a Peek card. Its websites
++// use ordinary browser delegates and tab features; promotion retains the same
++// model member and document. Peek has no dependency on Spaces or Pins.
++class PeekController : public TabStripModelObserver,
++                       public content::WebContentsObserver {
 + public:
 +  explicit PeekController(BrowserView* browser_view);
 +  PeekController(const PeekController&) = delete;
 +  PeekController& operator=(const PeekController&) = delete;
-+  ~PeekController();
++  ~PeekController() override;
 +
-+  // Shows `url` over `source_contents`. Returns false without changing the
-+  // current page when Peek cannot be created, allowing callers to fall back to
-+  // an ordinary navigation.
-+  bool Show(const GURL& url, content::WebContents* source_contents);
++  bool Show(content::NavigationController::LoadURLParams params,
++            content::WebContents* source_contents);
 +  void Close();
 +  void OpenInTab();
 +  void OpenInSidebar();
 +
-+  bool is_showing() const { return web_contents_ != nullptr; }
++  bool is_showing() const { return preview_contents_ != nullptr; }
 +  content::WebContents* web_contents_for_testing() const {
-+    return web_contents_.get();
++    return preview_contents_.get();
 +  }
 +  views::View* overlay_view_for_testing() const { return overlay_view_; }
 +
 + private:
-+  std::unique_ptr<content::WebContents> DetachPreview();
++  bool AttachPresentation();
++  void ClearPresentation();
++  void ResetPreviewState();
++  void ScheduleClose(bool restore_source);
++  void FinishScheduledClose(
++      base::WeakPtr<content::WebContents> expected_contents);
++  void FinishClose(base::WeakPtr<content::WebContents> expected_contents);
++  void RestoreSourceFocus(base::WeakPtr<content::WebContents> source_contents);
++  void OnPeekEnabledChanged();
++  void HandlePreviewCloseCancelled(
++      base::WeakPtr<content::WebContents> expected_contents);
++
++  // content::WebContentsObserver:
++  void BeforeUnloadFired(bool proceed) override;
++  void OnPreviewWillDeactivate(tabs::TabInterface* tab);
++  void OnPreviewDidActivate(tabs::TabInterface* tab);
++  void OnPreviewWillDetach(tabs::TabInterface* tab,
++                           tabs::TabInterface::DetachReason reason);
++  void OnPreviewWillDiscard(tabs::TabInterface* tab,
++                            content::WebContents* old_contents,
++                            content::WebContents* new_contents);
++  void OnSourceWillDetach(tabs::TabInterface* tab,
++                          tabs::TabInterface::DetachReason reason);
++  void OnSourceWillDiscard(tabs::TabInterface* tab,
++                           content::WebContents* old_contents,
++                           content::WebContents* new_contents);
++
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(
++      TabStripModel* model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override;
++  void OnTabCloseCancelled(const tabs::TabInterface* tab) override;
++  void WillCloseAllTabs(TabStripModel* model) override;
++  void CloseAllTabsStopped(TabStripModel* model,
++                           CloseAllStoppedReason reason) override;
++  void OnTabStripModelDestroyed(TabStripModel* model) override;
 +
 +  raw_ptr<BrowserView> browser_view_;
++  raw_ptr<TabStripModel> tab_strip_model_ = nullptr;
 +  raw_ptr<ContentsContainerView> contents_container_ = nullptr;
 +  raw_ptr<views::View> overlay_view_ = nullptr;
-+  raw_ptr<views::WebView> web_view_ = nullptr;
-+  std::unique_ptr<content::WebContents> web_contents_;
++  raw_ptr<views::WebView> backdrop_view_ = nullptr;
++  base::WeakPtr<content::WebContents> preview_contents_;
 +  base::WeakPtr<content::WebContents> source_contents_;
++  bool close_pending_ = false;
++  bool close_scheduled_ = false;
++  bool restore_source_on_close_ = false;
++  bool closing_all_ = false;
++  PrefChangeRegistrar pref_change_registrar_;
 +  std::optional<content::WebContents::ScopedIgnoreInputEvents>
 +      scoped_ignore_input_events_;
++  base::CallbackListSubscription preview_will_deactivate_subscription_;
++  base::CallbackListSubscription preview_did_activate_subscription_;
++  base::CallbackListSubscription preview_will_detach_subscription_;
++  base::CallbackListSubscription preview_will_discard_subscription_;
++  base::CallbackListSubscription source_will_detach_subscription_;
++  base::CallbackListSubscription source_will_discard_subscription_;
++  base::WeakPtrFactory<PeekController> weak_factory_{this};
 +};
 +
 +}  // namespace helium
@@ -696,29 +1158,116 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.h
 +#endif  // CHROME_BROWSER_UI_VIEWS_HELIUM_PEEK_CONTROLLER_H_
 Index: src/chrome/browser/ui/views/helium/peek_controller_browsertest.cc
 ===================================================================
---- /dev/null
+--- src.orig/chrome/browser/ui/views/helium/peek_controller_browsertest.cc
 +++ src/chrome/browser/ui/views/helium/peek_controller_browsertest.cc
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,504 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "chrome/browser/ui/views/helium/peek_controller.h"
 +
++#include <memory>
++#include <string>
++#include <tuple>
++#include <variant>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/run_loop.h"
++#include "base/strings/escape.h"
++#include "base/test/run_until.h"
++#include "base/test/test_future.h"
 +#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/content_settings/page_specific_content_settings_delegate.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/renderer_context_menu/render_view_context_menu_test_util.h"
++#include "chrome/browser/sessions/session_service.h"
++#include "chrome/browser/sessions/session_service_factory.h"
++#include "chrome/browser/sessions/session_service_test_helper.h"
++#include "chrome/browser/sessions/tab_restore_service_factory.h"
 +#include "chrome/browser/ui/browser.h"
 +#include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/browser_live_tab_context.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_features.h"
++#include "chrome/browser/ui/tabs/split_tab_metrics.h"
 +#include "chrome/browser/ui/tabs/tab_strip_model.h"
 +#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/contents_container_view.h"
++#include "chrome/common/pref_names.h"
 +#include "chrome/test/base/in_process_browser_test.h"
 +#include "chrome/test/base/ui_test_utils.h"
++#include "components/blocked_content/popup_blocker_tab_helper.h"
++#include "components/javascript_dialogs/app_modal_dialog_controller.h"
++#include "components/javascript_dialogs/app_modal_dialog_view.h"
++#include "components/javascript_dialogs/tab_modal_dialog_manager.h"
++#include "components/permissions/permission_request.h"
++#include "components/permissions/permission_request_manager.h"
++#include "components/permissions/test/permission_request_observer.h"
++#include "components/prefs/pref_service.h"
++#include "components/sessions/content/session_tab_helper.h"
++#include "components/sessions/core/command_storage_manager.h"
++#include "components/sessions/core/session_types.h"
++#include "components/sessions/core/tab_restore_service.h"
++#include "components/split_tabs/split_tab_visual_data.h"
++#include "components/tabs/public/tab_interface.h"
++#include "components/tabs/public/temporary_tab.h"
++#include "content/public/browser/context_menu_params.h"
++#include "content/public/browser/page_navigator.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/session_storage_namespace.h"
 +#include "content/public/browser/web_contents.h"
 +#include "content/public/test/browser_test.h"
 +#include "content/public/test/browser_test_utils.h"
++#include "net/dns/mock_host_resolver.h"
++#include "net/test/embedded_test_server/embedded_test_server.h"
++#include "net/test/embedded_test_server/http_request.h"
++#include "net/test/embedded_test_server/http_response.h"
++#include "ui/views/controls/webview/webview.h"
 +
 +namespace helium {
++namespace {
 +
-+class PeekControllerBrowserTest : public InProcessBrowserTest {};
++content::NavigationController::LoadURLParams PeekNavigationParams(
++    const GURL& url) {
++  return content::NavigationController::LoadURLParams(content::OpenURLParams(
++      url, content::Referrer(), WindowOpenDisposition::CURRENT_TAB,
++      ui::PAGE_TRANSITION_LINK, /*is_renderer_initiated=*/false));
++}
++
++}  // namespace
++
++class PeekControllerBrowserTest : public InProcessBrowserTest {
++ protected:
++  void SetUpOnMainThread() override {
++    InProcessBrowserTest::SetUpOnMainThread();
++    host_resolver()->AddRule("*", "127.0.0.1");
++  }
++};
++
++IN_PROC_BROWSER_TEST_F(PeekControllerBrowserTest,
++                       DisablingPeekClosesOpenSurface) {
++  ASSERT_TRUE(embedded_test_server()->Start());
++  const GURL url = embedded_test_server()->GetURL("/empty.html");
++  BrowserView* const browser_view =
++      BrowserView::GetBrowserViewForBrowser(browser());
++  ASSERT_TRUE(browser_view);
++  PeekController* const controller = browser_view->peek_controller();
++  ASSERT_TRUE(controller);
++  content::WebContents* const source =
++      browser()->tab_strip_model()->GetActiveWebContents();
++  ASSERT_TRUE(source);
++
++  ASSERT_TRUE(controller->Show(PeekNavigationParams(url), source));
++  ASSERT_TRUE(content::WaitForLoadStop(controller->web_contents_for_testing()));
++  EXPECT_TRUE(source->ShouldIgnoreInputEventsForTesting());
++
++  browser()->profile()->GetPrefs()->SetBoolean(prefs::kHeliumPeekEnabled,
++                                               false);
++  EXPECT_FALSE(controller->is_showing());
++  EXPECT_FALSE(source->ShouldIgnoreInputEventsForTesting());
++  EXPECT_FALSE(controller->Show(PeekNavigationParams(url), source));
++}
 +
 +IN_PROC_BROWSER_TEST_F(PeekControllerBrowserTest,
 +                       CloseAndTransferLiveContents) {
@@ -733,10 +1282,11 @@ Index: src/chrome/browser/ui/views/helium/peek_controller_browsertest.cc
 +      browser()->tab_strip_model()->GetActiveWebContents();
 +  ASSERT_TRUE(source);
 +
-+  EXPECT_FALSE(controller->Show(GURL("file:///tmp/not-peekable"), source));
++  EXPECT_FALSE(controller->Show(
++      PeekNavigationParams(GURL("file:///tmp/not-peekable")), source));
 +  EXPECT_FALSE(controller->is_showing());
 +
-+  ASSERT_TRUE(controller->Show(url, source));
++  ASSERT_TRUE(controller->Show(PeekNavigationParams(url), source));
 +  ASSERT_TRUE(controller->is_showing());
 +  ASSERT_TRUE(content::WaitForLoadStop(controller->web_contents_for_testing()));
 +  EXPECT_TRUE(source->ShouldIgnoreInputEventsForTesting());
@@ -745,33 +1295,373 @@ Index: src/chrome/browser/ui/views/helium/peek_controller_browsertest.cc
 +  EXPECT_FALSE(controller->is_showing());
 +  EXPECT_FALSE(source->ShouldIgnoreInputEventsForTesting());
 +
-+  ASSERT_TRUE(controller->Show(url, source));
++  ASSERT_TRUE(controller->Show(PeekNavigationParams(url), source));
 +  content::WebContents* const preview_contents =
 +      controller->web_contents_for_testing();
 +  ASSERT_TRUE(content::WaitForLoadStop(preview_contents));
 +  const int old_count = browser()->tab_strip_model()->count();
-+  const int source_index = browser()->tab_strip_model()->active_index();
++  const int source_index =
++      browser()->tab_strip_model()->GetIndexOfWebContents(source);
 +  controller->OpenInSidebar();
 +
 +  EXPECT_FALSE(controller->is_showing());
-+  EXPECT_EQ(old_count + 1, browser()->tab_strip_model()->count());
-+  EXPECT_EQ(source,
-+            browser()->tab_strip_model()->GetActiveWebContents());
++  EXPECT_EQ(old_count, browser()->tab_strip_model()->count());
++  EXPECT_EQ(source, browser()->tab_strip_model()->GetActiveWebContents());
 +  EXPECT_EQ(preview_contents,
 +            browser()->tab_strip_model()->GetWebContentsAt(source_index + 1));
 +  EXPECT_FALSE(source->ShouldIgnoreInputEventsForTesting());
 +
-+  ASSERT_TRUE(controller->Show(url, source));
++  ASSERT_TRUE(controller->Show(PeekNavigationParams(url), source));
 +  content::WebContents* const command_preview_contents =
 +      controller->web_contents_for_testing();
 +  ASSERT_TRUE(content::WaitForLoadStop(command_preview_contents));
 +  EXPECT_TRUE(chrome::ExecuteCommand(browser(), IDC_OPEN_FILE));
 +
 +  EXPECT_FALSE(controller->is_showing());
-+  EXPECT_EQ(old_count + 2, browser()->tab_strip_model()->count());
++  EXPECT_EQ(old_count + 1, browser()->tab_strip_model()->count());
 +  EXPECT_EQ(command_preview_contents,
 +            browser()->tab_strip_model()->GetActiveWebContents());
 +  EXPECT_FALSE(source->ShouldIgnoreInputEventsForTesting());
++}
++
++// Exercise the real production context-menu adapter, browser delegate routes
++// and prompt host. The request echo distinguishes full parameter forwarding
++// from a URL-only navigation even when both pages finish loading successfully.
++IN_PROC_BROWSER_TEST_F(PeekControllerBrowserTest,
++                       ProductionNavigationAndWebsiteInteractions) {
++  net::EmbeddedTestServer https_server(net::EmbeddedTestServer::TYPE_HTTPS);
++  https_server.SetSSLConfig(net::EmbeddedTestServer::CERT_TEST_NAMES);
++  https_server.ServeFilesFromSourceDirectory("chrome/test/data");
++  https_server.RegisterRequestHandler(base::BindRepeating(
++      [](const net::test_server::HttpRequest& request)
++          -> std::unique_ptr<net::test_server::HttpResponse> {
++        if (request.relative_url != "/peek-referrer") {
++          return nullptr;
++        }
++        auto response = std::make_unique<net::test_server::BasicHttpResponse>();
++        response->set_content_type("text/html");
++        const auto referrer = request.headers.find("Referer");
++        response->set_content(
++            "<body id='referrer'>" +
++            base::EscapeForHTML(referrer == request.headers.end()
++                                    ? std::string()
++                                    : referrer->second) +
++            "</body>");
++        return response;
++      }));
++  ASSERT_TRUE(https_server.Start());
++  const GURL source_url = https_server.GetURL("a.test", "/empty.html");
++  const GURL preview_url = https_server.GetURL("b.test", "/peek-referrer");
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), source_url));
++  TabStripModel* const model = browser()->tab_strip_model();
++  content::WebContents* const source = model->GetActiveWebContents();
++  PeekController* const controller =
++      BrowserView::GetBrowserViewForBrowser(browser())->peek_controller();
++  const int original_count = model->count();
++
++  const auto make_menu = [&]() {
++    content::ContextMenuParams params;
++    params.page_url = source_url;
++    params.frame_url = source_url;
++    params.link_url = preview_url;
++    params.unfiltered_link_url = preview_url;
++    params.frame_origin =
++        source->GetPrimaryMainFrame()->GetLastCommittedOrigin();
++    params.referrer_policy = network::mojom::ReferrerPolicy::kAlways;
++    auto menu = std::make_unique<TestRenderViewContextMenu>(
++        *source->GetPrimaryMainFrame(), params);
++    menu->Init();
++    return menu;
++  };
++  auto menu = make_menu();
++  ASSERT_TRUE(menu->IsItemPresent(IDC_CONTENT_CONTEXT_OPENLINKPEEK));
++  menu->ExecuteCommand(IDC_CONTENT_CONTEXT_OPENLINKPEEK, 0);
++  content::WebContents* const preview = controller->web_contents_for_testing();
++  ASSERT_TRUE(preview);
++  ASSERT_TRUE(content::WaitForLoadStop(preview));
++  EXPECT_EQ(source_url.spec(),
++            content::EvalJs(preview, "document.body.textContent"));
++  EXPECT_EQ(source_url, source->GetLastCommittedURL());
++  EXPECT_EQ(preview, model->GetActiveWebContents());
++  EXPECT_EQ(original_count + 1, model->count());
++  EXPECT_TRUE(tabs::TemporaryTab::IsTemporary(preview));
++  EXPECT_TRUE(tabs::TabInterface::GetFromContents(preview)->IsActivated());
++
++  auto* const preview_settings =
++      PageSpecificContentSettingsDelegate::FromWebContents(preview);
++  ASSERT_TRUE(preview_settings);
++  EXPECT_EQ(browser(), preview->GetDelegate());
++  // A gestured website request must reach the ordinary browser prompt host.
++  // NO_USER_GESTURE on ExecJs does not clear activation from the link request.
++  permissions::PermissionRequestObserver permission_observer(preview);
++  ASSERT_TRUE(content::ExecJs(
++      preview,
++      "navigator.registerProtocolHandler('web+arcium', '/handler?u=%s')"));
++  permission_observer.Wait();
++  ASSERT_TRUE(permission_observer.request_shown());
++  auto* const permission_manager =
++      permissions::PermissionRequestManager::FromWebContents(preview);
++  ASSERT_EQ(1u, permission_manager->Requests().size());
++  EXPECT_EQ(permissions::RequestType::kRegisterProtocolHandler,
++            permission_manager->Requests()[0]->request_type());
++  EXPECT_FALSE(PageSpecificContentSettingsDelegate::FromWebContents(source)
++                   ->pending_protocol_handler()
++                   .IsValid());
++  permission_manager->Dismiss(std::monostate());
++
++  auto* const popup_blocker =
++      blocked_content::PopupBlockerTabHelper::FromWebContents(preview);
++  ASSERT_TRUE(popup_blocker);
++  // Observe the website's activation state before testing an ungestured popup.
++  // The earlier link and permission request both granted transient activation.
++  ASSERT_EQ(true, content::EvalJs(preview, R"(
++      new Promise(resolve => {
++        const check = () => navigator.userActivation.isActive
++            ? setTimeout(check, 100) : resolve(true);
++        check();
++      }))", content::EXECUTE_SCRIPT_NO_USER_GESTURE));
++  ASSERT_TRUE(content::ExecJs(preview, "window.open('/empty.html')",
++                              content::EXECUTE_SCRIPT_NO_USER_GESTURE));
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return popup_blocker->GetBlockedPopupsCount() == 1; }));
++  EXPECT_EQ(original_count + 1, model->count());
++
++  auto* const dialogs =
++      javascript_dialogs::TabModalDialogManager::FromWebContents(preview);
++  ASSERT_TRUE(dialogs);
++  base::RunLoop dialog_shown;
++  dialogs->SetDialogShownCallbackForTesting(dialog_shown.QuitClosure());
++  content::ExecuteScriptAsync(preview,
++                              "window.peekConfirmResult = confirm('Peek?')");
++  dialog_shown.Run();
++  EXPECT_TRUE(dialogs->IsShowingDialogForTesting());
++  EXPECT_FALSE(
++      javascript_dialogs::TabModalDialogManager::FromWebContents(source)
++          ->IsShowingDialogForTesting());
++  dialogs->ClickDialogButtonForTesting(true, std::u16string());
++  EXPECT_EQ(true, content::EvalJs(preview, "window.peekConfirmResult"));
++
++  // A menu created while enabled can be invoked after the setting changes.
++  // Its ordinary foreground-tab fallback must preserve the same request.
++  auto fallback_menu = make_menu();
++  browser()->profile()->GetPrefs()->SetBoolean(prefs::kHeliumPeekEnabled,
++                                               false);
++  ASSERT_FALSE(controller->is_showing());
++  fallback_menu->ExecuteCommand(IDC_CONTENT_CONTEXT_OPENLINKPEEK, 0);
++  content::WebContents* const fallback = model->GetActiveWebContents();
++  ASSERT_NE(source, fallback);
++  ASSERT_TRUE(content::WaitForLoadStop(fallback));
++  EXPECT_EQ(source_url.spec(),
++            content::EvalJs(fallback, "document.body.textContent"));
++  EXPECT_FALSE(tabs::TemporaryTab::IsTemporary(fallback));
++  EXPECT_EQ(original_count + 1, model->count());
++  base::RunLoop().RunUntilIdle();
++  EXPECT_EQ(fallback, model->GetActiveWebContents());
++}
++
++IN_PROC_BROWSER_TEST_F(PeekControllerBrowserTest,
++                       TemporarySessionExclusionAndLivePromotion) {
++  ASSERT_TRUE(embedded_test_server()->Start());
++  const GURL source_url = embedded_test_server()->GetURL("/empty.html");
++  const GURL preview_url = embedded_test_server()->GetURL("/title1.html");
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), source_url));
++  TabStripModel* const model = browser()->tab_strip_model();
++  content::WebContents* const source = model->GetActiveWebContents();
++  PeekController* const controller =
++      BrowserView::GetBrowserViewForBrowser(browser())->peek_controller();
++  SessionService* const service =
++      SessionServiceFactory::GetForProfile(browser()->profile());
++  ASSERT_TRUE(service);
++  auto* const live_context = browser()->GetFeatures().live_tab_context();
++  SessionServiceTestHelper helper(service);
++  const auto read_snapshot = [&]() {
++    service->ResetFromCurrentBrowsers();
++    helper.SaveNow();
++    helper.command_storage_manager()->MoveCurrentSessionToLastSession();
++    // Read through the production service so queued writes and reads use its
++    // backend sequence, rather than performing file I/O on the browser thread.
++    base::test::TestFuture<
++        std::vector<std::unique_ptr<sessions::SessionWindow>>, SessionID, bool>
++        snapshot;
++    service->GetLastSession(snapshot.GetCallback());
++    EXPECT_FALSE(snapshot.Get<2>());
++    return std::get<0>(snapshot.Take());
++  };
++
++  ASSERT_TRUE(controller->Show(PeekNavigationParams(preview_url), source));
++  content::WebContents* const preview = controller->web_contents_for_testing();
++  ASSERT_TRUE(content::WaitForLoadStop(preview));
++  ASSERT_TRUE(content::ExecJs(preview, "window.peekState = 'retained'"));
++  const SessionID preview_id = sessions::SessionTabHelper::IdForTab(preview);
++  EXPECT_EQ(2, model->count());
++  EXPECT_EQ(1, live_context->GetTabCount());
++  EXPECT_EQ(0, live_context->GetSelectedIndex());
++  EXPECT_FALSE(preview->GetController()
++                   .GetDefaultSessionStorageNamespace()
++                   ->should_persist());
++  auto temporary_snapshot = read_snapshot();
++  ASSERT_EQ(1u, temporary_snapshot.size());
++  ASSERT_EQ(1u, temporary_snapshot[0]->tabs.size());
++  EXPECT_EQ(sessions::SessionTabHelper::IdForTab(source),
++            temporary_snapshot[0]->tabs[0]->tab_id);
++
++  controller->OpenInTab();
++  EXPECT_EQ(preview, model->GetActiveWebContents());
++  EXPECT_EQ(preview_id, sessions::SessionTabHelper::IdForTab(preview));
++  EXPECT_EQ("retained", content::EvalJs(preview, "window.peekState"));
++  EXPECT_EQ(2, model->count());
++  EXPECT_EQ(2, live_context->GetTabCount());
++  EXPECT_EQ(1, live_context->GetSelectedIndex());
++  // This assertion covers incremental enrollment before a snapshot rebuild.
++  EXPECT_TRUE(preview->GetController()
++                  .GetDefaultSessionStorageNamespace()
++                  ->should_persist());
++  auto promoted_snapshot = read_snapshot();
++  ASSERT_EQ(1u, promoted_snapshot.size());
++  ASSERT_EQ(2u, promoted_snapshot[0]->tabs.size());
++  EXPECT_EQ(preview_id, promoted_snapshot[0]->tabs[1]->tab_id);
++  EXPECT_EQ(1, promoted_snapshot[0]->selected_tab_index);
++
++  auto* const restore_service =
++      TabRestoreServiceFactory::GetForProfile(browser()->profile());
++  ASSERT_TRUE(restore_service);
++  const size_t restored_entries = restore_service->entries().size();
++  model->ActivateTabAt(model->GetIndexOfWebContents(source));
++  ASSERT_TRUE(controller->Show(PeekNavigationParams(preview_url), source));
++  ASSERT_TRUE(content::WaitForLoadStop(controller->web_contents_for_testing()));
++  controller->Close();
++  EXPECT_EQ(restored_entries, restore_service->entries().size());
++  EXPECT_EQ(2, model->count());
++  // Ordinary tabs are the negative control for recently-closed exclusion.
++  model->CloseWebContentsAt(model->GetIndexOfWebContents(preview),
++                            TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
++  EXPECT_EQ(restored_entries + 1, restore_service->entries().size());
++}
++
++// This goes through the renderer's actual beforeunload response, rather than
++// synthesizing the model's separate "not closable" notification.
++IN_PROC_BROWSER_TEST_F(PeekControllerBrowserTest,
++                       CancelledDisabledPeekBecomesReachableTab) {
++  ASSERT_TRUE(embedded_test_server()->Start());
++  TabStripModel* const model = browser()->tab_strip_model();
++  content::WebContents* const source = model->GetActiveWebContents();
++  PeekController* const controller =
++      BrowserView::GetBrowserViewForBrowser(browser())->peek_controller();
++  ASSERT_TRUE(controller->Show(
++      PeekNavigationParams(embedded_test_server()->GetURL("/empty.html")),
++      source));
++  content::WebContents* const preview = controller->web_contents_for_testing();
++  ASSERT_TRUE(content::WaitForLoadStop(preview));
++  ASSERT_TRUE(content::ExecJs(
++      preview,
++      "window.peekState = 'unsaved'; window.onbeforeunload = () => 'stay';"));
++  content::PrepContentsForBeforeUnloadTest(preview);
++
++  browser()->profile()->GetPrefs()->SetBoolean(prefs::kHeliumPeekEnabled,
++                                               false);
++  auto* const dialog = ui_test_utils::WaitForAppModalDialog();
++  ASSERT_TRUE(dialog->is_before_unload_dialog());
++  EXPECT_FALSE(source->ShouldIgnoreInputEventsForTesting());
++  dialog->view()->CancelAppModalDialog();
++  ASSERT_TRUE(base::test::RunUntil([&] { return !controller->is_showing(); }));
++
++  EXPECT_EQ(preview, model->GetActiveWebContents());
++  EXPECT_FALSE(tabs::TemporaryTab::IsTemporary(preview));
++  EXPECT_EQ(2, browser()->GetFeatures().live_tab_context()->GetTabCount());
++  EXPECT_EQ("unsaved", content::EvalJs(preview, "window.peekState"));
++  ASSERT_TRUE(content::ExecJs(preview, "window.onbeforeunload = null"));
++}
++
++IN_PROC_BROWSER_TEST_F(PeekControllerBrowserTest,
++                       SplitSourceRetainsLayoutAndContentsHosts) {
++  ASSERT_TRUE(embedded_test_server()->Start());
++  const GURL url = embedded_test_server()->GetURL("/empty.html");
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), url));
++  ASSERT_TRUE(ui_test_utils::NavigateToURLWithDisposition(
++      browser(), url, WindowOpenDisposition::NEW_BACKGROUND_TAB,
++      ui_test_utils::BROWSER_TEST_WAIT_FOR_LOAD_STOP));
++  TabStripModel* const model = browser()->tab_strip_model();
++  BrowserView* const view = BrowserView::GetBrowserViewForBrowser(browser());
++  PeekController* const controller = view->peek_controller();
++  const auto split =
++      model->AddToNewSplit({1}, split_tabs::SplitTabVisualData(),
++                           split_tabs::SplitTabCreatedSource::kToolbarButton);
++  for (int source_index : {0, 1}) {
++    model->ActivateTabAt(source_index);
++    content::WebContents* const source = model->GetWebContentsAt(source_index);
++    ASSERT_TRUE(controller->Show(PeekNavigationParams(url), source));
++    content::WebContents* const preview =
++        controller->web_contents_for_testing();
++    ASSERT_TRUE(content::WaitForLoadStop(preview));
++    EXPECT_EQ(split, model->GetSplitForTab(0));
++    EXPECT_EQ(split, model->GetSplitForTab(1));
++    EXPECT_FALSE(model->GetSplitForTab(model->GetIndexOfWebContents(preview)));
++    auto* const host = view->GetContentsContainerViewFor(preview);
++    ASSERT_TRUE(host);
++    EXPECT_EQ(preview, host->contents_view()->web_contents());
++    EXPECT_TRUE(source->ShouldIgnoreInputEventsForTesting());
++
++    controller->Close();
++    ASSERT_TRUE(base::test::RunUntil([&] {
++      return !controller->is_showing() &&
++             model->GetActiveWebContents() == source;
++    }));
++    EXPECT_EQ(2, model->count());
++    EXPECT_EQ(source, model->GetActiveWebContents());
++    EXPECT_EQ(split, model->GetSplitForTab(0));
++    EXPECT_EQ(split, model->GetSplitForTab(1));
++    EXPECT_FALSE(source->ShouldIgnoreInputEventsForTesting());
++    for (int index : {0, 1}) {
++      content::WebContents* const contents = model->GetWebContentsAt(index);
++      auto* const restored_host = view->GetContentsContainerViewFor(contents);
++      ASSERT_TRUE(restored_host);
++      EXPECT_EQ(contents, restored_host->contents_view()->web_contents());
++    }
++  }
++}
++
++IN_PROC_BROWSER_TEST_F(PeekControllerBrowserTest,
++                       CyclingAndSourceRemovalReleaseBackdrop) {
++  ASSERT_TRUE(embedded_test_server()->Start());
++  const GURL url = embedded_test_server()->GetURL("/empty.html");
++  TabStripModel* const model = browser()->tab_strip_model();
++  content::WebContents* const source = model->GetActiveWebContents();
++  ASSERT_TRUE(ui_test_utils::NavigateToURLWithDisposition(
++      browser(), url, WindowOpenDisposition::NEW_BACKGROUND_TAB,
++      ui_test_utils::BROWSER_TEST_WAIT_FOR_LOAD_STOP));
++  content::WebContents* const other = model->GetWebContentsAt(1);
++  PeekController* const controller =
++      BrowserView::GetBrowserViewForBrowser(browser())->peek_controller();
++
++  ASSERT_TRUE(controller->Show(PeekNavigationParams(url), source));
++  ASSERT_TRUE(content::WaitForLoadStop(controller->web_contents_for_testing()));
++  model->SelectNextTab();
++  EXPECT_EQ(other, model->GetActiveWebContents());
++  ASSERT_TRUE(base::test::RunUntil([&] { return !controller->is_showing(); }));
++  EXPECT_FALSE(source->ShouldIgnoreInputEventsForTesting());
++  EXPECT_EQ(2, model->count());
++
++  model->ActivateTabAt(model->GetIndexOfWebContents(source));
++  ASSERT_TRUE(controller->Show(PeekNavigationParams(url), source));
++  content::WebContents* const preview = controller->web_contents_for_testing();
++  ASSERT_TRUE(content::WaitForLoadStop(preview));
++  ASSERT_TRUE(content::ExecJs(preview,
++                              "window.peekState = 'source gone'; "
++                              "window.onbeforeunload = () => 'stay';"));
++  content::PrepContentsForBeforeUnloadTest(preview);
++  const auto source_weak = source->GetWeakPtr();
++  model->CloseWebContentsAt(model->GetIndexOfWebContents(source),
++                            TabCloseTypes::CLOSE_NONE);
++  auto* const dialog = ui_test_utils::WaitForAppModalDialog();
++  ASSERT_TRUE(dialog->is_before_unload_dialog());
++  EXPECT_FALSE(source_weak);
++  dialog->view()->CancelAppModalDialog();
++  ASSERT_TRUE(base::test::RunUntil([&] { return !controller->is_showing(); }));
++  EXPECT_EQ(preview, model->GetActiveWebContents());
++  EXPECT_FALSE(tabs::TemporaryTab::IsTemporary(preview));
++  EXPECT_EQ("source gone", content::EvalJs(preview, "window.peekState"));
++  EXPECT_EQ(2, browser()->GetFeatures().live_tab_context()->GetTabCount());
++  ASSERT_TRUE(content::ExecJs(preview, "window.onbeforeunload = null"));
 +}
 +
 +}  // namespace helium
@@ -833,3 +1723,29 @@ Index: src/chrome/browser/ui/browser_command_controller.cc
        browser_->GetFeatures()
            .browser_select_file_dialog_controller()
            ->OpenFile();
+Index: src/chrome/common/pref_names.h
+===================================================================
+--- src.orig/chrome/common/pref_names.h
++++ src/chrome/common/pref_names.h
+@@ -604,6 +604,9 @@
+ // A boolean pref set to true if MRU (Most Recently Used) order should be used
+ // when cycling through tabs with Ctrl+Tab.
+ inline constexpr char kTabCyclingMRU[] = "helium.browser.mru_tab_cycling";
++
++// A boolean pref set to true if the Peek surface should be available.
++inline constexpr char kHeliumPeekEnabled[] = "helium.browser.peek_enabled";
+ 
+ // A boolean pref set to true if Shift+right-click should bypass page context
+ // menu handlers and show the browser context menu.
+Index: src/chrome/browser/ui/browser_ui_prefs.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_ui_prefs.cc
++++ src/chrome/browser/ui/browser_ui_prefs.cc
+@@ -122,6 +122,7 @@
+   registry->RegisterBooleanPref(prefs::kNewTabNextToActive, false);
+ 
+   registry->RegisterBooleanPref(prefs::kTabCyclingMRU, false);
++  registry->RegisterBooleanPref(prefs::kHeliumPeekEnabled, true);
+ 
+   registry->RegisterBooleanPref(prefs::kShiftRightClickContextMenu, true);
+ 

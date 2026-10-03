@@ -1,0 +1,143 @@
+# Requires arcium-spaces, arcium-pins and arcium-persistent-item-transition-fixes.
+# Release borrowed collection and tab state during keyed-service shutdown.
+--- a/chrome/browser/ui/helium/helium_space_service.cc
++++ b/chrome/browser/ui/helium/helium_space_service.cc
+@@ -360,8 +360,24 @@ HeliumSpaceService::HeliumSpaceService(P
+ }
+ 
+ HeliumSpaceService::~HeliumSpaceService() {
++  Shutdown();
++}
++
++void HeliumSpaceService::Shutdown() {
++  // Profile services first release borrowed state while their dependencies are
++  // alive. Repeating this cleanup from destruction must not dereference them.
++  weak_factory_.InvalidateWeakPtrs();
++  browser_collection_observation_.Reset();
+   TabStripModelObserver::StopObservingAll(this);
+   observed_tab_strip_models_.clear();
++  live_associations_.clear();
++  live_token_by_tab_.clear();
++  persistent_item_drags_.clear();
++  items_changed_callbacks_.Clear();
++  pin_to_tab_conversion_hook_for_testing_.Reset();
++  session_space_ids_.clear();
++  // The profile owns this service and outlives it. Keep the owned durable model
++  // intact; shutdown neither rewrites preferences nor changes live tabs.
+ }
+ 
+ void HeliumSpaceService::LoadAndMigrateFavorites() {
+--- a/chrome/browser/ui/helium/helium_space_service.h
++++ b/chrome/browser/ui/helium/helium_space_service.h
+@@ -132,6 +132,9 @@ class HeliumSpaceService : public KeyedS
+   HeliumSpaceService& operator=(const HeliumSpaceService&) = delete;
+   ~HeliumSpaceService() override;
+ 
++  // Release borrowed observations and live associations in phase-one shutdown.
++  void Shutdown() override;
++
+   HeliumSpace* GetDefaultSpace();
+   const HeliumSpace* GetDefaultSpace() const;
+   HeliumSpace* GetActiveSpace();
+--- a/chrome/browser/ui/helium/helium_space_service_factory.cc
++++ b/chrome/browser/ui/helium/helium_space_service_factory.cc
+@@ -5,11 +5,18 @@
+ #include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ 
+ #include "base/no_destructor.h"
++#include "build/build_config.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/helium/helium_space_service.h"
+ #include "chrome/common/pref_names.h"
+ #include "components/pref_registry/pref_registry_syncable.h"
+ 
++#if BUILDFLAG(IS_ANDROID)
++#include "chrome/browser/ui/android/android_profile_browser_collection_service_factory.h"
++#else
++#include "chrome/browser/ui/browser_manager_service_factory.h"
++#endif
++
+ namespace helium {
+ 
+ // static
+@@ -31,7 +38,14 @@ HeliumSpaceServiceFactory::HeliumSpaceSe
+               .WithRegular(ProfileSelection::kOriginalOnly)
+               .WithGuest(ProfileSelection::kOriginalOnly)
+               .WithAshInternals(ProfileSelection::kOriginalOnly)
+-              .Build()) {}
++              .Build()) {
++  // Observe the profile collection only while its owning service is alive.
++#if BUILDFLAG(IS_ANDROID)
++  DependsOn(AndroidProfileBrowserCollectionServiceFactory::GetInstance());
++#else
++  DependsOn(BrowserManagerServiceFactory::GetInstance());
++#endif
++}
+ 
+ HeliumSpaceServiceFactory::~HeliumSpaceServiceFactory() = default;
+ 
+--- a/chrome/browser/ui/helium/helium_space_service_unittest.cc
++++ b/chrome/browser/ui/helium/helium_space_service_unittest.cc
+@@ -15,7 +15,9 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/run_loop.h"
+ #include "base/test/bind.h"
++#include "base/test/scoped_feature_list.h"
+ #include "chrome/browser/autocomplete/chrome_autocomplete_provider_client.h"
++#include "chrome/browser/browser_features.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+@@ -809,5 +811,52 @@ TEST_F(HeliumSpaceServiceTest, ActionSeq
+   }
+ }
+ 
++TEST_F(HeliumSpaceServiceTest,
++       ProfileDestructionCancelsPendingPinCloseCallbacks) {
++  // This fixture deletes profiles directly. Release Browser's keepalive
++  // synchronously so its inherited task cannot outlive the profile.
++  base::test::ScopedFeatureList feature_list;
++  feature_list.InitAndDisableFeature(features::kDestroyProfileOnBrowserClose);
++
++  // Destroy an actual keyed-service profile with close bookkeeping still
++  // queued. The manager collection must outlive Spaces' phase-one observation
++  // cleanup.
++  constexpr char kRetiringProfile[] = "space-shutdown";
++  TestingProfile* retiring_profile = CreateProfile(kRetiringProfile);
++  auto retiring_profile_weak = retiring_profile->GetWeakPtr();
++  auto* retiring_service =
++      HeliumSpaceServiceFactory::GetInstance()->SetTestingSubclassFactoryAndUse(
++          retiring_profile,
++          base::BindOnce([](content::BrowserContext* context) {
++            return std::make_unique<HeliumSpaceService>(
++                static_cast<Profile*>(context));
++          }));
++  ASSERT_TRUE(retiring_service);
++  auto retiring_browser = CreateBrowser(retiring_profile, Browser::TYPE_NORMAL,
++                                        /*hosted_app=*/false);
++  AddTab(retiring_browser.get(), GURL("https://shutdown.test/"));
++  ASSERT_TRUE(retiring_service->AddPinFromTab(
++      retiring_browser->tab_strip_model()->GetActiveTab()));
++  const auto durable_spaces =
++      retiring_profile->GetPrefs()->GetList(kHeliumSpacesPref).Clone();
++  int shutdown_updates = 0;
++  auto shutdown_subscription =
++      retiring_service->RegisterItemsChanged(base::BindRepeating(
++          [](int* updates, const PersistentItemChange&) { ++*updates; },
++          &shutdown_updates));
++  // Closing a live Pin posts deferred lifecycle work. Do not drain it before
++  // deleting the profile, and keep the subscription alive across that deletion.
++  retiring_browser->tab_strip_model()->CloseAllTabs();
++  retiring_browser->GetFeatures().TearDownPreBrowserWindowDestruction();
++  retiring_browser.reset();
++  EXPECT_EQ(durable_spaces,
++            retiring_profile->GetPrefs()->GetList(kHeliumSpacesPref));
++  const int updates_before_destruction = shutdown_updates;
++  DeleteProfile(kRetiringProfile);
++  ASSERT_FALSE(retiring_profile_weak);
++  base::RunLoop().RunUntilIdle();
++  EXPECT_EQ(updates_before_destruction, shutdown_updates);
++}
++
+ }  // namespace
+ }  // namespace helium

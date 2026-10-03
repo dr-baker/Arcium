@@ -1,0 +1,93 @@
+--- a/components/omnibox/browser/bookmark_provider.cc
++++ b/components/omnibox/browser/bookmark_provider.cc
+@@ -14,6 +14,7 @@
+ #include "base/i18n/case_conversion.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/time/time.h"
+ #include "base/trace_event/trace_event.h"
+@@ -102,6 +103,13 @@
+   return description;
+ }
+ 
++std::u16string ArciumItemDisplayTitle(const ArciumOmniboxItem& item) {
++  if (!base::TrimWhitespace(item.title, base::TRIM_ALL).empty()) {
++    return item.title;
++  }
++  return base::UTF8ToUTF16(item.url.spec());
++}
++
+ int ArciumRecencyScore(int64_t internal_value) {
+   if (internal_value == 0) {
+     return 0;
+@@ -216,9 +224,13 @@
+     match.destination_url = item.url;
+     match.fill_into_edit = base::UTF8ToUTF16(item.url.spec());
+     match.contents = ArciumItemDescription(item);
+-    match.contents_class = {{0, ACMatchClassification::DIM}};
+-    match.description = item.title;
+-    match.description_class = {{0, ACMatchClassification::MATCH}};
++    if (!match.contents.empty()) {
++      match.contents_class = {{0, ACMatchClassification::DIM}};
++    }
++    match.description = ArciumItemDisplayTitle(item);
++    if (!match.description.empty()) {
++      match.description_class = {{0, ACMatchClassification::MATCH}};
++    }
+     match.transition = ui::PAGE_TRANSITION_AUTO_BOOKMARK;
+     match.arcium_item = item;
+     // Durable tabs that share a URL remain independently selectable.
+--- a/components/omnibox/browser/bookmark_provider_unittest.cc
++++ b/components/omnibox/browser/bookmark_provider_unittest.cc
+@@ -347,6 +347,49 @@
+   EXPECT_EQ(pin.title, match.description);
+ }
+ 
++TEST_F(BookmarkProviderTest, ArciumItemsFallbackToURLForBlankTitles) {
++  const std::vector<ArciumOmniboxItem> items = [] {
++    ArciumOmniboxItem empty_title;
++    empty_title.kind = ArciumOmniboxItem::Kind::kFavorite;
++    empty_title.id = "empty-title";
++    empty_title.url = GURL("https://empty-title.example/page");
++
++    ArciumOmniboxItem whitespace_title;
++    whitespace_title.kind = ArciumOmniboxItem::Kind::kPin;
++    whitespace_title.id = "whitespace-title";
++    whitespace_title.title = u" \t";
++    whitespace_title.url = GURL("https://whitespace-title.example/page");
++
++    return std::vector<ArciumOmniboxItem>{empty_title, whitespace_title};
++  }();
++  ON_CALL(*provider_client_, GetArciumOmniboxItems())
++      .WillByDefault(testing::Return(items));
++
++  ASSERT_EQ(1u, GetNumMatches("empty-title"));
++  const AutocompleteMatch& empty_match = provider_->matches().front();
++  EXPECT_EQ(base::UTF8ToUTF16(items[0].url.spec()), empty_match.description);
++  ASSERT_EQ(1u, empty_match.description_class.size());
++  EXPECT_EQ(0u, empty_match.description_class.front().offset);
++  EXPECT_EQ(AutocompleteMatch::ACMatchClassification::MATCH,
++            empty_match.description_class.front().style);
++#if DCHECK_IS_ON()
++  empty_match.Validate();
++#endif
++
++  ResetProvider();
++  ASSERT_EQ(1u, GetNumMatches("whitespace-title"));
++  const AutocompleteMatch& whitespace_match = provider_->matches().front();
++  EXPECT_EQ(base::UTF8ToUTF16(items[1].url.spec()),
++            whitespace_match.description);
++  ASSERT_EQ(1u, whitespace_match.description_class.size());
++  EXPECT_EQ(0u, whitespace_match.description_class.front().offset);
++  EXPECT_EQ(AutocompleteMatch::ACMatchClassification::MATCH,
++            whitespace_match.description_class.front().style);
++#if DCHECK_IS_ON()
++  whitespace_match.Validate();
++#endif
++}
++
+ TEST_F(BookmarkProviderTest, Rankings) {
+   // Simulate searches.
+   struct QueryData {

@@ -246,7 +246,7 @@ Index: src/chrome/browser/ui/browser_live_tab_context.cc
  #include "chrome/browser/ui/helium/helium_space_service.h"
  #include "chrome/browser/ui/helium/helium_space_service_factory.h"
  #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
-@@ -159,8 +160,15 @@ std::map<std::string, std::string> Brows
+@@ -205,8 +206,15 @@
  
    glic::PopulateGlicExtraData(tab_strip_model_->GetTabAtIndex(index),
                                &extra_data);
@@ -319,9 +319,9 @@ Index: src/chrome/browser/ui/browser_tabrestore.cc
      // the throbber when a background restored tab is loading.
 Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 ===================================================================
---- /dev/null
+--- src.orig/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +++ src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
-@@ -0,0 +1,471 @@
+@@ -0,0 +1,473 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -348,6 +348,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +#include "components/tabs/public/tab_collection.h"
 +#include "components/tabs/public/tab_interface.h"
 +#include "components/tabs/public/tab_strip_collection.h"
++#include "components/tabs/public/temporary_tab.h"
 +#include "content/public/browser/navigation_controller.h"
 +#include "content/public/common/referrer.h"
 +#include "ui/base/page_transition_types.h"
@@ -379,6 +380,7 @@ Index: src/chrome/browser/ui/helium/helium_favorites_and_pins.cc
 +  const BrowserWindowInterface* const browser =
 +      tab ? tab->GetBrowserWindowInterface() : nullptr;
 +  return profile && browser &&
++         !tabs::TemporaryTab::IsTemporary(tab->GetContents()) &&
 +         browser->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
 +         !profile->IsOffTheRecord() && !profile->IsGuestSession();
 +}
@@ -1121,7 +1123,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/helium_space_service.cc
 +++ src/chrome/browser/ui/helium/helium_space_service.cc
-@@ -4,48 +4,450 @@
+@@ -4,48 +4,451 @@
  
  #include "chrome/browser/ui/helium/helium_space_service.h"
  
@@ -1155,6 +1157,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +#include "components/tabs/public/pin_tab_collection.h"
 +#include "components/tabs/public/tab_collection.h"
 +#include "components/tabs/public/tab_strip_collection.h"
++#include "components/tabs/public/temporary_tab.h"
 +#include "content/public/browser/web_contents.h"
  
  namespace helium {
@@ -1586,7 +1589,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
    }
  }
  
-@@ -56,16 +458,8 @@ void HeliumSpaceService::EnsureDefaultSp
+@@ -56,16 +459,8 @@
      }
      return;
    }
@@ -1605,7 +1608,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
  }
  
  HeliumSpace* HeliumSpaceService::GetDefaultSpace() {
-@@ -79,9 +473,8 @@ const HeliumSpace* HeliumSpaceService::G
+@@ -79,9 +474,8 @@
  
  HeliumSpace* HeliumSpaceService::GetActiveSpace() {
    EnsureDefaultSpace();
@@ -1617,16 +1620,17 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      return active;
    }
    return spaces_.front().get();
-@@ -100,52 +493,1974 @@ HeliumSpace* HeliumSpaceService::GetOrCr
+@@ -100,52 +494,1977 @@
                                                    std::u16string name) {
    if (HeliumSpace* existing = GetSpaceById(id)) {
      existing->SetName(std::move(name));
 +    NotifyItemsChanged(PersistentItemChange::Global());
      return existing;
    }
+-
 +  return GetOrCreateSpaceReplacingPins(std::move(id), std::move(name), {});
 +}
- 
++
 +HeliumSpace* HeliumSpaceService::GetOrCreateSpaceReplacingPins(
 +    std::string id,
 +    std::u16string name,
@@ -1658,8 +1662,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  RegisterDormantItems();
 +  NotifyItemsChanged(PersistentItemChange::Global());
    return spaces_.back().get();
- }
- 
++}
++
 +void HeliumSpaceService::ReconcileImportedPersistentItems(
 +    std::string source_profile,
 +    PersistentNodes favorites,
@@ -1733,11 +1737,12 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  ReconcileLiveAssociationsWithDurableModel();
 +  RegisterDormantItems();
 +  NotifyItemsChanged(PersistentItemChange::Global());
-+}
-+
+ }
+ 
  void HeliumSpaceService::SetActiveSpace(std::string_view id) {
    if (GetSpaceById(id)) {
      profile_->GetPrefs()->SetString(kHeliumActiveSpaceIdPref, std::string(id));
+-  }
 +    NotifyItemsChanged(PersistentItemChange::Global());
 +  }
 +}
@@ -2168,7 +2173,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +
 +bool HeliumSpaceService::AddFromTab(tabs::TabInterface* tab,
 +                                    PersistentRecordKind kind) {
-+  if (!tab || tab->GetProfile() != profile_ || profile_->IsOffTheRecord() ||
++  if (!tab || tabs::TemporaryTab::IsTemporary(tab->GetContents()) ||
++      tab->GetProfile() != profile_ || profile_->IsOffTheRecord() ||
 +      profile_->IsGuestSession() || IsPersistentItemTab(tab) ||
 +      tab->IsSplit() || tab->GetGroup().has_value()) {
 +    return false;
@@ -2258,7 +2264,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +                                          PersistentRecordKind kind,
 +                                          std::string_view id,
 +                                          tabs::TabInterface* tab) {
-+  if (!tab || live_token_by_tab_.contains(tab)) {
++  if (!tab || tabs::TemporaryTab::IsTemporary(tab->GetContents()) ||
++      live_token_by_tab_.contains(tab)) {
 +    return false;
 +  }
 +  BrowserWindowInterface* window = tab->GetBrowserWindowInterface();
@@ -2581,7 +2588,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    lifecycle_.CompleteClose(*token);
 +    NotifyItemsChanged(change);
 +    return true;
-   }
++  }
 +  if (!model || index == TabStripModel::kNoTab) {
 +    const PersistentItemChange change =
 +        ChangeForAssociation(*association->second);
@@ -2744,7 +2751,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +          : nullptr;
 +  if (!window || window->GetBrowserForMigrationOnly() != browser || !model ||
 +      !strip || model->GetIndexOfTab(tab) == TabStripModel::kNoTab ||
-+      strip->IsPinTab(tab) || !tab->GetContents()) {
++      strip->IsPinTab(tab) || !tab->GetContents() ||
++      tabs::TemporaryTab::IsTemporary(tab->GetContents())) {
 +    return std::nullopt;
 +  }
 +  const GURL url = tab->GetContents()->GetLastCommittedURL();
@@ -3599,7 +3607,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      return false;
    }
    SetSpaceForBrowser(browser, found->second);
-@@ -158,22 +2473,48 @@ void HeliumSpaceService::AddSpaceToSessi
+@@ -158,20 +2477,46 @@
    if (!extra_data) {
      return;
    }
@@ -3612,29 +3620,30 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  if (id.empty()) {
      extra_data->erase(kHeliumSpaceIdWindowExtraDataKey);
 -    return;
+-  }
+-  extra_data->insert_or_assign(kHeliumSpaceIdWindowExtraDataKey,
+-                               std::string(space_id));
 +  } else {
 +    extra_data->insert_or_assign(kHeliumSpaceIdWindowExtraDataKey,
 +                                 std::string(id));
-   }
--  extra_data->insert_or_assign(kHeliumSpaceIdWindowExtraDataKey,
--                               std::string(space_id));
- }
- 
--std::string_view HeliumSpaceService::GetSpaceIdForBrowser(
++  }
++}
++
 +std::string_view HeliumSpaceService::GetExplicitSpaceIdForBrowser(
-     Browser* browser) const {
--  auto found = browser_space_ids_.find(browser);
--  return found == browser_space_ids_.end() ? std::string_view()
++    Browser* browser) const {
 +  if (!IsEligibleBrowser(browser)) {
 +    return {};
 +  }
 +  const auto found = session_space_ids_.find(browser->session_id());
 +  return found == session_space_ids_.end() ? std::string_view()
-                                            : std::string_view(found->second);
++                                           : std::string_view(found->second);
  }
  
-+std::string_view HeliumSpaceService::GetSpaceIdForBrowser(
-+    Browser* browser) const {
+ std::string_view HeliumSpaceService::GetSpaceIdForBrowser(
+     Browser* browser) const {
+-  auto found = browser_space_ids_.find(browser);
+-  return found == browser_space_ids_.end() ? std::string_view()
+-                                           : std::string_view(found->second);
 +  if (const std::string_view explicit_id =
 +          GetExplicitSpaceIdForBrowser(browser);
 +      !explicit_id.empty()) {
@@ -3651,12 +3660,10 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    }
 +  }
 +  return spaces_.empty() ? std::string_view() : spaces_.front()->id();
-+}
-+
+ }
+ 
  std::vector<HeliumSpace*> HeliumSpaceService::GetSpaces() {
-   EnsureDefaultSpace();
-   std::vector<HeliumSpace*> result;
-@@ -186,33 +2527,77 @@ std::vector<HeliumSpace*> HeliumSpaceSer
+@@ -186,33 +2531,77 @@
  
  void HeliumSpaceService::OnBrowserCreated(BrowserWindowInterface* window) {
    Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
@@ -3687,7 +3694,6 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 -  Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
 -  if (!browser || browser->profile() != profile_ ||
 -      browser->type() != Browser::TYPE_NORMAL) {
--    return;
 +}
 +
 +void HeliumSpaceService::OnBrowserClosed(BrowserWindowInterface* window) {
@@ -3695,25 +3701,29 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +      window ? window->GetTabStripModel() : nullptr;
 +  if (tab_strip_model && observed_tab_strip_models_.erase(tab_strip_model)) {
 +    tab_strip_model->RemoveObserver(this);
-   }
--  const std::string_view space_id = GetSpaceIdForBrowser(browser);
--  if (!space_id.empty()) {
--    SetActiveSpace(space_id);
++  }
 +  if (window && window->GetProfile() == profile_) {
 +    session_space_ids_.erase(window->GetSessionID());
-   }
- }
- 
--void HeliumSpaceService::OnBrowserClosed(BrowserWindowInterface* window) {
--  if (Browser* browser = window->GetBrowserForMigrationOnly()) {
--    browser_space_ids_.erase(browser);
++  }
++}
++
 +void HeliumSpaceService::OnTabStripModelChanged(
 +    TabStripModel* tab_strip_model,
 +    const TabStripModelChange& change,
 +    const TabStripSelectionChange& selection) {
 +  if (change.type() != TabStripModelChange::kRemoved) {
-+    return;
-+  }
+     return;
+   }
+-  const std::string_view space_id = GetSpaceIdForBrowser(browser);
+-  if (!space_id.empty()) {
+-    SetActiveSpace(space_id);
+-  }
+-}
+-
+-void HeliumSpaceService::OnBrowserClosed(BrowserWindowInterface* window) {
+-  if (Browser* browser = window->GetBrowserForMigrationOnly()) {
+-    browser_space_ids_.erase(browser);
+-  }
 +  const TabStripModelChange::Remove* remove = change.GetRemove();
 +  CHECK(remove);
 +  for (const TabStripModelChange::RemovedTab& removed : remove->contents) {
@@ -3739,14 +3749,14 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +        FROM_HERE, base::BindOnce(&HeliumSpaceService::CompleteLiveTabClose,
 +                                  weak_factory_.GetWeakPtr(), token,
 +                                  item_change));
-   }
- }
- 
++  }
++}
++
 +void HeliumSpaceService::OnTabStripModelDestroyed(
 +    TabStripModel* tab_strip_model) {
 +  observed_tab_strip_models_.erase(tab_strip_model);
-+}
-+
+ }
+ 
  }  // namespace helium
 Index: src/chrome/browser/ui/helium/helium_space_service.h
 ===================================================================
@@ -5186,7 +5196,7 @@ Index: src/chrome/browser/ui/tabs/tab_model.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/tabs/tab_model.cc
 +++ src/chrome/browser/ui/tabs/tab_model.cc
-@@ -418,7 +418,9 @@ void TabModel::UpdateProperties() {
+@@ -419,7 +419,9 @@
          split = static_cast<SplitTabCollection*>(ancestor)->GetSplitTabId();
          break;
        case TabCollection::Type::TABSTRIP:
@@ -5345,8 +5355,8 @@ Index: src/chrome/browser/ui/tabs/tab_strip_api/tab_strip_model_impl/tab_strip_m
          tab_strip_model_->group_model()->GetTabGroup(tab_group_id.value());
 Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
 ===================================================================
---- src.orig/chrome/browser/ui/tabs/tab_strip_model.cc
-+++ src/chrome/browser/ui/tabs/tab_strip_model.cc
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
 @@ -60,6 +60,8 @@
  #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
@@ -5356,16 +5366,16 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_bubble.h"
  #include "chrome/browser/ui/tab_ui_helper.h"
  #include "chrome/browser/ui/tabs/features.h"
-@@ -108,6 +110,8 @@
- #include "components/tabs/public/tab_group_tab_collection.h"
- #include "components/tabs/public/tab_interface.h"
- #include "components/tabs/public/tab_strip_collection.h"
+@@ -102,6 +104,8 @@
+ #include "components/split_tabs/split_tab_visual_data.h"
+ #include "components/tab_groups/tab_group_id.h"
+ #include "components/tab_groups/tab_group_visual_data.h"
 +#include "components/tabs/public/folder_tab_collection.h"
 +#include "components/tabs/public/pin_tab_collection.h"
- #include "components/tabs/public/unpinned_tab_collection.h"
- #include "components/web_modal/web_contents_modal_dialog_manager.h"
- #include "components/webapps/common/web_app_id.h"
-@@ -1144,6 +1148,57 @@ int TabStripModel::MoveWebContentsAt(
+ #include "components/tabs/public/pinned_tab_collection.h"
+ #include "components/tabs/public/split_tab_collection.h"
+ #include "components/tabs/public/split_tab_data.h"
+@@ -1145,6 +1149,57 @@
    return to_position;
  }
  
@@ -5423,13 +5433,12 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  void TabStripModel::MoveSelectedTabsTo(
      int index,
      std::optional<tab_groups::TabGroupId> into_group) {
-@@ -1467,9 +1522,20 @@ void TabStripModel::SetTabBlocked(int in
+@@ -1468,8 +1523,19 @@
  }
  
  int TabStripModel::SetTabPinned(int index, bool pinned) {
--  ReentrancyCheck reentrancy_check(&reentrancy_guard_);
-   CHECK(ContainsIndex(index));
- 
++  CHECK(ContainsIndex(index));
++
 +  // Product-level pin requests create a durable Space Pin. The service owns
 +  // identity and moves the associated live tab into the Pin collection. Its
 +  // internal native move re-enters here only for a persistent Favorite.
@@ -5440,23 +5449,23 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
 +    return GetIndexOfTab(tab);
 +  }
 +
-+  ReentrancyCheck reentrancy_check(&reentrancy_guard_);
-+
+   ReentrancyCheck reentrancy_check(&reentrancy_guard_);
+-  CHECK(ContainsIndex(index));
+ 
    if (IsTabPinned(index) == pinned) {
      return index;
-   }
-@@ -1559,6 +1625,10 @@ int TabStripModel::IndexOfFirstNonPinned
-   return contents_data_->IndexOfFirstNonPinnedTab();
- }
+@@ -1558,6 +1624,10 @@
  
-+int TabStripModel::IndexOfFirstUnpinnedTab() const {
-+  return contents_data_->IndexOfFirstUnpinnedTab();
+ int TabStripModel::IndexOfFirstNonPinnedTab() const {
+   return contents_data_->IndexOfFirstNonPinnedTab();
 +}
 +
++int TabStripModel::IndexOfFirstUnpinnedTab() const {
++  return contents_data_->IndexOfFirstUnpinnedTab();
+ }
+ 
  void TabStripModel::ExtendSelectionTo(int index) {
-   CHECK(ContainsIndex(index));
-   tabs::TabStripModelSelectionState new_model = selection_model_;
-@@ -2474,6 +2544,15 @@ bool TabStripModel::IsContextMenuCommand
+@@ -2475,6 +2545,15 @@
      return false;
    }
  
@@ -5472,7 +5481,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
    switch (command_id) {
      case CommandNewTabToRight:
      case CommandCloseTab:
-@@ -2524,10 +2603,25 @@ bool TabStripModel::IsContextMenuCommand
+@@ -2525,10 +2604,25 @@
      }
  
      case CommandTogglePinned:
@@ -5500,7 +5509,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  
      case CommandSendTabToSelf:
        return true;
-@@ -2538,12 +2632,12 @@ bool TabStripModel::IsContextMenuCommand
+@@ -2539,12 +2633,12 @@
      case CommandAddToNewGroup:
      case CommandAddToNewGroupFromMenuItem:
      case CommandAddToExistingGroup:
@@ -5515,7 +5524,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  
      case CommandRemoveFromGroup:
        return SupportsTabGroups();
-@@ -2733,7 +2827,64 @@ void TabStripModel::ExecuteContextMenuCo
+@@ -2734,7 +2828,64 @@
        break;
      }
  
@@ -5580,7 +5589,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
        base::UmaHistogramCounts1000(
            "Tab.ContextMenu.TogglePinned.SelectedTabsCount",
            selection_model_.size());
-@@ -3469,13 +3620,13 @@ bool TabStripModel::ShouldRunUnloadListe
+@@ -3470,13 +3621,13 @@
  
  int TabStripModel::ConstrainInsertionIndex(int index, bool pinned_tab) const {
    return pinned_tab ? std::clamp(index, 0, IndexOfFirstNonPinnedTab())
@@ -5596,7 +5605,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  }
  
  std::vector<int> TabStripModel::GetIndicesForCommand(int index) const {
-@@ -3771,8 +3922,25 @@ tabs::TabInterface* TabStripModel::GetTa
+@@ -3772,8 +3923,25 @@
  void TabStripModel::CloseTabs(base::span<content::WebContents* const> items,
                                uint32_t close_types) {
    std::vector<content::WebContents*> filtered_items;
@@ -9762,7 +9771,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_view.cc
  #include "ui/views/background.h"
  #include "ui/views/border.h"
  #include "ui/views/controls/button/button.h"
-@@ -362,6 +365,16 @@ bool TabView::OnKeyReleased(const ui::Ke
+@@ -362,6 +365,16 @@
  bool TabView::OnMousePressed(const ui::MouseEvent& event) {
    CHECK(collection_node_);
  
@@ -9779,7 +9788,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_view.cc
    auto* controller = collection_node_->GetController();
    shift_pressed_on_mouse_down_ = event.IsShiftDown();
    RecordMousePressedInTab();
-@@ -1075,14 +1088,60 @@ void TabView::UpdateTabData(const tabs::
+@@ -1081,14 +1094,61 @@
  
  void TabView::UpdateTitle(std::u16string title,
                            bool should_render_loading_title) {
@@ -9800,11 +9809,9 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_view.cc
      title = icon_->GetShowingLoadingAnimation()
                  ? l10n_util::GetStringUTF16(IDS_TAB_LOADING_TITLE)
                  : CoreTabHelper::GetDefaultTitle();
--  } else {
 +  } else if (!showing_return_home_title_) {
-     title = WindowMetadataController::FormatTitleForDisplay(title);
-   }
--  title_->SetText(title);
++    title = WindowMetadataController::FormatTitleForDisplay(title);
++  }
 +
 +  // Slide the title up when entering return-home mode.
 +  if (showing_return_home_title_ && !was_showing_return) {
@@ -9823,7 +9830,10 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_view.cc
 +        .Once()
 +        .SetDuration(base::Milliseconds(180))
 +        .SetTransform(title_, gfx::Transform(), gfx::Tween::Type::EASE_OUT);
-+  } else {
+   } else {
+-    title = WindowMetadataController::FormatTitleForDisplay(title);
+-  }
+-  title_->SetText(title);
 +    title_->SetText(title);
 +    if (title_->layer()) {
 +      title_->layer()->SetTransform(gfx::Transform());
@@ -9836,8 +9846,9 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_view.cc
 +        showing_return_home_title_
 +            ? l10n_util::GetStringFUTF16(IDS_TAB_RETURN_TO_HOME, home_title)
 +            : std::u16string());
-+    icon_->SetAttention(TabIcon::AttentionType::kTabWantsAttentionStatus,
-+                        showing_return_home_title_);
++    icon_->SetAttention(
++        TabIcon::AttentionType::kTabWantsAttentionStatus,
++        tab_data_.needs_attention || showing_return_home_title_);
 +  }
  }
  
@@ -9879,7 +9890,7 @@ Index: src/chrome/common/pref_names.h
 ===================================================================
 --- src.orig/chrome/common/pref_names.h
 +++ src/chrome/common/pref_names.h
-@@ -978,6 +978,7 @@ inline constexpr char kPartitionPerHostZ
+@@ -981,6 +981,7 @@
  
  #if !BUILDFLAG(IS_ANDROID)
  inline constexpr char kPinnedTabs[] = "pinned_tabs";
@@ -9891,7 +9902,7 @@ Index: src/components/tabs/BUILD.gn
 ===================================================================
 --- src.orig/components/tabs/BUILD.gn
 +++ src/components/tabs/BUILD.gn
-@@ -19,6 +19,8 @@ source_set("enum") {
+@@ -19,6 +19,8 @@
  source_set("public") {
    sources = [
      "public/direct_child_walker.h",
@@ -9900,7 +9911,7 @@ Index: src/components/tabs/BUILD.gn
      "public/pinned_tab_collection.h",
      "public/split_tab_collection.h",
      "public/split_tab_data.h",
-@@ -51,6 +53,8 @@ source_set("public") {
+@@ -52,6 +54,8 @@
  
  source_set("impl") {
    sources = [
@@ -10522,8 +10533,8 @@ Index: src/chrome/browser/ui/startup/startup_browser_creator_impl_unittest.cc
  // New Tab Page should appear alongside pinned tabs and the reset trigger, but
 Index: src/chrome/browser/sessions/session_service_base.cc
 ===================================================================
---- src.orig/chrome/browser/sessions/session_service_base.cc
-+++ src/chrome/browser/sessions/session_service_base.cc
+--- a/chrome/browser/sessions/session_service_base.cc
++++ b/chrome/browser/sessions/session_service_base.cc
 @@ -30,6 +30,7 @@
  #include "chrome/browser/ui/browser_window.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
@@ -10532,36 +10543,27 @@ Index: src/chrome/browser/sessions/session_service_base.cc
  #include "chrome/browser/ui/helium/helium_space_service.h"
  #include "chrome/browser/ui/helium/helium_space_service_factory.h"
  #include "chrome/browser/ui/startup/startup_browser_creator.h"
-@@ -731,12 +732,19 @@ void SessionServiceBase::BuildCommandsFo
+@@ -756,13 +757,14 @@
+   for (int model_index = 0; model_index < persisted_active_index;
+        ++model_index) {
+     if (!tabs::TemporaryTab::IsTemporary(
+-            tab_strip->GetWebContentsAt(model_index))) {
++            tab_strip->GetWebContentsAt(model_index)) &&
++        !helium::IsPinTab(tab_strip->GetTabAtIndex(model_index))) {
+       ++selected_session_index;
      }
    }
- 
-+  TabStripModel* tab_strip = browser->tab_strip_model();
-+  int selected_session_index = 0;
-+  for (int model_index = 0; model_index < tab_strip->active_index();
-+       ++model_index) {
-+    if (!helium::IsPinTab(tab_strip->GetTabAtIndex(model_index))) {
-+      ++selected_session_index;
-+    }
-+  }
    command_storage_manager()->AppendRebuildCommand(
 -      sessions::CreateSetSelectedTabInWindowCommand(
--          browser->session_id(), browser->tab_strip_model()->active_index()));
+-          browser->session_id(), selected_session_index));
 +      sessions::CreateSetSelectedTabInWindowCommand(browser->session_id(),
 +                                                    selected_session_index));
  
    // Set the visual data for each tab group.
--  TabStripModel* tab_strip = browser->tab_strip_model();
    if (tab_strip->SupportsTabGroups()) {
-     TabGroupModel* group_model = tab_strip->group_model();
-     tab_groups::TabGroupSyncService* tab_group_service =
-@@ -769,19 +777,26 @@ void SessionServiceBase::BuildCommandsFo
-               split_id, tab_strip->GetSplitData(split_id)->visual_data()));
-     }
- 
--    int index = 0;
-+    int model_index = 0;
-+    int session_index = 0;
+@@ -800,6 +802,10 @@
+     int model_index = 0;
+     int session_index = 0;
      for (const tabs::TabInterface* tab_interface : *tab_strip) {
 +      if (helium::IsPinTab(tab_interface)) {
 +        ++model_index;
@@ -10569,25 +10571,7 @@ Index: src/chrome/browser/sessions/session_service_base.cc
 +      }
        WebContents* tab = tab_interface->GetContents();
        DCHECK(tab);
-       const std::optional<tab_groups::TabGroupId> group_id =
--          tab_strip->GetTabGroupForTab(index);
-+          tab_strip->GetTabGroupForTab(model_index);
-       const std::optional<split_tabs::SplitTabId> split_id =
--          tab_strip->GetSplitForTab(index);
-+          tab_strip->GetSplitForTab(model_index);
- 
--      BuildCommandsForTab(browser->session_id(), tab, index, group_id, split_id,
--                          tab_interface->IsPinned(), tab_to_available_range);
-+      BuildCommandsForTab(browser->session_id(), tab, session_index, group_id,
-+                          split_id, tab_interface->IsPinned(),
-+                          tab_to_available_range);
- 
--      index++;
-+      ++model_index;
-+      ++session_index;
-     }
- 
-   windows_to_track->insert(browser->session_id());
+       if (tabs::TemporaryTab::IsTemporary(tab)) {
 Index: src/chrome/browser/ui/helium/helium_space_service_factory.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/helium_space_service_factory.cc
@@ -11417,7 +11401,7 @@ Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
  #include "ui/base/metadata/metadata_impl_macros.h"
  #include "ui/gfx/geometry/rect.h"
  #include "ui/views/controls/scroll_view.h"
-@@ -105,7 +117,6 @@ views::ProposedLayout UnpinnedTabContain
+@@ -105,7 +117,6 @@
    views::ProposedLayout layouts;
    int width = 0;
    int height = 0;
@@ -11425,7 +11409,7 @@ Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
    auto collapse_state = GetTabStripCollapseState();
  
    // Apply horizontal padding immediately at start of collapse animation by
-@@ -118,7 +129,16 @@ views::ProposedLayout UnpinnedTabContain
+@@ -118,10 +129,19 @@
  
    // Layout children in order. Children will have their preferred height and
    // fill available width.
@@ -11436,14 +11420,17 @@ Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
 +  bool has_flow_child = false;
 +  for (size_t child_index = 0; child_index < children.size(); ++child_index) {
 +    views::View* child = children[child_index];
+     if (!child->GetVisible()) {
+       layouts.child_layouts.emplace_back(child, false, gfx::Rect());
+       continue;
++    }
 +    if (external_drop_index_ && *external_drop_index_ == child_index) {
 +      height += GetLayoutConstant(LayoutConstant::kVerticalTabHeight) +
 +                kTabVerticalPadding;
-+    }
+     }
      // The leading inset should not be applied for tab groups when the tab strip
      // is collapsed since the group color line is drawn in that space.
-     int x =
-@@ -145,28 +165,116 @@ views::ProposedLayout UnpinnedTabContain
+@@ -149,28 +169,116 @@
                         horizontal_padding);
      }
      layouts.child_layouts.emplace_back(child, child->GetVisible(), bounds);
@@ -11459,11 +11446,7 @@ Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
 +  if (has_flow_child) {
      height -= kTabVerticalPadding;
    }
-+  if (external_drop_index_ && *external_drop_index_ >= children.size()) {
-+    height += GetLayoutConstant(LayoutConstant::kVerticalTabHeight) +
-+              (has_flow_child ? kTabVerticalPadding : 0);
-+  }
- 
+-
 -  if (IsHandlingDrag()) {
 -    dragged_view_bottom = GetDraggingViewsBounds().bottom();
 -    if (size_bounds.height().is_bounded()) {
@@ -11474,8 +11457,16 @@ Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
 -      // dragged_view_bottom = GetDraggingViewsBounds().bottom();
 -      dragged_view_bottom =
 -          std::min(dragged_view_bottom, size_bounds.height().value());
+-    }
+-  }
+-  layouts.host_size = gfx::Size(width, std::max(height, dragged_view_bottom));
++  if (external_drop_index_ && *external_drop_index_ >= children.size()) {
++    height += GetLayoutConstant(LayoutConstant::kVerticalTabHeight) +
++              (has_flow_child ? kTabVerticalPadding : 0);
++  }
++
 +  layouts.host_size = gfx::Size(width, height);
-+  return layouts;
+   return layouts;
 +}
 +
 +void UnpinnedTabContainerView::OnTabDragPresentationEnded() {
@@ -11483,10 +11474,8 @@ Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
 +    if (auto* region =
 +            views::AsViewClass<BaseTabStripRegionView>(tab_strip->parent())) {
 +      region->ClearTabDragBoundaryPresentation();
-     }
-   }
--  layouts.host_size = gfx::Size(width, std::max(height, dragged_view_bottom));
--  return layouts;
++    }
++  }
 +}
 +
 +void UnpinnedTabContainerView::UpdatePersistentTabDragPreview(
@@ -11574,7 +11563,7 @@ Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
  }
  
  gfx::Size UnpinnedTabContainerView::GetMinimumSize() const {
-@@ -274,8 +382,7 @@ void UnpinnedTabContainerView::ResetColl
+@@ -278,8 +386,7 @@
  }
  
  views::ScrollView* UnpinnedTabContainerView::GetScrollViewForContainer() const {
@@ -16411,7 +16400,7 @@ Index: src/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
    // the start of the drag, and the position they're expected to be at this
 Index: src/chrome/browser/ui/helium/helium_anchored_navigation_throttle.cc
 ===================================================================
---- /dev/null
+--- src.orig/chrome/browser/ui/helium/helium_anchored_navigation_throttle.cc
 +++ src/chrome/browser/ui/helium/helium_anchored_navigation_throttle.cc
 @@ -0,0 +1,143 @@
 +// Copyright 2026 The Helium Authors
