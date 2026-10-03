@@ -19,9 +19,11 @@ def test_find_and_check_patch():
     with pytest.raises(ValueError):
         patches.find_and_check_patch(patch_bin_path=Path('/this/should/not/exist'))
 
+    false_binary = shutil.which('false')
+    assert false_binary is not None
     with pytest.raises(RuntimeError):
         # Use command "false" to return non-zero exit code
-        patches.find_and_check_patch(patch_bin_path=Path('/bin/false'))
+        patches.find_and_check_patch(patch_bin_path=Path(false_binary))
 
 
 def test_patch_from_which():
