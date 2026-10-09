@@ -2,31 +2,38 @@ Index: src/chrome/browser/autocomplete/chrome_autocomplete_provider_client.cc
 ===================================================================
 --- src.orig/chrome/browser/autocomplete/chrome_autocomplete_provider_client.cc
 +++ src/chrome/browser/autocomplete/chrome_autocomplete_provider_client.cc
-@@ -49,7 +49,12 @@
+@@ -49,8 +49,13 @@
  #include "chrome/browser/sync/sync_service_factory.h"
  #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
  #include "chrome/browser/translate/chrome_translate_client.h"
 +#include "chrome/browser/ui/browser.h"
  #include "chrome/browser/ui/browser_command_controller.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
 +#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
 +#include "chrome/browser/ui/helium/helium_space.h"
 +#include "chrome/browser/ui/helium/helium_space_service.h"
 +#include "chrome/browser/ui/helium/helium_space_service_factory.h"
- #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
  #include "chrome/browser/ui/lens/lens_overlay_entry_point_controller.h"
  #include "chrome/browser/ui/omnibox/omnibox_pedal_implementations.h"
-@@ -88,6 +93,10 @@
+ #include "chrome/browser/ui/omnibox/omnibox_tab_helper.h"
+@@ -83,11 +88,16 @@
+ #include "components/prefs/pref_service.h"
+ #include "components/saved_tab_groups/public/tab_group_sync_service.h"
+ #include "components/search_engines/ai_mode_button_service.h"
++#include "components/sessions/content/session_tab_helper.h"
+ #include "components/signin/public/identity_manager/accounts_in_cookie_jar_info.h"
+ #include "components/signin/public/identity_manager/identity_manager.h"
  #include "components/sync/service/sync_service.h"
  #include "components/sync_sessions/session_sync_service.h"
- #include "components/tabs/public/tab_interface.h"
 +#include "components/tabs/public/folder_tab_collection.h"
 +#include "components/tabs/public/pin_tab_collection.h"
 +#include "components/tabs/public/tab_collection.h"
+ #include "components/tabs/public/tab_interface.h"
 +#include "components/tabs/public/tab_strip_collection.h"
  #include "components/translate/core/browser/translate_manager.h"
  #include "components/unified_consent/url_keyed_data_collection_consent_helper.h"
  #include "components/variations/service/variations_service.h"
-@@ -304,6 +313,60 @@ bookmarks::BookmarkModel* ChromeAutocomp
+@@ -304,6 +314,138 @@ bookmarks::BookmarkModel* ChromeAutocomp
    return BookmarkModelFactory::GetForBrowserContext(profile_);
  }
  
@@ -84,6 +91,84 @@ Index: src/chrome/browser/autocomplete/chrome_autocomplete_provider_client.cc
 +  return result;
 +}
 +
++std::vector<ArciumOmniboxItem>
++ChromeAutocompleteProviderClient::GetArciumOmniboxCommands() const {
++  if (!helium::IsHeliumFavoritesAndPinsEnabled() ||
++      !profile_->GetPrefs()->GetBoolean(
++          prefs::kArciumOmniboxPersistentItemsEnabled) ||
++      profile_->IsOffTheRecord() || profile_->IsGuestSession()) {
++    return {};
++  }
++  auto* contents = web_contents_getter_ ? web_contents_getter_.Run() : nullptr;
++  auto* current_tab =
++      contents ? tabs::TabInterface::MaybeGetFromContents(contents) : nullptr;
++  auto* window =
++      current_tab ? current_tab->GetBrowserWindowInterface() : nullptr;
++  auto* current_browser =
++      window ? window->GetBrowserForMigrationOnly() : nullptr;
++  auto* spaces = helium::HeliumSpaceServiceFactory::GetForProfile(profile_);
++  if (!current_browser || current_browser->profile() != profile_ || !spaces) {
++    return {};
++  }
++  std::vector<ArciumOmniboxItem> result;
++  const std::string source_space(
++      spaces->GetExplicitSpaceIdForBrowser(current_browser));
++  auto add_current = [&](ArciumOmniboxItem::Command command,
++                         std::u16string label) {
++    ArciumOmniboxItem item;
++    item.command = command;
++    item.title = std::move(label);
++    item.command_search_text = item.title;
++    item.space_id = source_space;
++    item.source_tab_session_id =
++        sessions::SessionTabHelper::IdForTab(contents).id();
++    result.push_back(std::move(item));
++  };
++  const auto current_kind = spaces->GetPersistentItemKind(current_tab);
++  if (!source_space.empty() && !current_kind &&
++      contents->GetLastCommittedURL().SchemeIsHTTPOrHTTPS()) {
++    add_current(ArciumOmniboxItem::Command::kPinCurrentTab, u"Pin current tab");
++    add_current(ArciumOmniboxItem::Command::kFavoriteCurrentTab,
++                u"Add current tab to Favorites");
++  }
++  // Enumerate commands from an immutable item snapshot. Do not grow the vector
++  // being iterated; each command retains its qualified durable source identity.
++  const auto saved_items = GetArciumOmniboxItems();
++  for (const auto& saved : saved_items) {
++    if (saved.command != ArciumOmniboxItem::Command::kNone) {
++      continue;
++    }
++    auto add_command = [&](ArciumOmniboxItem::Command command,
++                           std::u16string label,
++                           std::string target_space = std::string()) {
++      auto item = saved;
++      item.command = command;
++      item.title = label + u" · " + saved.title;
++      item.command_search_text =
++          label + u" " + saved.title + u" " + saved.space_name;
++      item.target_space_id = std::move(target_space);
++      result.push_back(std::move(item));
++    };
++    if (saved.is_live) {
++      add_command(ArciumOmniboxItem::Command::kCloseLiveInstance,
++                  u"Close live instance");
++      if (saved.kind == ArciumOmniboxItem::Kind::kPin) {
++        add_command(ArciumOmniboxItem::Command::kReturnPinHome,
++                    u"Return Pin home");
++      }
++    }
++    if (saved.kind == ArciumOmniboxItem::Kind::kPin) {
++      for (const auto* space : spaces->GetSpaces()) {
++        if (space->id() != saved.space_id) {
++          add_command(ArciumOmniboxItem::Command::kMovePinToSpace,
++                      u"Move Pin to " + space->name(), space->id());
++        }
++      }
++    }
++  }
++  return result;
++}
++
  history::URLDatabase* ChromeAutocompleteProviderClient::GetInMemoryDatabase() {
    history::HistoryService* history_service = GetHistoryService();
  
@@ -91,11 +176,12 @@ Index: src/chrome/browser/autocomplete/chrome_autocomplete_provider_client.h
 ===================================================================
 --- src.orig/chrome/browser/autocomplete/chrome_autocomplete_provider_client.h
 +++ src/chrome/browser/autocomplete/chrome_autocomplete_provider_client.h
-@@ -70,6 +70,7 @@ class ChromeAutocompleteProviderClient :
+@@ -70,6 +70,8 @@ class ChromeAutocompleteProviderClient :
        override;
    scoped_refptr<history::TopSites> GetTopSites() override;
    bookmarks::BookmarkModel* GetBookmarkModel() override;
 +  std::vector<ArciumOmniboxItem> GetArciumOmniboxItems() const override;
++  std::vector<ArciumOmniboxItem> GetArciumOmniboxCommands() const override;
    history::URLDatabase* GetInMemoryDatabase() override;
    InMemoryURLIndex* GetInMemoryURLIndex() override;
    TemplateURLService* GetTemplateURLService() override;
@@ -103,31 +189,130 @@ Index: src/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
 +++ src/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
-@@ -60,6 +60,9 @@
- #include "chrome/browser/ui/browser_commands.h"
- #include "chrome/browser/ui/browser_window.h"
+@@ -12,6 +12,7 @@
+ 
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/metrics/field_trial_params.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/metrics/user_metrics.h"
+@@ -62,6 +63,10 @@
  #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/hats/hats_service.h"
+ #include "chrome/browser/ui/hats/hats_service_factory.h"
++#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
 +#include "chrome/browser/ui/helium/helium_space.h"
 +#include "chrome/browser/ui/helium/helium_space_service.h"
 +#include "chrome/browser/ui/helium/helium_space_service_factory.h"
- #include "chrome/browser/ui/hats/hats_service.h"
- #include "chrome/browser/ui/hats/hats_service_factory.h"
  #include "chrome/browser/ui/layout_constants.h"
-@@ -99,6 +102,8 @@
- #include "components/search_engines/template_url_service.h"
+ #include "chrome/browser/ui/lens/lens_search_controller.h"
+ #include "chrome/browser/ui/lens/lens_searchbox_controller.h"
+@@ -100,6 +105,9 @@
  #include "components/search_engines/template_url_starter_pack_data.h"
  #include "components/sessions/content/session_tab_helper.h"
-+#include "components/tabs/public/pin_tab_collection.h"
-+#include "components/tabs/public/tab_strip_collection.h"
  #include "components/strings/grit/components_strings.h"
++#include "components/tabs/public/pin_tab_collection.h"
++#include "components/tabs/public/tab_interface.h"
++#include "components/tabs/public/tab_strip_collection.h"
  #include "components/viz/common/frame_sinks/copy_output_result.h"
  #include "content/public/browser/devtools_agent_host.h"
-@@ -907,6 +912,28 @@ void ChromeOmniboxClient::OnAutocomplete
+ #include "content/public/browser/navigation_entry.h"
+@@ -167,6 +175,63 @@ ExtensionControlledDialogResult SettingD
+ 
+ }  // namespace
+ 
++bool ExecuteArciumOmniboxCommand(Browser* browser,
++                                 const ArciumOmniboxItem& item) {
++  if (!browser) {
++    return false;
++  }
++  Profile* profile = browser->profile();
++  auto* spaces = helium::HeliumSpaceServiceFactory::GetForProfile(profile);
++  if (!spaces || !helium::IsHeliumFavoritesAndPinsEnabled() ||
++      !profile->GetPrefs()->GetBoolean(
++          prefs::kArciumOmniboxPersistentItemsEnabled) ||
++      profile->IsOffTheRecord() || profile->IsGuestSession()) {
++    return false;
++  }
++  const auto kind = item.kind == ArciumOmniboxItem::Kind::kFavorite
++                        ? helium::PersistentRecordKind::kFavorite
++                        : helium::PersistentRecordKind::kPin;
++  auto* contents = browser->tab_strip_model()->GetActiveWebContents();
++  auto* tab =
++      contents ? tabs::TabInterface::MaybeGetFromContents(contents) : nullptr;
++  const bool current_tab_matches =
++      contents &&
++      sessions::SessionTabHelper::IdForTab(contents).id() ==
++          item.source_tab_session_id &&
++      spaces->GetExplicitSpaceIdForBrowser(browser) == item.space_id;
++  switch (item.command) {
++    case ArciumOmniboxItem::Command::kPinCurrentTab:
++      if (current_tab_matches && tab && !spaces->IsPersistentItemTab(tab)) {
++        return spaces->AddPinFromTab(tab);
++      }
++      break;
++    case ArciumOmniboxItem::Command::kFavoriteCurrentTab:
++      if (current_tab_matches && tab && !spaces->IsPersistentItemTab(tab)) {
++        return spaces->AddFavoriteFromTab(tab);
++      }
++      break;
++    case ArciumOmniboxItem::Command::kMovePinToSpace:
++      if (kind == helium::PersistentRecordKind::kPin) {
++        return spaces->MovePinToSpace(browser, item.id, item.space_id,
++                                      item.target_space_id);
++      }
++      break;
++    case ArciumOmniboxItem::Command::kCloseLiveInstance:
++      return spaces->ClosePersistentItemInstance(browser, kind, item.id,
++                                                 item.space_id);
++      break;
++    case ArciumOmniboxItem::Command::kReturnPinHome:
++      if (kind == helium::PersistentRecordKind::kPin) {
++        return spaces->ReturnPersistentItemHome(browser, kind, item.id,
++                                                item.space_id);
++      }
++      break;
++    case ArciumOmniboxItem::Command::kNone:
++      NOTREACHED();
++  }
++  return false;
++}
++
+ ChromeOmniboxClient::ChromeOmniboxClient(LocationBar* location_bar,
+                                          Browser* browser,
+                                          Profile* profile)
+@@ -907,6 +972,58 @@ void ChromeOmniboxClient::OnAutocomplete
                text, "match", match, "alternative_nav_match",
                alternative_nav_match);
  
++  BrowserWindow* window =
++      browser_ ? BrowserWindow::FromBrowser(browser_) : nullptr;
++  const bool command_bar_new_tab = window && window->IsArciumCommandBarNewTab();
++  auto* command_bar_owner =
++      browser_ ? BrowserView::GetBrowserViewForBrowser(browser_) : nullptr;
++  base::ScopedClosureRunner dismiss_command_bar(
++      command_bar_owner
++          ? base::BindOnce(&BrowserView::CloseArciumCommandBar,
++                           command_bar_owner->GetAsWeakPtr(), true)
++          : base::OnceClosure());
++
++  // Typed commands never degrade to URL navigation, including stale snapshots
++  // and modified Return. Only explicit row selection executes a command.
++  if (browser_ && match.arcium_item &&
++      match.arcium_item->command != ArciumOmniboxItem::Command::kNone) {
++    if (disposition == WindowOpenDisposition::CURRENT_TAB) {
++      ExecuteArciumOmniboxCommand(browser_, *match.arcium_item);
++    }
++    return;
++  }
++
 +  if (browser_ && disposition == WindowOpenDisposition::CURRENT_TAB &&
 +      match.arcium_item) {
++    if (!profile_->GetPrefs()->GetBoolean(
++            prefs::kArciumOmniboxPersistentItemsEnabled)) {
++      return;
++    }
 +    const ArciumOmniboxItem& item = *match.arcium_item;
 +    if (helium::HeliumSpaceService* spaces =
 +            helium::HeliumSpaceServiceFactory::GetForProfile(profile_)) {
@@ -148,6 +333,11 @@ Index: src/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
 +    return;
 +  }
 +
++  if (command_bar_new_tab &&
++      disposition == WindowOpenDisposition::CURRENT_TAB) {
++    disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++  }
++
    std::string extra_headers;
    for (const auto& header : match.extra_headers) {
      base::StrAppend(&extra_headers,
@@ -155,7 +345,7 @@ Index: src/components/omnibox/browser/arcium_omnibox_item.h
 ===================================================================
 --- /dev/null
 +++ src/components/omnibox/browser/arcium_omnibox_item.h
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,60 @@
 +// Copyright 2026 The Arcium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -174,6 +364,31 @@ Index: src/components/omnibox/browser/arcium_omnibox_item.h
 +// of a parallel persistent-item database.
 +struct ArciumOmniboxItem {
 +  enum class Kind { kFavorite, kPin };
++  enum class Command {
++    kNone,
++    kPinCurrentTab,
++    kFavoriteCurrentTab,
++    kMovePinToSpace,
++    kCloseLiveInstance,
++    kReturnPinHome
++  };
++
++  Command command = Command::kNone;
++  std::string target_space_id;
++  int source_tab_session_id = 0;
++  std::u16string command_search_text;
++
++  // Length-prefixed fields keep identity stable across enumeration changes,
++  // duplicate URLs, and IDs containing separators.
++  std::string Identity() const {
++    auto field = [](const std::string& value) {
++      return std::to_string(value.size()) + ":" + value;
++    };
++    return std::to_string(static_cast<int>(kind)) + ":" +
++           std::to_string(static_cast<int>(command)) + ":" + field(space_id) +
++           field(id) + field(target_space_id) + ":" +
++           std::to_string(source_tab_session_id);
++  }
 +  enum class Tier { kActiveSpacePin, kFavorite, kOtherSpacePin };
 +
 +  Kind kind = Kind::kPin;
@@ -246,12 +461,17 @@ Index: src/components/omnibox/browser/autocomplete_provider_client.cc
 ===================================================================
 --- src.orig/components/omnibox/browser/autocomplete_provider_client.cc
 +++ src/components/omnibox/browser/autocomplete_provider_client.cc
-@@ -7,6 +7,11 @@
+@@ -7,6 +7,16 @@
  #include "base/notreached.h"
  #include "components/omnibox/browser/omnibox_field_trial.h"
  
 +std::vector<ArciumOmniboxItem>
 +AutocompleteProviderClient::GetArciumOmniboxItems() const {
++  return {};
++}
++
++std::vector<ArciumOmniboxItem>
++AutocompleteProviderClient::GetArciumOmniboxCommands() const {
 +  return {};
 +}
 +
@@ -270,11 +490,12 @@ Index: src/components/omnibox/browser/autocomplete_provider_client.h
  #include "components/omnibox/browser/lens_suggest_inputs_utils.h"
  #include "third_party/metrics_proto/omnibox_event.pb.h"
  
-@@ -99,6 +100,7 @@ class AutocompleteProviderClient : publi
+@@ -99,6 +100,8 @@ class AutocompleteProviderClient : publi
    GetHistoryEmbeddingsSearch();
    virtual scoped_refptr<history::TopSites> GetTopSites() = 0;
    virtual bookmarks::BookmarkModel* GetBookmarkModel() = 0;
 +  virtual std::vector<ArciumOmniboxItem> GetArciumOmniboxItems() const;
++  virtual std::vector<ArciumOmniboxItem> GetArciumOmniboxCommands() const;
    virtual history::URLDatabase* GetInMemoryDatabase() = 0;
    virtual InMemoryURLIndex* GetInMemoryURLIndex() = 0;
    virtual TemplateURLService* GetTemplateURLService() = 0;
@@ -282,25 +503,26 @@ Index: src/components/omnibox/browser/bookmark_provider.cc
 ===================================================================
 --- src.orig/components/omnibox/browser/bookmark_provider.cc
 +++ src/components/omnibox/browser/bookmark_provider.cc
-@@ -11,7 +11,11 @@
+@@ -11,7 +11,12 @@
  #include <vector>
  
  #include "base/feature_list.h"
 +#include "base/i18n/case_conversion.h"
  #include "base/memory/raw_ptr.h"
 +#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
 +#include "base/strings/utf_string_conversions.h"
 +#include "base/time/time.h"
  #include "base/trace_event/trace_event.h"
  #include "components/bookmarks/browser/bookmark_model.h"
  #include "components/omnibox/browser/autocomplete_match.h"
-@@ -35,6 +39,102 @@
+@@ -35,6 +40,144 @@
  using bookmarks::BookmarkNode;
  using bookmarks::TitledUrlMatch;
  
 +namespace {
 +
-+constexpr int kArciumMatchWeight = 3;
++constexpr int kArciumMatchWeight = 10;
 +constexpr int kMaxArciumUsageCount = 10;
 +constexpr int kMaxArciumRecencyScore = 10;
 +
@@ -347,10 +569,26 @@ Index: src/components/omnibox/browser/bookmark_provider.cc
 +std::u16string ArciumItemDescription(const ArciumOmniboxItem& item) {
 +  std::u16string description =
 +      item.kind == ArciumOmniboxItem::Kind::kFavorite ? u"Favorite" : u"Pin";
-+  if (item.is_active) {
-+    description += u" · Active";
-+  } else if (!item.is_live) {
-+    description += u" · Dormant";
++  std::u16string action;
++  if (item.tier == ArciumOmniboxItem::Tier::kOtherSpacePin) {
++    action = u"Switch to " + item.space_name;
++  } else if (item.is_active) {
++    action = u"Current " + description;
++  } else if (item.is_live) {
++    action = u"Switch to " + description;
++  } else {
++    action = item.kind == ArciumOmniboxItem::Kind::kPin ? u"Restore Pin"
++                                                        : u"Open Favorite";
++  }
++  description = item.tier == ArciumOmniboxItem::Tier::kOtherSpacePin
++                    ? action + u" · " + description
++                    : action;
++  description += item.is_active ? u" · Active"
++                 : item.is_live ? u" · Live"
++                                : u" · Dormant";
++  if (item.kind == ArciumOmniboxItem::Kind::kFavorite &&
++      item.space_name.empty()) {
++    description += u" · All Spaces";
 +  }
 +  if (!item.space_name.empty()) {
 +    description += u" · " + item.space_name;
@@ -359,6 +597,33 @@ Index: src/components/omnibox/browser/bookmark_provider.cc
 +    description += u" › " + folder;
 +  }
 +  return description;
++}
++
++std::u16string ArciumCommandDescription(const ArciumOmniboxItem& item) {
++  if (item.id.empty()) {
++    return u"Command";
++  }
++  std::u16string description =
++      item.kind == ArciumOmniboxItem::Kind::kFavorite ? u"Favorite" : u"Pin";
++  const std::u16string scope = item.space_name.empty()
++      ? (item.kind == ArciumOmniboxItem::Kind::kFavorite ? u"All Spaces"
++                                                       : u"Space")
++      : item.space_name;
++  description += u" · " + scope;
++  for (const std::u16string& folder : item.folder_path) {
++    description += u" › " + folder;
++  }
++  description += item.is_active ? u" · Active"
++                 : item.is_live ? u" · Live"
++                                : u" · Dormant";
++  return description;
++}
++
++std::u16string ArciumItemDisplayTitle(const ArciumOmniboxItem& item) {
++  if (!base::TrimWhitespace(item.title, base::TRIM_ALL).empty()) {
++    return item.title;
++  }
++  return base::UTF8ToUTF16(item.url.spec());
 +}
 +
 +int ArciumRecencyScore(int64_t internal_value) {
@@ -370,18 +635,17 @@ Index: src/components/omnibox/browser/bookmark_provider.cc
 +  if (age.is_negative()) {
 +    age = base::TimeDelta();
 +  }
-+  return std::max(0, kMaxArciumRecencyScore -
-+                         static_cast<int>(age.InDays()));
++  return std::max(0, kMaxArciumRecencyScore - static_cast<int>(age.InDays()));
 +}
 +
 +int ArciumItemRelevance(const ArciumOmniboxItem& item, int match_quality) {
-+  int relevance = 970;
++  int relevance = 2000;
 +  switch (item.tier) {
 +    case ArciumOmniboxItem::Tier::kActiveSpacePin:
-+      relevance = 1000;
++      relevance = 4000;
 +      break;
 +    case ArciumOmniboxItem::Tier::kFavorite:
-+      relevance = 990;
++      relevance = 3000;
 +      break;
 +    case ArciumOmniboxItem::Tier::kOtherSpacePin:
 +      break;
@@ -397,71 +661,91 @@ Index: src/components/omnibox/browser/bookmark_provider.cc
  BookmarkProvider::BookmarkProvider(AutocompleteProviderClient* client)
      : AutocompleteProvider(AutocompleteProvider::TYPE_BOOKMARK),
        client_(client),
-@@ -55,8 +155,10 @@ void BookmarkProvider::Start(const Autoc
+@@ -55,8 +198,12 @@ void BookmarkProvider::Start(const Autoc
  BookmarkProvider::~BookmarkProvider() = default;
  
  void BookmarkProvider::DoAutocomplete(const AutocompleteInput& input) {
-+  const std::vector<ArciumOmniboxItem> arcium_items =
-+      client_->GetArciumOmniboxItems();
++  auto arcium_items = client_->GetArciumOmniboxItems();
++  auto arcium_commands = client_->GetArciumOmniboxCommands();
++  arcium_items.insert(arcium_items.end(), arcium_commands.begin(),
++                      arcium_commands.end());
    // We may not have a bookmark model for some unit tests.
 -  if (!bookmark_model_) {
 +  if (!bookmark_model_ && arcium_items.empty()) {
      return;
    }
  
-@@ -89,10 +191,44 @@ void BookmarkProvider::DoAutocomplete(co
+@@ -89,11 +236,62 @@ void BookmarkProvider::DoAutocomplete(co
    // Please refer to the code for TitledUrlIndex::GetResultsMatching for
    // complete details of how searches are performed against the user's
    // bookmarks.
 -  std::vector<TitledUrlMatch> matches = bookmark_model_->GetBookmarksMatching(
 -      adjusted_input.text(), kMaxBookmarkMatches, matching_algorithm);
 +  std::vector<TitledUrlMatch> matches =
-+      bookmark_model_ ? bookmark_model_->GetBookmarksMatching(
-+                            adjusted_input.text(), kMaxBookmarkMatches,
-+                            matching_algorithm)
-+                      : std::vector<TitledUrlMatch>();
++      bookmark_model_
++          ? bookmark_model_->GetBookmarksMatching(
++                adjusted_input.text(), kMaxBookmarkMatches, matching_algorithm)
++          : std::vector<TitledUrlMatch>();
 +
-+  size_t arcium_index = 0;
 +  for (const ArciumOmniboxItem& item : arcium_items) {
-+    int match_quality =
-+        MatchQuality(adjusted_input.text(), item.title,
-+                     base::UTF8ToUTF16(item.url.spec()));
-+    match_quality =
-+        std::max(match_quality,
-+                 MetadataMatchQuality(item, adjusted_input.text()));
-+    if (match_quality == 0) {
-+      ++arcium_index;
++    if (item.command != ArciumOmniboxItem::Command::kNone) {
++      const int quality = MatchQuality(adjusted_input.text(), item.title,
++                                       item.command_search_text);
++      if (quality == 0) {
++        continue;
++      }
++      AutocompleteMatch command(this, (quality >= 35 ? 5000 : 700) + quality,
++                                false, AutocompleteMatchType::BOOKMARK_TITLE);
++      command.allowed_to_be_default_match = false;
++      command.destination_url =
++          GURL("chrome://arcium-command/" + base::HexEncode(item.Identity()));
++      command.stripped_destination_url = command.destination_url;
++      command.fill_into_edit = item.title;
++      command.contents = item.title;
++      command.contents_class = {{0, ACMatchClassification::MATCH}};
++      command.description = ArciumCommandDescription(item);
++      command.description_class = {{0, ACMatchClassification::DIM}};
++      command.arcium_item = item;
++      matches_.push_back(std::move(command));
 +      continue;
 +    }
-+    AutocompleteMatch match(this,
-+                            ArciumItemRelevance(item, match_quality), false,
-+                            AutocompleteMatchType::BOOKMARK_TITLE);
-+    match.allowed_to_be_default_match = match_quality >= 35;
++    int match_quality = MatchQuality(adjusted_input.text(), item.title,
++                                     base::UTF8ToUTF16(item.url.spec()));
++    match_quality = std::max(match_quality,
++                             MetadataMatchQuality(item, adjusted_input.text()));
++    if (match_quality == 0) {
++      continue;
++    }
++    AutocompleteMatch match(this, ArciumItemRelevance(item, match_quality),
++                            false, AutocompleteMatchType::BOOKMARK_TITLE);
++    match.allowed_to_be_default_match = true;
 +    match.destination_url = item.url;
 +    match.fill_into_edit = base::UTF8ToUTF16(item.url.spec());
 +    match.contents = ArciumItemDescription(item);
 +    match.contents_class = {{0, ACMatchClassification::DIM}};
-+    match.description = item.title;
++    match.description = ArciumItemDisplayTitle(item);
 +    match.description_class = {{0, ACMatchClassification::MATCH}};
++    match.swap_contents_and_description = true;
 +    match.transition = ui::PAGE_TRANSITION_AUTO_BOOKMARK;
 +    match.arcium_item = item;
 +    // Durable tabs that share a URL remain independently selectable.
-+    match.stripped_destination_url = GURL(
-+        "chrome://arcium-omnibox/" + base::NumberToString(arcium_index));
++    match.stripped_destination_url =
++        GURL("chrome://arcium-omnibox/" + base::HexEncode(item.Identity()));
 +    matches_.push_back(std::move(match));
-+    ++arcium_index;
 +  }
  
 -  if (matches.empty())
-+  if (matches.empty() && matches_.empty())
++  if (matches.empty() && matches_.empty()) {
      return;  // There were no matches.
++  }
  
    const std::u16string fixed_up_input(FixupUserInput(adjusted_input).second);
+   for (auto& bookmark_match : matches) {
 Index: src/components/omnibox/browser/bookmark_provider_unittest.cc
 ===================================================================
 --- src.orig/components/omnibox/browser/bookmark_provider_unittest.cc
 +++ src/components/omnibox/browser/bookmark_provider_unittest.cc
-@@ -322,6 +322,31 @@ TEST_F(BookmarkProviderTest, Positions)
+@@ -322,6 +322,238 @@ TEST_F(BookmarkProviderTest, Positions)
    }
  }
  
@@ -486,8 +770,215 @@ Index: src/components/omnibox/browser/bookmark_provider_unittest.cc
 +  EXPECT_EQ(pin.space_id, match.arcium_item->space_id);
 +  EXPECT_EQ(pin.folder_path, match.arcium_item->folder_path);
 +  EXPECT_EQ(pin.id, match.arcium_item->id);
-+  EXPECT_EQ(u"Pin · Active · Work › Projects › Q4", match.contents);
++  EXPECT_EQ(u"Current Pin · Active · Work › Projects › Q4", match.contents);
 +  EXPECT_EQ(pin.title, match.description);
++}
++
++TEST_F(BookmarkProviderTest, ArciumStructuralTiersDominateQualityAndUsage) {
++  ArciumOmniboxItem active;
++  active.id = "active";
++  active.title = u"Weekly atlas notes";
++  active.url = GURL("https://saved.example/active");
++  active.tier = ArciumOmniboxItem::Tier::kActiveSpacePin;
++  auto favorite = active;
++  favorite.id = "favorite";
++  favorite.kind = ArciumOmniboxItem::Kind::kFavorite;
++  favorite.title = u"atlas";
++  favorite.tier = ArciumOmniboxItem::Tier::kFavorite;
++  favorite.use_count = 100000;
++  auto other = favorite;
++  other.id = "other";
++  other.kind = ArciumOmniboxItem::Kind::kPin;
++  other.tier = ArciumOmniboxItem::Tier::kOtherSpacePin;
++  ON_CALL(*provider_client_, GetArciumOmniboxItems())
++      .WillByDefault(testing::Return(std::vector{other, favorite, active}));
++  ASSERT_EQ(3u, GetNumMatches("atlas"));
++  const auto& matches = provider_->matches();
++  EXPECT_EQ("active", matches[0].arcium_item->id);
++  EXPECT_EQ("favorite", matches[1].arcium_item->id);
++  EXPECT_EQ("other", matches[2].arcium_item->id);
++  EXPECT_TRUE(matches[0].allowed_to_be_default_match);
++}
++
++TEST_F(BookmarkProviderTest, ArciumUsageBreaksQualityTiesOnly) {
++  ArciumOmniboxItem exact;
++  exact.id = "exact";
++  exact.title = u"atlas";
++  exact.url = GURL("https://saved.example/exact");
++  exact.tier = ArciumOmniboxItem::Tier::kActiveSpacePin;
++  auto used = exact;
++  used.id = "used";
++  used.use_count = 8;
++  auto prefix = used;
++  prefix.id = "prefix";
++  prefix.title = u"atlas notes";
++  prefix.use_count = 100000;
++  ON_CALL(*provider_client_, GetArciumOmniboxItems())
++      .WillByDefault(testing::Return(std::vector{prefix, exact, used}));
++  ASSERT_EQ(3u, GetNumMatches("atlas"));
++  EXPECT_EQ("used", provider_->matches()[0].arcium_item->id);
++  EXPECT_EQ("exact", provider_->matches()[1].arcium_item->id);
++  EXPECT_EQ("prefix", provider_->matches()[2].arcium_item->id);
++}
++
++TEST_F(BookmarkProviderTest, ArciumIdentitySurvivesReorderingAndDuplicateURLs) {
++  ArciumOmniboxItem first;
++  first.id = "one";
++  first.space_id = "work";
++  first.title = u"atlas";
++  first.url = GURL("https://saved.example/same");
++  auto second = first;
++  second.space_id = "personal";
++  ON_CALL(*provider_client_, GetArciumOmniboxItems())
++      .WillByDefault(testing::Return(std::vector{first, second}));
++  ASSERT_EQ(2u, GetNumMatches("atlas"));
++  auto work_match = [&]() -> const AutocompleteMatch& {
++    return *std::ranges::find_if(provider_->matches(), [](const auto& match) {
++      return match.arcium_item->space_id == "work";
++    });
++  };
++  const auto identity = work_match().stripped_destination_url;
++  EXPECT_NE(provider_->matches()[0].stripped_destination_url,
++            provider_->matches()[1].stripped_destination_url);
++  EXPECT_FALSE(provider_->matches()[0].deletable);
++  ON_CALL(*provider_client_, GetArciumOmniboxItems())
++      .WillByDefault(testing::Return(std::vector{second, first}));
++  ASSERT_EQ(2u, GetNumMatches("atlas"));
++  EXPECT_EQ(identity, work_match().stripped_destination_url);
++}
++
++TEST_F(BookmarkProviderTest, ArciumCommandRowsKeepQualifiedIdentity) {
++  for (const auto command : {ArciumOmniboxItem::Command::kPinCurrentTab,
++                             ArciumOmniboxItem::Command::kFavoriteCurrentTab,
++                             ArciumOmniboxItem::Command::kMovePinToSpace,
++                             ArciumOmniboxItem::Command::kCloseLiveInstance,
++                             ArciumOmniboxItem::Command::kReturnPinHome}) {
++    ArciumOmniboxItem item;
++    item.command = command;
++    item.title = u"atlas command";
++    item.command_search_text = item.title;
++    item.id = "shared-id";
++    item.space_id = "work";
++    item.target_space_id = "personal";
++    item.source_tab_session_id = 123;
++    ON_CALL(*provider_client_, GetArciumOmniboxCommands())
++        .WillByDefault(testing::Return(std::vector{item}));
++    ASSERT_EQ(1u, GetNumMatches("atlas"));
++    const auto& match = provider_->matches().front();
++    ASSERT_TRUE(match.arcium_item);
++    EXPECT_EQ(command, match.arcium_item->command);
++    EXPECT_EQ("work", match.arcium_item->space_id);
++    EXPECT_EQ("personal", match.arcium_item->target_space_id);
++    EXPECT_FALSE(match.allowed_to_be_default_match);
++    EXPECT_FALSE(match.deletable);
++  }
++}
++
++TEST_F(BookmarkProviderTest, ArciumCommandRowsIdentifyTheirSavedTargets) {
++  ArciumOmniboxItem work;
++  work.command = ArciumOmniboxItem::Command::kCloseLiveInstance;
++  work.kind = ArciumOmniboxItem::Kind::kPin;
++  work.id = "shared-id";
++  work.space_id = "work";
++  work.space_name = u"Work";
++  work.folder_path = {u"Projects", u"Q4"};
++  work.title = u"Close live instance · Atlas";
++  work.command_search_text = work.title;
++  work.is_live = true;
++  auto personal = work;
++  personal.space_id = "personal";
++  personal.space_name = u"Personal";
++  auto favorite = work;
++  favorite.kind = ArciumOmniboxItem::Kind::kFavorite;
++  favorite.space_id.clear();
++  favorite.space_name.clear();
++  favorite.folder_path.clear();
++  ON_CALL(*provider_client_, GetArciumOmniboxCommands())
++      .WillByDefault(testing::Return(std::vector{work, personal, favorite}));
++  ASSERT_EQ(3u, GetNumMatches("close live"));
++  std::vector<std::u16string> descriptions;
++  for (const auto& match : provider_->matches()) {
++    descriptions.push_back(match.description);
++    EXPECT_FALSE(match.allowed_to_be_default_match);
++  }
++  EXPECT_THAT(descriptions, testing::UnorderedElementsAre(
++      u"Pin · Work › Projects › Q4 · Live",
++      u"Pin · Personal › Projects › Q4 · Live",
++      u"Favorite · All Spaces · Live"));
++
++  work.id.clear();
++  ON_CALL(*provider_client_, GetArciumOmniboxCommands())
++      .WillByDefault(testing::Return(std::vector{work}));
++  ASSERT_EQ(1u, GetNumMatches("close live"));
++  EXPECT_EQ(u"Command", provider_->matches().front().description);
++}
++
++TEST_F(BookmarkProviderTest, ArciumItemsFallbackToURLForBlankTitles) {
++  const std::vector<ArciumOmniboxItem> items = [] {
++    ArciumOmniboxItem empty_title;
++    empty_title.kind = ArciumOmniboxItem::Kind::kFavorite;
++    empty_title.id = "empty-title";
++    empty_title.url = GURL("https://empty-title.example/page");
++
++    ArciumOmniboxItem whitespace_title;
++    whitespace_title.kind = ArciumOmniboxItem::Kind::kPin;
++    whitespace_title.id = "whitespace-title";
++    whitespace_title.title = u" \t";
++    whitespace_title.url = GURL("https://whitespace-title.example/page");
++
++    return std::vector<ArciumOmniboxItem>{empty_title, whitespace_title};
++  }();
++  ON_CALL(*provider_client_, GetArciumOmniboxItems())
++      .WillByDefault(testing::Return(items));
++
++  ASSERT_EQ(1u, GetNumMatches("empty-title"));
++  const AutocompleteMatch& empty_match = provider_->matches().front();
++  EXPECT_EQ(base::UTF8ToUTF16(items[0].url.spec()), empty_match.description);
++  ASSERT_EQ(1u, empty_match.description_class.size());
++  EXPECT_EQ(0u, empty_match.description_class.front().offset);
++  EXPECT_EQ(AutocompleteMatch::ACMatchClassification::MATCH,
++            empty_match.description_class.front().style);
++#if DCHECK_IS_ON()
++  empty_match.Validate();
++#endif
++
++  ResetProvider();
++  ASSERT_EQ(1u, GetNumMatches("whitespace-title"));
++  const AutocompleteMatch& whitespace_match = provider_->matches().front();
++  EXPECT_EQ(base::UTF8ToUTF16(items[1].url.spec()),
++            whitespace_match.description);
++  ASSERT_EQ(1u, whitespace_match.description_class.size());
++  EXPECT_EQ(0u, whitespace_match.description_class.front().offset);
++  EXPECT_EQ(AutocompleteMatch::ACMatchClassification::MATCH,
++            whitespace_match.description_class.front().style);
++#if DCHECK_IS_ON()
++  whitespace_match.Validate();
++#endif
++}
++
++TEST_F(BookmarkProviderTest, ArciumExplicitCommandSurvivesSavedResultClipping) {
++  std::vector<ArciumOmniboxItem> items;
++  for (int i = 0; i < 8; ++i) {
++    ArciumOmniboxItem item;
++    item.id = std::to_string(i);
++    item.title = u"Pin project";
++    item.url = GURL("https://saved.example/" + item.id);
++    item.tier = ArciumOmniboxItem::Tier::kActiveSpacePin;
++    items.push_back(item);
++  }
++  ArciumOmniboxItem command;
++  command.command = ArciumOmniboxItem::Command::kPinCurrentTab;
++  command.title = u"Pin current tab";
++  command.command_search_text = command.title;
++  ON_CALL(*provider_client_, GetArciumOmniboxItems())
++      .WillByDefault(testing::Return(items));
++  ON_CALL(*provider_client_, GetArciumOmniboxCommands())
++      .WillByDefault(testing::Return(std::vector{command}));
++  ASSERT_GT(GetNumMatches("Pin"), 0u);
++  EXPECT_TRUE(std::ranges::any_of(provider_->matches(), [](const auto& match) {
++    return match.arcium_item && match.arcium_item->command ==
++                                    ArciumOmniboxItem::Command::kPinCurrentTab;
++  }));
 +}
 +
  TEST_F(BookmarkProviderTest, Rankings) {
@@ -497,7 +988,7 @@ Index: src/components/omnibox/browser/mock_autocomplete_provider_client.h
 ===================================================================
 --- src.orig/components/omnibox/browser/mock_autocomplete_provider_client.h
 +++ src/components/omnibox/browser/mock_autocomplete_provider_client.h
-@@ -66,6 +66,10 @@ class MockAutocompleteProviderClient
+@@ -66,6 +66,14 @@ class MockAutocompleteProviderClient
    scoped_refptr<history::TopSites> GetTopSites() override { return nullptr; }
  
    MOCK_METHOD0(GetBookmarkModel, bookmarks::BookmarkModel*());
@@ -505,6 +996,956 @@ Index: src/components/omnibox/browser/mock_autocomplete_provider_client.h
 +              GetArciumOmniboxItems,
 +              (),
 +              (const, override));
++  MOCK_METHOD(std::vector<ArciumOmniboxItem>,
++              GetArciumOmniboxCommands,
++              (),
++              (const, override));
    MOCK_METHOD0(GetInMemoryDatabase, history::URLDatabase*());
    MOCK_METHOD0(GetInMemoryURLIndex, InMemoryURLIndex*());
+ 
+Index: src/chrome/browser/ui/browser_command_controller.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_command_controller.cc
++++ src/chrome/browser/ui/browser_command_controller.cc
+@@ -743,6 +743,9 @@ void BrowserCommandController::HandleCom
+       CloseWindow(browser_);
+       break;
+     case IDC_NEW_TAB: {
++      if (BrowserWindow::FromBrowser(browser_)->ShowArciumCommandBar(true)) {
++        break;
++      }
+       NewTab(browser_, NewTabTypes::kNewTabCommand);
+       break;
+     }
+Index: src/chrome/browser/ui/browser_window.h
+===================================================================
+--- src.orig/chrome/browser/ui/browser_window.h
++++ src/chrome/browser/ui/browser_window.h
+@@ -278,6 +278,11 @@ class BrowserWindow : public ui::BaseWin
+   // Returns the location bar.
+   virtual LocationBar* GetLocationBar() const = 0;
+ 
++  // Returns false for windows that retain the ordinary toolbar omnibox.
++  virtual bool ShowArciumCommandBar(bool new_tab) { return false; }
++  virtual bool IsArciumCommandBarNewTab() const { return false; }
++  virtual void CloseArciumCommandBar(bool accepted = false) {}
++
+   // Tries to focus the location bar.  Clears the window focus (to avoid
+   // inconsistent state) if this fails.
+   virtual void SetFocusToLocationBar(bool is_user_initiated) = 0;
+Index: src/chrome/browser/ui/omnibox/chrome_omnibox_client.h
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/chrome_omnibox_client.h
++++ src/chrome/browser/ui/omnibox/chrome_omnibox_client.h
+@@ -14,6 +14,7 @@
+ #include "base/time/time.h"
+ #include "chrome/browser/bitmap_fetcher/bitmap_fetcher_service.h"
+ #include "chrome/common/search/instant_types.h"
++#include "components/omnibox/browser/arcium_omnibox_item.h"
+ #include "components/omnibox/browser/favicon_cache.h"
+ #include "components/omnibox/browser/omnibox.mojom-shared.h"
+ #include "components/omnibox/browser/omnibox_client.h"
+@@ -34,6 +35,11 @@ namespace omnibox {
+ class OmniboxPopupCloser;
+ }  // namespace omnibox
+ 
++// Executes a typed command against its qualified, still-valid source identity.
++// Returns false for disabled features, stale tabs/items, or rejected mutations.
++bool ExecuteArciumOmniboxCommand(Browser* browser,
++                                 const ArciumOmniboxItem& item);
++
+ class ChromeOmniboxClient final : public OmniboxClient {
+  public:
+   ChromeOmniboxClient(LocationBar* location_bar,
+Index: src/chrome/browser/ui/views/frame/browser_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_view.cc
++++ src/chrome/browser/ui/views/frame/browser_view.cc
+@@ -104,6 +104,7 @@
+ #include "chrome/browser/ui/fullscreen/browser_window_fullscreen_controller.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
++#include "chrome/browser/ui/omnibox/omnibox_controller.h"
+ #include "chrome/browser/ui/omnibox/omnibox_next_features.h"
+ #include "chrome/browser/ui/omnibox/omnibox_popup_view.h"
+ #include "chrome/browser/ui/omnibox/omnibox_view.h"
+@@ -663,6 +664,31 @@ bool ConvertedHitTest(views::View* src,
+   return dst->HitTestPoint(*point);
+ }
+ 
++class ArciumCommandBarView : public views::View {
++  METADATA_HEADER(ArciumCommandBarView, views::View)
++
++ public:
++  explicit ArciumCommandBarView(base::RepeatingCallback<bool(bool)> show_mode)
++      : show_mode_(std::move(show_mode)) {
++#if BUILDFLAG(IS_MAC)
++    constexpr int modifiers = ui::EF_COMMAND_DOWN;
++#else
++    constexpr int modifiers = ui::EF_CONTROL_DOWN;
++#endif
++    AddAccelerator(ui::Accelerator(ui::VKEY_T, modifiers));
++    AddAccelerator(ui::Accelerator(ui::VKEY_L, modifiers));
++  }
++  bool AcceleratorPressed(const ui::Accelerator& accelerator) override {
++    return show_mode_.Run(accelerator.key_code() == ui::VKEY_T);
++  }
++
++ private:
++  base::RepeatingCallback<bool(bool)> show_mode_;
++};
++
++BEGIN_METADATA(ArciumCommandBarView)
++END_METADATA
++
+ }  // namespace
+ 
+ // Implements the exclusive access context and bubble context.
+@@ -1219,6 +1245,9 @@ BrowserView::~BrowserView() {
+     browser_shortcut_service_ = nullptr;
+   }
+ 
++  arcium_command_bar_accepted_ = true;
++  DestroyArciumCommandBar();
++
+   // Remove the layout manager to avoid dangling. This needs to be earlier than
+   // other cleanups that destroy views referenced in the layout manager.
+   SetLayoutManager(nullptr);
+@@ -2946,10 +2975,148 @@ void BrowserView::ExecutePageActionIconF
+ }
+ 
+ LocationBar* BrowserView::GetLocationBar() const {
++  if (arcium_command_bar_location_ && !arcium_command_bar_closing_) {
++    return arcium_command_bar_location_;
++  }
+   return toolbar_ ? toolbar_->location_bar() : nullptr;
+ }
+ 
++bool BrowserView::ShowArciumCommandBar(bool new_tab) {
++  if (!browser_->is_type_normal() || !toolbar_ || !GetWidget() ||
++      !GetActiveWebContents()) {
++    return false;
++  }
++  if (arcium_command_bar_widget_) {
++    if (arcium_command_bar_closing_) {
++      return true;
++    }
++    arcium_command_bar_location_->omnibox_view()->RevertAll();
++    arcium_command_bar_location_->GetOmniboxController()->StopAutocomplete(
++        true);
++    arcium_command_bar_new_tab_ = new_tab;
++    auto* dialog =
++        arcium_command_bar_widget_->widget_delegate()->AsDialogDelegate();
++    dialog->SetTitle(new_tab ? u"New tab" : u"Current tab");
++    arcium_command_bar_location_->FocusLocation(true, true);
++    if (new_tab) {
++      arcium_command_bar_location_->omnibox_view()->SetUserText(u"", true);
++    }
++    return true;
++  }
++  auto contents = std::make_unique<ArciumCommandBarView>(base::BindRepeating(
++      [](base::WeakPtr<BrowserView> view, bool new_tab) {
++        return view && view->ShowArciumCommandBar(new_tab);
++      },
++      weak_ptr_factory_.GetWeakPtr()));
++  auto bubble = std::make_unique<views::BubbleDialogDelegate>(
++      nullptr, views::BubbleBorder::NONE);
++  bubble->set_parent_window(GetWidget()->GetNativeView());
++  bubble->SetButtons(static_cast<int>(ui::mojom::DialogButton::kNone));
++  bubble->SetTitle(new_tab ? u"New tab" : u"Current tab");
++  bubble->SetShowTitle(true);
++  bubble->set_close_on_deactivate(true);
++  bubble->set_margins(gfx::Insets(16));
++  contents->SetLayoutManager(std::make_unique<views::FillLayout>());
++  const gfx::Rect bounds = GetBoundsInScreen();
++  const int width = std::clamp(bounds.width() - 80, 240, 640);
++  bubble->SetAnchorRect(
++      gfx::Rect(bounds.CenterPoint().x(),
++                bounds.y() + std::min(180, bounds.height() / 4), 0, 0));
++  // Widget creation lays out its contents synchronously. Attach the location
++  // bar only after the widget exists, so Init can precede its first layout.
++  contents->SetPreferredSize(gfx::Size(width, 48));
++  auto* contents_view = contents.get();
++  bubble->SetContentsView(std::move(contents));
++  arcium_command_bar_new_tab_ = new_tab;
++  arcium_command_bar_accepted_ = false;
++  arcium_command_bar_closing_ = false;
++  arcium_command_bar_delegate_ = std::move(bubble);
++  arcium_command_bar_widget_ = views::BubbleDialogDelegate::CreateBubble(
++      arcium_command_bar_delegate_.get(),
++      base::BindOnce(
++          [](base::WeakPtr<BrowserView> view,
++             views::Widget::ClosedReason reason) {
++            if (view) {
++              // Loss of focus can close the bubble during cross-window
++              // acceptance. The once callback schedules one teardown task.
++              view->arcium_command_bar_closing_ = true;
++              base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++                  FROM_HERE, base::BindOnce(
++                      &BrowserView::DestroyArciumCommandBar, view));
++            }
++          },
++          weak_ptr_factory_.GetWeakPtr()));
++  arcium_command_bar_widget_->AddObserver(this);
++  auto location = std::make_unique<LocationBarView>(
++      browser_.get(), browser_->profile(), browser_->command_controller(),
++      toolbar_, false);
++  location->SetPreferredSize(gfx::Size(width, 48));
++  arcium_command_bar_location_ =
++      contents_view->AddChildView(std::move(location));
++  arcium_command_bar_location_->Init();
++  arcium_command_bar_location_->Update(GetActiveWebContents());
++  arcium_command_bar_location_->SetArciumCommandBarDismissCallback(
++      base::BindRepeating(&BrowserView::CloseArciumCommandBar,
++                          weak_ptr_factory_.GetWeakPtr(), false));
++  arcium_command_bar_widget_->Show();
++  arcium_command_bar_location_->FocusLocation(true, true);
++  if (new_tab) {
++    arcium_command_bar_location_->omnibox_view()->RevertAll();
++    arcium_command_bar_location_->GetOmniboxController()->StopAutocomplete(
++        true);
++    arcium_command_bar_location_->omnibox_view()->SetUserText(u"", true);
++  }
++  return true;
++}
++
++bool BrowserView::IsArciumCommandBarNewTab() const {
++  return arcium_command_bar_widget_ && arcium_command_bar_new_tab_;
++}
++
++void BrowserView::CloseArciumCommandBar(bool accepted) {
++  if (!arcium_command_bar_widget_) {
++    return;
++  }
++  arcium_command_bar_accepted_ |= accepted;
++  if (arcium_command_bar_closing_) {
++    return;
++  }
++  arcium_command_bar_closing_ = true;
++  // Acceptance may activate another tab while the omnibox controller is on
++  // the stack. Close on the next task so its controller can finish first.
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(
++          [](base::WeakPtr<views::Widget> widget) {
++            if (widget) {
++              widget->Close();
++            }
++          },
++          arcium_command_bar_widget_->GetWeakPtr()));
++}
++
++void BrowserView::DestroyArciumCommandBar() {
++  if (!arcium_command_bar_widget_) {
++    return;
++  }
++  arcium_command_bar_widget_->RemoveObserver(this);
++  auto widget = std::move(arcium_command_bar_widget_);
++  auto delegate = std::move(arcium_command_bar_delegate_);
++  arcium_command_bar_location_ = nullptr;
++  arcium_command_bar_new_tab_ = false;
++  arcium_command_bar_closing_ = false;
++  const bool restore_focus = !arcium_command_bar_accepted_ && GetWidget() &&
++                             GetWidget()->IsActive();
++  widget.reset();
++  delegate.reset();
++  if (restore_focus) {
++    RestoreFocus();
++  }
++}
++
+ void BrowserView::SetFocusToLocationBar(bool is_user_initiated) {
++  if (is_user_initiated && ShowArciumCommandBar(false)) {
++    return;
++  }
+   // On Windows, changing focus to the location bar causes the browser window to
+   // become active. This can steal focus if the user has another window open
+   // already. On Chrome OS, changing focus makes a view believe it has a focus
+@@ -3452,6 +3619,10 @@ void BrowserView::TryNotifyWindowBoundsC
+ 
+ void BrowserView::OnWidgetVisibilityChanged(views::Widget* widget,
+                                             bool visible) {
++  if (widget == arcium_command_bar_widget_.get()) {
++    return;
++  }
++
+   UpdateLoadingAnimations(visible);
+ }
+ 
+@@ -3519,6 +3690,10 @@ void BrowserView::NotifyWidgetSizeConstr
+ }
+ 
+ void BrowserView::OnWidgetShowStateChanged(views::Widget* widget) {
++  if (widget == arcium_command_bar_widget_.get()) {
++    return;
++  }
++
+   if (toolbar_) {
+     toolbar_->InvalidateLayout();
+   }
+@@ -3529,6 +3704,10 @@ void BrowserView::OnWidgetShowStateChang
+ 
+ void BrowserView::OnWidgetWindowModalVisibilityChanged(views::Widget* widget,
+                                                        bool visible) {
++  if (widget == arcium_command_bar_widget_.get()) {
++    return;
++  }
++
+ #if !BUILDFLAG(IS_MAC)
+   // MacOS does not need views window scrim. We use sheets to show window modals
+   // (-[NSWindow beginSheet:]), which natively draw a scrim.
+@@ -4115,6 +4294,7 @@ void BrowserView::OnTabStripModelChanged
+   // can change its preferred size. Re-lay-out the toolbar to reflect the
+   // possible change.
+   if (selection.active_tab_changed()) {
++    CloseArciumCommandBar(true);
+     toolbar_->InvalidateLayout();
+ 
+     // Update the accessible URL when the selected tab changes. This ensures
+@@ -4702,6 +4882,11 @@ views::View* BrowserView::CreateMacOverl
+ #endif  // IS_MAC
+ 
+ void BrowserView::OnWidgetDestroying(views::Widget* widget) {
++  if (widget == arcium_command_bar_widget_.get()) {
++    return;
++  }
++  arcium_command_bar_accepted_ = true;
++  DestroyArciumCommandBar();
+   DCHECK(widget_observation_.IsObservingSource(widget));
+   widget_observation_.Reset();
+   // Destroy any remaining WebContents early on. Doing so may result in
+@@ -4716,6 +4901,10 @@ void BrowserView::OnWidgetDestroying(vie
+ 
+ void BrowserView::OnWidgetActivationChanged(views::Widget* widget,
+                                             bool active) {
++  if (widget == arcium_command_bar_widget_.get()) {
++    return;
++  }
++
+   if (browser_->GetWindow()) {
+     if (active) {
+       if (restore_focus_on_activation_.has_value() &&
+@@ -4747,6 +4936,10 @@ void BrowserView::OnWidgetActivationChan
+ 
+ void BrowserView::OnWidgetBoundsChanged(views::Widget* widget,
+                                         const gfx::Rect& new_bounds) {
++  if (widget == arcium_command_bar_widget_.get()) {
++    return;
++  }
++  CloseArciumCommandBar(false);
+   TryNotifyWindowBoundsChanged(new_bounds);
+ }
+ 
+Index: src/chrome/browser/ui/views/frame/browser_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_view.h
++++ src/chrome/browser/ui/views/frame/browser_view.h
+@@ -128,6 +128,7 @@ enum class Channel;
+ }
+ 
+ namespace views {
++class BubbleDialogDelegate;
+ class EventMonitor;
+ class WebView;
+ }  // namespace views
+@@ -581,6 +582,9 @@ class BrowserView : public BrowserWindow
+   autofill::AutofillBubbleHandler* GetAutofillBubbleHandler() override;
+   void ExecutePageActionIconForTesting(PageActionIconType type) override;
+   LocationBar* GetLocationBar() const override;
++  bool ShowArciumCommandBar(bool new_tab) override;
++  bool IsArciumCommandBarNewTab() const override;
++  void CloseArciumCommandBar(bool accepted = false) override;
+   void SetFocusToLocationBar(bool is_user_initiated) override;
+   void UpdateReloadStopState(bool is_loading, bool force) override;
+   void UpdateToolbar(content::WebContents* contents) override;
+@@ -1253,6 +1257,16 @@ class BrowserView : public BrowserWindow
+   // view tree. This is used to correctly reparent the tabstrip when exiting
+   // fullscreen mode. See BrowserView::ReparentTopContainerForEndOfImmersive.
+   std::optional<size_t> horizontal_tab_strip_region_insertion_index_;
++  // Floating command bar and its invocation state.
++  void DestroyArciumCommandBar();
++  // The delegate outlives its widget during reverse member destruction.
++  std::unique_ptr<views::BubbleDialogDelegate> arcium_command_bar_delegate_;
++  std::unique_ptr<views::Widget> arcium_command_bar_widget_;
++  raw_ptr<LocationBarView> arcium_command_bar_location_ = nullptr;
++  bool arcium_command_bar_new_tab_ = false;
++  bool arcium_command_bar_accepted_ = false;
++  bool arcium_command_bar_closing_ = false;
++
+   // The Toolbar containing the navigation buttons, menus and the address bar.
+   raw_ptr<ToolbarView> toolbar_ = nullptr;
+ 
+Index: src/chrome/browser/ui/views/location_bar/location_bar_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/location_bar/location_bar_view.h
++++ src/chrome/browser/ui/views/location_bar/location_bar_view.h
+@@ -155,6 +155,17 @@ class LocationBarView
+       bool antialias = true,
+       bool should_border_scale = false);
+ 
++  void SetArciumCommandBarDismissCallback(base::RepeatingClosure callback) {
++    arcium_command_bar_dismiss_ = std::move(callback);
++  }
++  bool DismissArciumCommandBar() {
++    if (!arcium_command_bar_dismiss_) {
++      return false;
++    }
++    arcium_command_bar_dismiss_.Run();
++    return true;
++  }
++
+   // Returns the delegate.
+   Delegate* delegate() const { return delegate_; }
+ 
+@@ -643,6 +654,7 @@ class LocationBarView
+ 
+   void OnMiddleClickPaste(base::TimeTicks event_timestamp, std::u16string text);
+ 
++  base::RepeatingClosure arcium_command_bar_dismiss_;
+   base::WeakPtrFactory<LocationBarView> weak_factory_{this};
+ };
+ 
+Index: src/chrome/browser/ui/views/omnibox/omnibox_view_views.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/omnibox_view_views.cc
++++ src/chrome/browser/ui/views/omnibox/omnibox_view_views.cc
+@@ -2203,6 +2203,9 @@ bool OmniboxViewViews::HandleKeyEvent(vi
+       return true;
+     }
+     case ui::VKEY_ESCAPE:
++      if (location_bar_view_ && location_bar_view_->DismissArciumCommandBar()) {
++        return true;
++      }
+       return controller()->edit_model()->OnEscapeKeyPressed();
+ 
+     case ui::VKEY_CONTROL:
+Index: src/components/omnibox/browser/autocomplete_result.cc
+===================================================================
+--- src.orig/components/omnibox/browser/autocomplete_result.cc
++++ src/components/omnibox/browser/autocomplete_result.cc
+@@ -372,7 +372,9 @@ void AutocompleteResult::Sort(
+   // TODO(manukh) Ranking and preserving the default suggestion should be done
+   //   by the grouping framework.
+   auto top_match = FindTopMatch(input, &matches_);
+-  if (default_match_to_preserve &&
++  const bool persistent_default =
++      top_match != matches_.end() && top_match->arcium_item.has_value();
++  if (!persistent_default && default_match_to_preserve &&
+       (top_match == matches_.end() ||
+        top_match->type != AutocompleteMatchType::URL_WHAT_YOU_TYPED)) {
+     const auto default_match_fields =
+@@ -1215,6 +1217,24 @@ ACMatches::iterator AutocompleteResult::
+   // can get a URL as the default match.
+   omnibox::CheckObsoletePageClass(input.current_page_classification());
+ 
++  // A matching saved item is the deliberate Return target. Search/history
++  // providers and a previously preserved default must not displace it.
++  auto persistent = matches->end();
++  for (auto it = matches->begin(); it != matches->end(); ++it) {
++    if (it->arcium_item &&
++        it->arcium_item->command == ArciumOmniboxItem::Command::kNone &&
++        it->allowed_to_be_default_match &&
++        (persistent == matches->end() ||
++         it->relevance > persistent->relevance ||
++         (it->relevance == persistent->relevance &&
++          it->arcium_item->Identity() < persistent->arcium_item->Identity()))) {
++      persistent = it;
++    }
++  }
++  if (persistent != matches->end()) {
++    return persistent;
++  }
++
+   if (input.current_page_classification() != OmniboxEventProto::NTP_REALBOX ||
+       input.type() == metrics::OmniboxInputType::URL) {
+     auto best = matches->end();
+@@ -1818,6 +1838,9 @@ AutocompleteResult::GetMatchComparisonFi
+     type = AutocompleteMatchDedupeType::kNormal;
+   }
+ 
++  if (match.arcium_item) {
++    return std::make_tuple("arcium:" + match.arcium_item->Identity(), type);
++  }
+   return std::make_tuple(match.stripped_destination_url.spec(), type);
+ }
+ 
+Index: src/components/omnibox/browser/autocomplete_result_unittest.cc
+===================================================================
+--- src.orig/components/omnibox/browser/autocomplete_result_unittest.cc
++++ src/components/omnibox/browser/autocomplete_result_unittest.cc
+@@ -420,6 +420,71 @@ TEST_F(AutocompleteResultTimeTest, Resul
+ }
+ 
+ // Assertion testing for AutocompleteResult::SwapMatchesWith.
++TEST_F(AutocompleteResultTest,
++       ArciumPersistentReturnBeatsSearchAndPreservedDefault) {
++  AutocompleteInput input(u"atlas", OmniboxEventProto::NTP_REALBOX,
++                          TestSchemeClassifier());
++  AutocompleteMatch search(nullptr, 9000, false,
++                           AutocompleteMatchType::SEARCH_WHAT_YOU_TYPED);
++  search.destination_url = GURL("https://search.example/?q=atlas");
++  search.allowed_to_be_default_match = true;
++  AutocompleteMatch saved(nullptr, 4100, false,
++                          AutocompleteMatchType::BOOKMARK_TITLE);
++  saved.destination_url = GURL("https://saved.example/atlas");
++  saved.allowed_to_be_default_match = true;
++  saved.arcium_item = ArciumOmniboxItem();
++  saved.arcium_item->id = "atlas";
++  AutocompleteResult result;
++  result.AppendMatches({search, saved});
++  result.SortAndCull(input, &template_url_service(),
++                     triggered_feature_service(), false, false, false, false,
++                     search);
++  ASSERT_TRUE(result.default_match());
++  ASSERT_TRUE(result.default_match()->arcium_item);
++  EXPECT_EQ("atlas", result.default_match()->arcium_item->id);
++}
++
++TEST_F(AutocompleteResultTest, ArciumDuplicateURLResultsRemainIndependent) {
++  AutocompleteInput input(u"atlas", OmniboxEventProto::OTHER,
++                          TestSchemeClassifier());
++  AutocompleteMatch first(nullptr, 4100, false,
++                          AutocompleteMatchType::BOOKMARK_TITLE);
++  first.destination_url = GURL("https://saved.example/same");
++  first.allowed_to_be_default_match = true;
++  first.arcium_item = ArciumOmniboxItem();
++  first.arcium_item->id = "same-id";
++  first.arcium_item->space_id = "work";
++  auto second = first;
++  second.arcium_item->space_id = "personal";
++  AutocompleteResult result;
++  result.AppendMatches({first, second, first});
++  result.SortAndCull(input, &template_url_service(),
++                     triggered_feature_service(), false, false, false, false);
++  ASSERT_EQ(2u, result.size());
++  EXPECT_NE(result.match_at(0)->arcium_item->space_id,
++            result.match_at(1)->arcium_item->space_id);
++}
++
++TEST_F(AutocompleteResultTest, ArciumCommandsNeverBecomeImplicitDefault) {
++  AutocompleteInput input(u"atlas", OmniboxEventProto::OTHER,
++                          TestSchemeClassifier());
++  AutocompleteMatch search(nullptr, 1300, false,
++                           AutocompleteMatchType::SEARCH_WHAT_YOU_TYPED);
++  search.destination_url = GURL("https://search.example/?q=atlas");
++  search.allowed_to_be_default_match = true;
++  auto command = search;
++  command.relevance = 9000;
++  command.allowed_to_be_default_match = false;
++  command.arcium_item = ArciumOmniboxItem();
++  command.arcium_item->command = ArciumOmniboxItem::Command::kCloseLiveInstance;
++  AutocompleteResult result;
++  result.AppendMatches({command, search});
++  result.SortAndCull(input, &template_url_service(),
++                     triggered_feature_service(), false, false, false, false);
++  ASSERT_TRUE(result.default_match());
++  EXPECT_FALSE(result.default_match()->arcium_item);
++}
++
+ TEST_F(AutocompleteResultTest, SwapMatches) {
+   AutocompleteResult r1;
+   AutocompleteResult r2;
+Index: src/chrome/browser/ui/omnibox/arcium_omnibox_service_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/omnibox/arcium_omnibox_service_unittest.cc
+@@ -0,0 +1,234 @@
++// Copyright 2026 The Arcium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include <algorithm>
++#include <memory>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/run_loop.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/helium/helium_space.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
++#include "chrome/browser/ui/omnibox/chrome_omnibox_client.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/common/pref_names.h"
++#include "chrome/test/base/browser_with_test_window_test.h"
++#include "components/prefs/pref_service.h"
++#include "components/sessions/content/session_tab_helper.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/test/navigation_simulator.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace helium {
++namespace {
++PersistentNode LinkNode(std::string id, std::u16string title, const char* url) {
++  return PersistentNode{.data = PersistentLink{.id = std::move(id),
++                                               .title = std::move(title),
++                                               .url = GURL(url)}};
++}
++class ArciumOmniboxServiceTest : public BrowserWithTestWindowTest {
++ protected:
++  TestingProfile::TestingFactories GetTestingFactories() override {
++    return {TestingProfile::TestingFactory{
++        HeliumSpaceServiceFactory::GetInstance(),
++        base::BindOnce([](content::BrowserContext* context)
++                          -> std::unique_ptr<KeyedService> {
++          return std::make_unique<HeliumSpaceService>(
++              Profile::FromBrowserContext(context));
++        })}};
++  }
++  void SetUp() override {
++    BrowserWithTestWindowTest::SetUp();
++    service_ = HeliumSpaceServiceFactory::GetForProfile(profile());
++    ASSERT_TRUE(service_);
++    space_ = service_->GetDefaultSpace();
++    ASSERT_TRUE(space_);
++    service_->SetSpaceForBrowser(browser(), space_->id());
++  }
++  tabs::TabInterface* AddOrdinaryTab(const char* url) {
++    AddTab(browser(), GURL(url));
++    return tabs::TabInterface::MaybeGetFromContents(
++        browser()->tab_strip_model()->GetActiveWebContents());
++  }
++  std::pair<std::string, tabs::TabInterface*> AddLivePin() {
++    auto* tab = AddOrdinaryTab("https://pin.test/");
++    const auto id =
++        service_->ConvertTabToPinInSpace(browser(), space_->id(), tab, {}, {});
++    EXPECT_TRUE(id);
++    return {id.value_or(std::string()), tab};
++  }
++  raw_ptr<HeliumSpaceService> service_ = nullptr;
++  raw_ptr<HeliumSpace> space_ = nullptr;
++};
++
++TEST_F(ArciumOmniboxServiceTest,
++       CrossSpaceDuplicateURLActivatesQualifiedPinOnce) {
++  auto [id, source_pin] = AddLivePin();
++  AddOrdinaryTab("https://origin.test/");
++  auto* origin = browser()->tab_strip_model()->GetActiveWebContents();
++  auto* other_space = service_->GetOrCreateSpaceReplacingPins(
++      "other", u"Other", {LinkNode(id, u"Other pin", "https://pin.test/")});
++  auto other_browser = CreateBrowser(profile(), Browser::TYPE_NORMAL, false);
++  AddTab(other_browser.get(), GURL("https://other-origin.test/"));
++  service_->SetSpaceForBrowser(other_browser.get(), other_space->id());
++  PersistentOmniboxItem target;
++  target.id = id;
++  target.space_id = other_space->id();
++  const int source_count = browser()->tab_strip_model()->count();
++  const int other_count = other_browser->tab_strip_model()->count();
++  ASSERT_TRUE(service_->ActivateOmniboxItem(browser(), target));
++  auto* restored = other_browser->tab_strip_model()->GetActiveWebContents();
++  EXPECT_NE(source_pin->GetContents(), restored);
++  EXPECT_EQ(origin, browser()->tab_strip_model()->GetActiveWebContents());
++  EXPECT_EQ(source_count, browser()->tab_strip_model()->count());
++  EXPECT_EQ(other_count + 1, other_browser->tab_strip_model()->count());
++  ASSERT_TRUE(service_->ActivateOmniboxItem(browser(), target));
++  EXPECT_EQ(restored, other_browser->tab_strip_model()->GetActiveWebContents());
++  EXPECT_EQ(other_count + 1, other_browser->tab_strip_model()->count());
++  const auto items = service_->GetOmniboxItemsForBrowser(browser());
++  const auto used = std::ranges::find_if(items, [&](const auto& item) {
++    return item.id == id && item.space_id == other_space->id();
++  });
++  ASSERT_NE(items.end(), used);
++  EXPECT_GE(used->use_count, 2);
++  EXPECT_GT(used->last_used_internal_value, 0);
++  EXPECT_FALSE(
++      profile()->GetPrefs()->GetDict(kHeliumPersistentItemUsagePref).empty());
++  other_browser->tab_strip_model()->CloseAllTabs();
++}
++
++TEST_F(ArciumOmniboxServiceTest,
++       OmniboxCurrentTabCommandsRejectChangedTabAndSpace) {
++  auto* first = AddOrdinaryTab("https://first.test/");
++  ASSERT_TRUE(first);
++  browser()->tab_strip_model()->ActivateTabAt(
++      browser()->tab_strip_model()->GetIndexOfTab(first));
++  ArciumOmniboxItem command;
++  command.command = ArciumOmniboxItem::Command::kPinCurrentTab;
++  command.space_id = space_->id();
++  command.source_tab_session_id =
++      sessions::SessionTabHelper::IdForTab(first->GetContents()).id();
++  auto* second = AddOrdinaryTab("https://second.test/");
++  ASSERT_NE(first, second);
++  browser()->tab_strip_model()->ActivateTabAt(
++      browser()->tab_strip_model()->GetIndexOfTab(second));
++  EXPECT_FALSE(ExecuteArciumOmniboxCommand(browser(), command));
++  EXPECT_FALSE(service_->IsPersistentItemTab(first));
++  browser()->tab_strip_model()->ActivateTabAt(
++      browser()->tab_strip_model()->GetIndexOfTab(first));
++  auto* other = service_->GetOrCreateSpace("other", u"Other");
++  service_->SetSpaceForBrowser(browser(), other->id());
++  EXPECT_FALSE(ExecuteArciumOmniboxCommand(browser(), command));
++  service_->SetSpaceForBrowser(browser(), space_->id());
++  EXPECT_TRUE(ExecuteArciumOmniboxCommand(browser(), command));
++  EXPECT_EQ(PersistentRecordKind::kPin, service_->GetPersistentItemKind(first));
++  EXPECT_FALSE(ExecuteArciumOmniboxCommand(browser(), command));
++}
++
++TEST_F(ArciumOmniboxServiceTest,
++       OmniboxFavoriteCommandPreservesTabAndHonorsSetting) {
++  auto* tab = AddOrdinaryTab("https://favorite.test/");
++  browser()->tab_strip_model()->ActivateTabAt(
++      browser()->tab_strip_model()->GetIndexOfTab(tab));
++  ArciumOmniboxItem command;
++  command.command = ArciumOmniboxItem::Command::kFavoriteCurrentTab;
++  command.space_id = space_->id();
++  command.source_tab_session_id =
++      sessions::SessionTabHelper::IdForTab(tab->GetContents()).id();
++  const int count = browser()->tab_strip_model()->count();
++  auto* contents = tab->GetContents();
++  profile()->GetPrefs()->SetBoolean(prefs::kArciumOmniboxPersistentItemsEnabled,
++                                    false);
++  EXPECT_FALSE(ExecuteArciumOmniboxCommand(browser(), command));
++  EXPECT_FALSE(service_->IsPersistentItemTab(tab));
++  profile()->GetPrefs()->SetBoolean(prefs::kArciumOmniboxPersistentItemsEnabled,
++                                    true);
++  ASSERT_TRUE(ExecuteArciumOmniboxCommand(browser(), command));
++  EXPECT_EQ(count, browser()->tab_strip_model()->count());
++  EXPECT_EQ(contents, tab->GetContents());
++  EXPECT_EQ(PersistentRecordKind::kFavorite,
++            service_->GetPersistentItemKind(tab));
++}
++
++TEST_F(ArciumOmniboxServiceTest,
++       OmniboxPinCommandsKeepQualifiedIdentityAndLifecycle) {
++  auto [id, pin] = AddLivePin();
++  ASSERT_TRUE(pin);
++  auto* contents = pin->GetContents();
++  AddOrdinaryTab("https://ordinary.test/");
++  auto* other = service_->GetOrCreateSpaceReplacingPins(
++      "other", u"Other", {LinkNode(id, u"Same ID", "https://unrelated.test/")});
++  ArciumOmniboxItem command;
++  command.id = id;
++  command.space_id = space_->id();
++  command.command = ArciumOmniboxItem::Command::kReturnPinHome;
++  content::NavigationSimulator::NavigateAndCommitFromBrowser(
++      contents, GURL("https://pin.test/deep"));
++  const int count = browser()->tab_strip_model()->count();
++  ASSERT_TRUE(ExecuteArciumOmniboxCommand(browser(), command));
++  EXPECT_EQ(contents, pin->GetContents());
++  EXPECT_EQ(count, browser()->tab_strip_model()->count());
++  EXPECT_EQ(GURL("https://pin.test/"), contents->GetVisibleURL());
++  command.space_id = "missing-space";
++  EXPECT_FALSE(ExecuteArciumOmniboxCommand(browser(), command));
++  command.space_id = space_->id();
++  command.command = ArciumOmniboxItem::Command::kCloseLiveInstance;
++  ASSERT_TRUE(ExecuteArciumOmniboxCommand(browser(), command));
++  base::RunLoop().RunUntilIdle();
++  EXPECT_TRUE(PersistentItemCodec::FindLink(space_->pins(), id));
++  EXPECT_FALSE(service_->GetLiveTabForPersistentItem(
++      browser(), PersistentRecordKind::kPin, id));
++  command.command = ArciumOmniboxItem::Command::kReturnPinHome;
++  EXPECT_FALSE(ExecuteArciumOmniboxCommand(browser(), command));
++  command.command = ArciumOmniboxItem::Command::kMovePinToSpace;
++  command.target_space_id = other->id();
++  EXPECT_FALSE(ExecuteArciumOmniboxCommand(browser(), command));
++  auto* destination = service_->GetOrCreateSpace("destination", u"Destination");
++  command.target_space_id = destination->id();
++  command.kind = ArciumOmniboxItem::Kind::kFavorite;
++  EXPECT_FALSE(ExecuteArciumOmniboxCommand(browser(), command));
++  EXPECT_TRUE(PersistentItemCodec::FindLink(space_->pins(), id));
++  EXPECT_FALSE(PersistentItemCodec::FindLink(destination->pins(), id));
++  command.kind = ArciumOmniboxItem::Kind::kPin;
++  ASSERT_TRUE(ExecuteArciumOmniboxCommand(browser(), command));
++  EXPECT_FALSE(PersistentItemCodec::FindLink(space_->pins(), id));
++  ASSERT_TRUE(PersistentItemCodec::FindLink(destination->pins(), id));
++  EXPECT_EQ(GURL("https://pin.test/"),
++            PersistentItemCodec::FindLink(destination->pins(), id)->url);
++  EXPECT_EQ(GURL("https://unrelated.test/"),
++            PersistentItemCodec::FindLink(other->pins(), id)->url);
++  EXPECT_FALSE(ExecuteArciumOmniboxCommand(browser(), command));
++}
++
++TEST_F(ArciumOmniboxServiceTest,
++       OmniboxActivationRestoresOnceAndRejectsStaleIdentity) {
++  auto [id, pin] = AddLivePin();
++  AddOrdinaryTab("https://origin.test/");
++  PersistentOmniboxItem target;
++  target.id = id;
++  target.space_id = space_->id();
++  auto* original = pin->GetContents();
++  const int count = browser()->tab_strip_model()->count();
++  ASSERT_TRUE(service_->ActivateOmniboxItem(browser(), target));
++  EXPECT_EQ(original, browser()->tab_strip_model()->GetActiveWebContents());
++  EXPECT_EQ(count, browser()->tab_strip_model()->count());
++  ASSERT_TRUE(service_->ClosePersistentItemInstance(
++      browser(), PersistentRecordKind::kPin, id, space_->id()));
++  base::RunLoop().RunUntilIdle();
++  ASSERT_TRUE(service_->ActivateOmniboxItem(browser(), target));
++  const int restored_count = browser()->tab_strip_model()->count();
++  auto* restored = browser()->tab_strip_model()->GetActiveWebContents();
++  ASSERT_TRUE(service_->ActivateOmniboxItem(browser(), target));
++  EXPECT_EQ(restored, browser()->tab_strip_model()->GetActiveWebContents());
++  EXPECT_EQ(restored_count, browser()->tab_strip_model()->count());
++  target.id = "removed";
++  EXPECT_FALSE(service_->ActivateOmniboxItem(browser(), target));
++  EXPECT_EQ(restored_count, browser()->tab_strip_model()->count());
++}
++
++}  // namespace
++}  // namespace helium
+Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
+@@ -0,0 +1,102 @@
++// Copyright 2026 The Arcium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "base/run_loop.h"
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/omnibox/omnibox_controller.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/test_with_browser_view.h"
++#include "chrome/browser/ui/views/location_bar/location_bar_view.h"
++#include "chrome/browser/ui/views/omnibox/omnibox_view_views.h"
++#include "components/omnibox/browser/autocomplete_controller.h"
++#include "ui/events/event.h"
++#include "ui/views/test/widget_test.h"
++
++class ArciumCommandBarTest : public TestWithBrowserView {
++ protected:
++  void SetUp() override {
++    TestWithBrowserView::SetUp();
++    AddTab(browser(), GURL("https://origin.test/"));
++    browser_view()->GetWidget()->Show();
++  }
++  LocationBarView* floating() {
++    return static_cast<LocationBarView*>(browser_view()->GetLocationBar());
++  }
++};
++
++TEST_F(ArciumCommandBarTest, NewTabCommandDefersCreationAndEscapeCancels) {
++  const int count = browser()->tab_strip_model()->count();
++  auto* contents = browser()->tab_strip_model()->GetActiveWebContents();
++  auto* toolbar = browser_view()->GetLocationBarView();
++  chrome::ExecuteCommand(browser(), IDC_NEW_TAB);
++  ASSERT_TRUE(browser_view()->IsArciumCommandBarNewTab());
++  ASSERT_NE(toolbar, floating());
++  EXPECT_TRUE(floating()->omnibox_view()->GetText().empty());
++  EXPECT_EQ(count, browser()->tab_strip_model()->count());
++  EXPECT_EQ(contents, browser()->tab_strip_model()->GetActiveWebContents());
++  auto* widget = floating()->GetWidget();
++  views::test::WidgetDestroyedWaiter destroyed(widget);
++  ui::KeyEvent escape(ui::EventType::kKeyPressed, ui::VKEY_ESCAPE, 0);
++  static_cast<views::Textfield*>(floating()->omnibox_view())
++      ->OnKeyEvent(&escape);
++  destroyed.Wait();
++  EXPECT_EQ(toolbar, browser_view()->GetLocationBar());
++  EXPECT_EQ(count, browser()->tab_strip_model()->count());
++  EXPECT_EQ(contents, browser()->tab_strip_model()->GetActiveWebContents());
++}
++
++TEST_F(ArciumCommandBarTest, ReusedBarResetsQueryAndInvocationMode) {
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  auto* location = floating();
++  auto* widget = location->GetWidget();
++  location->omnibox_view()->SetUserText(u"close live instance", true);
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(false));
++  EXPECT_EQ(widget, floating()->GetWidget());
++  EXPECT_FALSE(browser_view()->IsArciumCommandBarNewTab());
++  EXPECT_NE(u"close live instance", location->omnibox_view()->GetText());
++  EXPECT_FALSE(location->omnibox_view()->GetText().empty());
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  EXPECT_EQ(widget, floating()->GetWidget());
++  EXPECT_TRUE(location->omnibox_view()->GetText().empty());
++  EXPECT_TRUE(location->GetOmniboxController()
++                  ->autocomplete_controller()
++                  ->result()
++                  .empty());
++  views::test::WidgetDestroyedWaiter destroyed(widget);
++  browser_view()->CloseArciumCommandBar();
++  destroyed.Wait();
++}
++
++TEST_F(ArciumCommandBarTest, LostFocusDefersDestructionUntilAcceptanceReturns) {
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  auto* widget = floating()->GetWidget();
++  auto weak_widget = widget->GetWeakPtr();
++  views::test::WidgetDestroyedWaiter destroyed(widget);
++  const int count = browser()->tab_strip_model()->count();
++  widget->CloseWithReason(views::Widget::ClosedReason::kLostFocus);
++  EXPECT_TRUE(weak_widget);
++  // Reentrant Cmd-T while teardown is pending must not create a real tab.
++  chrome::ExecuteCommand(browser(), IDC_NEW_TAB);
++  EXPECT_EQ(count, browser()->tab_strip_model()->count());
++  destroyed.Wait();
++  EXPECT_FALSE(weak_widget);
++  EXPECT_EQ(browser_view()->GetLocationBarView(),
++            browser_view()->GetLocationBar());
++}
++
++TEST_F(ArciumCommandBarTest, ChangingActiveTabCancelsTransientInput) {
++  AddTab(browser(), GURL("https://other.test/"));
++  browser()->tab_strip_model()->ActivateTabAt(0);
++  auto* toolbar = browser_view()->GetLocationBarView();
++  const int count = browser()->tab_strip_model()->count();
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  views::test::WidgetDestroyedWaiter destroyed(floating()->GetWidget());
++  browser()->tab_strip_model()->ActivateTabAt(1);
++  destroyed.Wait();
++  EXPECT_EQ(toolbar, browser_view()->GetLocationBar());
++  EXPECT_EQ(count, browser()->tab_strip_model()->count());
++}
+Index: src/chrome/test/BUILD.gn
+===================================================================
+--- src.orig/chrome/test/BUILD.gn
++++ src/chrome/test/BUILD.gn
+@@ -69,6 +69,54 @@ if (is_chromeos && include_js2gtest_test
+   import("//chrome/test/base/ash/js2gtest.gni")
+ }
+ 
++# Focused omnibox and floating command-bar contracts. Avoid the monolithic
++# omnibox unit_tests data bundle; these fixtures require no SQL/model fixtures.
++if (!is_android && toolkit_views) {
++  test("arcium_omnibox_unit_tests") {
++    sources = [
++      "../browser/ui/omnibox/arcium_omnibox_service_unittest.cc",
++      "../browser/ui/views/frame/arcium_command_bar_unittest.cc",
++      "//components/omnibox/browser/autocomplete_result_unittest.cc",
++      "//components/omnibox/browser/bookmark_provider_unittest.cc",
++    ]
++    deps = [
++      ":test_interfaces",
++      ":test_support",
++      ":test_support_unit",
++      "//base",
++      "//base/test:test_support",
++      "//build:android_buildflags",
++      "//chrome/browser",
++      "//chrome/browser/ui",
++      "//chrome/browser/ui:ui_features",
++      "//components/bookmarks/browser",
++      "//components/bookmarks/test",
++      "//components/omnibox/browser",
++      "//components/omnibox/browser:test_support",
++      "//components/omnibox/common",
++      "//components/prefs",
++      "//components/prefs:test_support",
++      "//components/query_parser",
++      "//components/search_engines",
++      "//components/search_engines:test_support",
++      "//components/variations",
++      "//components/variations:test_support",
++      "//content/public/browser",
++      "//content/test:test_support",
++      "//testing/gmock",
++      "//testing/gtest",
++      "//ui/base",
++      "//ui/views:test_support",
++      "//url",
++    ]
++    if (is_mac) {
++      data_deps = [ "//chrome:chrome_framework" ]
++    } else if (is_linux || is_chromeos || is_win) {
++      data_deps = [ "//chrome:packed_resources" ]
++    }
++  }
++}
++
+ source_set("in_process_browser_test_mixin") {
+   testonly = true
  

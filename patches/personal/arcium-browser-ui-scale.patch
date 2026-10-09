@@ -1,6 +1,6 @@
 --- a/chrome/browser/ui/BUILD.gn
 +++ b/chrome/browser/ui/BUILD.gn
-@@ -4204,7 +4204,8 @@ static_library("ui") {
+@@ -4208,7 +4208,8 @@ static_library("ui") {
        "views/fullscreen_control/fullscreen_control_host.h",
        "views/global_error_bubble_view.cc",
        "views/global_error_bubble_view.h",
@@ -430,7 +430,7 @@
  #if BUILDFLAG(IS_MAC)
  #include "chrome/browser/ui/browser_shortcuts/browser_shortcut_platform_mac.h"
  #endif
-@@ -1407,6 +1408,9 @@ BrowserView::BrowserView(Browser* browse
+@@ -1429,6 +1430,9 @@ BrowserView::BrowserView(Browser* browse
  
    registrar_.Init(GetProfile()->GetPrefs());
    registrar_.Add(
@@ -440,7 +440,7 @@
        prefs::kFullscreenAllowed,
        base::BindRepeating(&BrowserView::UpdateFullscreenAllowedFromPolicy,
                            base::Unretained(this), CanFullscreen()));
-@@ -5994,6 +5998,11 @@ void BrowserView::AddedToWidget() {
+@@ -6141,6 +6145,11 @@ void BrowserView::AddedToWidget() {
        kBrowserDialogAnchorElementId, *this);
  
    initialized_ = true;
@@ -876,7 +876,7 @@
    tabs::VerticalTabStripState target_collapse_state_for_testing() {
 --- /dev/null
 +++ b/chrome/browser/ui/views/helium/arcium_chrome_ui_scale.cc
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,65 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license found in the LICENSE file.
@@ -905,14 +905,15 @@
 +}
 +
 +double GetChromeUIScale(const views::View* view) {
-+  const views::Widget* widget = view ? view->GetWidget() : nullptr;
-+  const BrowserView* browser_view =
-+      widget ? BrowserView::GetBrowserViewForNativeWindow(
-+                   widget->GetNativeWindow())
-+             : nullptr;
-+  return browser_view && browser_view->GetIsNormalType()
-+             ? GetChromeUIScale(browser_view->GetProfile())
-+             : 1.0;
++  for (const views::Widget* widget = view ? view->GetWidget() : nullptr;
++       widget; widget = widget->parent()) {
++    const BrowserView* browser_view =
++        BrowserView::GetBrowserViewForNativeWindow(widget->GetNativeWindow());
++    if (browser_view && browser_view->GetIsNormalType()) {
++      return GetChromeUIScale(browser_view->GetProfile());
++    }
++  }
++  return 1.0;
 +}
 +
 +int ScaleChromeDip(const views::View* view, int value) {
@@ -1330,7 +1331,7 @@
      return GetOmniboxController()->edit_model()->GetAddContextIcon(dip_size);
 --- a/chrome/browser/ui/views/location_bar/location_bar_view.h
 +++ b/chrome/browser/ui/views/location_bar/location_bar_view.h
-@@ -442,6 +442,9 @@ class LocationBarView
+@@ -453,6 +453,9 @@ class LocationBarView
  
    // PageActionIconView::Delegate:
    content::WebContents* GetWebContentsForPageActionIconView() override;
@@ -2158,8 +2159,8 @@
    }
    InvalidateLayout();
  }
---- src.orig/chrome/browser/ui/views/tabs/common/tab_view.cc
-+++ src/chrome/browser/ui/views/tabs/common/tab_view.cc
+--- a/chrome/browser/ui/views/tabs/common/tab_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view.cc
 @@ -34,6 +34,7 @@
  #include "chrome/browser/ui/views/frame/browser_view.h"
  #include "chrome/browser/ui/views/frame/themed_background.h"
@@ -2168,7 +2169,7 @@
  #include "chrome/browser/ui/views/helium/native_frame_materials.h"
  #include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
  #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
-@@ -165,8 +166,11 @@
+@@ -165,8 +166,11 @@ TabView::TabView(TabCollectionNode* coll
          glic::TabUnderlineView::Orientation::kVertical);
      glic_tab_underline_view_->SetProperty(views::kViewIgnoredByLayoutKey, true);
      glic_tab_underline_view_->SetBoundsRect(
@@ -2182,7 +2183,7 @@
    }
  
    // Ordered vector of children to be rendered in the tab.
-@@ -731,17 +735,28 @@
+@@ -731,17 +735,28 @@ void TabView::UpdateLayerRoundedCorners(
  
  void TabView::OnThemeChanged() {
    views::View::OnThemeChanged();
@@ -2212,7 +2213,7 @@
      // The only expandable view is the views::Label. Just get the line height to
      // make calculating bounds cheaper.
      views::Label* label = views::AsViewClass<views::Label>(config.view);
-@@ -756,7 +771,7 @@
+@@ -756,7 +771,7 @@ gfx::Rect TabView::GetChildBounds(const
    // Some icons have larger sizes to account for decoration. Make a distinction
    // between the design width and the actual width.
    const int design_width =
@@ -2221,20 +2222,19 @@
  
    int x = container.x();
    if (center) {
-@@ -808,9 +823,9 @@
+@@ -808,9 +823,9 @@ bool TabView::IsChildVisible(const views
      // button on active non-hovered tabs a little bit sooner than reaching the
      // uncollapsed min width, because otherwise the close buttons in a grouped
      // split tab will visibly show up at different times due to rounding.
 -    constexpr int kUncollapsedMinWidthThreshold = 3;
--
--    if (width < UncollapsedMinWidth() - kUncollapsedMinWidthThreshold) {
 +    const int uncollapsed_min_width_threshold = arcium::ScaleChromeDip(this, 3);
-+
+ 
+-    if (width < UncollapsedMinWidth() - kUncollapsedMinWidthThreshold) {
 +    if (width < UncollapsedMinWidth() - uncollapsed_min_width_threshold) {
        return active_ && (hovered_ || HasFocus() ||
                           (close_button_ && close_button_->HasFocus()));
      }
-@@ -824,16 +839,17 @@
+@@ -824,16 +839,17 @@ bool TabView::IsChildVisible(const views
  
  views::ProposedLayout TabView::CalculateProposedLayout(
      const views::SizeBounds& size_bounds) const {
@@ -2258,7 +2258,7 @@
  
    // If the tab is collapsed but animating with a wider width then we shouldn't
    // center the contents.
-@@ -842,10 +858,11 @@
+@@ -842,10 +858,11 @@ views::ProposedLayout TabView::Calculate
    int placed_children = 0;
    for (const auto& child : tab_children_configs_) {
      const bool can_render_child =
@@ -2274,7 +2274,7 @@
      const bool is_child_visible = IsChildVisible(child.view, width);
      if (is_child_visible && can_render_child) {
        layouts.child_layouts.emplace_back(
-@@ -855,8 +872,12 @@
+@@ -855,8 +872,12 @@ views::ProposedLayout TabView::Calculate
        if (!is_centered) {
          bounds_remaining.Inset(
              child.align_leading
@@ -2289,7 +2289,7 @@
        }
  
        placed_children += 1;
-@@ -1155,12 +1176,15 @@
+@@ -1156,12 +1177,15 @@ void TabView::UpdateBorder() {
    if (pinned_) {
      if (split_) {
        // Insets for border handled by the `SplitTabView`.
@@ -2309,7 +2309,7 @@
            IsFrameActive() ? kColorVerticalTabPinnedOutline
                            : kColorTabDividerFrameInactive));
      }
-@@ -1284,13 +1308,15 @@
+@@ -1285,13 +1309,15 @@ float TabView::GetHoverOpacity() const {
    // that most tabs will fall on the low end of the opacity range, but very
    // narrow tabs will still stand out on the high end.
    // TODO(crbug.com/457525745): Determine what the min and max widths should be.
@@ -2331,7 +2331,7 @@
    return gfx::Tween::FloatValueBetween(t * t, hover_opacity_min_,
                                         hover_opacity_max_);
  }
-@@ -1330,22 +1356,23 @@
+@@ -1331,22 +1357,23 @@ bool TabView::IsDragging() const {
               *this);
  }
  
@@ -2366,7 +2366,7 @@
  }
  
  bool TabView::IsInExpandOnHover(int width) const {
-@@ -1369,9 +1396,9 @@
+@@ -1370,9 +1397,9 @@ void TabView::UpdateHoverCard(HoverCardA
  }
  
  SkScalar TabView::GetCornerRadius() const {
@@ -2526,8 +2526,8 @@
    float expansion_factor_ = 1.0f;
    views::LayoutOrientation expansion_orientation_ =
        views::LayoutOrientation::kHorizontal;
---- src.orig/chrome/browser/ui/views/tabs/tab.cc
-+++ src/chrome/browser/ui/views/tabs/tab.cc
+--- a/chrome/browser/ui/views/tabs/tab.cc
++++ b/chrome/browser/ui/views/tabs/tab.cc
 @@ -39,6 +39,7 @@
  #include "chrome/browser/ui/view_ids.h"
  #include "chrome/browser/ui/views/event_utils.h"
@@ -2536,7 +2536,7 @@
  #include "chrome/browser/ui/views/tabs/browser_tab_strip_controller.h"
  #include "chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h"
  #include "chrome/browser/ui/views/tabs/shared/tab_strip_types.h"
-@@ -363,6 +364,7 @@
+@@ -363,6 +364,7 @@ bool Tab::GetHitTestMask(SkPath* mask) c
  
  void Tab::Layout(PassKey) {
    const gfx::Rect contents_rect = GetContentsBounds();
@@ -2544,7 +2544,7 @@
  
    const bool was_showing_icon = showing_icon_;
    UpdateIconVisibility();
-@@ -370,10 +372,10 @@
+@@ -370,10 +372,10 @@ void Tab::Layout(PassKey) {
    const int start = contents_rect.x();
  
    // Position the underline under the tab contents.
@@ -2557,7 +2557,7 @@
      // Use the full width of the tab in order to accommodate small tab sizes
      // where the width of the contents bounds is 0.
      glic_bounds.set_x(0);
-@@ -384,16 +386,15 @@
+@@ -384,16 +386,15 @@ void Tab::Layout(PassKey) {
    // The bounds for the favicon will include extra width for the attention
    // indicator, but visually it will be smaller at kFaviconSize wide.
    gfx::Rect favicon_bounds(
@@ -2577,7 +2577,7 @@
      }
      icon_->ResizeDiscardIndicatorRadiusForWidth(
          width() - 2 * tab_style()->GetBottomCornerRadius());
-@@ -405,15 +406,15 @@
+@@ -405,15 +406,15 @@ void Tab::Layout(PassKey) {
    icon_->SetBoundsRect(favicon_bounds);
    icon_->SetVisible(showing_icon_);
  
@@ -2597,7 +2597,7 @@
      const gfx::Size close_button_actual_size =
          close_button_->GetPreferredSize();
  
-@@ -447,7 +448,8 @@
+@@ -447,7 +448,8 @@ void Tab::Layout(PassKey) {
    if (showing_alert_indicator_) {
      int alert_left = start;
      if (showing_icon_) {
@@ -2607,7 +2607,7 @@
      }
      const gfx::Size image_size = alert_indicator_button_->GetPreferredSize();
      gfx::Rect bounds(
-@@ -477,15 +479,17 @@
+@@ -477,15 +479,17 @@ void Tab::Layout(PassKey) {
    if (show_title) {
      int title_left = start;
      if (showing_alert_indicator_) {
@@ -2629,7 +2629,7 @@
        title_left = std::max(title_left, after_favicon);
      }
      int title_right = contents_rect.right();
-@@ -745,8 +749,9 @@
+@@ -745,8 +749,9 @@ void Tab::OnGestureEvent(ui::GestureEven
  
  gfx::Size Tab::CalculatePreferredSize(
      const views::SizeBounds& available_size) const {
@@ -2641,7 +2641,7 @@
  }
  
  void Tab::PaintChildren(const views::PaintInfo& info) {
-@@ -812,6 +817,7 @@
+@@ -812,6 +817,7 @@ void Tab::OnBlur() {
  
  void Tab::OnThemeChanged() {
    TabSlotView::OnThemeChanged();
@@ -2649,7 +2649,7 @@
    UpdateForegroundColors();
  }
  
-@@ -820,10 +826,13 @@
+@@ -820,10 +826,13 @@ TabSlotView::ViewType Tab::GetTabSlotVie
  }
  
  TabSizeInfo Tab::GetTabSizeInfo() const {
@@ -2667,7 +2667,7 @@
  }
  
  void Tab::SetGroup(std::optional<tab_groups::TabGroupId> group) {
-@@ -1021,12 +1030,12 @@
+@@ -1021,12 +1030,12 @@ void Tab::MaybeAdjustLeftForPinnedTab(gf
    const int pinned_width = GetTabSizeInfo().pinned_tab_width;
    const int ideal_delta = width() - pinned_width;
    const int ideal_x = (pinned_width - visual_width) / 2;
@@ -2686,7 +2686,7 @@
  }
  
  void Tab::UpdateIconVisibility() {
-@@ -1034,7 +1043,7 @@
+@@ -1034,7 +1043,7 @@ void Tab::UpdateIconVisibility() {
    // collapsed, but some favicon functionality can escape the bounds of the tab
    // causing artifacts. Fix this by explicitly disabling the visibility of the
    // views in the tab if the width is such that it is collapsed.
@@ -2695,7 +2695,7 @@
      showing_icon_ = false;
      showing_alert_indicator_ = false;
      showing_close_button_ = false;
-@@ -1055,7 +1064,8 @@
+@@ -1055,7 +1064,8 @@ void Tab::UpdateIconVisibility() {
    showing_icon_ = showing_alert_indicator_ = false;
    extra_alert_indicator_padding_ = false;
  
@@ -2705,7 +2705,7 @@
      return;
    }
  
-@@ -1094,17 +1104,22 @@
+@@ -1094,17 +1104,22 @@ void Tab::UpdateIconVisibility() {
    int available_width = GetContentsBounds().width();
  
    const bool touch_ui = ui::TouchUiController::Get()->touch_ui();
@@ -2734,7 +2734,7 @@
  
  #if BUILDFLAG(IS_CHROMEOS)
    const bool should_show_close_button =
-@@ -1209,8 +1224,10 @@
+@@ -1209,8 +1224,10 @@ void Tab::UpdateIconVisibility() {
  
    if (!closing_ && features::IsTabStripDeclutterEnabled()) {
      const int max_width_to_center_icon =
@@ -2747,7 +2747,7 @@
  
      const int num_icons_showing =
          showing_icon_ + showing_alert_indicator_ + showing_close_button_;
-@@ -1222,8 +1239,10 @@
+@@ -1222,8 +1239,10 @@ void Tab::UpdateIconVisibility() {
  }
  
  bool Tab::ShouldRenderAsNormalTab() const {
@@ -2760,7 +2760,7 @@
  }
  
  void Tab::UpdateTabIconAttention() {
-@@ -1289,7 +1308,7 @@
+@@ -1289,7 +1308,7 @@ void Tab::MaybeUpdateHoverStatus(const u
    // hover cards when they are shown.
    // TODO(crbug.com/41467565): Once Linux/CrOS widget transparency is solved,
    // remove that case.
@@ -3154,8 +3154,8 @@
  }
  
  void TabTitle::OnProfileWillBeDestroyed(Profile*) {
---- src.orig/chrome/browser/ui/views/tabs/tab_container_impl.cc
-+++ src/chrome/browser/ui/views/tabs/tab_container_impl.cc
+--- a/chrome/browser/ui/views/tabs/tab_container_impl.cc
++++ b/chrome/browser/ui/views/tabs/tab_container_impl.cc
 @@ -11,6 +11,7 @@
  #include "chrome/browser/ui/layout_constants.h"
  #include "chrome/browser/ui/ui_features.h"
@@ -3164,7 +3164,7 @@
  #include "chrome/browser/ui/views/tabs/dragging/tab_drag_context.h"
  #include "chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h"
  #include "chrome/browser/ui/views/tabs/hovercard/tab_hover_card_controller.h"
-@@ -569,7 +570,8 @@
+@@ -569,7 +570,8 @@ bool TabContainerImpl::IsRectInContentAr
      if (tab_index.has_value() && IsValidModelIndex(tab_index.value())) {
        Tab* tab = GetTabAtModelIndex(tab_index.value());
        gfx::Rect tab_drag_handle = tab->GetMirroredBounds();
@@ -3174,7 +3174,7 @@
        return tab->IsActive() || !tab_drag_handle.Intersects(rect);
      }
    }
-@@ -770,7 +772,8 @@
+@@ -770,7 +772,8 @@ void TabContainerImpl::SetTabSlotVisibil
      const bool is_collapsed =
          (current_group.has_value() &&
           controller_->IsGroupCollapsed(current_group.value()) &&
@@ -3184,7 +3184,7 @@
      const bool should_be_visible = is_collapsed ? false : last_tab_visible;
  
      // If we change the visibility of a tab in a group, we must recalculate that
-@@ -866,8 +869,9 @@
+@@ -866,8 +869,9 @@ gfx::Size TabContainerImpl::GetMinimumSi
          layout_helper_->CalculateMinimumWidth());
    }
  
@@ -3196,7 +3196,7 @@
  }
  
  gfx::Size TabContainerImpl::CalculatePreferredSize(
-@@ -884,8 +888,9 @@
+@@ -884,8 +888,9 @@ gfx::Size TabContainerImpl::CalculatePre
          layout_helper_->CalculatePreferredWidth());
    }
  
@@ -3208,7 +3208,7 @@
  }
  
  views::View* TabContainerImpl::GetTooltipHandlerForPoint(
-@@ -1188,10 +1193,12 @@
+@@ -1188,10 +1193,12 @@ void TabContainerImpl::StartInsertTabAni
    ExitTabClosingMode();
  
    gfx::Rect bounds = GetTabAtModelIndex(model_index)->bounds();
@@ -3223,7 +3223,7 @@
    if (model_index > 0) {
      // If we have a tab to our left, start at its right edge.
      bounds.set_x(GetTabAtModelIndex(model_index - 1)->bounds().right() -
-@@ -1266,7 +1273,8 @@
+@@ -1266,7 +1273,8 @@ void TabContainerImpl::StartRemoveTabAni
  gfx::Rect TabContainerImpl::GetTargetBoundsForClosingTab(
      Tab* tab,
      int former_model_index) const {
@@ -3233,7 +3233,7 @@
  
    // Compute the target bounds for animating this tab closed.  The tab's left
    // edge should stay joined to the right edge of the previous tab, if any.
-@@ -1389,7 +1397,7 @@
+@@ -1389,7 +1397,7 @@ void TabContainerImpl::UpdateClosingMode
  
    override_available_width_for_tabs_ =
        tabs_view_model_.ideal_bounds(model_count).right() - size_delta +
@@ -3242,7 +3242,7 @@
  }
  
  void TabContainerImpl::ResizeLayoutTabs() {
-@@ -1454,11 +1462,11 @@
+@@ -1454,11 +1462,11 @@ void TabContainerImpl::AddMessageLoopObs
      // This allows users to move the cursor horizontally, to another tab,
      // without accidentally exiting closing mode if they drift verticaally
      // slightly out of the tabstrip.
@@ -3256,7 +3256,7 @@
      mouse_watcher_ = std::make_unique<views::MouseWatcher>(
          std::make_unique<views::MouseWatcherViewHost>(
              controller_->GetTabClosingModeMouseWatcherHostView(),
-@@ -1658,10 +1666,11 @@
+@@ -1658,10 +1666,11 @@ gfx::Rect TabContainerImpl::GetDropBound
    center_x = GetMirroredXInView(center_x);
  
    // Determine the screen bounds.
@@ -3655,8 +3655,8 @@
    }
  
    const std::optional<int> calculated_extra_space =
---- src.orig/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
-+++ src/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
+--- a/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
++++ b/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
 @@ -10,8 +10,10 @@
  
  #include "base/memory/raw_ptr.h"
@@ -3668,7 +3668,7 @@
  #include "chrome/browser/ui/views/tabs/tab.h"
  #include "chrome/browser/ui/views/tabs/tab_group_header.h"
  #include "chrome/browser/ui/views/tabs/tab_layout_state.h"
-@@ -284,7 +286,10 @@
+@@ -284,7 +286,10 @@ TabStripLayoutHelper::CalculateIdealBoun
          TabLayoutState(open, pinned, active, slots_[i].view->split());
      TabSizeInfo size_info = slots_[i].view->GetTabSizeInfo();
  
@@ -3680,7 +3680,7 @@
    }
  
    auto [projected_bounds, layout_domain] =
-@@ -298,6 +303,8 @@
+@@ -298,6 +303,8 @@ TabStripLayoutHelper::CalculateIdealBoun
      if (projected_index < projected_slots.size() &&
          projected_slots[projected_index] == slot_index) {
        bounds[slot_index] = projected_bounds[projected_index++];
@@ -4829,3 +4829,81 @@
  }
  
  void ExtensionsToolbarDesktop::SetExtensionIconVisibility(
+--- a/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
++++ b/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
+@@ -2,18 +2,28 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include <memory>
++
+ #include "base/run_loop.h"
+ #include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/omnibox/omnibox_controller.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/views/chrome_typography.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/test_with_browser_view.h"
++#include "chrome/browser/ui/views/helium/arcium_chrome_ui_scale.h"
+ #include "chrome/browser/ui/views/location_bar/location_bar_view.h"
++#include "chrome/browser/ui/views/omnibox/omnibox_text_view.h"
+ #include "chrome/browser/ui/views/omnibox/omnibox_view_views.h"
+ #include "components/omnibox/browser/autocomplete_controller.h"
++#include "components/prefs/pref_service.h"
+ #include "ui/events/event.h"
++#include "ui/gfx/render_text.h"
++#include "ui/views/style/typography.h"
++#include "ui/views/style/typography_provider.h"
+ #include "ui/views/test/widget_test.h"
+ 
+ class ArciumCommandBarTest : public TestWithBrowserView {
+@@ -83,3 +93,22 @@ TEST_F(ArciumCommandBarTest, ChangingAct
+   EXPECT_EQ(toolbar, browser_view()->GetLocationBar());
+   EXPECT_EQ(count, browser()->tab_strip_model()->count());
+ }
++
++TEST_F(ArciumCommandBarTest, FloatingBarAndSuggestionTextUseProfileScale) {
++  browser()->profile()->GetPrefs()->SetInteger(arcium::kChromeUIScalePref, 115);
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  auto* location = floating();
++  EXPECT_DOUBLE_EQ(1.15, arcium::GetChromeUIScale(location));
++  EXPECT_FALSE(BrowserView::GetBrowserViewForNativeWindow(
++      location->GetWidget()->GetNativeWindow()));
++  auto* text = location->AddChildView(std::make_unique<OmniboxTextView>(nullptr));
++  auto rendered = text->CreateRenderText(u"Saved Pin");
++  const auto& base_font = views::TypographyProvider::Get().GetFont(
++      CONTEXT_OMNIBOX_POPUP, views::style::STYLE_PRIMARY);
++  EXPECT_EQ(arcium::ScaleChromeDip(text, base_font.GetFontSize()),
++            rendered->font_list().GetFontSize());
++  EXPECT_EQ(arcium::ScaleChromeDip(text, 19), rendered->min_line_height());
++  views::test::WidgetDestroyedWaiter destroyed(location->GetWidget());
++  browser_view()->CloseArciumCommandBar();
++  destroyed.Wait();
++}
+--- a/chrome/browser/ui/views/omnibox/omnibox_text_view.cc
++++ b/chrome/browser/ui/views/omnibox/omnibox_text_view.cc
+@@ -18,6 +18,7 @@
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/omnibox/omnibox_theme.h"
+ #include "chrome/browser/ui/views/chrome_typography.h"
++#include "chrome/browser/ui/views/helium/arcium_chrome_ui_scale.h"
+ #include "components/omnibox/browser/omnibox_field_trial.h"
+ #include "components/omnibox/common/omnibox_features.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+@@ -278,9 +279,11 @@ std::unique_ptr<gfx::RenderText> Omnibox
+   render_text->SetElideBehavior(gfx::ELIDE_TAIL);
+   const gfx::FontList& font = views::TypographyProvider::Get().GetFont(
+       CONTEXT_OMNIBOX_POPUP, kTextStyle);
+-  render_text->SetFontList(font);
++  const int scaled_size = arcium::ScaleChromeDip(this, font.GetFontSize());
++  render_text->SetFontList(
++      font.DeriveWithSizeDelta(scaled_size - font.GetFontSize()));
+   render_text->SetText(text);
+   // Increase space between lines for multiline texts.
+-  render_text->SetMinLineHeight(19);
++  render_text->SetMinLineHeight(arcium::ScaleChromeDip(this, 19));
+   return render_text;
+ }
