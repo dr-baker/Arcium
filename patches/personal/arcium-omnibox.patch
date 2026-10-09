@@ -1787,12 +1787,13 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,348 @@
 +// Copyright 2026 The Arcium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include <memory>
++#include <utility>
 +
 +#include "base/functional/bind.h"
 +#include "base/run_loop.h"
@@ -1809,6 +1810,8 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 +#include "chrome/browser/ui/views/frame/test_with_browser_view.h"
 +#include "chrome/browser/ui/views/location_bar/location_bar_view.h"
 +#include "chrome/browser/ui/views/omnibox/omnibox_view_views.h"
++#include "chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.h"
++#include "chrome/browser/ui/views/theme_copying_widget.h"
 +#include "components/infobars/content/content_infobar_manager.h"
 +#include "components/infobars/core/infobar.h"
 +#include "components/omnibox/browser/autocomplete_controller.h"
@@ -1821,6 +1824,7 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 +#include "extensions/buildflags/buildflags.h"
 +#include "net/http/http_response_headers.h"
 +#include "ui/events/event.h"
++#include "ui/views/test/views_test_utils.h"
 +#include "ui/views/test/widget_test.h"
 +
 +#if BUILDFLAG(ENABLE_EXTENSIONS)
@@ -1842,6 +1846,96 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 +    return static_cast<LocationBarView*>(browser_view()->GetLocationBar());
 +  }
 +};
++
++#if BUILDFLAG(IS_MAC)
++namespace {
++
++class MouseRecordingWidget : public ThemeCopyingWidget {
++ public:
++  explicit MouseRecordingWidget(views::Widget* role_model)
++      : ThemeCopyingWidget(role_model) {}
++
++  void OnMouseEvent(ui::MouseEvent* event) override {
++    ++mouse_event_count;
++    last_type = event->type();
++    last_location = event->location();
++    last_root_location = event->root_location();
++  }
++
++  int mouse_event_count = 0;
++  ui::EventType last_type = ui::EventType::kUnknown;
++  gfx::Point last_location;
++  gfx::Point last_root_location;
++};
++
++}  // namespace
++
++TEST_F(ArciumCommandBarTest, PopupMouseEventsReachStandaloneParent) {
++  // Model the floating command bar's native parent, which has no BrowserView
++  // association, while keeping the real LocationBar for the popup cutout.
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  ASSERT_FALSE(BrowserView::GetBrowserViewForNativeWindow(
++      floating()->GetWidget()->GetNativeWindow()));
++  MouseRecordingWidget parent(floating()->GetWidget());
++  views::Widget::InitParams parent_params(
++      views::Widget::InitParams::CLIENT_OWNS_WIDGET,
++      views::Widget::InitParams::TYPE_WINDOW_FRAMELESS);
++  parent_params.parent = browser_view()->GetWidget()->GetNativeView();
++  parent.Init(std::move(parent_params));
++  parent.SetBounds(gfx::Rect(100, 100, 400, 200));
++  ASSERT_FALSE(BrowserView::GetBrowserViewForNativeWindow(
++      parent.GetNativeWindow()));
++
++  ThemeCopyingWidget popup(&parent);
++  views::Widget::InitParams popup_params(
++      views::Widget::InitParams::CLIENT_OWNS_WIDGET,
++      views::Widget::InitParams::TYPE_POPUP);
++  popup_params.parent = parent.GetNativeView();
++  popup_params.context = parent.GetNativeWindow();
++  RoundedOmniboxResultsFrame::OnBeforeWidgetInit(&popup_params, &popup);
++  popup.Init(std::move(popup_params));
++  auto* frame = popup.SetContentsView(
++      std::make_unique<RoundedOmniboxResultsFrame>(
++          new views::View, floating(), /*forward_mouse_events=*/true));
++  popup.SetBounds(gfx::Rect(120, 130, 400, 200));
++  views::test::RunScheduledLayout(&popup);
++  ASSERT_EQ(&parent, popup.parent());
++
++  // Enter and move within the shadow, exercising RootView's event dispatch
++  // through the results frame instead of calling its routing helper directly.
++  for (auto type : {ui::EventType::kMouseEntered, ui::EventType::kMouseMoved}) {
++    const gfx::Point location(1, 1);
++    ASSERT_EQ(frame,
++              popup.GetRootView()->GetEventHandlerForPoint(location));
++    gfx::Point expected = location;
++    views::View::ConvertPointToScreen(popup.GetRootView(), &expected);
++    views::View::ConvertPointFromScreen(parent.GetRootView(), &expected);
++    ui::MouseEvent event(type, location, location, base::TimeTicks::Now(), 0,
++                         0);
++    const int previous_count = parent.mouse_event_count;
++    popup.OnMouseEvent(&event);
++    EXPECT_EQ(previous_count + 1, parent.mouse_event_count);
++    EXPECT_EQ(type, parent.last_type);
++    EXPECT_EQ(expected, parent.last_location);
++    EXPECT_EQ(expected, parent.last_root_location);
++    EXPECT_EQ(location, event.location());
++    EXPECT_EQ(location, event.root_location());
++  }
++}
++
++TEST_F(ArciumCommandBarTest, DetachedPopupFrameDropsMouseEvents) {
++  RoundedOmniboxResultsFrame frame(new views::View,
++                                   browser_view()->GetLocationBar(), true);
++  ui::MouseEvent entered(ui::EventType::kMouseEntered, gfx::Point(1, 1),
++                         gfx::Point(1, 1), base::TimeTicks::Now(), 0, 0);
++  frame.OnMouseEvent(&entered);
++  EXPECT_FALSE(entered.handled());
++  ui::MouseEvent moved(ui::EventType::kMouseMoved, gfx::Point(2, 2),
++                       gfx::Point(2, 2), base::TimeTicks::Now(), 0, 0);
++  frame.OnMouseMoved(moved);
++  EXPECT_FALSE(moved.handled());
++}
++#endif  // BUILDFLAG(IS_MAC)
 +
 +TEST_F(ArciumCommandBarTest, NewTabCommandDefersCreationAndEscapeCancels) {
 +  const int count = browser()->tab_strip_model()->count();
@@ -2286,3 +2380,30 @@ Index: src/chrome/browser/ui/omnibox/chrome_omnibox_navigation_observer.h
    const AutocompleteMatch match_;
    const AutocompleteMatch alternative_nav_match_;
    const int64_t navigation_id_;
+Index: src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
++++ src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
+@@ -60,7 +60,8 @@ views::Widget* GetImmersiveFullscreenWid
+ 
+   // If the results window is not a child of the overlay widget we are not in
+   // immersive fullscreen.
+-  if (browser_view->overlay_widget() != parent_widget) {
++  // Floating command bars have their own widget without a BrowserView.
++  if (!browser_view || browser_view->overlay_widget() != parent_widget) {
+     return nullptr;
+   }
+ 
+@@ -107,10 +108,10 @@ WidgetEventPair GetParentWidgetAndEvent(
+   // Note that the floating results view is a top-level widget, so hop up a
+   // level before looking for the parent's top-level widget for event
+   // forwarding.
+-  views::Widget* this_widget = this_view->GetWidget();
+-  views::Widget* parent_widget = this_widget->parent();
+   std::unique_ptr<ui::MouseEvent> event(
+       static_cast<ui::MouseEvent*>(this_event->Clone().release()));
++  views::Widget* this_widget = this_view->GetWidget();
++  views::Widget* parent_widget = this_widget ? this_widget->parent() : nullptr;
+   if (!parent_widget) {
+     return {nullptr, std::move(event)};
+   }
