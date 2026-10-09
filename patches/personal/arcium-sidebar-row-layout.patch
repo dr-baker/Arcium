@@ -148,7 +148,17 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
            favicon_base::IconType::kTouchPrecomposedIcon,
            favicon_base::IconType::kWebManifestIcon};
  }
-@@ -261,37 +260,15 @@ void PersistentTabView::Layout(PassKey)
+@@ -131,7 +130,8 @@ PersistentTabView::PersistentTabView(Pro
+       presentation_mode_(presentation_mode),
+       tab_style_(TabStyle::Get()),
+       icon_(AddChildView(std::make_unique<TabIcon>())),
+-      title_(AddChildView(std::make_unique<TabTitle>(profile))),
++      title_(AddChildView(std::make_unique<TabTitle>(
++          profile, TabTitle::FadeStyle::kSidebar))),
+       close_button_(AddChildView(std::make_unique<TabCloseButton>(
+           base::BindRepeating(&PersistentTabView::CloseButtonPressed,
+                               base::Unretained(this)),
+@@ -261,37 +261,15 @@ void PersistentTabView::Layout(PassKey)
      return;
    }
  
@@ -199,15 +209,18 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
 +++ src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
-@@ -18,6 +18,7 @@
+@@ -18,8 +18,10 @@
  #include "chrome/browser/favicon/favicon_service_factory.h"
  #include "chrome/browser/ui/layout_constants.h"
  #include "chrome/browser/ui/tabs/tab_data.h"
 +#include "chrome/browser/ui/views/tabs/common/sidebar_row_layout.h"
  #include "chrome/browser/ui/views/tabs/tab/tab_close_button.h"
  #include "chrome/browser/ui/views/tabs/tab/tab_icon.h"
++#include "chrome/browser/ui/views/tabs/tab/tab_title.h"
  #include "chrome/grit/generated_resources.h"
-@@ -33,8 +34,8 @@
+ #include "chrome/test/base/testing_profile.h"
+ #include "chrome/test/views/chrome_views_test_base.h"
+@@ -33,17 +35,22 @@
  #include "third_party/skia/include/core/SkColor.h"
  #include "ui/accessibility/ax_enums.mojom.h"
  #include "ui/accessibility/ax_node_data.h"
@@ -217,8 +230,10 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
  #include "ui/events/event.h"
  #include "ui/events/types/event_type.h"
  #include "ui/gfx/codec/png_codec.h"
-@@ -43,7 +44,11 @@
+ #include "ui/gfx/geometry/point.h"
+ #include "ui/gfx/image/image_skia.h"
  #include "ui/gfx/image/image_skia_rep.h"
++#include "ui/gfx/render_text.h"
  #include "ui/menus/simple_menu_model.h"
  #include "ui/views/accessibility/view_accessibility.h"
 +#include "ui/views/controls/button/label_button.h"
@@ -229,7 +244,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
  #include "url/gurl.h"
  
  class PersistentTabViewTest : public ChromeViewsTestBase {
-@@ -75,10 +80,15 @@ class PersistentTabViewTest : public Chr
+@@ -75,10 +82,15 @@ class PersistentTabViewTest : public Chr
  
  namespace {
  
@@ -249,10 +264,23 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
    SkBitmap bitmap;
    bitmap.allocN32Pixels(pixel_size, pixel_size);
    bitmap.eraseColor(color);
-@@ -98,6 +108,132 @@ favicon_base::FaviconRawBitmapResult Mak
+@@ -98,6 +110,148 @@ favicon_base::FaviconRawBitmapResult Mak
  
  }  // namespace
  
++class TestTabTitle : public TabTitle {
++ public:
++  using TabTitle::CreateRenderText;
++  using TabTitle::TabTitle;
++};
++
++TEST_F(PersistentTabViewTest, SidebarFadeIsAnExplicitTitleStyle) {
++  TestTabTitle sidebar(nullptr, TabTitle::FadeStyle::kSidebar);
++  TestTabTitle standard;
++  EXPECT_EQ(16, sidebar.CreateRenderText()->fade_gradient_width());
++  EXPECT_EQ(std::nullopt, standard.CreateRenderText()->fade_gradient_width());
++}
++
 +TEST(SidebarRowLayoutTest, ExpandedRowsShareColumnsAtEachUIScale) {
 +  struct ScaleCase {
 +    double scale;
@@ -292,7 +320,10 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
 +          base::ClampRound(16 * test.scale));
 +      EXPECT_EQ(row_x + test.inset + test.slot + test.gap, tab.title.x());
 +      EXPECT_EQ(tab.title, folder.title);
-+      EXPECT_EQ(sidebar_width - 2 * test.inset, tab.title.right());
++      const int favicon_edge = test.inset + test.slot / 2 - favicon_size / 2;
++      EXPECT_EQ(sidebar_width - test.inset - favicon_edge, tab.title.right());
++      EXPECT_EQ(tab.icon.x() + icon_inset - depth * test.indent,
++                sidebar_width - tab.title.right());
 +      EXPECT_EQ(folder.icon.CenterPoint().x(),
 +                tab.icon.x() + icon_inset + favicon_size / 2);
 +
@@ -332,7 +363,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
 +  const arcium::SidebarRowBounds pinned = arcium::CalculateSidebarRowBounds(
 +      row, metrics, std::nullopt, 16, std::nullopt, alert);
 +  EXPECT_EQ(32, pinned.title.x());
-+  EXPECT_EQ(234, pinned.title.right());
++  EXPECT_EQ(233, pinned.title.right());
 +  EXPECT_EQ(15, pinned.alert_indicator.CenterPoint().x());
 +}
 +
@@ -382,7 +413,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
  class TestPersistentTabDragDelegate : public PersistentTabDragDelegate {
   public:
    bool BeginPersistentTabDrag(PersistentTabView&,
-@@ -119,6 +255,50 @@ class TestPersistentTabDragDelegate : pu
+@@ -119,6 +273,50 @@ class TestPersistentTabDragDelegate : pu
    bool accept_drag = true;
  };
  
@@ -433,7 +464,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
  TEST_F(PersistentTabViewTest, UsesNativeTabSemanticsAndSelection) {
    auto row = MakeView(PersistentTabView::PresentationMode::kFullRow);
  
-@@ -165,6 +345,96 @@ TEST_F(PersistentTabViewTest, LiveAndDor
+@@ -165,6 +363,96 @@ TEST_F(PersistentTabViewTest, LiveAndDor
    EXPECT_FALSE(row->close_button_for_testing()->GetVisible());
  }
  
@@ -445,7 +476,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
 +  const auto check_columns = [&](bool close_visible) {
 +    views::test::RunScheduledLayout(row.get());
 +    EXPECT_EQ(32, title->x());
-+    EXPECT_EQ(close_visible ? 208 : 234, title->bounds().right());
++    EXPECT_EQ(close_visible ? 208 : 233, title->bounds().right());
 +    EXPECT_EQ(15, icon->bounds().CenterPoint().x());
 +    EXPECT_EQ(close_visible, row->close_button_for_testing()->GetVisible());
 +    if (close_visible) {
@@ -530,7 +561,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
  TEST_F(PersistentTabViewTest, AcceptedCloseWaitsForServiceProjection) {
    int close_count = 0;
    auto row = MakeView(PersistentTabView::PresentationMode::kFullRow);
-@@ -313,6 +583,11 @@ TEST_F(PersistentTabViewTest, CompactGri
+@@ -313,6 +601,11 @@ TEST_F(PersistentTabViewTest, CompactGri
              tile->presentation_mode());
    EXPECT_EQ(44, tile->GetPreferredSize().height());
    EXPECT_EQ(56, tile->GetPreferredSize().width());
@@ -664,7 +695,7 @@ Index: src/chrome/browser/ui/views/tabs/common/sidebar_row_layout.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/sidebar_row_layout.h
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,129 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -691,6 +722,7 @@ Index: src/chrome/browser/ui/views/tabs/common/sidebar_row_layout.h
 +  int container_padding;
 +  int horizontal_inset;
 +  int icon_slot_width;
++  int favicon_width;
 +  int icon_title_gap;
 +  int close_slot_width;
 +  int close_title_gap;
@@ -701,6 +733,7 @@ Index: src/chrome/browser/ui/views/tabs/common/sidebar_row_layout.h
 +    return {.container_padding = edge_spacing,
 +            .horizontal_inset = edge_spacing,
 +            .icon_slot_width = base::ClampRound(18 * scale),
++            .favicon_width = base::ClampRound(16 * scale),
 +            .icon_title_gap = base::ClampRound(8 * scale),
 +            .close_slot_width = base::ClampRound(18 * scale),
 +            .close_title_gap = base::ClampRound(8 * scale),
@@ -774,6 +807,10 @@ Index: src/chrome/browser/ui/views/tabs/common/sidebar_row_layout.h
 +    bounds.close_button = CenterSidebarRowChild(
 +        contents, close_slot_x, metrics.close_slot_width, *close_size);
 +    trailing_edge = close_slot_x - metrics.close_title_gap;
++  } else {
++    // Mirror the painted favicon's leading edge, including integer centering
++    // at fractional scales. Folder indentation does not move the trailing edge.
++    trailing_edge -= metrics.icon_slot_width / 2 - metrics.favicon_width / 2;
 +  }
 +
 +  title_x = std::clamp(title_x, contents.x(), contents.right());
@@ -835,7 +872,17 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_view.cc
  #include "ui/gfx/geometry/insets.h"
  #include "ui/gfx/geometry/rect.h"
  #include "ui/gfx/geometry/rounded_corners_f.h"
-@@ -1016,52 +1017,70 @@ views::ProposedLayout TabView::Calculate
+@@ -159,7 +160,8 @@ TabView::TabView(TabCollectionNode* coll
+       tab_style_(TabStyle::Get()),
+       icon_(AddChildView(std::make_unique<TabIcon>())),
+       title_(AddChildView(std::make_unique<TabTitle>(
+-          collection_node ? GetTabInterface()->GetProfile() : nullptr))),
++          collection_node ? GetTabInterface()->GetProfile() : nullptr,
++          TabTitle::FadeStyle::kSidebar))),
+       alert_indicator_(
+           AddChildView(std::make_unique<AlertIndicatorButton>(this))),
+       close_button_(AddChildView(std::make_unique<TabCloseButton>(
+@@ -1016,52 +1018,70 @@ views::ProposedLayout TabView::Calculate
    views::ProposedLayout layouts;
    layouts.host_size = gfx::Size(width, height);
  
@@ -1001,3 +1048,299 @@ Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
      }
      layouts.child_layouts.emplace_back(child, child->GetVisible(), bounds);
      if (!(drag_data && leaving_section)) {
+Index: src/chrome/browser/ui/views/tabs/tab/tab_title.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/tab/tab_title.cc
++++ src/chrome/browser/ui/views/tabs/tab/tab_title.cc
+@@ -11,10 +11,13 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/tab_contents/core_tab_helper.h"
+ #include "chrome/browser/ui/views/helium/arcium_chrome_ui_scale.h"
++#include "chrome/browser/ui/views/tabs/common/sidebar_row_layout.h"
+ #include "components/prefs/pref_service.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/gfx/render_text.h"
+ 
+-TabTitle::TabTitle(Profile* profile) : base_font_list_(font_list()) {
++TabTitle::TabTitle(Profile* profile, FadeStyle fade_style)
++    : fade_style_(fade_style), base_font_list_(font_list()) {
+   SetHorizontalAlignment(gfx::ALIGN_TO_HEAD);
+   SetElideBehavior(gfx::FADE_TAIL);
+   SetHandlesTooltips(false);
+@@ -48,6 +51,15 @@ TabTitle::TabTitle(Profile* profile) : b
+ 
+ TabTitle::~TabTitle() = default;
+ 
++std::unique_ptr<gfx::RenderText> TabTitle::CreateRenderText() const {
++  auto text = views::Label::CreateRenderText();
++  if (fade_style_ == FadeStyle::kSidebar) {
++    text->SetFadeGradientWidth(
++        arcium::GetSidebarRowMetrics(this).favicon_width);
++  }
++  return text;
++}
++
+ void TabTitle::UpdateFont() {
+   PrefService* prefs = pref_change_registrar_.prefs();
+   if (!prefs || !prefs->FindPreference(arcium::kChromeUIScalePref)) {
+@@ -59,7 +71,10 @@ void TabTitle::UpdateFont() {
+                  arcium::kChromeUIScaleMin, arcium::kChromeUIScaleMax);
+   const int base_size = base_font_list_.GetFontSize();
+   const int requested_size = base::ClampRound(base_size * percent / 100.0);
+-  if (font_list().GetFontSize() != requested_size) {
++  // A scale change can alter the fade width without changing rounded font size.
++  // SetFontList also clears the cached display text.
++  if (fade_style_ == FadeStyle::kSidebar ||
++      font_list().GetFontSize() != requested_size) {
+     SetFontList(
+         base_font_list_.DeriveWithSizeDelta(requested_size - base_size));
+   }
+Index: src/chrome/browser/ui/views/tabs/tab/tab_title.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/tab/tab_title.h
++++ src/chrome/browser/ui/views/tabs/tab/tab_title.h
+@@ -18,15 +18,22 @@ class TabTitle : public views::Label, pu
+   METADATA_HEADER(TabTitle, views::Label)
+ 
+  public:
+-  explicit TabTitle(Profile* profile = nullptr);
++  enum class FadeStyle { kFont, kSidebar };
++
++  explicit TabTitle(Profile* profile = nullptr,
++                    FadeStyle fade_style = FadeStyle::kFont);
+   ~TabTitle() override;
+ 
++ protected:
++  std::unique_ptr<gfx::RenderText> CreateRenderText() const override;
++
+  private:
+   void UpdateFont();
+ 
+   // ProfileObserver:
+   void OnProfileWillBeDestroyed(Profile* profile) override;
+ 
++  const FadeStyle fade_style_;
+   const gfx::FontList base_font_list_;
+   PrefChangeRegistrar pref_change_registrar_;
+   base::ScopedObservation<Profile, ProfileObserver> profile_observation_{this};
+Index: src/ui/gfx/render_text.cc
+===================================================================
+--- src.orig/ui/gfx/render_text.cc
++++ src/ui/gfx/render_text.cc
+@@ -108,7 +108,8 @@ sk_sp<cc::PaintShader> CreateFadeShader(
+                                         const Rect& text_rect,
+                                         const Rect& left_part,
+                                         const Rect& right_part,
+-                                        SkColor color) {
++                                        SkColor color,
++                                        bool fade_to_zero) {
+   // The shader should only specify transparency of the fade itself, not the
+   // original transparency, which will be applied by the actual renderer.
+   DCHECK_EQ(SkColorGetA(color), static_cast<uint8_t>(0xff));
+@@ -121,7 +122,7 @@ sk_sp<cc::PaintShader> CreateFadeShader(
+       text_rect.width() / static_cast<float>(font_list.GetExpectedTextWidth(4));
+   const SkAlpha kAlphaAtZeroWidth = 51;
+   const SkAlpha alpha =
+-      (width_fraction < 1)
++      (!fade_to_zero && width_fraction < 1)
+           ? base::ClampRound<SkAlpha>((1 - width_fraction) * kAlphaAtZeroWidth)
+           : 0;
+   const SkColor fade_color = SkColorSetA(color, alpha);
+@@ -682,6 +683,11 @@ void RenderText::SetElideBehavior(ElideB
+   }
+ }
+ 
++void RenderText::SetFadeGradientWidth(std::optional<int> width) {
++  CHECK(!width || *width >= 0);
++  fade_gradient_width_ = width;
++}
++
+ void RenderText::SetWhitespaceElision(std::optional<bool> whitespace_elision) {
+   if (whitespace_elision_ != whitespace_elision) {
+     whitespace_elision_ = whitespace_elision;
+@@ -1944,11 +1950,15 @@ void RenderText::ApplyFadeEffects(intern
+   if (multiline() || elide_behavior_ != FADE_TAIL || GetContentWidth() <= width)
+     return;
+ 
+-  const int gradient_width = CalculateFadeGradientWidth(font_list(), width);
++  const HorizontalAlignment horizontal_alignment = GetCurrentHorizontalAlignment();
++  // Centered text fades at both edges; the ramps must not overlap.
++  const int maximum_width = horizontal_alignment == ALIGN_CENTER ? width / 2 : width;
++  const int gradient_width = fade_gradient_width_
++                                 ? std::min(*fade_gradient_width_, maximum_width)
++                                 : CalculateFadeGradientWidth(font_list(), width);
+   if (gradient_width == 0)
+     return;
+ 
+-  HorizontalAlignment horizontal_alignment = GetCurrentHorizontalAlignment();
+   Rect solid_part = display_rect();
+   Rect left_part;
+   Rect right_part;
+@@ -1976,7 +1986,8 @@ void RenderText::ApplyFadeEffects(intern
+   // TODO(msw): Use the actual text colors corresponding to each faded part.
+   renderer->SetShader(
+       CreateFadeShader(font_list(), text_rect, left_part, right_part,
+-                       SkColorSetA(colors_.breaks().front().second, 0xff)));
++                       SkColorSetA(colors_.breaks().front().second, 0xff),
++                       fade_gradient_width_.has_value()));
+ }
+ 
+ void RenderText::ApplyTextShadows(internal::SkiaTextRenderer* renderer) {
+Index: src/ui/gfx/render_text.h
+===================================================================
+--- src.orig/ui/gfx/render_text.h
++++ src/ui/gfx/render_text.h
+@@ -372,6 +372,13 @@ class COMPONENT_EXPORT(GFX) RenderText {
+   void SetElideBehavior(ElideBehavior elide_behavior);
+   ElideBehavior elide_behavior() const { return elide_behavior_; }
+ 
++  // Overrides the FADE_TAIL ramp width in DIP and makes its endpoint fully
++  // transparent. nullopt retains the font-based fade and narrow-label behavior.
++  void SetFadeGradientWidth(std::optional<int> width);
++  std::optional<int> fade_gradient_width() const {
++    return fade_gradient_width_;
++  }
++
+   // When display text is elided, determines how whitespace is handled.
+   // If std::nullopt is specified, the default elision for the current elide
+   // behavior will be applied.
+@@ -1066,6 +1073,7 @@ class COMPONENT_EXPORT(GFX) RenderText {
+ 
+   // The behavior for eliding, fading, or truncating.
+   ElideBehavior elide_behavior_ = NO_ELIDE;
++  std::optional<int> fade_gradient_width_;
+ 
+   // The behavior for eliding whitespace when eliding or truncating.
+   std::optional<bool> whitespace_elision_;
+Index: src/ui/gfx/render_text_unittest.cc
+===================================================================
+--- src.orig/ui/gfx/render_text_unittest.cc
++++ src/ui/gfx/render_text_unittest.cc
+@@ -37,6 +37,7 @@
+ #include "build/build_config.h"
+ #include "cc/paint/paint_record.h"
+ #include "cc/paint/paint_recorder.h"
++#include "cc/paint/paint_shader.h"
+ #include "testing/gmock/include/gmock/gmock.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ #include "third_party/skia/include/core/SkCanvas.h"
+@@ -465,6 +466,30 @@ class RenderTextTest : public testing::T
+     return test::RenderTextTestApi::GetRendererPaint(renderer());
+   }
+ 
++  void ExpectFadeShader(int gradient_width, SkAlpha endpoint_alpha) {
++    const Rect rect = GetRenderText()->display_rect();
++    const SkPoint points[] = {SkPoint::Make(rect.x(), rect.y()),
++                              SkPoint::Make(rect.right(), rect.y())};
++    const SkScalar start =
++        static_cast<SkScalar>(rect.width() - gradient_width) / rect.width();
++    std::vector<SkScalar> positions;
++    std::vector<SkColor4f> colors;
++    if (start > 0) {
++      positions.push_back(0);
++      colors.push_back(SkColor4f::FromColor(SK_ColorBLACK));
++    }
++    positions.push_back(start);
++    colors.push_back(SkColor4f::FromColor(SK_ColorBLACK));
++    positions.push_back(1);
++    colors.push_back(
++        SkColor4f::FromColor(SkColorSetA(SK_ColorBLACK, endpoint_alpha)));
++    const auto expected = cc::PaintShader::MakeLinearGradient(
++        points, colors.data(), positions.data(), colors.size(),
++        SkTileMode::kClamp);
++    ASSERT_TRUE(GetRendererPaint().getShader());
++    EXPECT_TRUE(GetRendererPaint().getShader()->EqualsForTesting(*expected));
++  }
++
+   const SkFont& GetRendererFont() {
+     return test::RenderTextTestApi::GetRendererFont(renderer());
+   }
+@@ -692,6 +717,88 @@ class RenderTextTest : public testing::T
+   TestSkiaTextRenderer renderer_;
+ };
+ 
++TEST_F(RenderTextTest, ExplicitFadeWidthEndsAtZero) {
++  for (int width : {100, 16, 7}) {
++    SCOPED_TRACE(width);
++    ResetRenderTextInstance();
++    auto* text = GetRenderText();
++    text->SetText(u"A long title that overflows the available display width");
++    text->SetColor(SK_ColorBLACK);
++    text->SetCursorEnabled(false);
++    text->SetHorizontalAlignment(ALIGN_LEFT);
++    text->SetElideBehavior(FADE_TAIL);
++    text->SetFadeGradientWidth(16);
++    text->SetDisplayRect(Rect(3, 7, width, 20));
++    DrawVisualText();
++    ExpectFadeShader(std::min(16, width), 0);
++  }
++}
++
++TEST_F(RenderTextTest, ExplicitCenteredFadeRampsDoNotOverlap) {
++  auto* text = GetRenderText();
++  text->SetText(u"A long title that overflows the available display width");
++  text->SetColor(SK_ColorBLACK);
++  text->SetCursorEnabled(false);
++  text->SetHorizontalAlignment(ALIGN_CENTER);
++  text->SetElideBehavior(FADE_TAIL);
++  text->SetFadeGradientWidth(16);
++  text->SetDisplayRect(Rect(3, 7, 7, 20));
++  DrawVisualText();
++
++  Rect shader_rect = text->display_rect();
++  shader_rect.Inset(Insets::TLBR(0, test_api()->GetAlignmentOffset(0).x(), 0, 0));
++  const SkPoint points[] = {SkPoint::Make(shader_rect.x(), shader_rect.y()),
++                            SkPoint::Make(shader_rect.right(), shader_rect.y())};
++  const auto position = [&](int x) {
++    return static_cast<SkScalar>(x - shader_rect.x()) / shader_rect.width();
++  };
++  const SkScalar positions[] = {0, position(3), position(6),
++                                position(7), 1};
++  const SkColor4f opaque = SkColor4f::FromColor(SK_ColorBLACK);
++  const SkColor4f transparent = SkColor4f::FromColor(SK_ColorTRANSPARENT);
++  const SkColor4f colors[] = {transparent, transparent, opaque, opaque,
++                              transparent};
++  const auto expected = cc::PaintShader::MakeLinearGradient(
++      points, colors, positions, std::size(colors), SkTileMode::kClamp);
++  ASSERT_TRUE(GetRendererPaint().getShader());
++  EXPECT_TRUE(GetRendererPaint().getShader()->EqualsForTesting(*expected));
++}
++
++TEST_F(RenderTextTest, DefaultFadeRetainsFontWidthAndNarrowAlpha) {
++  for (int width : {100, 7}) {
++    SCOPED_TRACE(width);
++    ResetRenderTextInstance();
++    auto* text = GetRenderText();
++    text->SetText(u"A long title that overflows the available display width");
++    text->SetColor(SK_ColorBLACK);
++    text->SetCursorEnabled(false);
++    text->SetHorizontalAlignment(ALIGN_LEFT);
++    text->SetElideBehavior(FADE_TAIL);
++    text->SetFadeGradientWidth(16);
++    text->SetFadeGradientWidth(std::nullopt);
++    text->SetDisplayRect(Rect(3, 7, width, 20));
++    DrawVisualText();
++    const int gradient_width =
++        std::min(text->font_list().GetExpectedTextWidth(3),
++                 base::ClampRound(width / 3.f));
++    const float fraction =
++        width / static_cast<float>(text->font_list().GetExpectedTextWidth(4));
++    const SkAlpha alpha =
++        fraction < 1 ? base::ClampRound<SkAlpha>((1 - fraction) * 51) : 0;
++    ExpectFadeShader(gradient_width, alpha);
++  }
++}
++
++TEST_F(RenderTextTest, ExplicitFadeLeavesFittingTextOpaque) {
++  auto* text = GetRenderText();
++  text->SetText(u"Short title");
++  text->SetElideBehavior(FADE_TAIL);
++  text->SetFadeGradientWidth(16);
++  text->SetDisplayRect(Rect(0, 0, 500, 20));
++  DrawVisualText();
++  EXPECT_FALSE(GetRendererPaint().getShader());
++}
++
+ TEST_F(RenderTextTest, DefaultStyles) {
+   // Check the default styles applied to new instances and adjusted text.
+   RenderText* render_text = GetRenderText();
