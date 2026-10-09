@@ -1258,9 +1258,9 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +  bubble->set_parent_window(GetWidget()->GetNativeView());
 +  bubble->SetButtons(static_cast<int>(ui::mojom::DialogButton::kNone));
 +  bubble->SetTitle(new_tab ? u"New tab" : u"Current tab");
-+  bubble->SetShowTitle(true);
++  bubble->SetShowTitle(false);
 +  bubble->set_close_on_deactivate(true);
-+  bubble->set_margins(gfx::Insets(16));
++  bubble->set_margins(gfx::Insets(8));
 +  contents->SetLayoutManager(std::make_unique<views::FillLayout>());
 +  const gfx::Rect bounds = GetBoundsInScreen();
 +  const int width = std::clamp(bounds.width() - 80, 240, 640);
@@ -1298,11 +1298,11 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +  location->SetPreferredSize(gfx::Size(width, 48));
 +  arcium_command_bar_location_ =
 +      contents_view->AddChildView(std::move(location));
-+  arcium_command_bar_location_->Init();
-+  arcium_command_bar_location_->Update(GetActiveWebContents());
 +  arcium_command_bar_location_->SetArciumCommandBarDismissCallback(
 +      base::BindRepeating(&BrowserView::CloseArciumCommandBar,
 +                          weak_ptr_factory_.GetWeakPtr(), false));
++  arcium_command_bar_location_->Init();
++  arcium_command_bar_location_->Update(GetActiveWebContents());
 +  arcium_command_bar_widget_->Show();
 +  arcium_command_bar_location_->FocusLocation(true, true);
 +  if (new_tab) {
@@ -1483,7 +1483,23 @@ Index: src/chrome/browser/ui/views/location_bar/location_bar_view.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/location_bar/location_bar_view.h
 +++ src/chrome/browser/ui/views/location_bar/location_bar_view.h
-@@ -155,6 +155,17 @@
+@@ -79,6 +79,7 @@
+ 
+ namespace views {
+ class ImageButton;
++class ImageView;
+ class Label;
+ }  // namespace views
+ 
+@@ -141,6 +142,7 @@
+   static int ComputeBorderRadius(gfx::Size size);
+ 
+   // Initializes the LocationBarView.
++  // Configure the dismiss callback first for floating command input.
+   void Init();
+ 
+   bool in_popup_state_transition() const override;
+@@ -155,6 +157,17 @@
        bool antialias = true,
        bool should_border_scale = false);
  
@@ -1501,7 +1517,27 @@ Index: src/chrome/browser/ui/views/location_bar/location_bar_view.h
    // Returns the delegate.
    Delegate* delegate() const { return delegate_; }
  
-@@ -643,6 +654,7 @@
+@@ -355,6 +368,9 @@
+   // Updates the background on a theme change, or dropdown state change.
+   void RefreshBackground();
+ 
++  // Keep command input independent of the current page's toolbar controls.
++  void RefreshArciumCommandBarPresentation();
++
+   // Updates the visibility state of the Content Blocked icons to reflect what
+   // is actually blocked on the current page. Returns true if the visibility
+   // of at least one of the views in |content_setting_views_| changed.
+@@ -568,6 +584,9 @@
+   // search icon, EV HTTPS bubble, etc.
+   raw_ptr<LocationIconView> location_icon_view_ = nullptr;
+ 
++  // A passive search glyph for the floating command input.
++  raw_ptr<views::ImageView> arcium_command_bar_search_icon_ = nullptr;
++
+   // Views to show inline autocompletion when an IME is active.  In this case,
+   // we shouldn't change the text or selection inside the OmniboxView itself,
+   // since this will conflict with the IME's control over the text.  So instead
+@@ -643,6 +662,7 @@
  
    void OnMiddleClickPaste(base::TimeTicks event_timestamp, std::u16string text);
  
@@ -1892,7 +1928,7 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
-@@ -0,0 +1,348 @@
+@@ -0,0 +1,464 @@
 +// Copyright 2026 The Arcium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1914,8 +1950,10 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 +#include "chrome/browser/ui/views/frame/browser_view.h"
 +#include "chrome/browser/ui/views/frame/test_with_browser_view.h"
 +#include "chrome/browser/ui/views/location_bar/location_bar_view.h"
++#include "chrome/browser/ui/views/location_bar/selected_keyword_view.h"
 +#include "chrome/browser/ui/views/omnibox/omnibox_view_views.h"
 +#include "chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.h"
++#include "chrome/browser/ui/views/page_action/page_action_container_view.h"
 +#include "chrome/browser/ui/views/theme_copying_widget.h"
 +#include "components/infobars/content/content_infobar_manager.h"
 +#include "components/infobars/core/infobar.h"
@@ -1928,9 +1966,15 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 +#include "content/public/test/navigation_simulator.h"
 +#include "extensions/buildflags/buildflags.h"
 +#include "net/http/http_response_headers.h"
++#include "ui/accessibility/ax_node_data.h"
 +#include "ui/events/event.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/controls/image_view.h"
++#include "ui/views/focus/focus_manager.h"
 +#include "ui/views/test/views_test_utils.h"
 +#include "ui/views/test/widget_test.h"
++#include "ui/views/view_utils.h"
++#include "ui/views/window/dialog_delegate.h"
 +
 +#if BUILDFLAG(ENABLE_EXTENSIONS)
 +#include "chrome/browser/extensions/test_extension_system.h"
@@ -2061,6 +2105,114 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 +  EXPECT_EQ(toolbar, browser_view()->GetLocationBar());
 +  EXPECT_EQ(count, browser()->tab_strip_model()->count());
 +  EXPECT_EQ(contents, browser()->tab_strip_model()->GetActiveWebContents());
++}
++
++TEST_F(ArciumCommandBarTest, CommandInputHidesPageControlsAfterUpdates) {
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  auto* location = floating();
++  auto* field = location->omnibox_view();
++  auto* dialog = location->GetWidget()->widget_delegate()->AsDialogDelegate();
++  ASSERT_TRUE(dialog);
++  EXPECT_FALSE(dialog->ShouldShowWindowTitle());
++  EXPECT_EQ(u"New tab", dialog->GetAccessibleWindowTitle());
++  EXPECT_EQ(gfx::Insets(8), dialog->margins());
++  EXPECT_FALSE(field->GetReadOnly());
++  EXPECT_TRUE(field->GetCursorEnabled());
++  EXPECT_EQ(field, field->GetFocusManager()->GetFocusedView());
++  ui::KeyEvent typed = ui::KeyEvent::FromCharacter(
++      u'q', ui::VKEY_Q, ui::DomCode::US_Q, ui::EF_NONE);
++  field->OnKeyEvent(&typed);
++  EXPECT_EQ(u"q", field->GetText());
++
++  const auto check_controls = [location, field] {
++    views::test::RunScheduledLayout(location);
++    EXPECT_EQ(48, location->height());
++    EXPECT_TRUE(field->GetVisible());
++    EXPECT_FALSE(location->location_icon_view()->GetVisible());
++    EXPECT_FALSE(location->selected_keyword_view()->GetVisible());
++    EXPECT_FALSE(location->page_action_container()->GetVisible());
++    int search_icons = 0;
++    for (views::View* child : location->children()) {
++      if (!child->GetVisible() || child == field) {
++        continue;
++      }
++      auto* image = views::AsViewClass<views::ImageView>(child);
++      ASSERT_TRUE(image) << "Only a passive search glyph may accompany input";
++      ++search_icons;
++      EXPECT_EQ(views::View::FocusBehavior::NEVER, image->GetFocusBehavior());
++      EXPECT_FALSE(image->GetCanProcessEventsWithinSubtree());
++      ui::AXNodeData data;
++      image->GetViewAccessibility().GetAccessibleNodeData(&data);
++      EXPECT_TRUE(data.IsIgnored());
++    }
++    EXPECT_EQ(1, search_icons);
++  };
++  check_controls();
++
++  // A previously visible page control must stay hidden through each path
++  // that normally refreshes toolbar state.
++  location->location_icon_view()->SetVisible(true);
++  location->page_action_container()->SetVisible(true);
++  location->Update(browser()->tab_strip_model()->GetActiveWebContents());
++  check_controls();
++  location->Update(nullptr);
++  location->OnThemeChanged();
++  check_controls();
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(false));
++  EXPECT_EQ(location, floating());
++  EXPECT_EQ(u"Current tab", dialog->GetAccessibleWindowTitle());
++  check_controls();
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  check_controls();
++  views::test::WidgetDestroyedWaiter destroyed(location->GetWidget());
++  browser_view()->CloseArciumCommandBar();
++  destroyed.Wait();
++}
++
++TEST_F(ArciumCommandBarTest, CommandInputFitsScaledTextAndCaretInHeader) {
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  auto* location = floating();
++  auto* field = location->omnibox_view();
++  field->SetFontList(field->GetFontList().DeriveWithSizeDelta(12));
++  field->SetUserText(u"command", false);
++  views::test::RunScheduledLayout(location);
++  auto* widget = location->GetWidget();
++  const int outer_width =
++      widget->GetWindowBoundsInScreen().width() - location->width();
++  for (int width : {240, 640, 320}) {
++    gfx::Rect bounds = widget->GetWindowBoundsInScreen();
++    bounds.set_width(width + outer_width);
++    widget->SetBounds(bounds);
++    location->InvalidateLayout();
++    views::test::RunScheduledLayout(location);
++    EXPECT_EQ(width, location->width());
++    EXPECT_EQ(48, field->height());
++    EXPECT_GE(field->GetContentsBounds().height(),
++              field->GetFontList().GetHeight());
++    EXPECT_TRUE(
++        location->GetBoundsInScreen().Contains(field->GetCaretBounds()));
++    views::ImageView* search_icon = nullptr;
++    for (views::View* child : location->children()) {
++      if (child->GetVisible() && child != field) {
++        search_icon = views::AsViewClass<views::ImageView>(child);
++      }
++    }
++    ASSERT_TRUE(search_icon);
++    EXPECT_EQ(field->GetFontList().GetFontSize(), search_icon->width());
++    EXPECT_LT(search_icon->bounds().right(), field->x());
++    EXPECT_TRUE(location->GetLocalBounds().Contains(field->bounds()));
++    const gfx::Rect field_bounds = field->bounds();
++    const gfx::Rect icon_bounds = search_icon->bounds();
++    for (int pass = 0; pass < 4; ++pass) {
++      location->InvalidateLayout();
++      views::test::RunScheduledLayout(location);
++      EXPECT_EQ(field_bounds, field->bounds());
++      EXPECT_EQ(icon_bounds, search_icon->bounds());
++    }
++  }
++  views::test::WidgetDestroyedWaiter destroyed(location->GetWidget());
++  browser_view()->CloseArciumCommandBar();
++  destroyed.Wait();
 +}
 +
 +TEST_F(ArciumCommandBarTest, ReusedBarResetsQueryAndInvocationMode) {
@@ -2490,7 +2642,7 @@ Index: src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
 +++ src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
-@@ -60,7 +60,8 @@ views::Widget* GetImmersiveFullscreenWid
+@@ -60,7 +60,8 @@
  
    // If the results window is not a child of the overlay widget we are not in
    // immersive fullscreen.
@@ -2500,7 +2652,7 @@ Index: src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
      return nullptr;
    }
  
-@@ -107,10 +108,10 @@ WidgetEventPair GetParentWidgetAndEvent(
+@@ -107,10 +108,10 @@
    // Note that the floating results view is a top-level widget, so hop up a
    // level before looking for the parent's top-level widget for event
    // forwarding.
@@ -3051,3 +3203,270 @@ Index: src/components/omnibox/browser/autocomplete_match_type.cc
    // Types with a message ID of zero get |text| returned as-is.
    static constexpr auto message_ids = std::to_array<int>({
        0,                             // URL_WHAT_YOU_TYPED
+Index: src/chrome/browser/ui/views/location_bar/location_bar_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/location_bar/location_bar_view.cc
++++ src/chrome/browser/ui/views/location_bar/location_bar_view.cc
+@@ -162,6 +162,7 @@
+ #include "ui/base/ime/virtual_keyboard_controller.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/image_model.h"
+ #include "ui/base/mojom/menu_source_type.mojom-forward.h"
+ #include "ui/base/resource/resource_bundle.h"
+ #include "ui/base/ui_base_features.h"
+@@ -178,6 +179,7 @@
+ #include "ui/gfx/scoped_canvas.h"
+ #include "ui/gfx/text_utils.h"
+ #include "ui/gfx/vector_icon_types.h"
++#include "ui/vector_icons/vector_icons.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/background.h"
+ #include "ui/views/border.h"
+@@ -186,6 +188,7 @@
+ #include "ui/views/controls/button/image_button_factory.h"
+ #include "ui/views/controls/focus_ring.h"
+ #include "ui/views/controls/highlight_path_generator.h"
++#include "ui/views/controls/image_view.h"
+ #include "ui/views/controls/label.h"
+ #include "ui/views/interaction/element_tracker_views.h"
+ #include "ui/views/property_effects.h"
+@@ -203,6 +206,10 @@
+ 
+ namespace {
+ 
++constexpr int kArciumCommandBarHeight = 48;
++constexpr int kArciumCommandBarHorizontalPadding = 8;
++constexpr int kArciumCommandBarIconGap = 8;
++
+ int IncrementalMinimumWidth(const views::View* view) {
+   return (view && view->GetVisible()) ? view->GetMinimumSize().width() : 0;
+ }
+@@ -359,6 +366,13 @@
+   location_icon_view->set_drag_controller(this);
+   location_icon_view_ = AddChildView(std::move(location_icon_view));
+ 
++  if (arcium_command_bar_dismiss_) {
++    arcium_command_bar_search_icon_ =
++        AddChildView(std::make_unique<views::ImageView>());
++    arcium_command_bar_search_icon_->SetCanProcessEventsWithinSubtree(false);
++    arcium_command_bar_search_icon_->GetViewAccessibility().SetIsIgnored(true);
++  }
++
+   // Initialize the Omnibox view. browser_ can be nullptr on ChromeOS in the
+   // case of simple_web_view_dialog. Or it can be nulltpr on ChromeOS and on
+   // other desktop platforms in the case of presentation_receiver_window_view.
+@@ -764,6 +778,13 @@
+   const int omnibox_width = omnibox_view_->GetMinimumSize().width();
+   const int trailing_width = GetMinimumTrailingWidth();
+ 
++  if (arcium_command_bar_dismiss_) {
++    return gfx::Size(
++        omnibox_width + omnibox_view_->GetFontList().GetFontSize() +
++            kArciumCommandBarIconGap + kArciumCommandBarHorizontalPadding * 2,
++        kArciumCommandBarHeight);
++  }
++
+   // The minimum width of the location bar is defined to be the greater of the
+   // minimum width of the location text field and the space required for the
+   // other child views. This ensures that the location bar can shrink
+@@ -785,6 +806,12 @@
+   }
+ 
+   const int min_width = GetMinimumSize().width();
++  if (arcium_command_bar_dismiss_) {
++    return gfx::Size(available_size.width().is_bounded()
++                         ? std::max(min_width, available_size.width().value())
++                         : min_width,
++                     kArciumCommandBarHeight);
++  }
+   if (base::FeatureList::IsEnabled(features::kOmniboxResizingPrioritization)) {
+     // If space is bounded, take all available space down to the min width.
+     if (available_size.width().is_bounded()) {
+@@ -821,6 +848,25 @@
+     return;
+   }
+ 
++  if (arcium_command_bar_dismiss_) {
++    RefreshArciumCommandBarPresentation();
++    gfx::Rect input_bounds(GetContentsBounds());
++    input_bounds.Inset(gfx::Insets::VH(0, kArciumCommandBarHorizontalPadding));
++    const int icon_size =
++        std::min({omnibox_view_->GetFontList().GetFontSize(),
++                  input_bounds.width(), input_bounds.height()});
++    arcium_command_bar_search_icon_->SetBounds(
++        input_bounds.x(), input_bounds.CenterPoint().y() - icon_size / 2,
++        icon_size, icon_size);
++    input_bounds.Inset(
++        gfx::Insets::TLBR(0, icon_size + kArciumCommandBarIconGap, 0, 0));
++    // Give the native field the whole header height so scaled text and its
++    // caret retain space. Textfield centers the text vertically itself.
++    omnibox_view_->SetBoundsRect(input_bounds);
++    LayoutSuperclass<View>(this);
++    return;
++  }
++
+   selected_keyword_view_->SetVisible(false);
+ 
+   // TODO(manukh): Move constants to layout_constants.cc.
+@@ -1088,6 +1134,12 @@
+     return;
+   }
+ 
++  if (arcium_command_bar_dismiss_) {
++    OnTouchUiChanged();
++    RefreshBackground();
++    return;
++  }
++
+   const SkColor icon_color =
+       GetColorProvider()->GetColor(kColorOmniboxActionIcon);
+   page_action_icon_controller_->SetIconColor(icon_color);
+@@ -1110,17 +1162,20 @@
+ 
+ void LocationBarView::Update(WebContents* contents) {
+   TRACE_EVENT("omnibox", "LocationBarView::Update");
+-  if (contents) {
++  if (contents && !arcium_command_bar_dismiss_) {
+     page_action_icon_controller_->UpdateWebContents(contents);
+   }
+ 
+-  RefreshContentSettingViews();
+-  RefreshPageActionIconViews();
+-  location_icon_view_->Update(
+-      /*suppress_animations=*/contents, GetOmniboxController()->IsPopupOpen());
++  if (!arcium_command_bar_dismiss_) {
++    RefreshContentSettingViews();
++    RefreshPageActionIconViews();
++    location_icon_view_->Update(
++        /*suppress_animations=*/contents,
++        GetOmniboxController()->IsPopupOpen());
+ 
+-  if (intent_chip_) {
+-    intent_chip_->Update();
++    if (intent_chip_) {
++      intent_chip_->Update();
++    }
+   }
+ 
+   if (contents) {
+@@ -1142,7 +1197,7 @@
+ 
+   // A permission prompt may be suspended due to an invalid state (empty or
+   // editing location bar). Restore the suspended prompt if possible.
+-  if (contents && !IsEditingOrEmpty()) {
++  if (contents && !arcium_command_bar_dismiss_ && !IsEditingOrEmpty()) {
+     auto* permission_request_manager =
+         permissions::PermissionRequestManager::FromWebContents(contents);
+     if (permission_request_manager->CanRestorePrompt()) {
+@@ -1314,6 +1369,10 @@
+     return false;
+   }
+ 
++  if (arcium_command_bar_dismiss_) {
++    return true;
++  }
++
+   // When the user is typing in the omnibox, the page action icons are no longer
+   // associated with the current omnibox text, so hide them.
+   if (GetOmniboxController()->edit_model()->user_input_in_progress()) {
+@@ -1572,7 +1631,31 @@
+   SchedulePaint();
+ }
+ 
++void LocationBarView::RefreshArciumCommandBarPresentation() {
++  if (!arcium_command_bar_dismiss_) {
++    return;
++  }
++  // Auxiliary views remain valid for existing callbacks, but none become
++  // visible or focusable inside the floating input.
++  for (views::View* child : children()) {
++    child->SetVisible(child == omnibox_view_ ||
++                      child == arcium_command_bar_search_icon_);
++  }
++  if (arcium_command_bar_search_icon_) {
++    const ui::ImageModel image = ui::ImageModel::FromVectorIcon(
++        vector_icons::kSearchIcon, kColorOmniboxResultsIcon,
++        omnibox_view_->GetFontList().GetFontSize());
++    if (arcium_command_bar_search_icon_->GetImageModel() != image) {
++      arcium_command_bar_search_icon_->SetImage(image);
++    }
++  }
++}
++
+ bool LocationBarView::RefreshContentSettingViews() {
++  if (arcium_command_bar_dismiss_) {
++    RefreshArciumCommandBarPresentation();
++    return false;
++  }
+   TRACE_EVENT("omnibox", "LocationBarView::RefreshContentSettingViews");
+   if (web_app::AppBrowserController::IsWebApp(browser_)) {
+     // For web apps, the location bar is normally hidden and icons appear in
+@@ -1624,6 +1707,10 @@
+ }
+ 
+ void LocationBarView::RefreshPageActionIconViews() {
++  if (arcium_command_bar_dismiss_) {
++    RefreshArciumCommandBarPresentation();
++    return;
++  }
+   if (web_app::AppBrowserController::IsWebApp(browser_)) {
+     // For web apps, the location bar is normally hidden and icons appear in
+     // the window frame instead.
+@@ -1636,6 +1723,10 @@
+ }
+ 
+ void LocationBarView::RefreshAiModePageActionIconView() {
++  if (arcium_command_bar_dismiss_) {
++    RefreshArciumCommandBarPresentation();
++    return;
++  }
+   if (IsPageActionMigrated(PageActionIconType::kAiMode)) {
+     auto* aim_page_action_controller =
+         omnibox::AiModePageActionController::From(browser_);
+@@ -1668,6 +1759,12 @@
+ 
+ void LocationBarView::RefreshPageActionContainerViewAndIconsVisibility(
+     bool should_hide_page_actions) {
++  if (arcium_command_bar_dismiss_) {
++    // This controller is shared with the toolbar. Hiding command-bar views
++    // must never change the active page's action visibility.
++    RefreshArciumCommandBarPresentation();
++    return;
++  }
+   TRACE_EVENT(
+       "omnibox",
+       "LocationBarView::RefreshPageActionContainerViewAndIconsVisibility",
+@@ -2042,6 +2139,12 @@
+   TRACE_EVENT("omnibox", "LocationBarView::OnChanged");
+   // Ensure that background colors get updated on tab-switch.
+   RefreshBackground();
++  if (arcium_command_bar_dismiss_) {
++    RefreshArciumCommandBarPresentation();
++    InvalidateLayout();
++    SchedulePaint();
++    return;
++  }
+   location_icon_view_->Update(
+       /*suppress_animations=*/false, GetOmniboxController()->IsPopupOpen());
+   clear_all_button_->SetVisible(
+@@ -2093,6 +2196,11 @@
+   }
+   RefreshBackground();
+ 
++  if (arcium_command_bar_dismiss_) {
++    RefreshArciumCommandBarPresentation();
++    return;
++  }
++
+   // The AI mode page action icon view should only be visible when the omnibox
+   // is focused, so if there is a change in focus, refresh the icon.
+   RefreshAiModePageActionIconView();
+@@ -2126,6 +2234,7 @@
+   location_icon_view_->Update(
+       /*suppress_animations=*/false, GetOmniboxController()->IsPopupOpen());
+   PreferredSizeChanged();
++  RefreshArciumCommandBarPresentation();
+ }
+ 
+ bool LocationBarView::ShouldChipOverrideLocationIcon() {
