@@ -1787,29 +1787,54 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,254 @@
 +// Copyright 2026 The Arcium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
++#include <memory>
++
++#include "base/functional/bind.h"
 +#include "base/run_loop.h"
++#include "build/build_config.h"
 +#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/autocomplete/shortcuts_backend_factory.h"
++#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/ui/browser.h"
 +#include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.h"
 +#include "chrome/browser/ui/omnibox/omnibox_controller.h"
 +#include "chrome/browser/ui/tabs/tab_strip_model.h"
 +#include "chrome/browser/ui/views/frame/browser_view.h"
 +#include "chrome/browser/ui/views/frame/test_with_browser_view.h"
 +#include "chrome/browser/ui/views/location_bar/location_bar_view.h"
 +#include "chrome/browser/ui/views/omnibox/omnibox_view_views.h"
++#include "components/infobars/content/content_infobar_manager.h"
++#include "components/infobars/core/infobar.h"
 +#include "components/omnibox/browser/autocomplete_controller.h"
++#include "components/omnibox/browser/autocomplete_match.h"
++#include "components/omnibox/browser/fake_autocomplete_provider.h"
++#include "components/omnibox/browser/omnibox_client.h"
++#include "components/omnibox/browser/shortcuts_backend.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/test/navigation_simulator.h"
++#include "extensions/buildflags/buildflags.h"
++#include "net/http/http_response_headers.h"
 +#include "ui/events/event.h"
 +#include "ui/views/test/widget_test.h"
++
++#if BUILDFLAG(ENABLE_EXTENSIONS)
++#include "chrome/browser/extensions/test_extension_system.h"
++#endif
 +
 +class ArciumCommandBarTest : public TestWithBrowserView {
 + protected:
 +  void SetUp() override {
 +    TestWithBrowserView::SetUp();
++#if BUILDFLAG(ENABLE_EXTENSIONS)
++    static_cast<extensions::TestExtensionSystem*>(
++        extensions::ExtensionSystem::Get(browser()->profile()))->Init();
++#endif
 +    AddTab(browser(), GURL("https://origin.test/"));
 +    browser_view()->GetWidget()->Show();
 +  }
@@ -1890,11 +1915,138 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 +  EXPECT_EQ(toolbar, browser_view()->GetLocationBar());
 +  EXPECT_EQ(count, browser()->tab_strip_model()->count());
 +}
++
++namespace {
++AutocompleteMatch NavigationMatch(AutocompleteProvider* provider) {
++  AutocompleteMatch match(provider, 1000, false,
++                          AutocompleteMatchType::URL_WHAT_YOU_TYPED);
++  match.destination_url = GURL("https://accepted.test/");
++  match.fill_into_edit = u"https://accepted.test/";
++  match.contents = match.fill_into_edit;
++  match.contents_class = {{0, ACMatchClassification::URL}};
++  match.transition = ui::PAGE_TRANSITION_TYPED;
++  return match;
++}
++
++scoped_refptr<ShortcutsBackend> PrepareShortcuts(Profile* profile) {
++  ShortcutsBackendFactory::GetInstance()->SetTestingFactoryAndUse(
++      profile, base::BindRepeating(
++                   &ShortcutsBackendFactory::BuildProfileNoDatabaseForTesting));
++  return ShortcutsBackendFactory::GetForProfile(profile);
++}
++}  // namespace
++
++TEST_F(ArciumCommandBarTest, HttpCommitAfterBarDestructionRecordsShortcut) {
++  auto backend = PrepareShortcuts(browser()->profile());
++  ASSERT_TRUE(backend);
++  ASSERT_TRUE(backend->initialized());
++  ASSERT_TRUE(backend->shortcuts_map().empty());
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(false));
++  auto* model = floating()->GetOmniboxController();
++  ASSERT_FALSE(model->autocomplete_controller()->providers().empty());
++  auto match = NavigationMatch(
++      model->autocomplete_controller()->providers().front().get());
++  views::test::WidgetDestroyedWaiter destroyed(floating()->GetWidget());
++  model->client()->OnAutocompleteAccept(
++      match.destination_url, nullptr, WindowOpenDisposition::CURRENT_TAB,
++      match.transition, match.type, base::TimeTicks::Now(), false, false,
++      match.fill_into_edit, match, AutocompleteMatch());
++  match = AutocompleteMatch();
++  destroyed.Wait();
++  ASSERT_EQ(browser_view()->GetLocationBarView(),
++            browser_view()->GetLocationBar());
++  auto* contents = browser()->tab_strip_model()->GetActiveWebContents();
++  auto navigation = content::NavigationSimulator::CreateFromPending(
++      contents->GetController());
++  navigation->SetResponseHeaders(base::MakeRefCounted<net::HttpResponseHeaders>(
++      "HTTP/1.1 200 OK\r\n"));
++  navigation->Commit();
++  ASSERT_EQ(1u, backend->shortcuts_map().size());
++  EXPECT_EQ(GURL("https://accepted.test/"),
++            backend->shortcuts_map().begin()->second.match_core.destination_url);
++}
++
++TEST_F(ArciumCommandBarTest, AlternateNavigationSurvivesSourceProviderDestruction) {
++  auto backend = PrepareShortcuts(browser()->profile());
++  ASSERT_TRUE(backend && backend->initialized());
++  auto provider = base::MakeRefCounted<FakeAutocompleteProvider>(
++      AutocompleteProvider::TYPE_HISTORY_URL);
++  auto match = NavigationMatch(provider.get());
++  auto* contents = browser()->tab_strip_model()->GetActiveWebContents();
++  AlternateNavInfoBarDelegate::CreateForOmniboxNavigation(
++      contents, u"accepted", match, GURL("https://search.test/"));
++  // The delayed consumer must copy data without retaining a provider whose
++  // prefetch callbacks can still depend on a destroyed controller client.
++  EXPECT_TRUE(provider->HasOneRef());
++  match = AutocompleteMatch();
++  provider.reset();
++  auto* manager = infobars::ContentInfoBarManager::FromWebContents(contents);
++  ASSERT_EQ(1u, manager->infobars().size());
++  EXPECT_TRUE(manager->infobars().back()->delegate()->LinkClicked(
++      WindowOpenDisposition::CURRENT_TAB));
++  ASSERT_EQ(1u, backend->shortcuts_map().size());
++  EXPECT_EQ(GURL("https://accepted.test/"),
++            backend->shortcuts_map().begin()->second.match_core.destination_url);
++  manager->RemoveAllInfoBars(/*animate=*/false);
++}
++
++TEST_F(ArciumCommandBarTest, AlternateZeroSuggestDoesNotRecordShortcut) {
++  auto backend = PrepareShortcuts(browser()->profile());
++  ASSERT_TRUE(backend && backend->initialized());
++  auto* contents = browser()->tab_strip_model()->GetActiveWebContents();
++  for (bool detached : {false, true}) {
++    auto original = NavigationMatch(nullptr);
++    original.destination_url = GURL("https://search.test/");
++    backend->AddOrUpdateShortcut(u"search", original);
++    ASSERT_EQ(1u, backend->shortcuts_map().size());
++    auto provider = base::MakeRefCounted<FakeAutocompleteProvider>(
++        AutocompleteProvider::TYPE_ZERO_SUGGEST);
++    auto match = NavigationMatch(detached ? nullptr : provider.get());
++    AlternateNavInfoBarDelegate::CreateForOmniboxNavigation(
++        contents, u"accepted", match, original.destination_url, detached);
++    EXPECT_TRUE(provider->HasOneRef());
++    match = AutocompleteMatch();
++    provider.reset();
++    auto* manager = infobars::ContentInfoBarManager::FromWebContents(contents);
++    ASSERT_EQ(1u, manager->infobars().size());
++    EXPECT_TRUE(manager->infobars().back()->delegate()->LinkClicked(
++        WindowOpenDisposition::CURRENT_TAB));
++    EXPECT_TRUE(backend->shortcuts_map().empty());
++    manager->RemoveAllInfoBars(/*animate=*/false);
++  }
++}
++
++TEST_F(ArciumCommandBarTest, HttpZeroSuggestSnapshotDoesNotRecordShortcut) {
++  auto backend = PrepareShortcuts(browser()->profile());
++  ASSERT_TRUE(backend && backend->initialized());
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(false));
++  auto provider = base::MakeRefCounted<FakeAutocompleteProvider>(
++      AutocompleteProvider::TYPE_ZERO_SUGGEST);
++  auto match = NavigationMatch(provider.get());
++  match.duplicate_matches.push_back(match);
++  match.associated_keyword = u"accepted";
++  views::test::WidgetDestroyedWaiter destroyed(floating()->GetWidget());
++  floating()->GetOmniboxController()->client()->OnAutocompleteAccept(
++      match.destination_url, nullptr, WindowOpenDisposition::CURRENT_TAB,
++      match.transition, match.type, base::TimeTicks::Now(), false, false,
++      match.fill_into_edit, match, AutocompleteMatch());
++  EXPECT_TRUE(provider->HasOneRef());
++  match = AutocompleteMatch();
++  provider.reset();
++  destroyed.Wait();
++  auto* contents = browser()->tab_strip_model()->GetActiveWebContents();
++  auto navigation = content::NavigationSimulator::CreateFromPending(
++      contents->GetController());
++  navigation->SetResponseHeaders(base::MakeRefCounted<net::HttpResponseHeaders>(
++      "HTTP/1.1 200 OK\r\n"));
++  navigation->Commit();
++  EXPECT_TRUE(backend->shortcuts_map().empty());
++}
 Index: src/chrome/test/BUILD.gn
 ===================================================================
 --- src.orig/chrome/test/BUILD.gn
 +++ src/chrome/test/BUILD.gn
-@@ -69,6 +69,54 @@ if (is_chromeos && include_js2gtest_test
+@@ -69,6 +69,57 @@ if (is_chromeos && include_js2gtest_test
    import("//chrome/test/base/ash/js2gtest.gni")
  }
  
@@ -1920,6 +2072,8 @@ Index: src/chrome/test/BUILD.gn
 +      "//chrome/browser/ui:ui_features",
 +      "//components/bookmarks/browser",
 +      "//components/bookmarks/test",
++      "//components/infobars/content",
++      "//components/infobars/core",
 +      "//components/omnibox/browser",
 +      "//components/omnibox/browser:test_support",
 +      "//components/omnibox/common",
@@ -1932,6 +2086,7 @@ Index: src/chrome/test/BUILD.gn
 +      "//components/variations:test_support",
 +      "//content/public/browser",
 +      "//content/test:test_support",
++      "//net",
 +      "//testing/gmock",
 +      "//testing/gtest",
 +      "//ui/base",
@@ -1949,3 +2104,185 @@ Index: src/chrome/test/BUILD.gn
  source_set("in_process_browser_test_mixin") {
    testonly = true
  
+Index: src/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.cc
++++ src/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.h"
+ 
++
+ #include <string>
+ #include <vector>
+ 
+@@ -19,6 +20,7 @@
+ #include "components/history/core/browser/history_service.h"
+ #include "components/infobars/content/content_infobar_manager.h"
+ #include "components/infobars/core/infobar.h"
++#include "components/omnibox/browser/autocomplete_provider.h"
+ #include "components/omnibox/browser/shortcuts_backend.h"
+ #include "content/public/browser/web_contents.h"
+ #include "ui/base/l10n/l10n_util.h"
+@@ -31,14 +33,15 @@ void AlternateNavInfoBarDelegate::Create
+     content::WebContents* web_contents,
+     const std::u16string& text,
+     const AutocompleteMatch& match,
+-    const GURL& search_url) {
++    const GURL& search_url,
++    bool from_zero_suggest) {
+   infobars::ContentInfoBarManager* infobar_manager =
+       infobars::ContentInfoBarManager::FromWebContents(web_contents);
+   infobar_manager->AddInfoBar(AlternateNavInfoBarDelegate::CreateInfoBar(
+       base::WrapUnique(new AlternateNavInfoBarDelegate(
+           Profile::FromBrowserContext(web_contents->GetBrowserContext()), text,
+           std::make_unique<AutocompleteMatch>(match), match.destination_url,
+-          search_url))));
++          search_url, from_zero_suggest))));
+ }
+ 
+ std::u16string AlternateNavInfoBarDelegate::GetMessageTextWithOffset(
+@@ -81,7 +84,9 @@ bool AlternateNavInfoBarDelegate::LinkCl
+       ShortcutsBackendFactory::GetForProfile(profile_));
+   if (shortcuts_backend.get()) {  // May be NULL in incognito.
+     shortcuts_backend->DeleteShortcutsWithURL(original_url_);
+-    shortcuts_backend->AddOrUpdateShortcut(text_, *match_);
++    if (!match_from_zero_suggest_) {
++      shortcuts_backend->AddOrUpdateShortcut(text_, *match_);
++    }
+   }
+ 
+   // Tell the history system to remove any saved search term for the search.
+@@ -134,13 +139,21 @@ AlternateNavInfoBarDelegate::AlternateNa
+     const std::u16string& text,
+     std::unique_ptr<AutocompleteMatch> match,
+     const GURL& destination_url,
+-    const GURL& original_url)
++    const GURL& original_url,
++    bool from_zero_suggest)
+     : profile_(profile),
+       text_(text),
++      match_from_zero_suggest_(
++          from_zero_suggest ||
++          (match && match->provider &&
++           match->provider->type() == AutocompleteProvider::TYPE_ZERO_SUGGEST)),
+       match_(std::move(match)),
+       destination_url_(destination_url),
+       original_url_(original_url) {
+   if (match_) {
++    // The source omnibox may have been destroyed before this infobar is used.
++    match_->provider = nullptr;
++    match_->duplicate_matches.clear();
+     DCHECK_EQ(destination_url_, match_->destination_url);
+   }
+ 
+Index: src/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.h
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.h
++++ src/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.h
+@@ -37,7 +37,8 @@ class AlternateNavInfoBarDelegate : publ
+   static void CreateForOmniboxNavigation(content::WebContents* web_contents,
+                                          const std::u16string& text,
+                                          const AutocompleteMatch& match,
+-                                         const GURL& search_url);
++                                         const GURL& search_url,
++                                         bool from_zero_suggest = false);
+ 
+   std::u16string GetMessageTextWithOffset(size_t* link_offset) const;
+ 
+@@ -62,7 +63,8 @@ class AlternateNavInfoBarDelegate : publ
+                               const std::u16string& text,
+                               std::unique_ptr<AutocompleteMatch> match,
+                               const GURL& destination_url,
+-                              const GURL& original_url);
++                              const GURL& original_url,
++                              bool from_zero_suggest);
+ 
+   // Returns an alternate nav infobar that owns |delegate|.
+   static std::unique_ptr<infobars::InfoBar> CreateInfoBar(
+@@ -74,6 +76,7 @@ class AlternateNavInfoBarDelegate : publ
+   // The autocomplete match to be used when deleting the corresponding shortcut.
+   // Can be null when the event triggering the infobar was not an omnibox
+   // navigation.
++  const bool match_from_zero_suggest_;
+   std::unique_ptr<AutocompleteMatch> match_;
+ 
+   // The URL to navigate to when the user clicks the link.
+Index: src/chrome/browser/ui/omnibox/chrome_omnibox_navigation_observer.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/chrome_omnibox_navigation_observer.cc
++++ src/chrome/browser/ui/omnibox/chrome_omnibox_navigation_observer.cc
+@@ -16,6 +16,7 @@
+ #include "chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.h"
+ #include "chrome/browser/ui/omnibox/chrome_omnibox_client.h"
+ #include "components/infobars/content/content_infobar_manager.h"
++#include "components/omnibox/browser/autocomplete_provider.h"
+ #include "components/omnibox/browser/shortcuts_backend.h"
+ #include "components/search_engines/template_url.h"
+ #include "components/search_engines/template_url_service.h"
+@@ -45,6 +46,15 @@ class ChromeOmniboxNavigationObserver;
+ 
+ namespace {
+ 
++// Navigation can finish after a transient omnibox and its providers are gone.
++// Delayed consumers need match data, without controller-owned provider pointers.
++AutocompleteMatch CopyMatchForNavigation(const AutocompleteMatch& match) {
++  AutocompleteMatch snapshot(match);
++  snapshot.provider = nullptr;
++  snapshot.duplicate_matches.clear();
++  return snapshot;
++}
++
+ // HTTP 2xx, 401, and 407 all indicate that the target address exists.
+ bool ResponseCodeIndicatesSuccess(int response_code) {
+   return ((response_code / 100) == 2) || (response_code == 401) ||
+@@ -251,8 +261,15 @@ ChromeOmniboxNavigationObserver::ChromeO
+     ShowInfobarCallback show_infobar)
+     : content::WebContentsObserver(navigation.GetWebContents()),
+       text_(text),
+-      match_(match),
+-      alternative_nav_match_(alternative_nav_match),
++      match_from_zero_suggest_(match.provider &&
++                              match.provider->type() ==
++                                  AutocompleteProvider::TYPE_ZERO_SUGGEST),
++      alternative_nav_match_from_zero_suggest_(
++          alternative_nav_match.provider &&
++          alternative_nav_match.provider->type() ==
++              AutocompleteProvider::TYPE_ZERO_SUGGEST),
++      match_(CopyMatchForNavigation(match)),
++      alternative_nav_match_(CopyMatchForNavigation(alternative_nav_match)),
+       navigation_id_(navigation.GetNavigationId()),
+       profile_(profile),
+       show_infobar_(std::move(show_infobar)) {
+@@ -296,7 +313,7 @@ void ChromeOmniboxNavigationObserver::Di
+   // correct here (as we are processing a committed primary main frame
+   // navigation), but we should consider adding a way to get virtual URL
+   // directly from NavigationHandle.
+-  if (ResponseCodeIndicatesSuccess(
++  if (!match_from_zero_suggest_ && ResponseCodeIndicatesSuccess(
+           navigation_handle->GetResponseHeaders()->response_code()) &&
+       IsValidNavigation(match_.destination_url,
+                         navigation_handle->GetWebContents()->GetVisibleURL())) {
+@@ -345,7 +362,8 @@ void ChromeOmniboxNavigationObserver::On
+ 
+ void ChromeOmniboxNavigationObserver::ShowAlternativeNavInfoBar() {
+   AlternateNavInfoBarDelegate::CreateForOmniboxNavigation(
+-      web_contents(), text_, alternative_nav_match_, match_.destination_url);
++      web_contents(), text_, alternative_nav_match_, match_.destination_url,
++      alternative_nav_match_from_zero_suggest_);
+ }
+ 
+ // static
+Index: src/chrome/browser/ui/omnibox/chrome_omnibox_navigation_observer.h
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/chrome_omnibox_navigation_observer.h
++++ src/chrome/browser/ui/omnibox/chrome_omnibox_navigation_observer.h
+@@ -89,6 +89,8 @@ class ChromeOmniboxNavigationObserver
+   void ShowAlternativeNavInfoBar();
+ 
+   const std::u16string text_;
++  const bool match_from_zero_suggest_;
++  const bool alternative_nav_match_from_zero_suggest_;
+   const AutocompleteMatch match_;
+   const AutocompleteMatch alternative_nav_match_;
+   const int64_t navigation_id_;
