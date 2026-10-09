@@ -2,7 +2,15 @@ Index: src/chrome/browser/autocomplete/chrome_autocomplete_provider_client.cc
 ===================================================================
 --- src.orig/chrome/browser/autocomplete/chrome_autocomplete_provider_client.cc
 +++ src/chrome/browser/autocomplete/chrome_autocomplete_provider_client.cc
-@@ -49,8 +49,13 @@
+@@ -13,6 +13,7 @@
+ #include "base/feature_list.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/strings/cstring_view.h"
++#include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "build/build_config.h"
+ #include "chrome/app/chrome_command_ids.h"
+@@ -49,8 +50,13 @@
  #include "chrome/browser/sync/sync_service_factory.h"
  #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
  #include "chrome/browser/translate/chrome_translate_client.h"
@@ -16,7 +24,7 @@ Index: src/chrome/browser/autocomplete/chrome_autocomplete_provider_client.cc
  #include "chrome/browser/ui/lens/lens_overlay_entry_point_controller.h"
  #include "chrome/browser/ui/omnibox/omnibox_pedal_implementations.h"
  #include "chrome/browser/ui/omnibox/omnibox_tab_helper.h"
-@@ -83,11 +88,16 @@
+@@ -83,11 +89,16 @@
  #include "components/prefs/pref_service.h"
  #include "components/saved_tab_groups/public/tab_group_sync_service.h"
  #include "components/search_engines/ai_mode_button_service.h"
@@ -33,7 +41,7 @@ Index: src/chrome/browser/autocomplete/chrome_autocomplete_provider_client.cc
  #include "components/translate/core/browser/translate_manager.h"
  #include "components/unified_consent/url_keyed_data_collection_consent_helper.h"
  #include "components/variations/service/variations_service.h"
-@@ -304,6 +314,138 @@ bookmarks::BookmarkModel* ChromeAutocomp
+@@ -304,6 +315,163 @@
    return BookmarkModelFactory::GetForBrowserContext(profile_);
  }
  
@@ -113,13 +121,22 @@ Index: src/chrome/browser/autocomplete/chrome_autocomplete_provider_client.cc
 +  std::vector<ArciumOmniboxItem> result;
 +  const std::string source_space(
 +      spaces->GetExplicitSpaceIdForBrowser(current_browser));
++  const auto* source = spaces->GetSpaceById(source_space);
 +  auto add_current = [&](ArciumOmniboxItem::Command command,
-+                         std::u16string label) {
++                         std::u16string label, std::u16string search_alias) {
 +    ArciumOmniboxItem item;
 +    item.command = command;
 +    item.title = std::move(label);
-+    item.command_search_text = item.title;
++    item.url = contents->GetLastCommittedURL();
++    item.command_target_title =
++        base::TrimWhitespace(contents->GetTitle(), base::TRIM_ALL).empty()
++            ? base::UTF8ToUTF16(item.url.spec())
++            : contents->GetTitle();
 +    item.space_id = source_space;
++    item.space_name = source ? source->name() : std::u16string();
++    item.command_search_text = search_alias + u" " + item.title + u" " +
++                               item.command_target_title + u" " +
++                               item.space_name;
 +    item.source_tab_session_id =
 +        sessions::SessionTabHelper::IdForTab(contents).id();
 +    result.push_back(std::move(item));
@@ -127,9 +144,10 @@ Index: src/chrome/browser/autocomplete/chrome_autocomplete_provider_client.cc
 +  const auto current_kind = spaces->GetPersistentItemKind(current_tab);
 +  if (!source_space.empty() && !current_kind &&
 +      contents->GetLastCommittedURL().SchemeIsHTTPOrHTTPS()) {
-+    add_current(ArciumOmniboxItem::Command::kPinCurrentTab, u"Pin current tab");
++    add_current(ArciumOmniboxItem::Command::kPinCurrentTab, u"Pin this tab",
++                u"Pin current tab");
 +    add_current(ArciumOmniboxItem::Command::kFavoriteCurrentTab,
-+                u"Add current tab to Favorites");
++                u"Add to Favorites", u"Add current tab to Favorites");
 +  }
 +  // Enumerate commands from an immutable item snapshot. Do not grow the vector
 +  // being iterated; each command retains its qualified durable source identity.
@@ -140,28 +158,43 @@ Index: src/chrome/browser/autocomplete/chrome_autocomplete_provider_client.cc
 +    }
 +    auto add_command = [&](ArciumOmniboxItem::Command command,
 +                           std::u16string label,
-+                           std::string target_space = std::string()) {
++                           std::string target_space = std::string(),
++                           std::u16string target_name = std::u16string()) {
 +      auto item = saved;
 +      item.command = command;
-+      item.title = label + u" · " + saved.title;
-+      item.command_search_text =
-+          label + u" " + saved.title + u" " + saved.space_name;
++      item.title = std::move(label);
++      item.command_target_title =
++          base::TrimWhitespace(saved.title, base::TRIM_ALL).empty()
++              ? base::UTF8ToUTF16(saved.url.spec())
++              : saved.title;
++      item.target_space_name = std::move(target_name);
++      item.command_search_text = item.title + u" " + item.command_target_title +
++                                 u" " + saved.space_name + u" " +
++                                 item.target_space_name;
++      if (command == ArciumOmniboxItem::Command::kCloseLiveInstance) {
++        item.command_search_text =
++            u"Close live instance " + item.command_search_text;
++      }
++      for (const auto& folder : saved.folder_path) {
++        item.command_search_text += u" " + folder;
++      }
 +      item.target_space_id = std::move(target_space);
 +      result.push_back(std::move(item));
 +    };
 +    if (saved.is_live) {
 +      add_command(ArciumOmniboxItem::Command::kCloseLiveInstance,
-+                  u"Close live instance");
++                  u"Close live tab");
 +      if (saved.kind == ArciumOmniboxItem::Kind::kPin) {
 +        add_command(ArciumOmniboxItem::Command::kReturnPinHome,
-+                    u"Return Pin home");
++                    u"Return pin home");
 +      }
 +    }
 +    if (saved.kind == ArciumOmniboxItem::Kind::kPin) {
 +      for (const auto* space : spaces->GetSpaces()) {
 +        if (space->id() != saved.space_id) {
 +          add_command(ArciumOmniboxItem::Command::kMovePinToSpace,
-+                      u"Move Pin to " + space->name(), space->id());
++                      u"Move pin to " + space->name(), space->id(),
++                      space->name());
 +        }
 +      }
 +    }
@@ -176,7 +209,7 @@ Index: src/chrome/browser/autocomplete/chrome_autocomplete_provider_client.h
 ===================================================================
 --- src.orig/chrome/browser/autocomplete/chrome_autocomplete_provider_client.h
 +++ src/chrome/browser/autocomplete/chrome_autocomplete_provider_client.h
-@@ -70,6 +70,8 @@ class ChromeAutocompleteProviderClient :
+@@ -70,6 +70,8 @@
        override;
    scoped_refptr<history::TopSites> GetTopSites() override;
    bookmarks::BookmarkModel* GetBookmarkModel() override;
@@ -218,7 +251,7 @@ Index: src/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
  #include "components/viz/common/frame_sinks/copy_output_result.h"
  #include "content/public/browser/devtools_agent_host.h"
  #include "content/public/browser/navigation_entry.h"
-@@ -167,6 +175,63 @@ ExtensionControlledDialogResult SettingD
+@@ -167,6 +175,63 @@
  
  }  // namespace
  
@@ -282,7 +315,7 @@ Index: src/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
  ChromeOmniboxClient::ChromeOmniboxClient(LocationBar* location_bar,
                                           Browser* browser,
                                           Profile* profile)
-@@ -907,6 +972,58 @@ void ChromeOmniboxClient::OnAutocomplete
+@@ -907,6 +972,58 @@
                text, "match", match, "alternative_nav_match",
                alternative_nav_match);
  
@@ -345,7 +378,7 @@ Index: src/components/omnibox/browser/arcium_omnibox_item.h
 ===================================================================
 --- /dev/null
 +++ src/components/omnibox/browser/arcium_omnibox_item.h
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,86 @@
 +// Copyright 2026 The Arcium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -355,6 +388,7 @@ Index: src/components/omnibox/browser/arcium_omnibox_item.h
 +
 +#include <cstdint>
 +#include <string>
++#include <string_view>
 +#include <vector>
 +
 +#include "url/gurl.h"
@@ -377,6 +411,31 @@ Index: src/components/omnibox/browser/arcium_omnibox_item.h
 +  std::string target_space_id;
 +  int source_tab_session_id = 0;
 +  std::u16string command_search_text;
++  // Presentation context is separate from the action's short verb and stable
++  // identity. A renamed tab or Space must not redirect a selected command.
++  std::u16string command_target_title;
++  std::u16string target_space_name;
++
++  bool IsCommand() const { return command != Command::kNone; }
++
++  // The same consequence is shown visually and announced by accessibility.
++  std::u16string_view CommandHint() const {
++    switch (command) {
++      case Command::kPinCurrentTab:
++        return u"Save pin";
++      case Command::kFavoriteCurrentTab:
++        return u"All Spaces";
++      case Command::kMovePinToSpace:
++        return u"Change Space";
++      case Command::kCloseLiveInstance:
++        return kind == Kind::kPin ? u"Keep pin" : u"Keep favorite";
++      case Command::kReturnPinHome:
++        return u"Saved URL";
++      case Command::kNone:
++        return u"";
++    }
++    return u"";
++  }
 +
 +  // Length-prefixed fields keep identity stable across enumeration changes,
 +  // duplicate URLs, and IDs containing separators.
@@ -410,7 +469,7 @@ Index: src/components/omnibox/browser/autocomplete_match.cc
 ===================================================================
 --- src.orig/components/omnibox/browser/autocomplete_match.cc
 +++ src/components/omnibox/browser/autocomplete_match.cc
-@@ -307,6 +307,7 @@ AutocompleteMatch::AutocompleteMatch(con
+@@ -307,6 +307,7 @@
        post_content(match.post_content
                         ? new TemplateURLRef::PostContent(*match.post_content)
                         : nullptr),
@@ -418,7 +477,7 @@ Index: src/components/omnibox/browser/autocomplete_match.cc
        additional_info(match.additional_info),
        duplicate_matches(match.duplicate_matches),
        suggest_tiles(match.suggest_tiles),
-@@ -379,6 +380,7 @@ AutocompleteMatch& AutocompleteMatch::op
+@@ -379,6 +380,7 @@
    session = std::move(match.session);
    search_terms_args = std::move(match.search_terms_args);
    post_content = std::move(match.post_content);
@@ -426,7 +485,7 @@ Index: src/components/omnibox/browser/autocomplete_match.cc
    additional_info = std::move(match.additional_info);
    duplicate_matches = std::move(match.duplicate_matches);
    suggest_tiles = std::move(match.suggest_tiles);
-@@ -464,6 +466,7 @@ AutocompleteMatch& AutocompleteMatch::op
+@@ -464,6 +466,7 @@
    post_content.reset(match.post_content
                           ? new TemplateURLRef::PostContent(*match.post_content)
                           : nullptr);
@@ -446,7 +505,7 @@ Index: src/components/omnibox/browser/autocomplete_match.h
  #include "components/omnibox/browser/autocomplete_enums.h"
  #include "components/omnibox/browser/autocomplete_input.h"
  #include "components/omnibox/browser/autocomplete_match_type.h"
-@@ -1090,6 +1091,10 @@ struct AutocompleteMatch {
+@@ -1090,6 +1091,10 @@
    // url will pass this post content as well.
    std::unique_ptr<TemplateURLRef::PostContent> post_content;
  
@@ -490,7 +549,7 @@ Index: src/components/omnibox/browser/autocomplete_provider_client.h
  #include "components/omnibox/browser/lens_suggest_inputs_utils.h"
  #include "third_party/metrics_proto/omnibox_event.pb.h"
  
-@@ -99,6 +100,8 @@ class AutocompleteProviderClient : publi
+@@ -99,6 +100,8 @@
    GetHistoryEmbeddingsSearch();
    virtual scoped_refptr<history::TopSites> GetTopSites() = 0;
    virtual bookmarks::BookmarkModel* GetBookmarkModel() = 0;
@@ -516,7 +575,7 @@ Index: src/components/omnibox/browser/bookmark_provider.cc
  #include "base/trace_event/trace_event.h"
  #include "components/bookmarks/browser/bookmark_model.h"
  #include "components/omnibox/browser/autocomplete_match.h"
-@@ -35,6 +40,144 @@
+@@ -35,6 +40,154 @@
  using bookmarks::BookmarkNode;
  using bookmarks::TitledUrlMatch;
  
@@ -600,22 +659,32 @@ Index: src/components/omnibox/browser/bookmark_provider.cc
 +}
 +
 +std::u16string ArciumCommandDescription(const ArciumOmniboxItem& item) {
-+  if (item.id.empty()) {
-+    return u"Command";
++  const bool current_tab_command =
++      item.command == ArciumOmniboxItem::Command::kPinCurrentTab ||
++      item.command == ArciumOmniboxItem::Command::kFavoriteCurrentTab;
++  std::u16string description = item.command_target_title;
++  if (base::TrimWhitespace(description, base::TRIM_ALL).empty()) {
++    description = item.url.is_empty()
++                      ? (current_tab_command ? u"Current tab" : u"Saved tab")
++                      : base::UTF8ToUTF16(item.url.spec());
 +  }
-+  std::u16string description =
-+      item.kind == ArciumOmniboxItem::Kind::kFavorite ? u"Favorite" : u"Pin";
-+  const std::u16string scope = item.space_name.empty()
-+      ? (item.kind == ArciumOmniboxItem::Kind::kFavorite ? u"All Spaces"
-+                                                       : u"Space")
-+      : item.space_name;
++  description += current_tab_command ? u" · Tab"
++                 : item.kind == ArciumOmniboxItem::Kind::kFavorite
++                     ? u" · Favorite"
++                     : u" · Pin";
++  std::u16string scope = item.space_name;
++  if (!current_tab_command && item.kind == ArciumOmniboxItem::Kind::kFavorite) {
++    scope = u"All Spaces";
++  } else if (scope.empty()) {
++    scope = current_tab_command ? u"Current Space" : u"Space";
++  }
 +  description += u" · " + scope;
 +  for (const std::u16string& folder : item.folder_path) {
 +    description += u" › " + folder;
 +  }
-+  description += item.is_active ? u" · Active"
-+                 : item.is_live ? u" · Live"
-+                                : u" · Dormant";
++  if (!item.target_space_name.empty()) {
++    description += u" → " + item.target_space_name;
++  }
 +  return description;
 +}
 +
@@ -661,7 +730,7 @@ Index: src/components/omnibox/browser/bookmark_provider.cc
  BookmarkProvider::BookmarkProvider(AutocompleteProviderClient* client)
      : AutocompleteProvider(AutocompleteProvider::TYPE_BOOKMARK),
        client_(client),
-@@ -55,8 +198,12 @@ void BookmarkProvider::Start(const Autoc
+@@ -55,8 +208,12 @@
  BookmarkProvider::~BookmarkProvider() = default;
  
  void BookmarkProvider::DoAutocomplete(const AutocompleteInput& input) {
@@ -675,7 +744,7 @@ Index: src/components/omnibox/browser/bookmark_provider.cc
      return;
    }
  
-@@ -89,11 +236,62 @@ void BookmarkProvider::DoAutocomplete(co
+@@ -89,11 +246,62 @@
    // Please refer to the code for TitledUrlIndex::GetResultsMatching for
    // complete details of how searches are performed against the user's
    // bookmarks.
@@ -745,7 +814,7 @@ Index: src/components/omnibox/browser/bookmark_provider_unittest.cc
 ===================================================================
 --- src.orig/components/omnibox/browser/bookmark_provider_unittest.cc
 +++ src/components/omnibox/browser/bookmark_provider_unittest.cc
-@@ -322,6 +322,238 @@ TEST_F(BookmarkProviderTest, Positions)
+@@ -322,6 +322,274 @@
    }
  }
  
@@ -882,8 +951,9 @@ Index: src/components/omnibox/browser/bookmark_provider_unittest.cc
 +  work.space_id = "work";
 +  work.space_name = u"Work";
 +  work.folder_path = {u"Projects", u"Q4"};
-+  work.title = u"Close live instance · Atlas";
-+  work.command_search_text = work.title;
++  work.title = u"Close live tab";
++  work.command_target_title = u"Atlas";
++  work.command_search_text = work.title + u" " + work.command_target_title;
 +  work.is_live = true;
 +  auto personal = work;
 +  personal.space_id = "personal";
@@ -902,15 +972,50 @@ Index: src/components/omnibox/browser/bookmark_provider_unittest.cc
 +    EXPECT_FALSE(match.allowed_to_be_default_match);
 +  }
 +  EXPECT_THAT(descriptions, testing::UnorderedElementsAre(
-+      u"Pin · Work › Projects › Q4 · Live",
-+      u"Pin · Personal › Projects › Q4 · Live",
-+      u"Favorite · All Spaces · Live"));
++                                u"Atlas · Pin · Work › Projects › Q4",
++                                u"Atlas · Pin · Personal › Projects › Q4",
++                                u"Atlas · Favorite · All Spaces"));
 +
 +  work.id.clear();
++  work.command = ArciumOmniboxItem::Command::kPinCurrentTab;
++  work.title = u"Pin this tab";
++  work.command_search_text = work.title + u" " + work.command_target_title;
++  work.folder_path.clear();
 +  ON_CALL(*provider_client_, GetArciumOmniboxCommands())
 +      .WillByDefault(testing::Return(std::vector{work}));
-+  ASSERT_EQ(1u, GetNumMatches("close live"));
-+  EXPECT_EQ(u"Command", provider_->matches().front().description);
++  ASSERT_EQ(1u, GetNumMatches("pin this"));
++  EXPECT_EQ(u"Pin this tab", provider_->matches().front().contents);
++  EXPECT_EQ(u"Atlas · Tab · Work", provider_->matches().front().description);
++}
++
++TEST_F(BookmarkProviderTest, ArciumMoveCommandShowsSourceAndDestination) {
++  ArciumOmniboxItem move;
++  move.command = ArciumOmniboxItem::Command::kMovePinToSpace;
++  move.id = "atlas";
++  move.title = u"Move pin to Research";
++  move.command_target_title = u" ";
++  move.url = GURL("https://atlas.test/");
++  move.space_id = "work";
++  move.space_name = u"Work";
++  move.target_space_id = "research";
++  move.target_space_name = u"Research";
++  move.command_search_text = move.title;
++  const auto identity = move.Identity();
++  ON_CALL(*provider_client_, GetArciumOmniboxCommands())
++      .WillByDefault(testing::Return(std::vector{move}));
++  ASSERT_EQ(1u, GetNumMatches("move pin"));
++  const auto& match = provider_->matches().front();
++  EXPECT_EQ(move.title, match.contents);
++  EXPECT_EQ(u"https://atlas.test/ · Pin · Work → Research", match.description);
++  EXPECT_EQ(
++      u"Action, Move pin to Research, https://atlas.test/ · Pin · Work → "
++      u"Research, Change Space",
++      AutocompleteMatchType::ToAccessibilityLabel(match, u"", match.contents));
++  EXPECT_FALSE(match.allowed_to_be_default_match);
++  EXPECT_FALSE(match.deletable);
++  move.command_target_title = u"Renamed tab";
++  move.target_space_name = u"Renamed Space";
++  EXPECT_EQ(identity, move.Identity());
 +}
 +
 +TEST_F(BookmarkProviderTest, ArciumItemsFallbackToURLForBlankTitles) {
@@ -988,7 +1093,7 @@ Index: src/components/omnibox/browser/mock_autocomplete_provider_client.h
 ===================================================================
 --- src.orig/components/omnibox/browser/mock_autocomplete_provider_client.h
 +++ src/components/omnibox/browser/mock_autocomplete_provider_client.h
-@@ -66,6 +66,14 @@ class MockAutocompleteProviderClient
+@@ -66,6 +66,14 @@
    scoped_refptr<history::TopSites> GetTopSites() override { return nullptr; }
  
    MOCK_METHOD0(GetBookmarkModel, bookmarks::BookmarkModel*());
@@ -1007,7 +1112,7 @@ Index: src/chrome/browser/ui/browser_command_controller.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/browser_command_controller.cc
 +++ src/chrome/browser/ui/browser_command_controller.cc
-@@ -743,6 +743,9 @@ void BrowserCommandController::HandleCom
+@@ -743,6 +743,9 @@
        CloseWindow(browser_);
        break;
      case IDC_NEW_TAB: {
@@ -1021,7 +1126,7 @@ Index: src/chrome/browser/ui/browser_window.h
 ===================================================================
 --- src.orig/chrome/browser/ui/browser_window.h
 +++ src/chrome/browser/ui/browser_window.h
-@@ -278,6 +278,11 @@ class BrowserWindow : public ui::BaseWin
+@@ -278,6 +278,11 @@
    // Returns the location bar.
    virtual LocationBar* GetLocationBar() const = 0;
  
@@ -1045,7 +1150,7 @@ Index: src/chrome/browser/ui/omnibox/chrome_omnibox_client.h
  #include "components/omnibox/browser/favicon_cache.h"
  #include "components/omnibox/browser/omnibox.mojom-shared.h"
  #include "components/omnibox/browser/omnibox_client.h"
-@@ -34,6 +35,11 @@ namespace omnibox {
+@@ -34,6 +35,11 @@
  class OmniboxPopupCloser;
  }  // namespace omnibox
  
@@ -1069,7 +1174,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  #include "chrome/browser/ui/omnibox/omnibox_next_features.h"
  #include "chrome/browser/ui/omnibox/omnibox_popup_view.h"
  #include "chrome/browser/ui/omnibox/omnibox_view.h"
-@@ -663,6 +664,31 @@ bool ConvertedHitTest(views::View* src,
+@@ -663,6 +664,31 @@
    return dst->HitTestPoint(*point);
  }
  
@@ -1101,7 +1206,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  }  // namespace
  
  // Implements the exclusive access context and bubble context.
-@@ -1219,6 +1245,9 @@ BrowserView::~BrowserView() {
+@@ -1219,6 +1245,9 @@
      browser_shortcut_service_ = nullptr;
    }
  
@@ -1111,7 +1216,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    // Remove the layout manager to avoid dangling. This needs to be earlier than
    // other cleanups that destroy views referenced in the layout manager.
    SetLayoutManager(nullptr);
-@@ -2946,10 +2975,148 @@ void BrowserView::ExecutePageActionIconF
+@@ -2946,10 +2975,148 @@
  }
  
  LocationBar* BrowserView::GetLocationBar() const {
@@ -1260,7 +1365,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    // On Windows, changing focus to the location bar causes the browser window to
    // become active. This can steal focus if the user has another window open
    // already. On Chrome OS, changing focus makes a view believe it has a focus
-@@ -3452,6 +3619,10 @@ void BrowserView::TryNotifyWindowBoundsC
+@@ -3452,6 +3619,10 @@
  
  void BrowserView::OnWidgetVisibilityChanged(views::Widget* widget,
                                              bool visible) {
@@ -1271,7 +1376,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    UpdateLoadingAnimations(visible);
  }
  
-@@ -3519,6 +3690,10 @@ void BrowserView::NotifyWidgetSizeConstr
+@@ -3519,6 +3690,10 @@
  }
  
  void BrowserView::OnWidgetShowStateChanged(views::Widget* widget) {
@@ -1282,7 +1387,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    if (toolbar_) {
      toolbar_->InvalidateLayout();
    }
-@@ -3529,6 +3704,10 @@ void BrowserView::OnWidgetShowStateChang
+@@ -3529,6 +3704,10 @@
  
  void BrowserView::OnWidgetWindowModalVisibilityChanged(views::Widget* widget,
                                                         bool visible) {
@@ -1293,7 +1398,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  #if !BUILDFLAG(IS_MAC)
    // MacOS does not need views window scrim. We use sheets to show window modals
    // (-[NSWindow beginSheet:]), which natively draw a scrim.
-@@ -4115,6 +4294,7 @@ void BrowserView::OnTabStripModelChanged
+@@ -4115,6 +4294,7 @@
    // can change its preferred size. Re-lay-out the toolbar to reflect the
    // possible change.
    if (selection.active_tab_changed()) {
@@ -1301,7 +1406,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
      toolbar_->InvalidateLayout();
  
      // Update the accessible URL when the selected tab changes. This ensures
-@@ -4702,6 +4882,11 @@ views::View* BrowserView::CreateMacOverl
+@@ -4702,6 +4882,11 @@
  #endif  // IS_MAC
  
  void BrowserView::OnWidgetDestroying(views::Widget* widget) {
@@ -1313,7 +1418,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    DCHECK(widget_observation_.IsObservingSource(widget));
    widget_observation_.Reset();
    // Destroy any remaining WebContents early on. Doing so may result in
-@@ -4716,6 +4901,10 @@ void BrowserView::OnWidgetDestroying(vie
+@@ -4716,6 +4901,10 @@
  
  void BrowserView::OnWidgetActivationChanged(views::Widget* widget,
                                              bool active) {
@@ -1324,7 +1429,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    if (browser_->GetWindow()) {
      if (active) {
        if (restore_focus_on_activation_.has_value() &&
-@@ -4747,6 +4936,10 @@ void BrowserView::OnWidgetActivationChan
+@@ -4747,6 +4936,10 @@
  
  void BrowserView::OnWidgetBoundsChanged(views::Widget* widget,
                                          const gfx::Rect& new_bounds) {
@@ -1339,7 +1444,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/browser_view.h
 +++ src/chrome/browser/ui/views/frame/browser_view.h
-@@ -128,6 +128,7 @@ enum class Channel;
+@@ -128,6 +128,7 @@
  }
  
  namespace views {
@@ -1347,7 +1452,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.h
  class EventMonitor;
  class WebView;
  }  // namespace views
-@@ -581,6 +582,9 @@ class BrowserView : public BrowserWindow
+@@ -581,6 +582,9 @@
    autofill::AutofillBubbleHandler* GetAutofillBubbleHandler() override;
    void ExecutePageActionIconForTesting(PageActionIconType type) override;
    LocationBar* GetLocationBar() const override;
@@ -1357,7 +1462,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.h
    void SetFocusToLocationBar(bool is_user_initiated) override;
    void UpdateReloadStopState(bool is_loading, bool force) override;
    void UpdateToolbar(content::WebContents* contents) override;
-@@ -1253,6 +1257,16 @@ class BrowserView : public BrowserWindow
+@@ -1253,6 +1257,16 @@
    // view tree. This is used to correctly reparent the tabstrip when exiting
    // fullscreen mode. See BrowserView::ReparentTopContainerForEndOfImmersive.
    std::optional<size_t> horizontal_tab_strip_region_insertion_index_;
@@ -1378,7 +1483,7 @@ Index: src/chrome/browser/ui/views/location_bar/location_bar_view.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/location_bar/location_bar_view.h
 +++ src/chrome/browser/ui/views/location_bar/location_bar_view.h
-@@ -155,6 +155,17 @@ class LocationBarView
+@@ -155,6 +155,17 @@
        bool antialias = true,
        bool should_border_scale = false);
  
@@ -1396,7 +1501,7 @@ Index: src/chrome/browser/ui/views/location_bar/location_bar_view.h
    // Returns the delegate.
    Delegate* delegate() const { return delegate_; }
  
-@@ -643,6 +654,7 @@ class LocationBarView
+@@ -643,6 +654,7 @@
  
    void OnMiddleClickPaste(base::TimeTicks event_timestamp, std::u16string text);
  
@@ -1408,7 +1513,7 @@ Index: src/chrome/browser/ui/views/omnibox/omnibox_view_views.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/omnibox/omnibox_view_views.cc
 +++ src/chrome/browser/ui/views/omnibox/omnibox_view_views.cc
-@@ -2203,6 +2203,9 @@ bool OmniboxViewViews::HandleKeyEvent(vi
+@@ -2203,6 +2203,9 @@
        return true;
      }
      case ui::VKEY_ESCAPE:
@@ -1422,7 +1527,7 @@ Index: src/components/omnibox/browser/autocomplete_result.cc
 ===================================================================
 --- src.orig/components/omnibox/browser/autocomplete_result.cc
 +++ src/components/omnibox/browser/autocomplete_result.cc
-@@ -372,7 +372,9 @@ void AutocompleteResult::Sort(
+@@ -372,7 +372,9 @@
    // TODO(manukh) Ranking and preserving the default suggestion should be done
    //   by the grouping framework.
    auto top_match = FindTopMatch(input, &matches_);
@@ -1433,7 +1538,7 @@ Index: src/components/omnibox/browser/autocomplete_result.cc
        (top_match == matches_.end() ||
         top_match->type != AutocompleteMatchType::URL_WHAT_YOU_TYPED)) {
      const auto default_match_fields =
-@@ -1215,6 +1217,24 @@ ACMatches::iterator AutocompleteResult::
+@@ -1215,6 +1217,24 @@
    // can get a URL as the default match.
    omnibox::CheckObsoletePageClass(input.current_page_classification());
  
@@ -1458,7 +1563,7 @@ Index: src/components/omnibox/browser/autocomplete_result.cc
    if (input.current_page_classification() != OmniboxEventProto::NTP_REALBOX ||
        input.type() == metrics::OmniboxInputType::URL) {
      auto best = matches->end();
-@@ -1818,6 +1838,9 @@ AutocompleteResult::GetMatchComparisonFi
+@@ -1818,6 +1838,9 @@
      type = AutocompleteMatchDedupeType::kNormal;
    }
  
@@ -1472,7 +1577,7 @@ Index: src/components/omnibox/browser/autocomplete_result_unittest.cc
 ===================================================================
 --- src.orig/components/omnibox/browser/autocomplete_result_unittest.cc
 +++ src/components/omnibox/browser/autocomplete_result_unittest.cc
-@@ -420,6 +420,71 @@ TEST_F(AutocompleteResultTimeTest, Resul
+@@ -420,6 +420,71 @@
  }
  
  // Assertion testing for AutocompleteResult::SwapMatchesWith.
@@ -2140,7 +2245,7 @@ Index: src/chrome/test/BUILD.gn
 ===================================================================
 --- src.orig/chrome/test/BUILD.gn
 +++ src/chrome/test/BUILD.gn
-@@ -69,6 +69,57 @@ if (is_chromeos && include_js2gtest_test
+@@ -69,6 +69,58 @@
    import("//chrome/test/base/ash/js2gtest.gni")
  }
  
@@ -2151,6 +2256,7 @@ Index: src/chrome/test/BUILD.gn
 +    sources = [
 +      "../browser/ui/omnibox/arcium_omnibox_service_unittest.cc",
 +      "../browser/ui/views/frame/arcium_command_bar_unittest.cc",
++      "../browser/ui/views/omnibox/omnibox_result_view_unittest.cc",
 +      "//components/omnibox/browser/autocomplete_result_unittest.cc",
 +      "//components/omnibox/browser/bookmark_provider_unittest.cc",
 +    ]
@@ -2218,7 +2324,7 @@ Index: src/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.cc
  #include "components/omnibox/browser/shortcuts_backend.h"
  #include "content/public/browser/web_contents.h"
  #include "ui/base/l10n/l10n_util.h"
-@@ -31,14 +33,15 @@ void AlternateNavInfoBarDelegate::Create
+@@ -31,14 +33,15 @@
      content::WebContents* web_contents,
      const std::u16string& text,
      const AutocompleteMatch& match,
@@ -2236,7 +2342,7 @@ Index: src/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.cc
  }
  
  std::u16string AlternateNavInfoBarDelegate::GetMessageTextWithOffset(
-@@ -81,7 +84,9 @@ bool AlternateNavInfoBarDelegate::LinkCl
+@@ -81,7 +84,9 @@
        ShortcutsBackendFactory::GetForProfile(profile_));
    if (shortcuts_backend.get()) {  // May be NULL in incognito.
      shortcuts_backend->DeleteShortcutsWithURL(original_url_);
@@ -2247,7 +2353,7 @@ Index: src/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.cc
    }
  
    // Tell the history system to remove any saved search term for the search.
-@@ -134,13 +139,21 @@ AlternateNavInfoBarDelegate::AlternateNa
+@@ -134,13 +139,21 @@
      const std::u16string& text,
      std::unique_ptr<AutocompleteMatch> match,
      const GURL& destination_url,
@@ -2274,7 +2380,7 @@ Index: src/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.h
 ===================================================================
 --- src.orig/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.h
 +++ src/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.h
-@@ -37,7 +37,8 @@ class AlternateNavInfoBarDelegate : publ
+@@ -37,7 +37,8 @@
    static void CreateForOmniboxNavigation(content::WebContents* web_contents,
                                           const std::u16string& text,
                                           const AutocompleteMatch& match,
@@ -2284,7 +2390,7 @@ Index: src/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.h
  
    std::u16string GetMessageTextWithOffset(size_t* link_offset) const;
  
-@@ -62,7 +63,8 @@ class AlternateNavInfoBarDelegate : publ
+@@ -62,7 +63,8 @@
                                const std::u16string& text,
                                std::unique_ptr<AutocompleteMatch> match,
                                const GURL& destination_url,
@@ -2294,7 +2400,7 @@ Index: src/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.h
  
    // Returns an alternate nav infobar that owns |delegate|.
    static std::unique_ptr<infobars::InfoBar> CreateInfoBar(
-@@ -74,6 +76,7 @@ class AlternateNavInfoBarDelegate : publ
+@@ -74,6 +76,7 @@
    // The autocomplete match to be used when deleting the corresponding shortcut.
    // Can be null when the event triggering the infobar was not an omnibox
    // navigation.
@@ -2314,7 +2420,7 @@ Index: src/chrome/browser/ui/omnibox/chrome_omnibox_navigation_observer.cc
  #include "components/omnibox/browser/shortcuts_backend.h"
  #include "components/search_engines/template_url.h"
  #include "components/search_engines/template_url_service.h"
-@@ -45,6 +46,15 @@ class ChromeOmniboxNavigationObserver;
+@@ -45,6 +46,15 @@
  
  namespace {
  
@@ -2330,7 +2436,7 @@ Index: src/chrome/browser/ui/omnibox/chrome_omnibox_navigation_observer.cc
  // HTTP 2xx, 401, and 407 all indicate that the target address exists.
  bool ResponseCodeIndicatesSuccess(int response_code) {
    return ((response_code / 100) == 2) || (response_code == 401) ||
-@@ -251,8 +261,15 @@ ChromeOmniboxNavigationObserver::ChromeO
+@@ -251,8 +261,15 @@
      ShowInfobarCallback show_infobar)
      : content::WebContentsObserver(navigation.GetWebContents()),
        text_(text),
@@ -2348,7 +2454,7 @@ Index: src/chrome/browser/ui/omnibox/chrome_omnibox_navigation_observer.cc
        navigation_id_(navigation.GetNavigationId()),
        profile_(profile),
        show_infobar_(std::move(show_infobar)) {
-@@ -296,7 +313,7 @@ void ChromeOmniboxNavigationObserver::Di
+@@ -296,7 +313,7 @@
    // correct here (as we are processing a committed primary main frame
    // navigation), but we should consider adding a way to get virtual URL
    // directly from NavigationHandle.
@@ -2357,7 +2463,7 @@ Index: src/chrome/browser/ui/omnibox/chrome_omnibox_navigation_observer.cc
            navigation_handle->GetResponseHeaders()->response_code()) &&
        IsValidNavigation(match_.destination_url,
                          navigation_handle->GetWebContents()->GetVisibleURL())) {
-@@ -345,7 +362,8 @@ void ChromeOmniboxNavigationObserver::On
+@@ -345,7 +362,8 @@
  
  void ChromeOmniboxNavigationObserver::ShowAlternativeNavInfoBar() {
    AlternateNavInfoBarDelegate::CreateForOmniboxNavigation(
@@ -2371,7 +2477,7 @@ Index: src/chrome/browser/ui/omnibox/chrome_omnibox_navigation_observer.h
 ===================================================================
 --- src.orig/chrome/browser/ui/omnibox/chrome_omnibox_navigation_observer.h
 +++ src/chrome/browser/ui/omnibox/chrome_omnibox_navigation_observer.h
-@@ -89,6 +89,8 @@ class ChromeOmniboxNavigationObserver
+@@ -89,6 +89,8 @@
    void ShowAlternativeNavInfoBar();
  
    const std::u16string text_;
@@ -2407,3 +2513,541 @@ Index: src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
    if (!parent_widget) {
      return {nullptr, std::move(event)};
    }
+Index: src/chrome/browser/ui/views/omnibox/omnibox_match_cell_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/omnibox_match_cell_view.cc
++++ src/chrome/browser/ui/views/omnibox/omnibox_match_cell_view.cc
+@@ -45,6 +45,8 @@
+ #include "ui/gfx/image/image_skia_operations.h"
+ #include "ui/gfx/paint_vector_icon.h"
+ #include "ui/gfx/render_text.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/background.h"
+ #include "ui/views/controls/image_view.h"
+ #include "ui/views/controls/link.h"
+ #include "ui/views/layout/layout_provider.h"
+@@ -81,6 +83,13 @@
+ // and the bottom of the hover fill is the same as for other, 1-line matches.
+ static constexpr int kHistoryEmbeddingAnswerBottomPadding = 8;
+ 
++// Action context gets its own line; ordinary navigation rows stay compact.
++constexpr int kCommandVerticalPadding = 6;
++constexpr int kCommandLineGap = 2;
++constexpr int kCommandHintGap = 8;
++constexpr int kCommandKeySize = 24;
++constexpr int kCommandMinimumCopyWidth = 120;
++
+ ////////////////////////////////////////////////////////////////////////////////
+ // PlaceholderImageSource:
+ 
+@@ -208,6 +217,17 @@
+       AddChildView(std::make_unique<OmniboxTextView>(result_view));
+   separator_view_->SetText(
+       l10n_util::GetStringUTF16(IDS_AUTOCOMPLETE_MATCH_DESCRIPTION_SEPARATOR));
++  command_hint_view_ =
++      AddChildView(std::make_unique<OmniboxTextView>(result_view));
++  command_key_view_ =
++      AddChildView(std::make_unique<OmniboxTextView>(result_view));
++  command_key_view_->SetHorizontalAlignment(gfx::ALIGN_CENTER);
++  // The result's accessible name announces the action and its consequence.
++  // These cues decorate the row, and must never handle input independently.
++  command_hint_view_->GetViewAccessibility().SetIsIgnored(true);
++  command_key_view_->GetViewAccessibility().SetIsIgnored(true);
++  command_hint_view_->SetVisible(false);
++  command_key_view_->SetVisible(false);
+   iph_link_view_ = AddChildView(std::make_unique<views::Link>(
+       u"", ChromeTextContext::CONTEXT_OMNIBOX_POPUP, views::style::STYLE_LINK));
+ }
+@@ -232,7 +252,10 @@
+ 
+ void OmniboxMatchCellView::OnMatchUpdate(const OmniboxResultView* result_view,
+                                          const AutocompleteMatch& match) {
+-  if (ShouldDisplayImage(match)) {
++  const bool command = match.arcium_item && match.arcium_item->IsCommand();
++  if (command) {
++    layout_style_ = LayoutStyle::ARCIUM_COMMAND;
++  } else if (ShouldDisplayImage(match)) {
+     // Enterprise search aggregator people suggestions may display an image.
+     layout_style_ = LayoutStyle::SEARCH_SUGGESTION_WITH_IMAGE;
+   } else if (AutocompleteMatch::IsSearchType(match.type)) {
+@@ -258,7 +281,7 @@
+   // Set up the separator.
+   separator_view_->SetSize(layout_style_ ==
+                                        LayoutStyle::HISTORY_EMBEDDING_ANSWER ||
+-                                   match.description.empty()
++                                   command || match.description.empty()
+                                ? gfx::Size()
+                                : separator_view_->GetPreferredSize());
+ 
+@@ -345,14 +368,43 @@
+     description_view_->SetTextWithStyling(match.description,
+                                           match.description_class);
+   }
++
++  command_hint_view_->SetVisible(command);
++  command_hint_view_->SetText(command ? match.arcium_item->CommandHint() : u"");
++  command_key_view_->SetText(command ? u"↵" : u"");
++  UpdateCommandTheme(result_view->GetThemeState() ==
++                     OmniboxPartState::SELECTED);
+ }
+ 
+ void OmniboxMatchCellView::OnSecondaryTextVisibilityChanged() {
+   PreferredSizeChanged();
+ }
+ 
++void OmniboxMatchCellView::UpdateCommandTheme(bool selected) {
++  const bool command = layout_style_ == LayoutStyle::ARCIUM_COMMAND;
++  command_key_view_->SetVisible(command && selected);
++  if (!command) {
++    return;
++  }
++  command_hint_view_->ApplyTextColor(
++      selected ? kColorOmniboxResultsTextDimmedSelected
++               : kColorOmniboxResultsTextDimmed);
++  command_key_view_->SetBackground(
++      views::CreateRoundedRectBackground(kColorOmniboxResultsTextSelected, 4));
++  command_key_view_->ApplyTextColor(kColorOmniboxResultsBackgroundSelected);
++}
++
+ void OmniboxMatchCellView::SetIcon(const gfx::ImageSkia& image,
+                                    const AutocompleteMatch& match) {
++  if (match.arcium_item && match.arcium_item->IsCommand()) {
++    const auto icon_color =
++        GetColorProvider()->GetColor(kColorOmniboxResultsIcon);
++    icon_view_->SetImage(ui::ImageModel::FromImageSkia(
++        gfx::ImageSkiaOperations::CreateImageWithRoundRectBackground(
++            gfx::SizeF(kUniformRowHeightIconSize, kUniformRowHeightIconSize),
++            kIconAndImageCornerRadius, SkColorSetA(icon_color, 0x20), image)));
++    return;
++  }
+     icon_view_->SetImage(ui::ImageModel::FromImageSkia(image));
+ }
+ 
+@@ -449,6 +501,42 @@
+   image_view->SetBounds(image_x, y, kImageBoundsWidth, row_height);
+ 
+   const int text_indent = GetTextIndent() + tail_suggest_common_prefix_width_;
++  if (layout_style_ == LayoutStyle::ARCIUM_COMMAND) {
++    x += std::min(text_indent, child_area.width());
++    const int text_width = std::max(0, child_area.right() - x);
++    const int key_size =
++        std::max(kCommandKeySize, command_key_view_->GetLineHeight() + 4);
++    const int key_width = std::min(key_size, text_width);
++    const int key_gap = std::min(kCommandHintGap, text_width - key_width);
++    int copy_width = text_width - key_width - key_gap;
++    const int preferred_hint_width =
++        command_hint_view_->GetPreferredSize().width();
++    const int hint_width = copy_width >= kCommandMinimumCopyWidth +
++                                             kCommandHintGap +
++                                             preferred_hint_width
++                               ? preferred_hint_width
++                               : 0;
++    if (hint_width) {
++      copy_width -= hint_width + kCommandHintGap;
++    }
++
++    const int content_height = content_view_->GetLineHeight();
++    const int description_height = description_view_->GetLineHeight();
++    const int copy_height =
++        content_height + kCommandLineGap + description_height;
++    const int copy_y = y + std::max(0, (row_height - copy_height) / 2);
++    content_view_->SetBounds(x, copy_y, copy_width, content_height);
++    description_view_->SetBounds(x, copy_y + content_height + kCommandLineGap,
++                                 copy_width, description_height);
++    separator_view_->SetSize(gfx::Size());
++    command_hint_view_->SetBounds(
++        child_area.right() - key_width - key_gap - hint_width, y, hint_width,
++        row_height);
++    command_key_view_->SetBounds(child_area.right() - key_width,
++                                 y + std::max(0, (row_height - key_size) / 2),
++                                 key_width, std::min(key_size, row_height));
++    return;
++  }
+   x += text_indent;
+   const int text_width = child_area.width() - text_indent;
+ 
+@@ -517,6 +605,19 @@
+ 
+ gfx::Size OmniboxMatchCellView::CalculatePreferredSize(
+     const views::SizeBounds& available_size) const {
++  if (layout_style_ == LayoutStyle::ARCIUM_COMMAND) {
++    const int width =
++        GetInsets().width() + GetTextIndent() +
++        std::max(content_view_->GetPreferredSize().width(),
++                 description_view_->GetPreferredSize().width()) +
++        command_hint_view_->GetPreferredSize().width() +
++        std::max(kCommandKeySize, command_key_view_->GetLineHeight() + 4) +
++        2 * kCommandHintGap;
++    const int height = content_view_->GetLineHeight() +
++                       description_view_->GetLineHeight() + kCommandLineGap +
++                       2 * kCommandVerticalPadding;
++    return gfx::Size(width, height);
++  }
+   // Compute width before height because height for multiline suggestions (e.g.,
+   // `HISTORY_EMBEDDING_ANSWER`) will depend on how many lines they require,
+   // which will in turn depend on available width.
+Index: src/chrome/browser/ui/views/omnibox/omnibox_match_cell_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/omnibox_match_cell_view.h
++++ src/chrome/browser/ui/views/omnibox/omnibox_match_cell_view.h
+@@ -71,6 +71,8 @@
+   OmniboxTextView* content() { return content_view_; }
+   OmniboxTextView* description() { return description_view_; }
+   OmniboxTextView* separator() { return separator_view_; }
++  OmniboxTextView* command_hint() { return command_hint_view_; }
++  OmniboxTextView* command_key() { return command_key_view_; }
+   views::Link* iph_link_view() { return iph_link_view_; }
+ 
+   // Determines if `match` should display an answer, calculator, or entity
+@@ -83,6 +85,10 @@
+   // Notifies the view that the visibility of the secondary text has changed.
+   void OnSecondaryTextVisibilityChanged();
+ 
++  // Passive command affordances follow row selection without creating another
++  // keyboard or accessibility focus stop.
++  void UpdateCommandTheme(bool selected);
++
+   // Set's the `icon_view_` image, possibly with a rounded square background.
+   void SetIcon(const gfx::ImageSkia& image, const AutocompleteMatch& match);
+ 
+@@ -112,6 +118,7 @@
+     IPH_SUGGESTION,
+     HISTORY_EMBEDDING_ANSWER,
+     TOOLBELT,
++    ARCIUM_COMMAND,
+   };
+ 
+   // How far to indent the icon, entity, or answer image from the left side of
+@@ -139,6 +146,8 @@
+   raw_ptr<OmniboxTextView> content_view_;
+   raw_ptr<OmniboxTextView> description_view_;
+   raw_ptr<OmniboxTextView> separator_view_;
++  raw_ptr<OmniboxTextView> command_hint_view_;
++  raw_ptr<OmniboxTextView> command_key_view_;
+   // Some IPH matches have a link users can click to learn more or take action.
+   raw_ptr<views::Link> iph_link_view_;
+ 
+Index: src/chrome/browser/ui/views/omnibox/omnibox_result_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/omnibox_result_view.cc
++++ src/chrome/browser/ui/views/omnibox/omnibox_result_view.cc
+@@ -16,6 +16,7 @@
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "build/build_config.h"
++#include "chrome/app/vector_icons/vector_icons.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/omnibox/omnibox_controller.h"
+@@ -373,7 +374,9 @@
+           match_.IsToolbelt()
+               ? views::MinimumFlexSizeRule::kPreferredSnapToMinimum
+               : views::MinimumFlexSizeRule::kScaleToMinimum,
+-          views::MaximumFlexSizeRule::kPreferred)
++          match_.arcium_item && match_.arcium_item->IsCommand()
++              ? views::MaximumFlexSizeRule::kUnbounded
++              : views::MaximumFlexSizeRule::kPreferred)
+           .WithOrder(2));
+ 
+   suggestion_view_->OnMatchUpdate(this, match_);
+@@ -473,6 +476,7 @@
+                                     ? kColorOmniboxResultsTextDimmedSelected
+                                     : kColorOmniboxResultsTextDimmed;
+   suggestion_view_->separator()->ApplyTextColor(dimmed_id);
++  suggestion_view_->UpdateCommandTheme(selected);
+ 
+   // Recreate the icons in case the color needs to change.
+   // Note: if this is an extension icon or favicon then this can be done in
+@@ -664,6 +668,35 @@
+ }
+ 
+ gfx::Image OmniboxResultView::GetIcon() const {
++  if (match_.arcium_item && match_.arcium_item->IsCommand()) {
++    const gfx::VectorIcon* icon = nullptr;
++    switch (match_.arcium_item->command) {
++      case ArciumOmniboxItem::Command::kPinCurrentTab:
++        icon = &kKeepIcon;
++        break;
++      case ArciumOmniboxItem::Command::kFavoriteCurrentTab:
++        icon = &kStarIcon;
++        break;
++      case ArciumOmniboxItem::Command::kMovePinToSpace:
++        icon = &kMoveGroupIcon;
++        break;
++      case ArciumOmniboxItem::Command::kCloseLiveInstance:
++        icon = &kCloseIcon;
++        break;
++      case ArciumOmniboxItem::Command::kReturnPinHome:
++        icon = &kHomeIcon;
++        break;
++      case ArciumOmniboxItem::Command::kNone:
++        break;
++    }
++    if (icon) {
++      return gfx::Image(gfx::CreateVectorIcon(
++          *icon, GetLayoutConstant(LayoutConstant::kLocationBarIconSize),
++          GetColorProvider()->GetColor(GetMatchSelected()
++                                           ? kColorOmniboxResultsIconSelected
++                                           : kColorOmniboxResultsIcon)));
++    }
++  }
+   // Usually, use kColorOmniboxResultsIcon[Selected] for icon color. Except for
+   // history cluster suggestions which want to stand out. They reuse the
+   // kColorOmniboxResultsUrl[Selected] color which is intended for the URL text
+Index: src/chrome/browser/ui/views/omnibox/omnibox_result_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/omnibox_result_view.h
++++ src/chrome/browser/ui/views/omnibox/omnibox_result_view.h
+@@ -104,6 +104,14 @@
+  private:
+   FRIEND_TEST_ALL_PREFIXES(OmniboxPopupViewViewsTest, DeleteSuggestion);
+   FRIEND_TEST_ALL_PREFIXES(OmniboxResultViewTest, ContextualSecondaryText);
++  FRIEND_TEST_ALL_PREFIXES(OmniboxResultViewTest,
++                           ArciumActionsShowTwoLineContextAndPassiveCue);
++  FRIEND_TEST_ALL_PREFIXES(OmniboxResultViewTest,
++                           ArciumActionReuseClearsCommandAffordances);
++  FRIEND_TEST_ALL_PREFIXES(OmniboxResultViewTest,
++                           ArciumActionResizeDoesNotOverlapReturnCue);
++  FRIEND_TEST_ALL_PREFIXES(OmniboxResultViewTest,
++                           ArciumActionRepeatedLayoutKeepsReturnCueStable);
+ 
+   void OpenIphLink();
+ 
+Index: src/chrome/browser/ui/views/omnibox/omnibox_result_view_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/omnibox_result_view_unittest.cc
++++ src/chrome/browser/ui/views/omnibox/omnibox_result_view_unittest.cc
+@@ -27,7 +27,9 @@
+ #include "ui/events/event_utils.h"
+ #include "ui/events/types/event_type.h"
+ #include "ui/gfx/image/image.h"
++#include "ui/gfx/render_text.h"
+ #include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/test/views_test_utils.h"
+ #include "ui/views/widget/widget.h"
+ 
+ #if defined(USE_AURA)
+@@ -357,3 +359,123 @@
+     EXPECT_TRUE(description_view->GetVisible());
+   }
+ }
++
++TEST_F(OmniboxResultViewTest, ArciumActionsShowTwoLineContextAndPassiveCue) {
++  AutocompleteMatch match;
++  match.type = AutocompleteMatchType::BOOKMARK_TITLE;
++  match.contents = u"Close live tab";
++  match.contents_class = {{0, ACMatchClassification::MATCH}};
++  match.description = u"Atlas · Pin · Work › Projects";
++  match.description_class = {{0, ACMatchClassification::DIM}};
++  match.arcium_item = ArciumOmniboxItem();
++  match.arcium_item->command = ArciumOmniboxItem::Command::kCloseLiveInstance;
++  result_view()->SetMatch(match);
++  auto* cell = result_view()->suggestion_view_.get();
++  result_view()->SetBoundsRect(
++      gfx::Rect(0, 0, 640, cell->GetPreferredSize().height()));
++  views::test::RunScheduledLayout(result_view());
++
++  EXPECT_EQ(match.contents, cell->content()->GetText());
++  EXPECT_EQ(match.description, cell->description()->GetText());
++  EXPECT_GT(cell->description()->y(), cell->content()->y());
++  EXPECT_GE(cell->description()->y(), cell->content()->bounds().bottom());
++  EXPECT_EQ(0, cell->separator()->width());
++  EXPECT_GT(cell->GetPreferredSize().height(),
++            OmniboxMatchCellView::kRowHeight);
++  EXPECT_EQ(u"Keep pin", cell->command_hint()->GetText());
++  EXPECT_EQ(views::View::FocusBehavior::NEVER,
++            cell->command_hint()->GetFocusBehavior());
++  EXPECT_EQ(views::View::FocusBehavior::NEVER,
++            cell->command_key()->GetFocusBehavior());
++  EXPECT_FALSE(cell->command_key()->GetVisible());
++
++  popup_view()->SetSelectedIndex(kTestResultViewIndex);
++  result_view()->OnSelectionStateChanged();
++  EXPECT_TRUE(cell->command_key()->GetVisible());
++  EXPECT_EQ(u"↵", cell->command_key()->GetText());
++}
++
++TEST_F(OmniboxResultViewTest, ArciumActionReuseClearsCommandAffordances) {
++  AutocompleteMatch command;
++  command.type = AutocompleteMatchType::BOOKMARK_TITLE;
++  command.contents = u"Add to Favorites";
++  command.description = u"Atlas · Tab · Work";
++  command.arcium_item = ArciumOmniboxItem();
++  command.arcium_item->command =
++      ArciumOmniboxItem::Command::kFavoriteCurrentTab;
++  popup_view()->SetSelectedIndex(kTestResultViewIndex);
++  result_view()->SetMatch(command);
++  auto* cell = result_view()->suggestion_view_.get();
++  ASSERT_TRUE(cell->command_key()->GetVisible());
++  ASSERT_TRUE(cell->command_hint()->GetVisible());
++
++  AutocompleteMatch navigation;
++  navigation.type = AutocompleteMatchType::HISTORY_URL;
++  navigation.contents = u"Atlas";
++  navigation.description = u"atlas.test";
++  result_view()->SetMatch(navigation);
++  EXPECT_FALSE(cell->command_key()->GetVisible());
++  EXPECT_FALSE(cell->command_hint()->GetVisible());
++  EXPECT_TRUE(cell->command_hint()->GetText().empty());
++  EXPECT_EQ(OmniboxMatchCellView::kRowHeight,
++            cell->GetPreferredSize().height());
++  EXPECT_EQ(navigation.contents, cell->content()->GetText());
++  EXPECT_EQ(navigation.description, cell->description()->GetText());
++}
++
++TEST_F(OmniboxResultViewTest, ArciumActionResizeDoesNotOverlapReturnCue) {
++  AutocompleteMatch command;
++  command.type = AutocompleteMatchType::BOOKMARK_TITLE;
++  command.contents = u"Move pin to Research";
++  command.description =
++      u"A long document title · Pin · Work › Projects → Research";
++  command.arcium_item = ArciumOmniboxItem();
++  command.arcium_item->command = ArciumOmniboxItem::Command::kMovePinToSpace;
++  popup_view()->SetSelectedIndex(kTestResultViewIndex);
++  result_view()->SetMatch(command);
++  auto* cell = result_view()->suggestion_view_.get();
++  for (const int width : {48, 120, 320, 640}) {
++    SCOPED_TRACE(width);
++    result_view()->SetBoundsRect(
++        gfx::Rect(0, 0, width, cell->GetPreferredSize().height()));
++    views::test::RunScheduledLayout(result_view());
++    EXPECT_GE(cell->content()->width(), 0);
++    EXPECT_GE(cell->description()->width(), 0);
++    EXPECT_LE(cell->content()->bounds().right(), cell->command_key()->x());
++    EXPECT_LE(cell->description()->bounds().right(), cell->command_key()->x());
++    EXPECT_LE(cell->command_key()->bounds().right(), cell->width());
++    EXPECT_GE(cell->command_key()->x(), 0);
++  }
++}
++
++TEST_F(OmniboxResultViewTest, ArciumActionRepeatedLayoutKeepsReturnCueStable) {
++  AutocompleteMatch command;
++  command.type = AutocompleteMatchType::BOOKMARK_TITLE;
++  command.contents = u"Pin this tab";
++  command.description = u"Atlas · Tab · Work";
++  command.arcium_item = ArciumOmniboxItem();
++  command.arcium_item->command = ArciumOmniboxItem::Command::kPinCurrentTab;
++  popup_view()->SetSelectedIndex(kTestResultViewIndex);
++  result_view()->SetMatch(command);
++  auto* cell = result_view()->suggestion_view_.get();
++  result_view()->SetBoundsRect(
++      gfx::Rect(0, 0, 640, cell->GetPreferredSize().height()));
++  views::test::RunScheduledLayout(result_view());
++  const auto key_bounds = cell->command_key()->bounds();
++  const auto key_contents = cell->command_key()->GetContentsBounds();
++  const auto copy_bounds = cell->content()->bounds();
++  EXPECT_EQ(
++      gfx::ALIGN_CENTER,
++      cell->command_key()->CreateRenderText(u"↵")->horizontal_alignment());
++  for (int pass = 0; pass < 8; ++pass) {
++    SCOPED_TRACE(pass);
++    cell->InvalidateLayout();
++    views::test::RunScheduledLayout(result_view());
++    EXPECT_EQ(key_bounds, cell->command_key()->bounds());
++    EXPECT_EQ(key_contents, cell->command_key()->GetContentsBounds());
++    EXPECT_EQ(copy_bounds, cell->content()->bounds());
++    EXPECT_TRUE(cell->command_key()->GetVisible());
++    EXPECT_EQ(views::View::FocusBehavior::NEVER,
++              cell->command_key()->GetFocusBehavior());
++  }
++}
+Index: src/chrome/browser/ui/views/omnibox/omnibox_text_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/omnibox_text_view.cc
++++ src/chrome/browser/ui/views/omnibox/omnibox_text_view.cc
+@@ -125,6 +125,18 @@
+   SchedulePaint();
+ }
+ 
++void OmniboxTextView::SetHorizontalAlignment(
++    gfx::HorizontalAlignment alignment) {
++  if (horizontal_alignment_ == alignment) {
++    return;
++  }
++  horizontal_alignment_ = alignment;
++  if (render_text_) {
++    render_text_->SetHorizontalAlignment(alignment);
++  }
++  SchedulePaint();
++}
++
+ std::u16string_view OmniboxTextView::GetText() const {
+   return render_text_ ? render_text_->text() : std::u16string_view();
+ }
+@@ -274,6 +286,9 @@
+   std::unique_ptr<gfx::RenderText> render_text =
+       gfx::RenderText::CreateRenderText();
+   render_text->SetDisplayRect(gfx::Rect(gfx::Size(INT_MAX, 0)));
++  if (horizontal_alignment_) {
++    render_text->SetHorizontalAlignment(*horizontal_alignment_);
++  }
+   render_text->SetCursorEnabled(false);
+   render_text->SetElideBehavior(gfx::ELIDE_TAIL);
+   const gfx::FontList& font = views::TypographyProvider::Get().GetFont(
+Index: src/chrome/browser/ui/views/omnibox/omnibox_text_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/omnibox_text_view.h
++++ src/chrome/browser/ui/views/omnibox/omnibox_text_view.h
+@@ -8,6 +8,7 @@
+ #include <stddef.h>
+ 
+ #include <memory>
++#include <optional>
+ #include <string_view>
+ 
+ #include "base/memory/raw_ptr.h"
+@@ -19,6 +20,7 @@
+ #include "third_party/omnibox_proto/rich_answer_template.pb.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/gfx/font_list.h"
++#include "ui/gfx/text_constants.h"
+ #include "ui/views/view.h"
+ 
+ namespace gfx {
+@@ -48,6 +50,9 @@
+   // after setting text with methods below.
+   void ApplyTextColor(ui::ColorId id);
+ 
++  // Alignment survives text recreation and does not change the intrinsic size.
++  void SetHorizontalAlignment(gfx::HorizontalAlignment alignment);
++
+   // Returns the render text, or an empty string if there is none.
+   std::u16string_view GetText() const;
+ 
+@@ -112,6 +117,7 @@
+   bool wrap_text_lines_ = false;
+ 
+   // The primary data for this class.
++  std::optional<gfx::HorizontalAlignment> horizontal_alignment_;
+   std::unique_ptr<gfx::RenderText> render_text_;
+   // The classifications most recently passed to SetText. Used to exit
+   // early instead of setting text when the text and classifications
+Index: src/components/omnibox/browser/autocomplete_match_type.cc
+===================================================================
+--- src.orig/components/omnibox/browser/autocomplete_match_type.cc
++++ src/components/omnibox/browser/autocomplete_match_type.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <array>
+ #include <optional>
++#include <string_view>
+ 
+ #include "base/check.h"
+ #include "base/notreached.h"
+@@ -111,6 +112,16 @@
+ std::u16string GetAccessibilityBaseLabel(const AutocompleteMatch& match,
+                                          const std::u16string& match_text,
+                                          int* label_prefix_length) {
++  if (match.arcium_item && match.arcium_item->IsCommand()) {
++    // Keep the spoken action, target, and consequence aligned with command
++    // rows.
++    constexpr std::u16string_view prefix = u"Action, ";
++    if (label_prefix_length) {
++      *label_prefix_length = static_cast<int>(prefix.size());
++    }
++    return base::StrCat({prefix, match_text, u", ", match.description, u", ",
++                         match.arcium_item->CommandHint()});
++  }
+   // Types with a message ID of zero get |text| returned as-is.
+   static constexpr auto message_ids = std::to_array<int>({
+       0,                             // URL_WHAT_YOU_TYPED
