@@ -1928,7 +1928,7 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
-@@ -0,0 +1,465 @@
+@@ -0,0 +1,533 @@
 +// Copyright 2026 The Arcium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1951,6 +1951,7 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 +#include "chrome/browser/ui/views/frame/test_with_browser_view.h"
 +#include "chrome/browser/ui/views/location_bar/location_bar_view.h"
 +#include "chrome/browser/ui/views/location_bar/selected_keyword_view.h"
++#include "chrome/browser/ui/views/omnibox/omnibox_popup_view_views.h"
 +#include "chrome/browser/ui/views/omnibox/omnibox_view_views.h"
 +#include "chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.h"
 +#include "chrome/browser/ui/views/page_action/page_action_container_view.h"
@@ -1959,6 +1960,7 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 +#include "components/infobars/core/infobar.h"
 +#include "components/omnibox/browser/autocomplete_controller.h"
 +#include "components/omnibox/browser/autocomplete_match.h"
++#include "components/omnibox/browser/autocomplete_result.h"
 +#include "components/omnibox/browser/fake_autocomplete_provider.h"
 +#include "components/omnibox/browser/omnibox_client.h"
 +#include "components/omnibox/browser/shortcuts_backend.h"
@@ -2212,6 +2214,72 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 +    }
 +  }
 +  views::test::WidgetDestroyedWaiter destroyed(location->GetWidget());
++  browser_view()->CloseArciumCommandBar();
++  destroyed.Wait();
++}
++
++TEST_F(ArciumCommandBarTest, PopupResultsBeginBelowActualCommandInput) {
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  auto* location = floating();
++  auto* field = location->omnibox_view();
++  field->SetFontList(field->GetFontList().DeriveWithSizeDelta(12));
++  field->SetUserText(u"boundary", false);
++  auto* controller = location->GetOmniboxController();
++  controller->StopAutocomplete(true);
++  auto* autocomplete = controller->autocomplete_controller();
++  ASSERT_FALSE(autocomplete->providers().empty());
++  ACMatches matches;
++  for (int i = 0; i < 3; ++i) {
++    AutocompleteMatch match(autocomplete->providers().front().get(), 1000 - i,
++                            false, AutocompleteMatchType::URL_WHAT_YOU_TYPED);
++    match.allowed_to_be_default_match = i == 0;
++    match.destination_url = GURL("https://boundary.test/");
++    match.contents = u"Boundary result";
++    match.description = u"boundary.test";
++    match.contents_class = {{0, ACMatchClassification::NONE}};
++    match.description_class = {{0, ACMatchClassification::NONE}};
++    matches.push_back(std::move(match));
++  }
++  auto& result = const_cast<AutocompleteResult&>(autocomplete->result());
++  result.Reset();
++  result.AppendMatches(matches);
++  auto* popup =
++      static_cast<OmniboxPopupViewViews*>(location->GetOmniboxPopupView());
++  ASSERT_TRUE(popup);
++  popup->UpdatePopupAppearance();
++  ASSERT_TRUE(popup->GetWidget());
++  auto* widget = location->GetWidget();
++  const int outer_width =
++      widget->GetWindowBoundsInScreen().width() - location->width();
++  for (int width : {240, 640, 320}) {
++    gfx::Rect bounds = widget->GetWindowBoundsInScreen();
++    bounds.set_width(width + outer_width);
++    widget->SetBounds(bounds);
++    location->InvalidateLayout();
++    views::test::RunScheduledLayout(location);
++    popup->UpdatePopupBounds();
++    views::test::RunScheduledLayout(popup->GetWidget()->GetRootView());
++    const gfx::Rect input_bounds = location->GetBoundsInScreen();
++    const gfx::Rect popup_bounds = popup->GetBoundsInScreen();
++    const int results_top =
++        input_bounds.bottom() +
++        RoundedOmniboxResultsFrame::GetLocationBarAlignmentInsets().bottom();
++    EXPECT_EQ(results_top, popup_bounds.y());
++    int previous_bottom = results_top;
++    int visible_rows = 0;
++    for (views::View* row : popup->children()) {
++      if (!row->GetVisible()) {
++        continue;
++      }
++      const gfx::Rect row_bounds = row->GetBoundsInScreen();
++      EXPECT_GE(row_bounds.y(), previous_bottom);
++      EXPECT_LE(row_bounds.bottom(), popup_bounds.bottom());
++      previous_bottom = row_bounds.bottom();
++      ++visible_rows;
++    }
++    EXPECT_EQ(3, visible_rows);
++  }
++  views::test::WidgetDestroyedWaiter destroyed(widget);
 +  browser_view()->CloseArciumCommandBar();
 +  destroyed.Wait();
 +}
@@ -2643,7 +2711,15 @@ Index: src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
 +++ src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
-@@ -60,7 +60,8 @@ views::Widget* GetImmersiveFullscreenWid
+@@ -13,7 +13,6 @@
+ #include "build/build_config.h"
+ #include "chrome/browser/themes/theme_service.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+-#include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/location_bar/location_bar_view.h"
+ #include "chrome/browser/ui/views/omnibox/omnibox_aim_popup_webui_content.h"
+@@ -60,7 +59,8 @@ views::Widget* GetImmersiveFullscreenWid
  
    // If the results window is not a child of the overlay widget we are not in
    // immersive fullscreen.
@@ -2653,7 +2729,7 @@ Index: src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
      return nullptr;
    }
  
-@@ -107,10 +108,10 @@ WidgetEventPair GetParentWidgetAndEvent(
+@@ -107,10 +107,10 @@ WidgetEventPair GetParentWidgetAndEvent(
    // Note that the floating results view is a top-level widget, so hop up a
    // level before looking for the parent's top-level widget for event
    // forwarding.
@@ -2666,6 +2742,50 @@ Index: src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
    if (!parent_widget) {
      return {nullptr, std::move(event)};
    }
+@@ -235,7 +235,9 @@ RoundedOmniboxResultsFrame::RoundedOmnib
+     views::View* contents,
+     LocationBar* location_bar,
+     bool forward_mouse_events)
+-    : contents_(contents), forward_mouse_events_(forward_mouse_events) {
++    : location_bar_(location_bar),
++      contents_(contents),
++      forward_mouse_events_(forward_mouse_events) {
+   const int corner_radius = 12;
+   // Host the contents in its own View to simplify layout and customization.
+   auto contents_host_builder =
+@@ -290,9 +292,11 @@ void RoundedOmniboxResultsFrame::OnBefor
+ }
+ 
+ // static
+-int RoundedOmniboxResultsFrame::GetNonResultSectionHeight(bool include_cutout) {
++int RoundedOmniboxResultsFrame::GetNonResultSectionHeight(
++    const LocationBar& location_bar,
++    bool include_cutout) {
+   return include_cutout
+-             ? GetLayoutConstant(LayoutConstant::kLocationBarHeight) +
++             ? location_bar.Bounds().height() +
+                    GetLocationBarAlignmentInsets().height()
+              : 0;
+ }
+@@ -362,7 +366,7 @@ void RoundedOmniboxResultsFrame::Layout(
+ 
+   if (top_background_->GetVisible()) {
+     gfx::Rect top_bounds(contents_host_->GetContentsBounds());
+-    top_bounds.set_height(GetNonResultSectionHeight(true));
++    top_bounds.set_height(GetNonResultSectionHeight(*location_bar_));
+     top_bounds.Inset(GetLocationBarAlignmentInsets());
+     top_background_->SetBoundsRect(top_bounds);
+   }
+@@ -428,7 +432,8 @@ void RoundedOmniboxResultsFrame::OnMouse
+ // Insets used to position |contents_| within |contents_host_|.
+ gfx::Insets RoundedOmniboxResultsFrame::GetContentInsets() {
+   return gfx::Insets::TLBR(
+-      GetNonResultSectionHeight(top_background_->GetVisible()), 0, 0, 0);
++      GetNonResultSectionHeight(*location_bar_, top_background_->GetVisible()),
++      0, 0, 0);
+ }
+ 
+ BEGIN_METADATA(RoundedOmniboxResultsFrame)
 Index: src/chrome/browser/ui/views/omnibox/omnibox_match_cell_view.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/omnibox/omnibox_match_cell_view.cc
@@ -3598,3 +3718,51 @@ Index: src/chrome/browser/ui/views/location_bar/BUILD.gn
        "//components/zoom",
        "//extensions:extensions_browser_resources",
        "//extensions/browser",
+Index: src/chrome/browser/ui/views/omnibox/omnibox_popup_view_views.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/omnibox_popup_view_views.cc
++++ src/chrome/browser/ui/views/omnibox/omnibox_popup_view_views.cc
+@@ -95,7 +95,8 @@ std::optional<gfx::Rect> GetDebugWidgetB
+   // Calculate the frame's Y position so the top of the results area
+   // (frame_y + non_result_height) aligns with the content area's top.
+   frame_bounds.set_y(contents_bounds.y() -
+-                     RoundedOmniboxResultsFrame::GetNonResultSectionHeight());
++                     RoundedOmniboxResultsFrame::GetNonResultSectionHeight(
++                         *location_bar_view));
+ 
+   return frame_bounds;
+ }
+@@ -745,7 +746,8 @@ gfx::Rect OmniboxPopupViewViews::GetTarg
+   // Add enough space on the top and bottom so it looks like there is the same
+   // amount of space between the text and the popup border as there is in the
+   // interior between each row of text.
+-  popup_height += RoundedOmniboxResultsFrame::GetNonResultSectionHeight();
++  popup_height += RoundedOmniboxResultsFrame::GetNonResultSectionHeight(
++      *location_bar_view_);
+ 
+   // The rounded popup is always offset the same amount from the omnibox.
+   gfx::Rect content_rect = location_bar_view_->GetBoundsInScreen();
+Index: src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.h
++++ src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.h
+@@ -33,8 +33,9 @@ class RoundedOmniboxResultsFrame : publi
+   static void OnBeforeWidgetInit(views::Widget::InitParams* params,
+                                  views::Widget* widget);
+ 
+-  // The height of the location bar view part of the omnibox popup.
+-  static int GetNonResultSectionHeight(bool include_cutout = true);
++  // The height reserved above results, using the laid-out input height.
++  static int GetNonResultSectionHeight(const LocationBar& location_bar,
++                                      bool include_cutout = true);
+ 
+   // How the Widget is aligned relative to the location bar.
+   static gfx::Insets GetLocationBarAlignmentInsets();
+@@ -77,6 +78,7 @@ class RoundedOmniboxResultsFrame : publi
+ 
+   gfx::Insets GetContentInsets();
+ 
++  raw_ptr<const LocationBar> location_bar_;
+   raw_ptr<views::View> top_background_ = nullptr;
+   raw_ptr<views::View> contents_host_ = nullptr;
+   raw_ptr<views::View> contents_;
