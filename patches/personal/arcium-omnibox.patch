@@ -3784,7 +3784,7 @@ Index: src/components/omnibox/browser/arcium_command_search.cc
 ===================================================================
 --- /dev/null
 +++ src/components/omnibox/browser/arcium_command_search.cc
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,204 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -3794,11 +3794,11 @@ Index: src/components/omnibox/browser/arcium_command_search.cc
 +#include <utility>
 +
 +#include "base/check.h"
-+#include "components/omnibox/browser/autocomplete_result.h"
-+#include "components/omnibox/browser/autocomplete_provider.h"
 +#include "base/i18n/case_conversion.h"
 +#include "base/strings/string_split.h"
 +#include "base/strings/string_util.h"
++#include "components/omnibox/browser/autocomplete_provider.h"
++#include "components/omnibox/browser/autocomplete_result.h"
 +#include "third_party/icu/source/common/unicode/normalizer2.h"
 +#include "third_party/icu/source/common/unicode/unistr.h"
 +
@@ -3810,13 +3810,12 @@ Index: src/components/omnibox/browser/arcium_command_search.cc
 +  const auto* nfc = icu::Normalizer2::getNFCInstance(status);
 +  CHECK(U_SUCCESS(status));
 +  icu::UnicodeString output;
-+  nfc->normalize(icu::UnicodeString(false, folded.data(), folded.size()), output,
-+                 status);
++  nfc->normalize(icu::UnicodeString(false, folded.data(), folded.size()),
++                 output, status);
 +  CHECK(U_SUCCESS(status));
 +  return std::u16string(output.getBuffer(), output.length());
 +}
-+bool Better(const CommandSearchResult& left,
-+            const CommandSearchResult& right) {
++bool Better(const CommandSearchResult& left, const CommandSearchResult& right) {
 +  if (left.text_score != right.text_score) {
 +    return left.text_score > right.text_score;
 +  }
@@ -3828,10 +3827,17 @@ Index: src/components/omnibox/browser/arcium_command_search.cc
 +  }
 +  return left.record.slot < right.record.slot;
 +}
-+int Score(std::u16string_view text, std::u16string_view token,
-+          int exact, int prefix, int contains) {
-+  if (text == token) return exact;
-+  if (base::StartsWith(text, token)) return prefix;
++int Score(std::u16string_view text,
++          std::u16string_view token,
++          int exact,
++          int prefix,
++          int contains) {
++  if (text == token) {
++    return exact;
++  }
++  if (base::StartsWith(text, token)) {
++    return prefix;
++  }
 +  return text.find(token) != std::u16string_view::npos ? contains : 0;
 +}
 +}  // namespace
@@ -3843,55 +3849,77 @@ Index: src/components/omnibox/browser/arcium_command_search.cc
 +  CHECK_LE(records_.size(), UINT32_MAX);
 +  search_text_.reserve(records_.size());
 +  for (const auto& record : records_) {
-+    search_text_.push_back({Normalize(record.title), Normalize(record.url),
-+                            Normalize(record.context + u" " + record.category)});
++    search_text_.push_back(
++        {Normalize(record.title), Normalize(record.url),
++         Normalize(record.context + u" " + record.category)});
 +  }
 +}
 +CommandSearchIndex::~CommandSearchIndex() = default;
 +
 +std::vector<CommandSearchResult> CommandSearchIndex::Search(
-+    std::u16string_view query, SearchScope scope, size_t limit) const {
++    std::u16string_view query,
++    SearchScope scope,
++    size_t limit) const {
 +  limit = std::min(limit, kMaxResults);
 +  std::vector<CommandSearchResult> results;
 +  results.reserve(limit);
-+  if (!limit || query.size() > kMaxQueryLength) return results;
++  if (!limit || query.size() > kMaxQueryLength) {
++    return results;
++  }
 +  const auto normalized = Normalize(query);
-+  const auto tokens = base::SplitStringPiece(
-+      normalized, base::kWhitespaceUTF16, base::TRIM_WHITESPACE,
-+      base::SPLIT_WANT_NONEMPTY);
-+  if (tokens.size() > kMaxQueryTerms) return results;
++  const auto tokens =
++      base::SplitStringPiece(normalized, base::kWhitespaceUTF16,
++                             base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++  if (tokens.size() > kMaxQueryTerms) {
++    return results;
++  }
 +  for (size_t slot = 0; slot < records_.size(); ++slot) {
 +    const auto& record = records_[slot];
 +    if (scope != SearchScope::kEverything && record.scope != scope &&
-+        !(record.memberships & ScopeBit(scope))) continue;
-+    if (tokens.empty() && !record.suggested) continue;
++        !(record.memberships & ScopeBit(scope))) {
++      continue;
++    }
++    if (tokens.empty() && !record.suggested) {
++      continue;
++    }
 +    const auto& text = search_text_[slot];
 +    int score = 0;
 +    bool matched = true;
 +    for (const auto token : tokens) {
-+      const int token_score = std::max({
-+          Score(text.title, token, 100, 80, 50),
-+          Score(text.url, token, 45, 35, 25),
-+          Score(text.context, token, 30, 20, 10)});
-+      if (!token_score) { matched = false; break; }
++      const int token_score =
++          std::max({Score(text.title, token, 100, 80, 50),
++                    Score(text.url, token, 45, 35, 25),
++                    Score(text.context, token, 30, 20, 10)});
++      if (!token_score) {
++        matched = false;
++        break;
++      }
 +      score += token_score;
 +    }
-+    if (!matched) continue;
++    if (!matched) {
++      continue;
++    }
 +    CommandSearchResult candidate{Ref(slot), score, record.source_relevance};
-+    const auto position = std::lower_bound(results.begin(), results.end(),
-+                                           candidate, Better);
-+    if (results.size() == limit && position == results.end()) continue;
++    const auto position =
++        std::lower_bound(results.begin(), results.end(), candidate, Better);
++    if (results.size() == limit && position == results.end()) {
++      continue;
++    }
 +    // Allocation remains bounded by the requested visible result count.
-+    if (results.size() == limit) results.pop_back();
-+    const auto insertion = std::lower_bound(results.begin(), results.end(),
-+                                            candidate, Better);
++    if (results.size() == limit) {
++      results.pop_back();
++    }
++    const auto insertion =
++        std::lower_bound(results.begin(), results.end(), candidate, Better);
 +    results.insert(insertion, candidate);
 +  }
 +  return results;
 +}
 +const CommandRecord* CommandSearchIndex::Get(CommandRecordRef ref) const {
 +  if (ref.snapshot != snapshot_ || ref.revision != revision_ ||
-+      ref.slot >= records_.size()) return nullptr;
++      ref.slot >= records_.size()) {
++    return nullptr;
++  }
 +  return &records_[ref.slot];
 +}
 +CommandRecordRef CommandSearchIndex::Ref(size_t slot) const {
@@ -3903,17 +3931,20 @@ Index: src/components/omnibox/browser/arcium_command_search.cc
 +                 search_text_.capacity() * sizeof(SearchText);
 +  for (const auto& r : records_) {
 +    bytes += r.id.capacity() + 1;
-+    for (const auto* text : {&r.title, &r.url, &r.context, &r.category})
++    for (const auto* text : {&r.title, &r.url, &r.context, &r.category}) {
 +      bytes += (text->capacity() + 1) * sizeof(char16_t);
++    }
 +  }
 +  for (const auto& r : search_text_) {
-+    for (const auto* text : {&r.title, &r.url, &r.context})
++    for (const auto* text : {&r.title, &r.url, &r.context}) {
 +      bytes += (text->capacity() + 1) * sizeof(char16_t);
++    }
 +  }
 +  return bytes;
 +}
 +std::vector<NativeCommandRow> ProjectNativeCommandRows(
-+    const AutocompleteResult& result, base::UnguessableToken result_revision,
++    const AutocompleteResult& result,
++    base::UnguessableToken result_revision,
 +    size_t limit) {
 +  CHECK(!result_revision.is_empty());
 +  limit = std::min({limit, CommandSearchIndex::kMaxResults, result.size()});
@@ -3922,29 +3953,39 @@ Index: src/components/omnibox/browser/arcium_command_search.cc
 +  const auto* default_match = result.default_match();
 +  for (size_t i = 0; i < limit; ++i) {
 +    const auto& match = result.match_at(i);
-+    rows.push_back({result_revision, static_cast<uint32_t>(i), match.relevance,
-+                    match.provider ? static_cast<int>(match.provider->type()) : 0,
-+                    static_cast<int>(match.type), match.allowed_to_be_default_match,
-+                    &match == default_match});
++    rows.push_back(
++        {result_revision, static_cast<uint32_t>(i), match.relevance,
++         match.provider ? static_cast<int>(match.provider->type()) : 0,
++         static_cast<int>(match.type), match.allowed_to_be_default_match,
++         &match == default_match});
 +  }
 +  return rows;
 +}
 +std::vector<CommandAction> ResolveCommandActions(
-+    const CommandSearchIndex& index, CommandRecordRef target,
++    const CommandSearchIndex& index,
++    CommandRecordRef target,
 +    CommandCapabilities capabilities) {
 +  const auto* record = index.Get(target);
-+  if (!record) return {};
++  if (!record) {
++    return {};
++  }
 +  std::vector<CommandAction> actions;
 +  actions.reserve(5);
-+  if (capabilities.can_pin) actions.push_back({CommandActionKind::kPin, target});
-+  if (capabilities.can_favorite)
++  if (capabilities.can_pin) {
++    actions.push_back({CommandActionKind::kPin, target});
++  }
++  if (capabilities.can_favorite) {
 +    actions.push_back({CommandActionKind::kFavorite, target});
-+  if (capabilities.can_move)
++  }
++  if (capabilities.can_move) {
 +    actions.push_back({CommandActionKind::kChooseSpace, target});
-+  if (capabilities.can_close_live)
++  }
++  if (capabilities.can_close_live) {
 +    actions.push_back({CommandActionKind::kCloseLiveTab, target});
-+  if (capabilities.can_return_home)
++  }
++  if (capabilities.can_return_home) {
 +    actions.push_back({CommandActionKind::kReturnHome, target});
++  }
 +  return actions;
 +}
 +}  // namespace arcium
@@ -3952,7 +3993,7 @@ Index: src/components/omnibox/browser/arcium_command_search.h
 ===================================================================
 --- /dev/null
 +++ src/components/omnibox/browser/arcium_command_search.h
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,159 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -3977,10 +4018,25 @@ Index: src/components/omnibox/browser/arcium_command_search.h
 +}
 +
 +enum class CommandKind {
-+  kSuggestion, kWebsite, kPin, kFavorite, kVideo, kTab, kPost,
-+  kConversation, kCurrentTab
++  kSuggestion,
++  kWebsite,
++  kPin,
++  kFavorite,
++  kVideo,
++  kTab,
++  kPost,
++  kConversation,
++  kCurrentTab
 +};
-+enum class CommandIcon { kSearch, kGlobe, kFigma, kStudio, kYouTube, kX, kChat };
++enum class CommandIcon {
++  kSearch,
++  kGlobe,
++  kFigma,
++  kStudio,
++  kYouTube,
++  kX,
++  kChat
++};
 +
 +// A search projection, not a second bookmark/history store. Production adapters
 +// supply durable qualified IDs and their existing relevance/frecency signal.
@@ -4028,8 +4084,8 @@ Index: src/components/omnibox/browser/arcium_command_search.h
 +  ~CommandSearchIndex();
 +
 +  std::vector<CommandSearchResult> Search(std::u16string_view query,
-+                                        SearchScope scope,
-+                                        size_t limit = 8) const;
++                                          SearchScope scope,
++                                          size_t limit = 8) const;
 +  const CommandRecord* Get(CommandRecordRef ref) const;
 +  CommandRecordRef Ref(size_t slot) const;
 +  size_t size() const { return records_.size(); }
@@ -4071,7 +4127,11 @@ Index: src/components/omnibox/browser/arcium_command_search.h
 +// Intent descriptors are a separate, late-bound projection. Search never
 +// constructs these or enumerates destinations for a move operation.
 +enum class CommandActionKind {
-+  kPin, kFavorite, kChooseSpace, kCloseLiveTab, kReturnHome
++  kPin,
++  kFavorite,
++  kChooseSpace,
++  kCloseLiveTab,
++  kReturnHome
 +};
 +struct CommandAction {
 +  CommandActionKind kind;
@@ -4086,9 +4146,10 @@ Index: src/components/omnibox/browser/arcium_command_search.h
 +  bool can_close_live = false;
 +  bool can_return_home = false;
 +};
-+std::vector<CommandAction> ResolveCommandActions(const CommandSearchIndex& index,
-+                                               CommandRecordRef target,
-+                                               CommandCapabilities capabilities);
++std::vector<CommandAction> ResolveCommandActions(
++    const CommandSearchIndex& index,
++    CommandRecordRef target,
++    CommandCapabilities capabilities);
 +
 +}  // namespace arcium
 +#endif  // COMPONENTS_OMNIBOX_BROWSER_ARCIUM_COMMAND_SEARCH_H_
@@ -4096,7 +4157,7 @@ Index: src/components/omnibox/browser/arcium_command_search_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/components/omnibox/browser/arcium_command_search_unittest.cc
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,296 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -4109,11 +4170,12 @@ Index: src/components/omnibox/browser/arcium_command_search_unittest.cc
 +#include "base/command_line.h"
 +#include "base/files/file_util.h"
 +#include "base/json/json_reader.h"
-+#include "base/strings/utf_string_conversions.h"
-+#include "components/omnibox/browser/autocomplete_result.h"
-+
 +#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
 +#include "base/time/time.h"
++#include "components/omnibox/browser/autocomplete_result.h"
 +#include "testing/gtest/include/gtest/gtest.h"
 +
 +namespace arcium {
@@ -4144,8 +4206,7 @@ Index: src/components/omnibox/browser/arcium_command_search_unittest.cc
 +    const auto results = index.Search(u"interface figma", SearchScope::kSaved);
 +    ASSERT_EQ(results.size(), 8u);
 +    EXPECT_LE(results.capacity(), CommandSearchIndex::kMaxResults);
-+    EXPECT_EQ(index.Get(results.front().record)->id,
-+              "space:design/pin:209");
++    EXPECT_EQ(index.Get(results.front().record)->id, "space:design/pin:209");
 +  }
 +  // This is a generous regression guard, not the reported latency benchmark.
 +  EXPECT_LT(base::TimeTicks::Now() - started, base::Seconds(5));
@@ -4155,7 +4216,9 @@ Index: src/components/omnibox/browser/arcium_command_search_unittest.cc
 +}
 +TEST(CommandSearchIndexTest, CarriesProviderFrecencyAndStableIdentity) {
 +  auto records = Pins(3);
-+  for (auto& record : records) record.title = u"Figma";
++  for (auto& record : records) {
++    record.title = u"Figma";
++  }
 +  records[0].source_relevance = 10;
 +  records[1].source_relevance = 1200;
 +  records[2].source_relevance = 100;
@@ -4171,7 +4234,8 @@ Index: src/components/omnibox/browser/arcium_command_search_unittest.cc
 +  CommandSearchIndex after(Pins(2), 2);
 +  const auto ref = before.Ref(0);
 +  EXPECT_EQ(after.Get(ref), nullptr);
-+  EXPECT_TRUE(ResolveCommandActions(after, ref, {true, true, true, true, true}).empty());
++  EXPECT_TRUE(ResolveCommandActions(after, ref, {true, true, true, true, true})
++                  .empty());
 +  EXPECT_TRUE(after.Search(u"reference", SearchScope::kSaved, 0).empty());
 +}
 +TEST(CommandSearchIndexTest, ResolvesActionsOnlyForOneChosenTarget) {
@@ -4182,9 +4246,11 @@ Index: src/components/omnibox/browser/arcium_command_search_unittest.cc
 +  const auto actions = ResolveCommandActions(index, index.Ref(3),
 +                                             {true, true, true, true, true});
 +  ASSERT_EQ(actions.size(), 5u);
-+  for (const auto& action : actions) EXPECT_EQ(action.target, index.Ref(3));
++  for (const auto& action : actions) {
++    EXPECT_EQ(action.target, index.Ref(3));
++  }
 +  const auto dormant = ResolveCommandActions(index, matches.front().record,
-+                                              {true, true, true, false, true});
++                                             {true, true, true, false, true});
 +  EXPECT_EQ(dormant.size(), 4u);
 +  EXPECT_TRUE(ResolveCommandActions(index, index.Ref(3), {}).empty());
 +}
@@ -4193,7 +4259,8 @@ Index: src/components/omnibox/browser/arcium_command_search_unittest.cc
 +  records[0].title = u"CAFÉ Straße";
 +  records[0].context = u"Design › Résumé";
 +  CommandSearchIndex index(std::move(records), 1);
-+  EXPECT_EQ(index.Search(u"café STRASSE résumé", SearchScope::kSaved).size(), 1u);
++  EXPECT_EQ(index.Search(u"café STRASSE résumé", SearchScope::kSaved).size(),
++            1u);
 +  EXPECT_TRUE(index.Search(u"café missing", SearchScope::kSaved).empty());
 +}
 +TEST(CommandSearchIndexTest, SameRevisionInAnotherSnapshotRejectsForeignRefs) {
@@ -4203,21 +4270,27 @@ Index: src/components/omnibox/browser/arcium_command_search_unittest.cc
 +  CommandSearchIndex second(std::move(reversed), 1);
 +  EXPECT_EQ(second.Get(first.Ref(0)), nullptr);
 +  EXPECT_TRUE(ResolveCommandActions(second, first.Ref(0),
-+                                   {true, true, true, true, true}).empty());
++                                    {true, true, true, true, true})
++                  .empty());
 +}
 +TEST(CommandSearchIndexTest, CanonicallyEquivalentUnicodeMatches) {
 +  auto records = Pins(1);
 +  records[0].title = u"CAFÉ Résumé";
 +  CommandSearchIndex index(std::move(records), 1);
-+  EXPECT_EQ(index.Search(u"cafe\u0301 re\u0301sume\u0301",
-+                         SearchScope::kSaved).size(), 1u);
++  EXPECT_EQ(index.Search(u"cafe\u0301 re\u0301sume\u0301", SearchScope::kSaved)
++                .size(),
++            1u);
 +}
 +TEST(CommandSearchIndexTest, QueryWorkHasExplicitBounds) {
 +  CommandSearchIndex index(Pins(1), 1);
-+  EXPECT_TRUE(index.Search(std::u16string(2049, u'a'), SearchScope::kSaved).empty());
-+  EXPECT_TRUE(index.Search(std::u16string(2048, u'a'), SearchScope::kSaved).empty());
++  EXPECT_TRUE(
++      index.Search(std::u16string(2049, u'a'), SearchScope::kSaved).empty());
++  EXPECT_TRUE(
++      index.Search(std::u16string(2048, u'a'), SearchScope::kSaved).empty());
 +  std::u16string terms;
-+  for (int i = 0; i < 32; ++i) terms += u"reference ";
++  for (int i = 0; i < 32; ++i) {
++    terms += u"reference ";
++  }
 +  EXPECT_EQ(index.Search(terms, SearchScope::kSaved).size(), 1u);
 +  terms += u"reference";
 +  EXPECT_TRUE(index.Search(terms, SearchScope::kSaved).empty());
@@ -4232,10 +4305,12 @@ Index: src/components/omnibox/browser/arcium_command_search_unittest.cc
 +}
 +TEST(CommandSearchIndexTest, PublishedNativeOrderAndDefaultArePreserved) {
 +  AutocompleteResult result;
-+  AutocompleteMatch first(nullptr, 200, false, AutocompleteMatchType::SEARCH_SUGGEST);
++  AutocompleteMatch first(nullptr, 200, false,
++                          AutocompleteMatchType::SEARCH_SUGGEST);
 +  first.contents = u"semantic suggestion without literal query";
 +  first.allowed_to_be_default_match = true;
-+  AutocompleteMatch second(nullptr, 9000, false, AutocompleteMatchType::HISTORY_URL);
++  AutocompleteMatch second(nullptr, 9000, false,
++                           AutocompleteMatchType::HISTORY_URL);
 +  second.contents = u"exact literal match";
 +  second.allowed_to_be_default_match = false;
 +  result.AppendMatches({first, second});
@@ -4258,77 +4333,124 @@ Index: src/components/omnibox/browser/arcium_command_search_unittest.cc
 +// default, and emits only aggregate counts, storage budget and timings.
 +TEST(CommandSearchIndexTest, ActualProfileCorpusBenchmark) {
 +  const auto* command = base::CommandLine::ForCurrentProcess();
-+  if (!command->HasSwitch("arcium-pins-preferences")) GTEST_SKIP();
++  if (!command->HasSwitch("arcium-pins-preferences")) {
++    GTEST_SKIP();
++  }
 +  std::string json;
 +  ASSERT_TRUE(base::ReadFileToStringWithMaxSize(
-+      command->GetSwitchValuePath("arcium-pins-preferences"), &json, 32*1024*1024));
-+  auto parsed = base::JSONReader::Read(json, base::JSON_PARSE_CHROMIUM_EXTENSIONS);
++      command->GetSwitchValuePath("arcium-pins-preferences"), &json,
++      32 * 1024 * 1024));
++  auto parsed =
++      base::JSONReader::Read(json, base::JSON_PARSE_CHROMIUM_EXTENSIONS);
 +  ASSERT_TRUE(parsed && parsed->is_dict());
 +  const auto* spaces = parsed->GetDict().FindListByDottedPath("helium.spaces");
 +  ASSERT_TRUE(spaces);
 +  std::vector<CommandRecord> records;
 +  size_t folders = 0;
-+  auto walk = [&](auto&& self, const base::ListValue& nodes, const std::string& space,
++  size_t visited = 0;
++  std::set<std::string> space_ids;
++  auto walk = [&](auto&& self, const base::ListValue& nodes,
++                  const std::string& space, const std::u16string& context,
 +                  std::set<std::string>& ids, size_t depth) -> bool {
-+    if (depth > 64 || nodes.size() > 10000) return false;
++    if (depth > 64 || nodes.size() > 10000) {
++      return false;
++    }
 +    for (const auto& value : nodes) {
-+      if (!value.is_dict()) return false;
++      if (++visited > 10000 || !value.is_dict()) {
++        return false;
++      }
 +      const auto& node = value.GetDict();
 +      const auto* type = node.FindString("type");
 +      const auto* id = node.FindString("id");
 +      const auto* title = node.FindString("title");
-+      if (!type || !id || !title || !ids.insert(*id).second) return false;
++      if (!type || !id || id->empty() || !title || !ids.insert(*id).second) {
++        return false;
++      }
 +      if (*type == "folder") {
 +        ++folders;
 +        const auto* children = node.FindList("children");
-+        if (!children || !self(self, *children, space, ids, depth+1)) return false;
++        if (!children || !node.FindBool("collapsed").has_value() ||
++            !self(
++                self, *children, space,
++                (context + u" › " + base::UTF8ToUTF16(*title)).substr(0, 2048),
++                ids, depth + 1)) {
++          return false;
++        }
 +      } else if (*type == "link") {
 +        const auto* url = node.FindString("url");
-+        if (!url || records.size() >= 10000) return false;
++        if (!url || records.size() >= 10000) {
++          return false;
++        }
 +        CommandRecord record;
 +        record.id = space + "/pin:" + *id;
 +        record.title = base::UTF8ToUTF16(*title);
 +        record.url = base::UTF8ToUTF16(*url);
++        record.context = context;
++        record.category = u"Pin";
 +        record.scope = SearchScope::kSaved;
 +        record.kind = CommandKind::kPin;
 +        records.push_back(std::move(record));
-+      } else return false;
++      } else {
++        return false;
++      }
 +    }
 +    return true;
 +  };
++  ASSERT_LE(spaces->size(), 100u);
 +  for (const auto& value : *spaces) {
 +    ASSERT_TRUE(value.is_dict());
 +    const auto& space = value.GetDict();
 +    const auto* id = space.FindString("id");
 +    const auto* pins = space.FindList("pins");
-+    ASSERT_TRUE(id && pins);
++    const auto* name = space.FindString("name");
++    ASSERT_TRUE(id && !id->empty() && pins && name &&
++                space_ids.insert(*id).second);
 +    std::set<std::string> ids;
-+    ASSERT_TRUE(walk(walk, *pins, *id, ids, 0));
++    ASSERT_TRUE(walk(walk, *pins, *id, base::UTF8ToUTF16(*name), ids, 0));
 +  }
 +  ASSERT_EQ(records.size(), 211u);
 +  std::vector<std::u16string> queries;
 +  for (const auto& record : records) {
-+    if (!record.title.empty()) queries.push_back(record.title.substr(0, 12));
++    auto terms = base::SplitStringPiece(record.title, base::kWhitespaceUTF16,
++                                        base::TRIM_WHITESPACE,
++                                        base::SPLIT_WANT_NONEMPTY);
++    std::u16string query(terms.empty() ? std::u16string_view(record.url)
++                                       : terms.front());
++    if (query.size() > 12) {
++      query.resize(12);
++      if (query.back() >= 0xd800 && query.back() <= 0xdbff) {
++        query.pop_back();
++      }
++    }
++    if (!query.empty()) {
++      queries.push_back(std::move(query));
++    }
 +  }
++  ASSERT_FALSE(queries.empty());
 +  CommandSearchIndex index(std::move(records), 1);
 +  const auto bytes = index.EstimateOwnedBytes();
-+  ASSERT_LT(bytes, 1024u*1024u);
++  ASSERT_LT(bytes, 1024u * 1024u);
 +  std::vector<int64_t> micros;
-+  for (int i=0; i<1000; ++i) {
++  for (int i = 0; i < 1000; ++i) {
 +    const auto started = base::TimeTicks::Now();
-+    const auto matches = index.Search(queries[i%queries.size()], SearchScope::kSaved);
-+    micros.push_back((base::TimeTicks::Now()-started).InMicroseconds());
++    const auto matches =
++        index.Search(queries[i % queries.size()], SearchScope::kSaved);
++    micros.push_back((base::TimeTicks::Now() - started).InMicroseconds());
 +    ASSERT_FALSE(matches.empty());
 +    ASSERT_LE(matches.size(), 8u);
-+    for (const auto& match : matches) ASSERT_NE(index.Get(match.record), nullptr);
++    for (const auto& match : matches) {
++      ASSERT_NE(index.Get(match.record), nullptr);
++    }
 +  }
 +  std::sort(micros.begin(), micros.end());
 +  EXPECT_EQ(index.EstimateOwnedBytes(), bytes);
 +  EXPECT_LT(micros[950], 2000);
-+  std::printf("Corpus: %zu pins, %zu folders; owned storage budget %zu bytes; "
-+              "1000 queries median %lld us, p95 %lld us; max 8 results; no action cache\n",
-+              index.size(), folders, bytes, static_cast<long long>(micros[500]),
-+              static_cast<long long>(micros[950]));
++  std::printf(
++      "Corpus: %zu pins, %zu folders; owned storage budget %zu bytes; "
++      "1000 queries median %lld us, p95 %lld us; max 8 results; no action "
++      "cache\n",
++      index.size(), folders, bytes, static_cast<long long>(micros[500]),
++      static_cast<long long>(micros[950]));
 +}
 +}  // namespace
 +}  // namespace arcium
