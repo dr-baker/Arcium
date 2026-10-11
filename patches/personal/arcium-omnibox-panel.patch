@@ -377,7 +377,15 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  }
  
  bool BrowserView::IsArciumCommandBarNewTab() const {
-@@ -3847,12 +3700,12 @@ void BrowserView::CloseArciumCommandBar(
+@@ -3835,6 +3688,7 @@ bool BrowserView::IsArciumCommandBarNewT
+ }
+ 
+ void BrowserView::CloseArciumCommandBar(bool accepted) {
++  arcium_pending_command_invocation_.reset();
+   if (!arcium_command_bar_widget_) {
+     return;
+   }
+@@ -3847,32 +3701,39 @@ void BrowserView::CloseArciumCommandBar(
    // the stack. Close on the next task so its controller can finish first.
    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
        FROM_HERE, base::BindOnce(
@@ -395,8 +403,14 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +                     arcium_command_bar_widget_->GetWeakPtr()));
  }
  
- void BrowserView::DestroyArciumCommandBar() {
-@@ -3862,14 +3715,14 @@ void BrowserView::DestroyArciumCommandBa
+-void BrowserView::DestroyArciumCommandBar() {
++void BrowserView::DestroyArciumCommandBar(bool reopen_pending) {
++  const auto pending = reopen_pending ? arcium_pending_command_invocation_
++                                      : std::nullopt;
++  arcium_pending_command_invocation_.reset();
+   if (!arcium_command_bar_widget_) {
+     return;
+   }
    arcium_command_bar_material_.reset();
    arcium_command_bar_widget_->RemoveObserver(this);
    auto widget = std::move(arcium_command_bar_widget_);
@@ -409,14 +423,21 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 -  const bool restore_focus = !arcium_command_bar_accepted_ && GetWidget() &&
 -                             GetWidget()->IsActive();
 +  const bool restore_focus =
-+      !arcium_command_bar_accepted_ && GetWidget() && GetWidget()->IsActive();
++      !pending.has_value() && !arcium_command_bar_accepted_ && GetWidget() &&
++      GetWidget()->IsActive();
    widget.reset();
 -  delegate.reset();
 +  native_delegate.reset();
    if (restore_focus) {
      RestoreFocus();
    }
-@@ -5719,6 +5572,9 @@ void BrowserView::OnWidgetDestroying(vie
++  if (pending.has_value()) {
++    ShowArciumNativeCommandPanel(*pending);
++  }
+ }
+ 
+ void BrowserView::SetFocusToLocationBar(bool is_user_initiated) {
+@@ -5719,6 +5580,9 @@ void BrowserView::OnWidgetDestroying(vie
  void BrowserView::OnWidgetActivationChanged(views::Widget* widget,
                                              bool active) {
    if (widget == arcium_command_bar_widget_.get()) {
@@ -426,7 +447,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
      return;
    }
  
-@@ -5889,8 +5745,8 @@ void BrowserView::UpdateTabSearchBubbleH
+@@ -5889,8 +5753,8 @@ void BrowserView::UpdateTabSearchBubbleH
      return;
    }
  
@@ -437,7 +458,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    if (auto* controller =
            TabSearchToolbarButtonController::From(browser_.get())) {
      controller->UpdateBubbleHost(tab_search_bubble_host_.get());
-@@ -6843,8 +6699,9 @@ bool BrowserView::AcceleratorPressed(con
+@@ -6843,8 +6707,9 @@ bool BrowserView::AcceleratorPressed(con
  
    // Only Ctrl+Tab holds a pending selection until Control is released. Menu,
    // wheel, and other next/previous-tab shortcuts must activate immediately.
@@ -449,7 +470,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    const bool next_tab = command_id == IDC_SELECT_NEXT_TAB ||
                          command_id == IDC_ARCIUM_SELECT_RECENT_TAB;
    const bool previous_tab = command_id == IDC_SELECT_PREVIOUS_TAB ||
-@@ -7261,8 +7118,7 @@ void BrowserView::LoadAccelerators() {
+@@ -7261,8 +7126,7 @@ void BrowserView::LoadAccelerators() {
        base::FeatureList::IsEnabled(features::kCustomizableBrowserShortcuts)) {
      std::erase_if(accelerator_list, [this](const AcceleratorMapping& entry) {
        return browser_shortcut_service_->HasDefaultAccelerator(
@@ -504,10 +525,12 @@ Index: src/chrome/browser/ui/views/frame/browser_view.h
    void SetFocusToLocationBar(bool is_user_initiated) override;
    void UpdateReloadStopState(bool is_loading, bool force) override;
    void UpdateToolbar(content::WebContents* contents) override;
-@@ -1294,11 +1297,12 @@ class BrowserView : public BrowserWindow
+@@ -1293,15 +1296,17 @@ class BrowserView : public BrowserWindow
+   // fullscreen mode. See BrowserView::ReparentTopContainerForEndOfImmersive.
    std::optional<size_t> horizontal_tab_strip_region_insertion_index_;
    // Floating command bar and its invocation state.
-   void DestroyArciumCommandBar();
+-  void DestroyArciumCommandBar();
++  void DestroyArciumCommandBar(bool reopen_pending = false);
 +  bool ShowArciumNativeCommandPanel(bool new_tab);
    // The delegate outlives its widget during reverse member destruction.
    std::unique_ptr<arcium::CommandBarMaterial> arcium_command_bar_material_;
@@ -519,6 +542,10 @@ Index: src/chrome/browser/ui/views/frame/browser_view.h
    bool arcium_command_bar_new_tab_ = false;
    bool arcium_command_bar_accepted_ = false;
    bool arcium_command_bar_closing_ = false;
++  std::optional<bool> arcium_pending_command_invocation_;
+ 
+   // The Toolbar containing the navigation buttons, menus and the address bar.
+   raw_ptr<ToolbarView> toolbar_ = nullptr;
 Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 ===================================================================
 --- /dev/null
@@ -2512,7 +2539,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,128 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -2534,11 +2561,15 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
 +
 +bool BrowserView::ShowArciumNativeCommandPanel(bool new_tab) {
 +  if (!browser_->is_type_normal() || !toolbar_ || !GetWidget() ||
-+      !GetActiveWebContents()) {
++      GetWidget()->IsClosed() || !GetActiveWebContents()) {
 +    return false;
 +  }
 +  if (arcium_command_bar_widget_) {
-+    if (!arcium_command_bar_closing_ && arcium_native_command_panel_) {
++    if (arcium_command_bar_closing_) {
++      // The current widget is already closing. Keep only the latest invocation
++      // and reopen after the owner has destroyed that widget and its delegate.
++      arcium_pending_command_invocation_ = new_tab;
++    } else if (arcium_native_command_panel_) {
 +      arcium_command_bar_new_tab_ = new_tab;
 +      arcium_native_command_panel_->SetInvocation(new_tab);
 +      arcium_command_bar_widget_->Activate();
@@ -2586,7 +2617,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
 +        view->arcium_command_bar_closing_ = true;
 +        base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
 +            FROM_HERE,
-+            base::BindOnce(&BrowserView::DestroyArciumCommandBar, view));
++            base::BindOnce(&BrowserView::DestroyArciumCommandBar, view, true));
 +      },
 +      weak_ptr_factory_.GetWeakPtr()));
 +  arcium_native_command_delegate_ = std::move(delegate);
@@ -2641,7 +2672,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,231 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +#include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
@@ -2815,6 +2846,35 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  }
 +}
 +
++TEST_F(ArciumNativePanelTest, QueuedDismissalPreservesTheLatestInvocation) {
++  for (bool new_tab : {false, true}) {
++    ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++    views::ViewTracker old_panel(panel());
++    views::test::WidgetDestroyedWaiter destroyed(panel()->GetWidget());
++    browser_view()->CloseArciumCommandBar();
++    ASSERT_TRUE(browser_view()->ShowArciumCommandBar(!new_tab));
++    ASSERT_TRUE(browser_view()->ShowArciumCommandBar(new_tab));
++    destroyed.Wait();
++    base::RunLoop().RunUntilIdle();
++    EXPECT_FALSE(old_panel.view());
++    ASSERT_TRUE(panel());
++    EXPECT_EQ(new_tab, browser_view()->IsArciumCommandBarNewTab());
++    EXPECT_EQ(new_tab, panel()->input_for_testing()->GetText().empty());
++    Close();
++  }
++}
++
++TEST_F(ArciumNativePanelTest, DismissalCanCancelAPendingInvocation) {
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  views::test::WidgetDestroyedWaiter destroyed(panel()->GetWidget());
++  browser_view()->CloseArciumCommandBar();
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(false));
++  browser_view()->CloseArciumCommandBar();
++  destroyed.Wait();
++  base::RunLoop().RunUntilIdle();
++  EXPECT_EQ(nullptr, panel());
++}
++
 +TEST_F(ArciumNativePanelTest, RepeatedQueryAndActionsKeepTheResultListBounded) {
 +  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
 +  const auto storage = panel()->corpus_for_testing().EstimateOwnedBytes();
@@ -2841,6 +2901,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +TEST_F(ArciumNativePanelTest, ParentTeardownWithQueuedDismissalLeavesNoPanel) {
 +  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
 +  browser_view()->CloseArciumCommandBar();
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(false));
 +  ASSERT_TRUE(panel());
 +}
 Index: src/chrome/test/BUILD.gn
