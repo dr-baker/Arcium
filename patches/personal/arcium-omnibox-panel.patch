@@ -550,7 +550,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
-@@ -0,0 +1,1866 @@
+@@ -0,0 +1,1874 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -1320,10 +1320,10 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    GetViewAccessibility().SetRole(ax::mojom::Role::kListBoxOption);
 +  }
 +  void OnMouseEntered(const ui::MouseEvent&) override {
-+    panel_->Select(index_, true);
++    SelectFromPointer();
 +  }
 +  void OnMouseMoved(const ui::MouseEvent&) override {
-+    panel_->Select(index_, true);
++    SelectFromPointer();
 +  }
 +  void PaintButtonContents(gfx::Canvas* canvas) override {
 +    gfx::ScopedCanvas restore(canvas);
@@ -1334,6 +1334,13 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  }
 +
 + private:
++  void SelectFromPointer() {
++    if (panel_->scope_browsing_) {
++      panel_->BrowseScopes(false);
++    }
++    panel_->Select(index_, true);
++  }
++
 +  raw_ptr<CommandPanelView> panel_;
 +  size_t index_;
 +};
@@ -2264,6 +2271,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  selected_ = 0;
 +  current_context_ = false;
 +  RebuildResults();
++  BrowseScopes(true);
 +  FocusInput();
 +}
 +void CommandPanelView::ShowActions(bool enabled) {
@@ -2713,7 +2721,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,388 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +#include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
@@ -2731,9 +2739,12 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +#include "ui/accessibility/ax_node_data.h"
 +#include "ui/base/ime/composition_text.h"
 +#include "ui/base/ime/text_edit_commands.h"
++#include "ui/events/event.h"
 +#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/controls/button/button.h"
 +#include "ui/views/controls/textfield/textfield.h"
 +#include "ui/views/focus/focus_manager.h"
++#include "ui/views/test/button_test_api.h"
 +#include "ui/views/test/views_test_utils.h"
 +#include "ui/views/test/widget_test.h"
 +#include "ui/views/view_tracker.h"
@@ -2952,6 +2963,59 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  Key(ui::VKEY_ESCAPE);
 +  EXPECT_EQ(prefix, input->GetText());
 +  EXPECT_EQ(gfx::Range(prefix.size()), input->GetSelectedRange());
++  Close();
++}
++TEST_F(ArciumNativePanelTest, PointerResultSelectionLeavesScopeMode) {
++  for (bool enter : {true, false}) {
++    ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++    auto* input = panel()->input_for_testing();
++    auto* first = input->GetViewAccessibility().GetActiveDescendantView();
++    ASSERT_TRUE(first);
++    ASSERT_GE(first->view()->parent()->children().size(), 2u);
++    views::View* hovered = first->view()->parent()->children()[1];
++    Key(ui::VKEY_UP);
++    ASSERT_TRUE(panel()->scopes_focused_for_testing());
++    ui::MouseEvent event(
++        enter ? ui::EventType::kMouseEntered : ui::EventType::kMouseMoved,
++        gfx::PointF(), gfx::PointF(), base::TimeTicks(), 0, 0);
++    if (enter) {
++      hovered->OnMouseEntered(event);
++    } else {
++      hovered->OnMouseMoved(event);
++    }
++    EXPECT_FALSE(panel()->scopes_focused_for_testing());
++    EXPECT_EQ(&hovered->GetViewAccessibility(),
++              input->GetViewAccessibility().GetActiveDescendantView());
++    Key(ui::VKEY_RETURN);
++    ui::AXNodeData panel_data;
++    panel()->GetViewAccessibility().GetAccessibleNodeData(&panel_data);
++    EXPECT_EQ(u"Preview · Open website",
++              panel_data.GetString16Attribute(
++                  ax::mojom::StringAttribute::kDescription));
++    EXPECT_EQ(input, panel()->GetFocusManager()->GetFocusedView());
++    Close();
++  }
++}
++TEST_F(ArciumNativePanelTest, ScopeClickEntersKeyboardScopeMode) {
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  auto* input = panel()->input_for_testing();
++  Key(ui::VKEY_UP);
++  auto* scope = input->GetViewAccessibility().GetActiveDescendantView();
++  ASSERT_TRUE(scope);
++  auto* button = static_cast<views::Button*>(scope->view());
++  Key(ui::VKEY_DOWN);
++  ASSERT_FALSE(panel()->scopes_focused_for_testing());
++  views::test::ButtonTestApi(button).NotifyDefaultMouseClick();
++  EXPECT_TRUE(panel()->scopes_focused_for_testing());
++  EXPECT_EQ(scope, input->GetViewAccessibility().GetActiveDescendantView());
++  Key(ui::VKEY_RIGHT);
++  auto* web_scope = input->GetViewAccessibility().GetActiveDescendantView();
++  ASSERT_TRUE(web_scope);
++  ui::AXNodeData scope_data;
++  web_scope->GetAccessibleNodeData(&scope_data);
++  EXPECT_EQ(u"Search DuckDuckGo",
++            scope_data.GetString16Attribute(ax::mojom::StringAttribute::kName));
++  EXPECT_EQ(input, panel()->GetFocusManager()->GetFocusedView());
 +  Close();
 +}
 +TEST_F(ArciumNativePanelTest,
