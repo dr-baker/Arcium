@@ -550,7 +550,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
-@@ -0,0 +1,2010 @@
+@@ -0,0 +1,2049 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -651,6 +651,19 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  return SkColorSetRGB((SkColorGetR(tint) + 4 * SkColorGetR(base)) / 5,
 +                       (SkColorGetG(tint) + 4 * SkColorGetG(base)) / 5,
 +                       (SkColorGetB(tint) + 4 * SkColorGetB(base)) / 5);
++}
++
++SkPath TopRoundedRectPath(const gfx::RectF& rect, float radius) {
++  radius = std::min({radius, rect.width() / 2, rect.height()});
++  SkPathBuilder path;
++  path.moveTo(rect.x(), rect.bottom())
++      .lineTo(rect.x(), rect.y() + radius)
++      .quadTo(rect.x(), rect.y(), rect.x() + radius, rect.y())
++      .lineTo(rect.right() - radius, rect.y())
++      .quadTo(rect.right(), rect.y(), rect.right(), rect.y() + radius)
++      .lineTo(rect.right(), rect.bottom())
++      .close();
++  return path.detach();
 +}
 +
 +void FillRoundRect(gfx::Canvas* canvas,
@@ -1391,6 +1404,11 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    contour = contour.makeOffset(-x(), -y());
 +    if (panel_->appearance_.connected) {
 +      canvas->ClipPath(contour, true);
++    } else {
++      canvas->ClipPath(TopRoundedRectPath(
++          gfx::RectF(0, 0, width(),
++                     std::max(0, panel_->BodyBounds().y() - y())),
++          13 * panel_->ui_scale_), true);
 +    }
 +    canvas->Scale(panel_->ui_scale_, panel_->ui_scale_);
 +    if (GetState() == STATE_HOVERED || GetState() == STATE_PRESSED) {
@@ -1904,7 +1922,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    selection_initialized_ = true;
 +  }
 +}
-+SkPath CommandPanelView::GetContourPath() const {
++SkPath CommandPanelView::GetPanelContourPath() const {
 +  const auto b = BodyBounds();
 +  const float radius = 13 * ui_scale_, left = b.x() + .5f,
 +              right = b.right() - .5f;
@@ -1942,6 +1960,21 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +      .close();
 +  return path.detach();
 +}
++SkPath CommandPanelView::GetContourPath() const {
++  SkPathBuilder path;
++  path.addPath(GetPanelContourPath());
++  if (!appearance_.connected && !actions_visible_) {
++    for (const auto& button : scope_buttons_) {
++      const float height = BodyBounds().y() + .5f - button->y();
++      if (button->GetVisible() && height > 0) {
++        path.addPath(TopRoundedRectPath(
++            gfx::RectF(button->x(), button->y(), button->width(), height),
++            13 * ui_scale_));
++      }
++    }
++  }
++  return path.detach();
++}
 +void CommandPanelView::OnPaint(gfx::Canvas* canvas) {
 +  const auto body = BodyBounds();
 +  cc::PaintFlags fill;
@@ -1955,7 +1988,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  edge.setColor(Alpha(SK_ColorWHITE, 54));
 +  edge.setStyle(cc::PaintFlags::kStroke_Style);
 +  edge.setStrokeWidth(ui_scale_);
-+  canvas->DrawPath(GetContourPath(), edge);
++  canvas->DrawPath(GetPanelContourPath(), edge);
 +  canvas->FillRect(gfx::Rect(body.x() + S(ui_scale_, 10),
 +                             body.y() + S(ui_scale_, kSearchHeight - 1),
 +                             body.width() - S(ui_scale_, 20), S(ui_scale_, 1)),
@@ -2163,7 +2196,13 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +                                  int height) {
 +  const float weight = ScopeWeight(scope);
 +  if (!appearance_.connected) {
-+    FillRoundRect(canvas, gfx::Rect(0, 0, width, height), 13, kPanel);
++    cc::PaintFlags edge;
++    edge.setAntiAlias(true);
++    edge.setColor(Alpha(SK_ColorWHITE, base::ClampRound(36 + 20 * weight)));
++    edge.setStyle(cc::PaintFlags::kStroke_Style);
++    edge.setStrokeWidth(1);
++    canvas->DrawPath(TopRoundedRectPath(
++        gfx::RectF(.5f, .5f, width - 1, height - 1), 13), edge);
 +  }
 +  if (appearance_.scope_tints) {
 +    cc::PaintFlags glow;
@@ -2565,7 +2604,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,176 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -2693,6 +2732,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 +  void PaintFooter(gfx::Canvas*, int width, int height);
 +  std::u16string Verb(const DisplayRow&) const;
 +  gfx::Rect BodyBounds() const;
++  SkPath GetPanelContourPath() const;
 +  float ScopeRise() const;
 +
 +  raw_ptr<views::Textfield> input_;
@@ -2883,7 +2923,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
-@@ -0,0 +1,528 @@
+@@ -0,0 +1,554 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +#include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
@@ -3239,6 +3279,32 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  panel()->GetViewAccessibility().GetAccessibleNodeData(&data);
 +  EXPECT_TRUE(data.GetString16Attribute(
 +      ax::mojom::StringAttribute::kDescription).empty());
++  Close();
++}
++TEST_F(ArciumNativePanelTest, SeparateScopesShareTheMaterialContour) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  arcium::CommandPanelAppearance appearance;
++  appearance.connected = false;
++  appearance.reveal = arcium::CommandPanelAppearance::Reveal::kTabs;
++  panel()->SetAppearance(appearance);
++  views::test::RunScheduledLayout(panel());
++  const auto first = panel()->children()[0]->bounds();
++  const auto second = panel()->children()[1]->bounds();
++  const auto point = first.CenterPoint();
++  EXPECT_TRUE(panel()->GetContourPath().contains(point.x(), point.y()));
++  EXPECT_FALSE(panel()->GetContourPath().contains(
++      (first.right() + second.x()) / 2, point.y()));
++  appearance.reveal = arcium::CommandPanelAppearance::Reveal::kHidden;
++  panel()->SetAppearance(appearance);
++  views::test::RunScheduledLayout(panel());
++  EXPECT_FALSE(panel()->GetContourPath().contains(point.x(), point.y()));
++  Key(ui::VKEY_RIGHT);
++  EXPECT_TRUE(panel()->GetContourPath().contains(point.x(), point.y()));
++  Key(ui::VKEY_DOWN);
++  Key(ui::VKEY_K, kActionModifier);
++  EXPECT_FALSE(panel()->GetContourPath().contains(point.x(), point.y()));
 +  Close();
 +}
 +TEST_F(ArciumNativePanelTest, EmptyScopeFocusSurvivesActionsAndAppearanceChanges) {
