@@ -1174,18 +1174,6 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  #include "chrome/browser/ui/omnibox/omnibox_next_features.h"
  #include "chrome/browser/ui/omnibox/omnibox_popup_view.h"
  #include "chrome/browser/ui/omnibox/omnibox_view.h"
-@@ -174,10 +175,10 @@
- #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
- #include "chrome/browser/ui/views/frame/web_contents_close_handler.h"
- #include "chrome/browser/ui/views/fullscreen_control/fullscreen_control_host.h"
--#include "chrome/browser/ui/views/helium/peek_controller.h"
- #include "chrome/browser/ui/views/glic/glic_button_interface.h"
- #include "chrome/browser/ui/views/global_media_controls/media_toolbar_button_view.h"
- #include "chrome/browser/ui/views/hats/hats_next_web_dialog.h"
-+#include "chrome/browser/ui/views/helium/peek_controller.h"
- #include "chrome/browser/ui/views/incognito_clear_browsing_data_dialog_coordinator.h"
- #include "chrome/browser/ui/views/infobars/infobar_container_view.h"
- #include "chrome/browser/ui/views/interaction/browser_elements_views.h"
 @@ -663,6 +664,31 @@ bool ConvertedHitTest(views::View* src,
    return dst->HitTestPoint(*point);
  }
@@ -1298,8 +1286,8 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +              // acceptance. The once callback schedules one teardown task.
 +              view->arcium_command_bar_closing_ = true;
 +              base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
-+                  FROM_HERE,
-+                  base::BindOnce(&BrowserView::DestroyArciumCommandBar, view));
++                  FROM_HERE, base::BindOnce(
++                      &BrowserView::DestroyArciumCommandBar, view));
 +            }
 +          },
 +          weak_ptr_factory_.GetWeakPtr()));
@@ -1343,12 +1331,12 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +  // the stack. Close on the next task so its controller can finish first.
 +  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
 +      FROM_HERE, base::BindOnce(
-+                     [](base::WeakPtr<views::Widget> widget) {
-+                       if (widget) {
-+                         widget->Close();
-+                       }
-+                     },
-+                     arcium_command_bar_widget_->GetWeakPtr()));
++          [](base::WeakPtr<views::Widget> widget) {
++            if (widget) {
++              widget->Close();
++            }
++          },
++          arcium_command_bar_widget_->GetWeakPtr()));
 +}
 +
 +void BrowserView::DestroyArciumCommandBar() {
@@ -1361,8 +1349,8 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +  arcium_command_bar_location_ = nullptr;
 +  arcium_command_bar_new_tab_ = false;
 +  arcium_command_bar_closing_ = false;
-+  const bool restore_focus =
-+      !arcium_command_bar_accepted_ && GetWidget() && GetWidget()->IsActive();
++  const bool restore_focus = !arcium_command_bar_accepted_ && GetWidget() &&
++                             GetWidget()->IsActive();
 +  widget.reset();
 +  delegate.reset();
 +  if (restore_focus) {
@@ -1740,7 +1728,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_omnibox_service_unittest.cc
 +    return {TestingProfile::TestingFactory{
 +        HeliumSpaceServiceFactory::GetInstance(),
 +        base::BindOnce([](content::BrowserContext* context)
-+                           -> std::unique_ptr<KeyedService> {
++                          -> std::unique_ptr<KeyedService> {
 +          return std::make_unique<HeliumSpaceService>(
 +              Profile::FromBrowserContext(context));
 +        })}};
@@ -1940,7 +1928,7 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
-@@ -0,0 +1,536 @@
+@@ -0,0 +1,533 @@
 +// Copyright 2026 The Arcium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -2001,8 +1989,7 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 +    TestWithBrowserView::SetUp();
 +#if BUILDFLAG(ENABLE_EXTENSIONS)
 +    static_cast<extensions::TestExtensionSystem*>(
-+        extensions::ExtensionSystem::Get(browser()->profile()))
-+        ->Init();
++        extensions::ExtensionSystem::Get(browser()->profile()))->Init();
 +#endif
 +    AddTab(browser(), GURL("https://origin.test/"));
 +    browser_view()->GetWidget()->Show();
@@ -2048,8 +2035,8 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 +  parent_params.parent = browser_view()->GetWidget()->GetNativeView();
 +  parent.Init(std::move(parent_params));
 +  parent.SetBounds(gfx::Rect(100, 100, 400, 200));
-+  ASSERT_FALSE(
-+      BrowserView::GetBrowserViewForNativeWindow(parent.GetNativeWindow()));
++  ASSERT_FALSE(BrowserView::GetBrowserViewForNativeWindow(
++      parent.GetNativeWindow()));
 +
 +  ThemeCopyingWidget popup(&parent);
 +  views::Widget::InitParams popup_params(
@@ -2059,8 +2046,8 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 +  popup_params.context = parent.GetNativeWindow();
 +  RoundedOmniboxResultsFrame::OnBeforeWidgetInit(&popup_params, &popup);
 +  popup.Init(std::move(popup_params));
-+  auto* frame =
-+      popup.SetContentsView(std::make_unique<RoundedOmniboxResultsFrame>(
++  auto* frame = popup.SetContentsView(
++      std::make_unique<RoundedOmniboxResultsFrame>(
 +          new views::View, floating(), /*forward_mouse_events=*/true));
 +  popup.SetBounds(gfx::Rect(120, 130, 400, 200));
 +  views::test::RunScheduledLayout(&popup);
@@ -2070,7 +2057,8 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 +  // through the results frame instead of calling its routing helper directly.
 +  for (auto type : {ui::EventType::kMouseEntered, ui::EventType::kMouseMoved}) {
 +    const gfx::Point location(1, 1);
-+    ASSERT_EQ(frame, popup.GetRootView()->GetEventHandlerForPoint(location));
++    ASSERT_EQ(frame,
++              popup.GetRootView()->GetEventHandlerForPoint(location));
 +    gfx::Point expected = location;
 +    views::View::ConvertPointToScreen(popup.GetRootView(), &expected);
 +    views::View::ConvertPointFromScreen(parent.GetRootView(), &expected);
@@ -2390,17 +2378,15 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 +  auto* contents = browser()->tab_strip_model()->GetActiveWebContents();
 +  auto navigation = content::NavigationSimulator::CreateFromPending(
 +      contents->GetController());
-+  navigation->SetResponseHeaders(
-+      base::MakeRefCounted<net::HttpResponseHeaders>("HTTP/1.1 200 OK\r\n"));
++  navigation->SetResponseHeaders(base::MakeRefCounted<net::HttpResponseHeaders>(
++      "HTTP/1.1 200 OK\r\n"));
 +  navigation->Commit();
 +  ASSERT_EQ(1u, backend->shortcuts_map().size());
-+  EXPECT_EQ(
-+      GURL("https://accepted.test/"),
-+      backend->shortcuts_map().begin()->second.match_core.destination_url);
++  EXPECT_EQ(GURL("https://accepted.test/"),
++            backend->shortcuts_map().begin()->second.match_core.destination_url);
 +}
 +
-+TEST_F(ArciumCommandBarTest,
-+       AlternateNavigationSurvivesSourceProviderDestruction) {
++TEST_F(ArciumCommandBarTest, AlternateNavigationSurvivesSourceProviderDestruction) {
 +  auto backend = PrepareShortcuts(browser()->profile());
 +  ASSERT_TRUE(backend && backend->initialized());
 +  auto provider = base::MakeRefCounted<FakeAutocompleteProvider>(
@@ -2419,9 +2405,8 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 +  EXPECT_TRUE(manager->infobars().back()->delegate()->LinkClicked(
 +      WindowOpenDisposition::CURRENT_TAB));
 +  ASSERT_EQ(1u, backend->shortcuts_map().size());
-+  EXPECT_EQ(
-+      GURL("https://accepted.test/"),
-+      backend->shortcuts_map().begin()->second.match_core.destination_url);
++  EXPECT_EQ(GURL("https://accepted.test/"),
++            backend->shortcuts_map().begin()->second.match_core.destination_url);
 +  manager->RemoveAllInfoBars(/*animate=*/false);
 +}
 +
@@ -2472,8 +2457,8 @@ Index: src/chrome/browser/ui/views/frame/arcium_command_bar_unittest.cc
 +  auto* contents = browser()->tab_strip_model()->GetActiveWebContents();
 +  auto navigation = content::NavigationSimulator::CreateFromPending(
 +      contents->GetController());
-+  navigation->SetResponseHeaders(
-+      base::MakeRefCounted<net::HttpResponseHeaders>("HTTP/1.1 200 OK\r\n"));
++  navigation->SetResponseHeaders(base::MakeRefCounted<net::HttpResponseHeaders>(
++      "HTTP/1.1 200 OK\r\n"));
 +  navigation->Commit();
 +  EXPECT_TRUE(backend->shortcuts_map().empty());
 +}
@@ -2545,7 +2530,15 @@ Index: src/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.cc
 +++ src/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.cc
-@@ -19,6 +19,7 @@
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.h"
+ 
++
+ #include <string>
+ #include <vector>
+ 
+@@ -19,6 +20,7 @@
  #include "components/history/core/browser/history_service.h"
  #include "components/infobars/content/content_infobar_manager.h"
  #include "components/infobars/core/infobar.h"
@@ -2553,7 +2546,7 @@ Index: src/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.cc
  #include "components/omnibox/browser/shortcuts_backend.h"
  #include "content/public/browser/web_contents.h"
  #include "ui/base/l10n/l10n_util.h"
-@@ -31,14 +32,15 @@ void AlternateNavInfoBarDelegate::Create
+@@ -31,14 +33,15 @@ void AlternateNavInfoBarDelegate::Create
      content::WebContents* web_contents,
      const std::u16string& text,
      const AutocompleteMatch& match,
@@ -2571,7 +2564,7 @@ Index: src/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.cc
  }
  
  std::u16string AlternateNavInfoBarDelegate::GetMessageTextWithOffset(
-@@ -81,7 +83,9 @@ bool AlternateNavInfoBarDelegate::LinkCl
+@@ -81,7 +84,9 @@ bool AlternateNavInfoBarDelegate::LinkCl
        ShortcutsBackendFactory::GetForProfile(profile_));
    if (shortcuts_backend.get()) {  // May be NULL in incognito.
      shortcuts_backend->DeleteShortcutsWithURL(original_url_);
@@ -2582,7 +2575,7 @@ Index: src/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.cc
    }
  
    // Tell the history system to remove any saved search term for the search.
-@@ -134,13 +138,21 @@ AlternateNavInfoBarDelegate::AlternateNa
+@@ -134,13 +139,21 @@ AlternateNavInfoBarDelegate::AlternateNa
      const std::u16string& text,
      std::unique_ptr<AutocompleteMatch> match,
      const GURL& destination_url,
@@ -2649,13 +2642,12 @@ Index: src/chrome/browser/ui/omnibox/chrome_omnibox_navigation_observer.cc
  #include "components/omnibox/browser/shortcuts_backend.h"
  #include "components/search_engines/template_url.h"
  #include "components/search_engines/template_url_service.h"
-@@ -45,6 +46,16 @@ class ChromeOmniboxNavigationObserver;
+@@ -45,6 +46,15 @@ class ChromeOmniboxNavigationObserver;
  
  namespace {
  
 +// Navigation can finish after a transient omnibox and its providers are gone.
-+// Delayed consumers need match data, without controller-owned provider
-+// pointers.
++// Delayed consumers need match data, without controller-owned provider pointers.
 +AutocompleteMatch CopyMatchForNavigation(const AutocompleteMatch& match) {
 +  AutocompleteMatch snapshot(match);
 +  snapshot.provider = nullptr;
@@ -2666,15 +2658,15 @@ Index: src/chrome/browser/ui/omnibox/chrome_omnibox_navigation_observer.cc
  // HTTP 2xx, 401, and 407 all indicate that the target address exists.
  bool ResponseCodeIndicatesSuccess(int response_code) {
    return ((response_code / 100) == 2) || (response_code == 401) ||
-@@ -251,8 +262,15 @@ ChromeOmniboxNavigationObserver::ChromeO
+@@ -251,8 +261,15 @@ ChromeOmniboxNavigationObserver::ChromeO
      ShowInfobarCallback show_infobar)
      : content::WebContentsObserver(navigation.GetWebContents()),
        text_(text),
 -      match_(match),
 -      alternative_nav_match_(alternative_nav_match),
 +      match_from_zero_suggest_(match.provider &&
-+                               match.provider->type() ==
-+                                   AutocompleteProvider::TYPE_ZERO_SUGGEST),
++                              match.provider->type() ==
++                                  AutocompleteProvider::TYPE_ZERO_SUGGEST),
 +      alternative_nav_match_from_zero_suggest_(
 +          alternative_nav_match.provider &&
 +          alternative_nav_match.provider->type() ==
@@ -2684,17 +2676,16 @@ Index: src/chrome/browser/ui/omnibox/chrome_omnibox_navigation_observer.cc
        navigation_id_(navigation.GetNavigationId()),
        profile_(profile),
        show_infobar_(std::move(show_infobar)) {
-@@ -296,7 +314,8 @@ void ChromeOmniboxNavigationObserver::Di
+@@ -296,7 +313,7 @@ void ChromeOmniboxNavigationObserver::Di
    // correct here (as we are processing a committed primary main frame
    // navigation), but we should consider adding a way to get virtual URL
    // directly from NavigationHandle.
 -  if (ResponseCodeIndicatesSuccess(
-+  if (!match_from_zero_suggest_ &&
-+      ResponseCodeIndicatesSuccess(
++  if (!match_from_zero_suggest_ && ResponseCodeIndicatesSuccess(
            navigation_handle->GetResponseHeaders()->response_code()) &&
        IsValidNavigation(match_.destination_url,
                          navigation_handle->GetWebContents()->GetVisibleURL())) {
-@@ -345,7 +364,8 @@ void ChromeOmniboxNavigationObserver::On
+@@ -345,7 +362,8 @@ void ChromeOmniboxNavigationObserver::On
  
  void ChromeOmniboxNavigationObserver::ShowAlternativeNavInfoBar() {
    AlternateNavInfoBarDelegate::CreateForOmniboxNavigation(
@@ -2763,25 +2754,21 @@ Index: src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
    const int corner_radius = 12;
    // Host the contents in its own View to simplify layout and customization.
    auto contents_host_builder =
-@@ -290,11 +292,12 @@ void RoundedOmniboxResultsFrame::OnBefor
+@@ -290,9 +292,11 @@ void RoundedOmniboxResultsFrame::OnBefor
  }
  
  // static
 -int RoundedOmniboxResultsFrame::GetNonResultSectionHeight(bool include_cutout) {
--  return include_cutout
--             ? GetLayoutConstant(LayoutConstant::kLocationBarHeight) +
--                   GetLocationBarAlignmentInsets().height()
--             : 0;
 +int RoundedOmniboxResultsFrame::GetNonResultSectionHeight(
 +    const LocationBar& location_bar,
 +    bool include_cutout) {
-+  return include_cutout ? location_bar.Bounds().height() +
-+                              GetLocationBarAlignmentInsets().height()
-+                        : 0;
+   return include_cutout
+-             ? GetLayoutConstant(LayoutConstant::kLocationBarHeight) +
++             ? location_bar.Bounds().height() +
+                    GetLocationBarAlignmentInsets().height()
+              : 0;
  }
- 
- // static
-@@ -362,7 +365,7 @@ void RoundedOmniboxResultsFrame::Layout(
+@@ -362,7 +366,7 @@ void RoundedOmniboxResultsFrame::Layout(
  
    if (top_background_->GetVisible()) {
      gfx::Rect top_bounds(contents_host_->GetContentsBounds());
@@ -2790,7 +2777,7 @@ Index: src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
      top_bounds.Inset(GetLocationBarAlignmentInsets());
      top_background_->SetBoundsRect(top_bounds);
    }
-@@ -428,7 +431,8 @@ void RoundedOmniboxResultsFrame::OnMouse
+@@ -428,7 +432,8 @@ void RoundedOmniboxResultsFrame::OnMouse
  // Insets used to position |contents_| within |contents_host_|.
  gfx::Insets RoundedOmniboxResultsFrame::GetContentInsets() {
    return gfx::Insets::TLBR(
@@ -2866,7 +2853,7 @@ Index: src/chrome/browser/ui/views/omnibox/omnibox_match_cell_view.cc
                                 ? gfx::Size()
                                 : separator_view_->GetPreferredSize());
  
-@@ -341,19 +364,51 @@ void OmniboxMatchCellView::OnMatchUpdate
+@@ -341,18 +364,50 @@ void OmniboxMatchCellView::OnMatchUpdate
      description_view_->SetTextWithStyling(match.description,
                                            match.description_class);
    } else {
@@ -2906,7 +2893,6 @@ Index: src/chrome/browser/ui/views/omnibox/omnibox_match_cell_view.cc
 +
  void OmniboxMatchCellView::SetIcon(const gfx::ImageSkia& image,
                                     const AutocompleteMatch& match) {
--    icon_view_->SetImage(ui::ImageModel::FromImageSkia(image));
 +  if (match.arcium_item && match.arcium_item->IsCommand()) {
 +    const auto icon_color =
 +        GetColorProvider()->GetColor(kColorOmniboxResultsIcon);
@@ -2916,10 +2902,9 @@ Index: src/chrome/browser/ui/views/omnibox/omnibox_match_cell_view.cc
 +            kIconAndImageCornerRadius, SkColorSetA(icon_color, 0x20), image)));
 +    return;
 +  }
-+  icon_view_->SetImage(ui::ImageModel::FromImageSkia(image));
+     icon_view_->SetImage(ui::ImageModel::FromImageSkia(image));
  }
  
- void OmniboxMatchCellView::ClearIcon() {
 @@ -449,6 +504,42 @@ void OmniboxMatchCellView::Layout(PassKe
    image_view->SetBounds(image_x, y, kImageBoundsWidth, row_height);
  
@@ -3159,7 +3144,7 @@ Index: src/chrome/browser/ui/views/omnibox/omnibox_result_view_unittest.cc
  #include "ui/views/widget/widget.h"
  
  #if defined(USE_AURA)
-@@ -357,3 +362,178 @@ TEST_F(OmniboxResultViewTest, Contextual
+@@ -357,3 +362,180 @@ TEST_F(OmniboxResultViewTest, Contextual
      EXPECT_TRUE(description_view->GetVisible());
    }
  }
@@ -3271,8 +3256,9 @@ Index: src/chrome/browser/ui/views/omnibox/omnibox_result_view_unittest.cc
 +  result_view()->parent()->AddChildViewRaw(popup_view());
 +  std::array<OmniboxRowView*, 3> rows;
 +  for (size_t i = 0; i < rows.size(); ++i) {
-+    rows[i] = popup_view()->AddChildView(std::make_unique<OmniboxRowView>(
-+        i == 0 ? kTestResultViewIndex : i - 1, popup_view()));
++    rows[i] = popup_view()->AddChildView(
++        std::make_unique<OmniboxRowView>(i == 0 ? kTestResultViewIndex : i - 1,
++                                       popup_view()));
 +  }
 +  auto* active_result = rows.front()->result_view();
 +  auto* cell = active_result->suggestion_view_.get();
@@ -3296,13 +3282,14 @@ Index: src/chrome/browser/ui/views/omnibox/omnibox_result_view_unittest.cc
 +          const auto* flex =
 +              result->suggestion_view_->GetProperty(views::kFlexBehaviorKey);
 +          ASSERT_NE(nullptr, flex);
-+          const auto flex_size = flex->rule().Run(result->suggestion_view_,
-+                                                  {width, cell_height + 40});
++          const auto flex_size = flex->rule().Run(
++              result->suggestion_view_, {width, cell_height + 40});
 +          EXPECT_EQ(width, flex_size.width());
 +          EXPECT_EQ(cell_height, flex_size.height());
 +        }
 +        EXPECT_EQ(cell_height + rows[i]->GetInsets().height(), row_height);
-+        EXPECT_EQ(row_height, rows[i]->GetPreferredSize({width, {}}).height());
++        EXPECT_EQ(row_height,
++                  rows[i]->GetPreferredSize({width, {}}).height());
 +        popup_height += row_height;
 +      }
 +      popup_view()->SetBoundsRect(gfx::Rect(0, 0, width, popup_height));
@@ -3371,18 +3358,17 @@ Index: src/chrome/browser/ui/views/omnibox/omnibox_text_view.cc
    render_text->SetCursorEnabled(false);
    render_text->SetElideBehavior(gfx::ELIDE_TAIL);
    const gfx::FontList& font = views::TypographyProvider::Get().GetFont(
-@@ -294,7 +309,14 @@ void OmniboxTextView::OnStyleChanged() {
+@@ -294,7 +309,13 @@ void OmniboxTextView::OnStyleChanged() {
            .GetFontListForDetails(ui::ResourceBundle::FontDetails(
                std::string(), size_delta, gfx::Font::Weight::BOLD))
            .GetHeight();
 -  font_height_ = std::max(height_normal, height_bold);
 +  // The renderer's minimum line height can exceed the font metrics, e.g.
 +  // with profile UI scaling. Reserve the same height that will be painted.
-+  font_height_ =
-+      std::max({height_normal, height_bold, render_text_->min_line_height()});
++  font_height_ = std::max(
++      {height_normal, height_bold, render_text_->min_line_height()});
 +  if (!wrap_text_lines_) {
-+    font_height_ =
-+        std::max(font_height_, render_text_->GetStringSize().height());
++    font_height_ = std::max(font_height_, render_text_->GetStringSize().height());
 +  }
    font_height_ += kVerticalPadding;
  
@@ -3769,7 +3755,7 @@ Index: src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.h
 -  static int GetNonResultSectionHeight(bool include_cutout = true);
 +  // The height reserved above results, using the laid-out input height.
 +  static int GetNonResultSectionHeight(const LocationBar& location_bar,
-+                                       bool include_cutout = true);
++                                      bool include_cutout = true);
  
    // How the Widget is aligned relative to the location bar.
    static gfx::Insets GetLocationBarAlignmentInsets();
