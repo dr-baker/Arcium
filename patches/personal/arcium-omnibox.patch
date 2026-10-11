@@ -2466,7 +2466,7 @@ Index: src/chrome/test/BUILD.gn
 ===================================================================
 --- src.orig/chrome/test/BUILD.gn
 +++ src/chrome/test/BUILD.gn
-@@ -69,6 +69,58 @@ if (is_chromeos && include_js2gtest_test
+@@ -69,6 +69,59 @@ if (is_chromeos && include_js2gtest_test
    import("//chrome/test/base/ash/js2gtest.gni")
  }
  
@@ -2478,6 +2478,7 @@ Index: src/chrome/test/BUILD.gn
 +      "../browser/ui/omnibox/arcium_omnibox_service_unittest.cc",
 +      "../browser/ui/views/frame/arcium_command_bar_unittest.cc",
 +      "../browser/ui/views/omnibox/omnibox_result_view_unittest.cc",
++      "//components/omnibox/browser/arcium_command_search_unittest.cc",
 +      "//components/omnibox/browser/autocomplete_result_unittest.cc",
 +      "//components/omnibox/browser/bookmark_provider_unittest.cc",
 +    ]
@@ -3766,3 +3767,690 @@ Index: src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.h
    raw_ptr<views::View> top_background_ = nullptr;
    raw_ptr<views::View> contents_host_ = nullptr;
    raw_ptr<views::View> contents_;
+Index: src/components/omnibox/browser/BUILD.gn
+===================================================================
+--- src.orig/components/omnibox/browser/BUILD.gn
++++ src/components/omnibox/browser/BUILD.gn
+@@ -155,6 +155,8 @@ static_library("browser") {
+   configs = []
+   configs = [ "//third_party/tflite:tflite_shim_config" ] + _configs
+   sources = [
++    "arcium_command_search.cc",
++    "arcium_command_search.h",
+     "actions/contextual_search_action.cc",
+     "actions/contextual_search_action.h",
+     "actions/cross_device_tab_action.cc",
+Index: src/components/omnibox/browser/arcium_command_search.cc
+===================================================================
+--- /dev/null
++++ src/components/omnibox/browser/arcium_command_search.cc
+@@ -0,0 +1,204 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by the GPL-3.0 license.
++
++#include "components/omnibox/browser/arcium_command_search.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/check.h"
++#include "base/i18n/case_conversion.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "components/omnibox/browser/autocomplete_provider.h"
++#include "components/omnibox/browser/autocomplete_result.h"
++#include "third_party/icu/source/common/unicode/normalizer2.h"
++#include "third_party/icu/source/common/unicode/unistr.h"
++
++namespace arcium {
++namespace {
++std::u16string Normalize(std::u16string_view value) {
++  const auto folded = base::i18n::FoldCase(value);
++  UErrorCode status = U_ZERO_ERROR;
++  const auto* nfc = icu::Normalizer2::getNFCInstance(status);
++  CHECK(U_SUCCESS(status));
++  icu::UnicodeString output;
++  nfc->normalize(icu::UnicodeString(false, folded.data(), folded.size()),
++                 output, status);
++  CHECK(U_SUCCESS(status));
++  return std::u16string(output.getBuffer(), output.length());
++}
++bool Better(const CommandSearchResult& left, const CommandSearchResult& right) {
++  if (left.text_score != right.text_score) {
++    return left.text_score > right.text_score;
++  }
++  // This local matcher uses owner relevance (including frecency) as a tie
++  // breaker. Native autocomplete results require an order-preserving adapter;
++  // they must never be fed back through this local text matcher.
++  if (left.source_relevance != right.source_relevance) {
++    return left.source_relevance > right.source_relevance;
++  }
++  return left.record.slot < right.record.slot;
++}
++int Score(std::u16string_view text,
++          std::u16string_view token,
++          int exact,
++          int prefix,
++          int contains) {
++  if (text == token) {
++    return exact;
++  }
++  if (base::StartsWith(text, token)) {
++    return prefix;
++  }
++  return text.find(token) != std::u16string_view::npos ? contains : 0;
++}
++}  // namespace
++
++CommandSearchIndex::CommandSearchIndex(std::vector<CommandRecord> records,
++                                       uint64_t revision)
++    : records_(std::move(records)), revision_(revision) {
++  CHECK_NE(revision_, 0u);
++  CHECK_LE(records_.size(), UINT32_MAX);
++  search_text_.reserve(records_.size());
++  for (const auto& record : records_) {
++    search_text_.push_back(
++        {Normalize(record.title), Normalize(record.url),
++         Normalize(record.context + u" " + record.category)});
++  }
++}
++CommandSearchIndex::~CommandSearchIndex() = default;
++
++std::vector<CommandSearchResult> CommandSearchIndex::Search(
++    std::u16string_view query,
++    SearchScope scope,
++    size_t limit) const {
++  limit = std::min(limit, kMaxResults);
++  std::vector<CommandSearchResult> results;
++  results.reserve(limit);
++  if (!limit || query.size() > kMaxQueryLength) {
++    return results;
++  }
++  const auto normalized = Normalize(query);
++  const auto tokens =
++      base::SplitStringPiece(normalized, base::kWhitespaceUTF16,
++                             base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++  if (tokens.size() > kMaxQueryTerms) {
++    return results;
++  }
++  for (size_t slot = 0; slot < records_.size(); ++slot) {
++    const auto& record = records_[slot];
++    if (scope != SearchScope::kEverything && record.scope != scope &&
++        !(record.memberships & ScopeBit(scope))) {
++      continue;
++    }
++    if (tokens.empty() && !record.suggested) {
++      continue;
++    }
++    const auto& text = search_text_[slot];
++    int score = 0;
++    bool matched = true;
++    for (const auto token : tokens) {
++      const int token_score =
++          std::max({Score(text.title, token, 100, 80, 50),
++                    Score(text.url, token, 45, 35, 25),
++                    Score(text.context, token, 30, 20, 10)});
++      if (!token_score) {
++        matched = false;
++        break;
++      }
++      score += token_score;
++    }
++    if (!matched) {
++      continue;
++    }
++    CommandSearchResult candidate{Ref(slot), score, record.source_relevance};
++    const auto position =
++        std::lower_bound(results.begin(), results.end(), candidate, Better);
++    if (results.size() == limit && position == results.end()) {
++      continue;
++    }
++    // Allocation remains bounded by the requested visible result count.
++    if (results.size() == limit) {
++      results.pop_back();
++    }
++    const auto insertion =
++        std::lower_bound(results.begin(), results.end(), candidate, Better);
++    results.insert(insertion, candidate);
++  }
++  return results;
++}
++const CommandRecord* CommandSearchIndex::Get(CommandRecordRef ref) const {
++  if (ref.snapshot != snapshot_ || ref.revision != revision_ ||
++      ref.slot >= records_.size()) {
++    return nullptr;
++  }
++  return &records_[ref.slot];
++}
++CommandRecordRef CommandSearchIndex::Ref(size_t slot) const {
++  CHECK_LT(slot, records_.size());
++  return {snapshot_, revision_, static_cast<uint32_t>(slot)};
++}
++size_t CommandSearchIndex::EstimateOwnedBytes() const {
++  size_t bytes = sizeof(*this) + records_.capacity() * sizeof(CommandRecord) +
++                 search_text_.capacity() * sizeof(SearchText);
++  for (const auto& r : records_) {
++    bytes += r.id.capacity() + 1;
++    for (const auto* text : {&r.title, &r.url, &r.context, &r.category}) {
++      bytes += (text->capacity() + 1) * sizeof(char16_t);
++    }
++  }
++  for (const auto& r : search_text_) {
++    for (const auto* text : {&r.title, &r.url, &r.context}) {
++      bytes += (text->capacity() + 1) * sizeof(char16_t);
++    }
++  }
++  return bytes;
++}
++std::vector<NativeCommandRow> ProjectNativeCommandRows(
++    const AutocompleteResult& result,
++    base::UnguessableToken result_revision,
++    size_t limit) {
++  CHECK(!result_revision.is_empty());
++  limit = std::min({limit, CommandSearchIndex::kMaxResults, result.size()});
++  std::vector<NativeCommandRow> rows;
++  rows.reserve(limit);
++  const auto* default_match = result.default_match();
++  for (size_t i = 0; i < limit; ++i) {
++    const auto& match = result.match_at(i);
++    rows.push_back(
++        {result_revision, static_cast<uint32_t>(i), match.relevance,
++         match.provider ? static_cast<int>(match.provider->type()) : 0,
++         static_cast<int>(match.type), match.allowed_to_be_default_match,
++         &match == default_match});
++  }
++  return rows;
++}
++std::vector<CommandAction> ResolveCommandActions(
++    const CommandSearchIndex& index,
++    CommandRecordRef target,
++    CommandCapabilities capabilities) {
++  const auto* record = index.Get(target);
++  if (!record) {
++    return {};
++  }
++  std::vector<CommandAction> actions;
++  actions.reserve(5);
++  if (capabilities.can_pin) {
++    actions.push_back({CommandActionKind::kPin, target});
++  }
++  if (capabilities.can_favorite) {
++    actions.push_back({CommandActionKind::kFavorite, target});
++  }
++  if (capabilities.can_move) {
++    actions.push_back({CommandActionKind::kChooseSpace, target});
++  }
++  if (capabilities.can_close_live) {
++    actions.push_back({CommandActionKind::kCloseLiveTab, target});
++  }
++  if (capabilities.can_return_home) {
++    actions.push_back({CommandActionKind::kReturnHome, target});
++  }
++  return actions;
++}
++}  // namespace arcium
+Index: src/components/omnibox/browser/arcium_command_search.h
+===================================================================
+--- /dev/null
++++ src/components/omnibox/browser/arcium_command_search.h
+@@ -0,0 +1,159 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by the GPL-3.0 license.
++
++#ifndef COMPONENTS_OMNIBOX_BROWSER_ARCIUM_COMMAND_SEARCH_H_
++#define COMPONENTS_OMNIBOX_BROWSER_ARCIUM_COMMAND_SEARCH_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/unguessable_token.h"
++
++class AutocompleteResult;
++
++namespace arcium {
++
++enum class SearchScope { kEverything, kWeb, kSaved, kYouTube, kX, kChatGPT };
++constexpr uint32_t ScopeBit(SearchScope scope) {
++  return 1u << static_cast<unsigned>(scope);
++}
++
++enum class CommandKind {
++  kSuggestion,
++  kWebsite,
++  kPin,
++  kFavorite,
++  kVideo,
++  kTab,
++  kPost,
++  kConversation,
++  kCurrentTab
++};
++enum class CommandIcon {
++  kSearch,
++  kGlobe,
++  kFigma,
++  kStudio,
++  kYouTube,
++  kX,
++  kChat
++};
++
++// A search projection, not a second bookmark/history store. Production adapters
++// supply durable qualified IDs and their existing relevance/frecency signal.
++// Favicons and actions are deliberately absent: resolve them for visible rows.
++struct CommandRecord {
++  std::string id;
++  std::u16string title;
++  std::u16string url;
++  std::u16string context;
++  std::u16string category;
++  SearchScope scope = SearchScope::kEverything;
++  CommandKind kind = CommandKind::kWebsite;
++  CommandIcon icon = CommandIcon::kGlobe;
++  int source_relevance = 0;
++  bool live = false;
++  bool suggested = false;
++  // Additional memberships, e.g. a saved YouTube video. Primary scope drives
++  // presentation; membership drives filtering, without duplicating records.
++  uint32_t memberships = 0;
++};
++
++// Slots are valid only for this immutable corpus revision. A view must never
++// retain a result ordinal across a replaced search generation.
++struct CommandRecordRef {
++  base::UnguessableToken snapshot;
++  uint64_t revision = 0;
++  uint32_t slot = 0;
++  friend bool operator==(const CommandRecordRef&,
++                         const CommandRecordRef&) = default;
++};
++struct CommandSearchResult {
++  CommandRecordRef record;
++  int text_score = 0;
++  int source_relevance = 0;
++};
++
++class CommandSearchIndex {
++ public:
++  static constexpr size_t kMaxResults = 32;
++  static constexpr size_t kMaxQueryLength = 2048;
++  static constexpr size_t kMaxQueryTerms = 32;
++  CommandSearchIndex(std::vector<CommandRecord> records, uint64_t revision);
++  CommandSearchIndex(const CommandSearchIndex&) = delete;
++  CommandSearchIndex& operator=(const CommandSearchIndex&) = delete;
++  ~CommandSearchIndex();
++
++  std::vector<CommandSearchResult> Search(std::u16string_view query,
++                                          SearchScope scope,
++                                          size_t limit = 8) const;
++  const CommandRecord* Get(CommandRecordRef ref) const;
++  CommandRecordRef Ref(size_t slot) const;
++  size_t size() const { return records_.size(); }
++  uint64_t revision() const { return revision_; }
++  // Conservative storage budget, including capacity and inline string space.
++  // No action or favicon cache. Use a process allocator for exact allocations.
++  size_t EstimateOwnedBytes() const;
++
++ private:
++  struct SearchText {
++    std::u16string title;
++    std::u16string url;
++    std::u16string context;
++  };
++  std::vector<CommandRecord> records_;
++  std::vector<SearchText> search_text_;
++  uint64_t revision_;
++  const base::UnguessableToken snapshot_ = base::UnguessableToken::Create();
++};
++
++// Published native results keep their owner's final ordering/default. This
++// projection copies no text, URLs, favicons or actions, and never applies the
++// local corpus matcher. The owner must mint a fresh revision token on EVERY
++// result notification, including asynchronous updates within the same query.
++struct NativeCommandRow {
++  base::UnguessableToken result_revision;
++  uint32_t ordinal;
++  int relevance;
++  int provider_type;
++  int match_type;
++  bool allowed_default;
++  bool is_default;
++};
++std::vector<NativeCommandRow> ProjectNativeCommandRows(
++    const AutocompleteResult& result,
++    base::UnguessableToken result_revision,
++    size_t limit = 8);
++
++// Intent descriptors are a separate, late-bound projection. Search never
++// constructs these or enumerates destinations for a move operation.
++enum class CommandActionKind {
++  kPin,
++  kFavorite,
++  kChooseSpace,
++  kCloseLiveTab,
++  kReturnHome
++};
++struct CommandAction {
++  CommandActionKind kind;
++  CommandRecordRef target;
++};
++// Obtained from authoritative owners only when actions are requested. Keep
++// eligibility separate from search metadata and revalidate before execution.
++struct CommandCapabilities {
++  bool can_pin = false;
++  bool can_favorite = false;
++  bool can_move = false;
++  bool can_close_live = false;
++  bool can_return_home = false;
++};
++std::vector<CommandAction> ResolveCommandActions(
++    const CommandSearchIndex& index,
++    CommandRecordRef target,
++    CommandCapabilities capabilities);
++
++}  // namespace arcium
++#endif  // COMPONENTS_OMNIBOX_BROWSER_ARCIUM_COMMAND_SEARCH_H_
+Index: src/components/omnibox/browser/arcium_command_search_unittest.cc
+===================================================================
+--- /dev/null
++++ src/components/omnibox/browser/arcium_command_search_unittest.cc
+@@ -0,0 +1,296 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by the GPL-3.0 license.
++
++#include "components/omnibox/browser/arcium_command_search.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <set>
++
++#include "base/command_line.h"
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/time/time.h"
++#include "components/omnibox/browser/autocomplete_result.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace arcium {
++namespace {
++std::vector<CommandRecord> Pins(size_t count) {
++  std::vector<CommandRecord> records;
++  records.reserve(count);
++  for (size_t i = 0; i < count; ++i) {
++    CommandRecord record;
++    record.id = "space:design/pin:" + base::NumberToString(i);
++    record.title = u"Interface reference " + base::NumberToString16(i);
++    record.url = u"https://example.test/design/" + base::NumberToString16(i);
++    record.context = i % 2 ? u"Design › Figma" : u"Research › Typography";
++    record.kind = CommandKind::kPin;
++    record.scope = SearchScope::kSaved;
++    record.source_relevance = static_cast<int>(i);
++    records.push_back(std::move(record));
++  }
++  return records;
++}
++TEST(CommandSearchIndexTest, Queries211PinsWithoutUnboundedResultsOrActions) {
++  CommandSearchIndex index(Pins(211), 42);
++  const auto bytes = index.EstimateOwnedBytes();
++  ASSERT_EQ(index.size(), 211u);
++  EXPECT_LT(bytes, 512u * 1024u);
++  const auto started = base::TimeTicks::Now();
++  for (int i = 0; i < 1000; ++i) {
++    const auto results = index.Search(u"interface figma", SearchScope::kSaved);
++    ASSERT_EQ(results.size(), 8u);
++    EXPECT_LE(results.capacity(), CommandSearchIndex::kMaxResults);
++    EXPECT_EQ(index.Get(results.front().record)->id, "space:design/pin:209");
++  }
++  // This is a generous regression guard, not the reported latency benchmark.
++  EXPECT_LT(base::TimeTicks::Now() - started, base::Seconds(5));
++  EXPECT_EQ(index.EstimateOwnedBytes(), bytes);
++  EXPECT_EQ(index.Search(u"interface", SearchScope::kSaved, 1000).size(), 32u);
++  EXPECT_TRUE(index.Search(u"interface", SearchScope::kWeb).empty());
++}
++TEST(CommandSearchIndexTest, CarriesProviderFrecencyAndStableIdentity) {
++  auto records = Pins(3);
++  for (auto& record : records) {
++    record.title = u"Figma";
++  }
++  records[0].source_relevance = 10;
++  records[1].source_relevance = 1200;
++  records[2].source_relevance = 100;
++  CommandSearchIndex index(std::move(records), 1);
++  const auto matches = index.Search(u"FIGMA", SearchScope::kSaved);
++  ASSERT_EQ(matches.size(), 3u);
++  EXPECT_EQ(matches[0].record.slot, 1u);
++  EXPECT_EQ(matches[0].source_relevance, 1200);
++  EXPECT_EQ(matches[1].record.slot, 2u);
++}
++TEST(CommandSearchIndexTest, StaleRevisionCannotResolveRecordOrActions) {
++  CommandSearchIndex before(Pins(2), 1);
++  CommandSearchIndex after(Pins(2), 2);
++  const auto ref = before.Ref(0);
++  EXPECT_EQ(after.Get(ref), nullptr);
++  EXPECT_TRUE(ResolveCommandActions(after, ref, {true, true, true, true, true})
++                  .empty());
++  EXPECT_TRUE(after.Search(u"reference", SearchScope::kSaved, 0).empty());
++}
++TEST(CommandSearchIndexTest, ResolvesActionsOnlyForOneChosenTarget) {
++  auto records = Pins(211);
++  records[3].live = true;
++  CommandSearchIndex index(std::move(records), 8);
++  const auto matches = index.Search(u"reference", SearchScope::kSaved);
++  const auto actions = ResolveCommandActions(index, index.Ref(3),
++                                             {true, true, true, true, true});
++  ASSERT_EQ(actions.size(), 5u);
++  for (const auto& action : actions) {
++    EXPECT_EQ(action.target, index.Ref(3));
++  }
++  const auto dormant = ResolveCommandActions(index, matches.front().record,
++                                             {true, true, true, false, true});
++  EXPECT_EQ(dormant.size(), 4u);
++  EXPECT_TRUE(ResolveCommandActions(index, index.Ref(3), {}).empty());
++}
++TEST(CommandSearchIndexTest, UnicodeCaseAndAllQueryTermsMatchAcrossFields) {
++  auto records = Pins(1);
++  records[0].title = u"CAFÉ Straße";
++  records[0].context = u"Design › Résumé";
++  CommandSearchIndex index(std::move(records), 1);
++  EXPECT_EQ(index.Search(u"café STRASSE résumé", SearchScope::kSaved).size(),
++            1u);
++  EXPECT_TRUE(index.Search(u"café missing", SearchScope::kSaved).empty());
++}
++TEST(CommandSearchIndexTest, SameRevisionInAnotherSnapshotRejectsForeignRefs) {
++  CommandSearchIndex first(Pins(2), 1);
++  auto reversed = Pins(2);
++  std::reverse(reversed.begin(), reversed.end());
++  CommandSearchIndex second(std::move(reversed), 1);
++  EXPECT_EQ(second.Get(first.Ref(0)), nullptr);
++  EXPECT_TRUE(ResolveCommandActions(second, first.Ref(0),
++                                    {true, true, true, true, true})
++                  .empty());
++}
++TEST(CommandSearchIndexTest, CanonicallyEquivalentUnicodeMatches) {
++  auto records = Pins(1);
++  records[0].title = u"CAFÉ Résumé";
++  CommandSearchIndex index(std::move(records), 1);
++  EXPECT_EQ(index.Search(u"cafe\u0301 re\u0301sume\u0301", SearchScope::kSaved)
++                .size(),
++            1u);
++}
++TEST(CommandSearchIndexTest, QueryWorkHasExplicitBounds) {
++  CommandSearchIndex index(Pins(1), 1);
++  EXPECT_TRUE(
++      index.Search(std::u16string(2049, u'a'), SearchScope::kSaved).empty());
++  EXPECT_TRUE(
++      index.Search(std::u16string(2048, u'a'), SearchScope::kSaved).empty());
++  std::u16string terms;
++  for (int i = 0; i < 32; ++i) {
++    terms += u"reference ";
++  }
++  EXPECT_EQ(index.Search(terms, SearchScope::kSaved).size(), 1u);
++  terms += u"reference";
++  EXPECT_TRUE(index.Search(terms, SearchScope::kSaved).empty());
++}
++TEST(CommandSearchIndexTest, SavedVideoBelongsToBothScopesWithoutDuplication) {
++  auto records = Pins(1);
++  records[0].memberships = ScopeBit(SearchScope::kYouTube);
++  CommandSearchIndex index(std::move(records), 1);
++  EXPECT_EQ(index.Search(u"reference", SearchScope::kEverything).size(), 1u);
++  EXPECT_EQ(index.Search(u"reference", SearchScope::kSaved).size(), 1u);
++  EXPECT_EQ(index.Search(u"reference", SearchScope::kYouTube).size(), 1u);
++}
++TEST(CommandSearchIndexTest, PublishedNativeOrderAndDefaultArePreserved) {
++  AutocompleteResult result;
++  AutocompleteMatch first(nullptr, 200, false,
++                          AutocompleteMatchType::SEARCH_SUGGEST);
++  first.contents = u"semantic suggestion without literal query";
++  first.allowed_to_be_default_match = true;
++  AutocompleteMatch second(nullptr, 9000, false,
++                           AutocompleteMatchType::HISTORY_URL);
++  second.contents = u"exact literal match";
++  second.allowed_to_be_default_match = false;
++  result.AppendMatches({first, second});
++  const auto revision = base::UnguessableToken::Create();
++  const auto rows = ProjectNativeCommandRows(result, revision);
++  ASSERT_EQ(rows.size(), 2u);
++  EXPECT_EQ(rows[0].ordinal, 0u);
++  EXPECT_EQ(rows[0].relevance, 200);
++  EXPECT_EQ(rows[1].relevance, 9000);
++  EXPECT_TRUE(rows[0].allowed_default);
++  EXPECT_FALSE(rows[1].allowed_default);
++  EXPECT_EQ(rows[0].is_default, result.default_match() == result.match_at(0));
++  EXPECT_EQ(rows[0].result_revision, revision);
++  const auto next_revision = base::UnguessableToken::Create();
++  EXPECT_NE(ProjectNativeCommandRows(result, next_revision)[0].result_revision,
++            rows[0].result_revision);
++}
++
++// Explicitly opted-in, read-only benchmark. Never runs against a profile by
++// default, and emits only aggregate counts, storage budget and timings.
++TEST(CommandSearchIndexTest, ActualProfileCorpusBenchmark) {
++  const auto* command = base::CommandLine::ForCurrentProcess();
++  if (!command->HasSwitch("arcium-pins-preferences")) {
++    GTEST_SKIP();
++  }
++  std::string json;
++  ASSERT_TRUE(base::ReadFileToStringWithMaxSize(
++      command->GetSwitchValuePath("arcium-pins-preferences"), &json,
++      32 * 1024 * 1024));
++  auto parsed =
++      base::JSONReader::Read(json, base::JSON_PARSE_CHROMIUM_EXTENSIONS);
++  ASSERT_TRUE(parsed && parsed->is_dict());
++  const auto* spaces = parsed->GetDict().FindListByDottedPath("helium.spaces");
++  ASSERT_TRUE(spaces);
++  std::vector<CommandRecord> records;
++  size_t folders = 0;
++  size_t visited = 0;
++  std::set<std::string> space_ids;
++  auto walk = [&](auto&& self, const base::ListValue& nodes,
++                  const std::string& space, const std::u16string& context,
++                  std::set<std::string>& ids, size_t depth) -> bool {
++    if (depth > 64 || nodes.size() > 10000) {
++      return false;
++    }
++    for (const auto& value : nodes) {
++      if (++visited > 10000 || !value.is_dict()) {
++        return false;
++      }
++      const auto& node = value.GetDict();
++      const auto* type = node.FindString("type");
++      const auto* id = node.FindString("id");
++      const auto* title = node.FindString("title");
++      if (!type || !id || id->empty() || !title || !ids.insert(*id).second) {
++        return false;
++      }
++      if (*type == "folder") {
++        ++folders;
++        const auto* children = node.FindList("children");
++        if (!children || !node.FindBool("collapsed").has_value() ||
++            !self(
++                self, *children, space,
++                (context + u" › " + base::UTF8ToUTF16(*title)).substr(0, 2048),
++                ids, depth + 1)) {
++          return false;
++        }
++      } else if (*type == "link") {
++        const auto* url = node.FindString("url");
++        if (!url || records.size() >= 10000) {
++          return false;
++        }
++        CommandRecord record;
++        record.id = space + "/pin:" + *id;
++        record.title = base::UTF8ToUTF16(*title);
++        record.url = base::UTF8ToUTF16(*url);
++        record.context = context;
++        record.category = u"Pin";
++        record.scope = SearchScope::kSaved;
++        record.kind = CommandKind::kPin;
++        records.push_back(std::move(record));
++      } else {
++        return false;
++      }
++    }
++    return true;
++  };
++  ASSERT_LE(spaces->size(), 100u);
++  for (const auto& value : *spaces) {
++    ASSERT_TRUE(value.is_dict());
++    const auto& space = value.GetDict();
++    const auto* id = space.FindString("id");
++    const auto* pins = space.FindList("pins");
++    const auto* name = space.FindString("name");
++    ASSERT_TRUE(id && !id->empty() && pins && name &&
++                space_ids.insert(*id).second);
++    std::set<std::string> ids;
++    ASSERT_TRUE(walk(walk, *pins, *id, base::UTF8ToUTF16(*name), ids, 0));
++  }
++  ASSERT_EQ(records.size(), 211u);
++  std::vector<std::u16string> queries;
++  for (const auto& record : records) {
++    auto terms = base::SplitStringPiece(record.title, base::kWhitespaceUTF16,
++                                        base::TRIM_WHITESPACE,
++                                        base::SPLIT_WANT_NONEMPTY);
++    std::u16string query(terms.empty() ? std::u16string_view(record.url)
++                                       : terms.front());
++    if (query.size() > 12) {
++      query.resize(12);
++      if (query.back() >= 0xd800 && query.back() <= 0xdbff) {
++        query.pop_back();
++      }
++    }
++    if (!query.empty()) {
++      queries.push_back(std::move(query));
++    }
++  }
++  ASSERT_FALSE(queries.empty());
++  CommandSearchIndex index(std::move(records), 1);
++  const auto bytes = index.EstimateOwnedBytes();
++  ASSERT_LT(bytes, 1024u * 1024u);
++  std::vector<int64_t> micros;
++  for (int i = 0; i < 1000; ++i) {
++    const auto started = base::TimeTicks::Now();
++    const auto matches =
++        index.Search(queries[i % queries.size()], SearchScope::kSaved);
++    micros.push_back((base::TimeTicks::Now() - started).InMicroseconds());
++    ASSERT_FALSE(matches.empty());
++    ASSERT_LE(matches.size(), 8u);
++    for (const auto& match : matches) {
++      ASSERT_NE(index.Get(match.record), nullptr);
++    }
++  }
++  std::sort(micros.begin(), micros.end());
++  EXPECT_EQ(index.EstimateOwnedBytes(), bytes);
++  EXPECT_LT(micros[950], 2000);
++  std::printf(
++      "Corpus: %zu pins, %zu folders; owned storage budget %zu bytes; "
++      "1000 queries median %lld us, p95 %lld us; max 8 results; no action "
++      "cache\n",
++      index.size(), folders, bytes, static_cast<long long>(micros[500]),
++      static_cast<long long>(micros[950]));
++}
++}  // namespace
++}  // namespace arcium
