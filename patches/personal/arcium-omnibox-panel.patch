@@ -550,7 +550,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
-@@ -0,0 +1,1830 @@
+@@ -0,0 +1,1866 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -561,6 +561,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +#include <cmath>
 +#include <utility>
 +
++#include "base/auto_reset.h"
 +#include "base/check.h"
 +#include "base/functional/bind.h"
 +#include "base/i18n/case_conversion.h"
@@ -569,6 +570,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +#include "base/strings/string_number_conversions.h"
 +#include "base/strings/string_util.h"
 +#include "base/strings/utf_string_conversions.h"
++#include "base/third_party/icu/icu_utf.h"
 +#include "build/build_config.h"
 +#include "cc/paint/paint_shader.h"
 +#include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
@@ -1569,11 +1571,37 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  }
 +  return u"Open website";
 +}
++std::u16string_view CommandPanelView::ClampInputForQuery() {
++  const auto text = input_->GetText();
++  if (text.size() <= CommandSearchIndex::kMaxQueryLength) {
++    return text;
++  }
++  size_t length = CommandSearchIndex::kMaxQueryLength;
++  if (CBU16_IS_LEAD(text[length - 1]) && CBU16_IS_TRAIL(text[length])) {
++    --length;
++  }
++  // Preserve the IME's composition. Query and row copies use only the bounded
++  // prefix until ContentsChanged is called again for the committed text.
++  if (input_->IsIMEComposing()) {
++    return text.substr(0, length);
++  }
++  const auto selection = input_->GetSelectedRange();
++  const std::u16string bounded(text.substr(0, length));
++  const base::AutoReset<bool> update_guard(&updating_, true);
++  input_->SetText(bounded);
++  input_->SetSelectedRange(gfx::Range(std::min(selection.start(), length),
++                                    std::min(selection.end(), length)));
++  // SetText records the old value. Release it so Undo cannot restore an
++  // oversized query after the clamp.
++  input_->ClearEditHistory();
++  return input_->GetText();
++}
 +void CommandPanelView::RebuildResults() {
 +  rows_.clear();
++  const auto input_query = ClampInputForQuery();
 +  const std::u16string query(current_context_ && !actions_visible_
 +                                 ? std::u16string_view{}
-+                                 : input_->GetText());
++                                 : input_query);
 +  if (actions_visible_) {
 +    const auto normalized = base::i18n::FoldCase(query);
 +    for (const auto& action : actions_) {
@@ -2246,8 +2274,11 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  if (enabled) {
 +    saved_context_ = current_context_;
 +    saved_scopes_ = scope_browsing_;
-+    saved_query_ = input_->GetText();
-+    saved_selection_ = input_->GetSelectedRange();
++    saved_query_ = ClampInputForQuery();
++    const auto selection = input_->GetSelectedRange();
++    saved_selection_ =
++        gfx::Range(std::min(selection.start(), saved_query_.size()),
++                   std::min(selection.end(), saved_query_.size()));
 +    saved_row_ = selected_;
 +    action_target_ = FixtureIndex().Ref(kCurrentFixture);
 +    if (selected_ >= 0 && rows_[selected_].record &&
@@ -2261,7 +2292,12 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    ++action_resolutions_;
 +    actions_visible_ = true;
 +    scope_browsing_ = false;
++    const bool oversized_composition =
++        input_->GetText().size() > CommandSearchIndex::kMaxQueryLength;
 +    input_->SetText(u"");
++    if (oversized_composition) {
++      input_->ClearEditHistory();
++    }
 +    selected_ = 0;
 +  } else {
 +    actions_visible_ = false;
@@ -2385,7 +2421,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,154 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -2394,6 +2430,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 +
 +#include <memory>
 +#include <optional>
++#include <string_view>
 +#include <vector>
 +
 +#include "base/functional/callback.h"
@@ -2482,6 +2519,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 +    std::optional<CommandActionKind> action;
 +    const CommandRecord& Data(const CommandSearchIndex&) const;
 +  };
++  std::u16string_view ClampInputForQuery();
 +  void RebuildResults();
 +  void RebuildViews();
 +  void Select(int index, bool animate);
@@ -2675,7 +2713,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,332 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +#include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
@@ -2690,6 +2728,10 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +#include "chrome/browser/ui/views/frame/browser_view.h"
 +#include "chrome/browser/ui/views/frame/test_with_browser_view.h"
 +#include "extensions/buildflags/buildflags.h"
++#include "ui/accessibility/ax_node_data.h"
++#include "ui/base/ime/composition_text.h"
++#include "ui/base/ime/text_edit_commands.h"
++#include "ui/views/accessibility/view_accessibility.h"
 +#include "ui/views/controls/textfield/textfield.h"
 +#include "ui/views/focus/focus_manager.h"
 +#include "ui/views/test/views_test_utils.h"
@@ -2815,6 +2857,101 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  EXPECT_EQ(7u, panel()->row_count_for_testing());
 +  EXPECT_EQ(panel()->input_for_testing(),
 +            panel()->GetFocusManager()->GetFocusedView());
++  Close();
++}
++TEST_F(ArciumNativePanelTest,
++       OversizedQueriesAreClampedBeforeActionsAndCannotBeUndone) {
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  constexpr auto limit = arcium::CommandSearchIndex::kMaxQueryLength;
++  auto* input = panel()->input_for_testing();
++  const std::u16string oversized(limit + 512, u'a');
++  Query(oversized);
++  EXPECT_EQ(std::u16string(limit, u'a'), input->GetText());
++  EXPECT_FALSE(input->IsTextEditCommandEnabled(ui::TextEditCommand::UNDO));
++  EXPECT_LE(panel()->row_count_for_testing(), 9u);
++
++  input->SetText(oversized);
++  Key(ui::VKEY_UP);
++  Key(ui::VKEY_RIGHT);
++  EXPECT_EQ(std::u16string(limit, u'a'), input->GetText());
++  Key(ui::VKEY_ESCAPE);
++
++  // Programmatic changes do not call ContentsChanged. Opening actions must
++  // still bound the value before keeping the search query for restoration.
++  input->SetText(oversized);
++  Key(ui::VKEY_K, kActionModifier);
++  EXPECT_TRUE(panel()->actions_visible_for_testing());
++  Query(oversized);
++  EXPECT_EQ(std::u16string(limit, u'a'), input->GetText());
++  EXPECT_FALSE(input->IsTextEditCommandEnabled(ui::TextEditCommand::UNDO));
++  EXPECT_EQ(0u, panel()->row_count_for_testing());
++  Key(ui::VKEY_ESCAPE);
++  EXPECT_EQ(std::u16string(limit, u'a'), input->GetText());
++  Close();
++}
++TEST_F(ArciumNativePanelTest,
++       QueryClampPreservesSurrogatePairsAndSelectionDirection) {
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  constexpr auto limit = arcium::CommandSearchIndex::kMaxQueryLength;
++  auto* input = panel()->input_for_testing();
++  const std::u16string prefix(limit - 1, u'a');
++  input->SetText(prefix + u"\U0001f642tail");
++  input->SetSelectedRange(gfx::Range(limit + 2, 5));
++  panel()->ContentsChanged(input, std::u16string(input->GetText()));
++  EXPECT_EQ(prefix, input->GetText());
++  EXPECT_EQ(gfx::Range(limit - 1, 5), input->GetSelectedRange());
++
++  const std::u16string complete =
++      std::u16string(limit - 2, u'a') + u"\U0001f642";
++  Query(complete + u"tail");
++  EXPECT_EQ(complete, input->GetText());
++  Close();
++}
++TEST_F(ArciumNativePanelTest,
++       CompositionUsesBoundedRowsAndClampsOnlyAfterCommit) {
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  constexpr auto limit = arcium::CommandSearchIndex::kMaxQueryLength;
++  const std::u16string prefix(limit - 1, u'a');
++  Query(prefix);
++  auto* input = panel()->input_for_testing();
++  ui::CompositionText composition;
++  composition.text = u"\U0001f642b";
++  composition.selection = gfx::Range(composition.text.size());
++  input->SetCompositionText(composition);
++  EXPECT_TRUE(input->IsIMEComposing());
++  EXPECT_EQ(prefix + composition.text, input->GetText());
++  EXPECT_EQ(1u, panel()->row_count_for_testing());
++  auto* descendant = input->GetViewAccessibility().GetActiveDescendantView();
++  ASSERT_TRUE(descendant);
++  ui::AXNodeData row_data;
++  descendant->GetAccessibleNodeData(&row_data);
++  EXPECT_TRUE(row_data.GetString16Attribute(ax::mojom::StringAttribute::kName)
++                  .starts_with(prefix + u", Search"));
++
++  input->ConfirmCompositionText(/*keep_selection=*/false);
++  EXPECT_FALSE(input->IsIMEComposing());
++  EXPECT_EQ(prefix, input->GetText());
++  EXPECT_FALSE(input->IsTextEditCommandEnabled(ui::TextEditCommand::UNDO));
++  Close();
++}
++TEST_F(ArciumNativePanelTest,
++       ActionRestorationBoundsComposingInputAndSelection) {
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  constexpr auto limit = arcium::CommandSearchIndex::kMaxQueryLength;
++  const std::u16string prefix(limit - 1, u'a');
++  Query(prefix);
++  auto* input = panel()->input_for_testing();
++  ui::CompositionText composition;
++  composition.text = u"\U0001f642b";
++  composition.selection = gfx::Range(composition.text.size());
++  input->SetCompositionText(composition);
++  ASSERT_TRUE(input->IsIMEComposing());
++  Key(ui::VKEY_K, kActionModifier);
++  ASSERT_TRUE(panel()->actions_visible_for_testing());
++  EXPECT_FALSE(input->IsTextEditCommandEnabled(ui::TextEditCommand::UNDO));
++  Key(ui::VKEY_ESCAPE);
++  EXPECT_EQ(prefix, input->GetText());
++  EXPECT_EQ(gfx::Range(prefix.size()), input->GetSelectedRange());
 +  Close();
 +}
 +TEST_F(ArciumNativePanelTest,
