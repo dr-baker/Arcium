@@ -550,7 +550,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
-@@ -0,0 +1,2234 @@
+@@ -0,0 +1,2238 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -946,6 +946,10 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  result.connected = value.FindBool("connected").value_or(true);
 +  result.full_width = value.FindBool("full_width").value_or(true);
 +  result.scope_tints = value.FindBool("scope_tints").value_or(true);
++  const double strength = value.FindDouble("glow_strength").value_or(1.0);
++  if (std::isfinite(strength) && strength >= 0.0 && strength <= 2.0) {
++    result.glow_strength = strength;
++  }
 +  result.activity_dots = value.FindBool("activity_dots").value_or(true);
 +  return result;
 +}
@@ -1947,7 +1951,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +      matrix.postTranslate(x, y - (tail ? 70 * ui_scale_ : 0));
 +      const SkColor4f stops[] = {
 +          SkColor4f::FromColor(
-+              Alpha(tint, base::ClampRound(255 * alpha * (tail ? .65f : 1)))),
++              Alpha(tint, base::ClampRound(255 * alpha * appearance_.glow_strength * (tail ? .65f : 1)))),
 +          SkColors::kTransparent};
 +      cc::PaintFlags flags;
 +      flags.setShader(cc::PaintShader::MakeRadialGradient(
@@ -2246,7 +2250,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +                                      height * fade);
 +        matrix.postTranslate(width * centers[i], 0);
 +        const SkColor4f stops[] = {
-+            SkColor4f::FromColor(Alpha(colors[i], base::ClampRound(46 + 25 * weight))),
++            SkColor4f::FromColor(Alpha(colors[i], base::ClampRound((46 + 25 * weight) * appearance_.glow_strength))),
 +            SkColors::kTransparent};
 +        glow.setShader(cc::PaintShader::MakeRadialGradient(
 +            {0, 0}, 1, stops, nullptr, 2, SkTileMode::kClamp,
@@ -2258,8 +2262,8 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +      const SkPoint points[] = {{0, 0}, {0, static_cast<float>(height)}};
 +      const SkScalar positions[] = {0, .7f, 1};
 +      const SkColor4f colors[] = {
-+          SkColor4f::FromColor(Alpha(tint, base::ClampRound(40 + 25 * weight))),
-+          SkColor4f::FromColor(Alpha(tint, base::ClampRound(20 + 13 * weight))),
++          SkColor4f::FromColor(Alpha(tint, base::ClampRound((40 + 25 * weight) * appearance_.glow_strength))),
++          SkColor4f::FromColor(Alpha(tint, base::ClampRound((20 + 13 * weight) * appearance_.glow_strength))),
 +          SkColors::kTransparent};
 +      glow.setShader(cc::PaintShader::MakeLinearGradient(
 +          points, colors, positions, 3, SkTileMode::kClamp));
@@ -2789,7 +2793,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,242 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -2833,6 +2837,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 +  bool connected = true;
 +  bool full_width = true;
 +  bool scope_tints = true;
++  double glow_strength = 1.0;
 +  bool activity_dots = true;
 +  friend bool operator==(const CommandPanelAppearance&,
 +                         const CommandPanelAppearance&) = default;
@@ -3175,7 +3180,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
-@@ -0,0 +1,1860 @@
+@@ -0,0 +1,1878 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +#include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
@@ -3637,6 +3642,19 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  prefs.SetDict(kCommandPanelLayoutPref, std::move(malformed));
 +  EXPECT_EQ(CommandPanelAppearance::Reveal::kEdge,
 +            ReadCommandPanelAppearance(&prefs).reveal);
++}
++
++TEST(CommandPanelAppearanceTest, ReadsGlowStrengthAndRejectsInvalidValues) {
++  TestingPrefServiceSimple prefs;
++  prefs.registry()->RegisterDictionaryPref(kCommandPanelLayoutPref);
++  EXPECT_EQ(1.0, ReadCommandPanelAppearance(&prefs).glow_strength);
++  for (double strength : {0.0, 0.75, 2.0, -0.1, 2.1}) {
++    base::DictValue layout;
++    layout.Set("glow_strength", strength);
++    prefs.SetDict(kCommandPanelLayoutPref, std::move(layout));
++    EXPECT_EQ(strength >= 0.0 && strength <= 2.0 ? strength : 1.0,
++              ReadCommandPanelAppearance(&prefs).glow_strength);
++  }
 +}
 +
 +TEST_F(ArciumNativePanelTest, HiddenPresenterOwnsInputAndPaintsItsContents) {
@@ -4821,6 +4839,11 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  const int y = panel()->body_bounds_for_testing().y() + 5;
 +  const SkColor untinted = PaintPanel().getColor(x, y);
 +  appearance.scope_tints = true;
++  panel()->SetAppearance(appearance);
++  appearance.glow_strength = 0.0;
++  panel()->SetAppearance(appearance);
++  EXPECT_EQ(untinted, PaintPanel().getColor(x, y));
++  appearance.glow_strength = 1.0;
 +  panel()->SetAppearance(appearance);
 +  const SkColor during = PaintPanel().getColor(x, y);
 +  EXPECT_GT(SkColorGetR(during), SkColorGetR(untinted));
