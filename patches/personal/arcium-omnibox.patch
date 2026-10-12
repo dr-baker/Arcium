@@ -7491,7 +7491,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_corpus.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/omnibox/arcium_command_corpus.cc
-@@ -0,0 +1,609 @@
+@@ -0,0 +1,671 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -7550,14 +7550,6 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_corpus.cc
 +  const Profile* profile = browser->profile();
 +  return !profile->IsOffTheRecord() && !profile->IsGuestSession() &&
 +         helium::IsHeliumFavoritesAndPinsEnabled();
-+}
-+
-+std::string PersistentIdentity(const CommandPersistentTarget& target) {
-+  auto field = [](const std::string& value) {
-+    return base::NumberToString(value.size()) + ":" + value;
-+  };
-+  return "saved:" + base::NumberToString(static_cast<int>(target.kind)) + ":" +
-+         field(target.space_id) + field(target.item_id);
 +}
 +
 +std::string LiveIdentity(const CommandLiveTarget& target) {
@@ -7652,6 +7644,43 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_corpus.cc
 +
 +}  // namespace
 +
++std::string CommandPersistentSelectionKey(
++    const CommandPersistentTarget& target) {
++  auto field = [](const std::string& value) {
++    return base::NumberToString(value.size()) + ":" + value;
++  };
++  return "saved:" + base::NumberToString(static_cast<int>(target.kind)) + ":" +
++         field(target.space_id) + field(target.item_id);
++}
++
++CommandRow ProjectLiveCommandRow(
++    const CommandLiveTarget& target,
++    std::optional<CommandPersistentTarget> saved_target,
++    bool at_saved_home) {
++  CommandRow row;
++  row.provider_id = kBuiltinCommandProvider;
++  row.target = target;
++  row.selection_key = LiveIdentity(target);
++  row.category = u"Tab";
++  row.primary_verb = u"Switch";
++  row.primary_icon = CommandPrimaryIcon::kSwitch;
++  row.activity = CommandActivity::kDot;
++  row.has_actions = true;
++  if (saved_target &&
++      (saved_target->kind == CommandPersistentKind::kPin ||
++       saved_target->kind == CommandPersistentKind::kFavorite)) {
++    const bool pin = saved_target->kind == CommandPersistentKind::kPin;
++    row.category = pin ? u"Pin" : u"Favorite";
++    row.tint = SkColorSetRGB(0xb3, 0x91, 0x65);
++    row.activity = pin ? CommandActivity::kCircleDot : CommandActivity::kDot;
++    if (at_saved_home) {
++      row.target = *saved_target;
++      row.selection_key = CommandPersistentSelectionKey(*saved_target);
++    }
++  }
++  return row;
++}
++
 +class CommandLocalCorpus::Impl final : public BrowserCollectionObserver,
 +                                       public TabStripModelObserver {
 + public:
@@ -7742,6 +7771,49 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_corpus.cc
 +    return nullptr;
 +  }
 +
++  std::optional<CommandRow> GetLiveRow(const CommandLiveTarget& target) const {
++    auto* contents = GetContents(target);
++    if (!contents) {
++      return std::nullopt;
++    }
++    auto* window = browsers_->FindBrowserWithID(
++        SessionID::FromSerializedValue(target.browser_session_id));
++    auto* browser = window->GetBrowserForMigrationOnly();
++    auto* tab = tabs::TabInterface::GetFromContents(contents);
++    std::optional<CommandPersistentTarget> saved_target;
++    bool at_saved_home = false;
++    if (service_ && SavedItemsEligible(browser)) {
++      const auto kind = service_->GetPersistentItemKind(tab);
++      const auto id = service_->GetPersistentItemId(tab);
++      if (kind && id) {
++        const bool pin = *kind == helium::PersistentRecordKind::kPin;
++        saved_target = CommandPersistentTarget{
++            pin ? CommandPersistentKind::kPin
++                : CommandPersistentKind::kFavorite,
++            pin ? service_->GetSpaceIdForBrowser(browser) : std::string(), *id};
++        for (const auto& item : native_items_) {
++          if (item.id == saved_target->item_id &&
++              item.space_id == saved_target->space_id &&
++              (item.kind == ArciumOmniboxItem::Kind::kPin) == pin) {
++            at_saved_home = item.url == contents->GetVisibleURL();
++            break;
++          }
++        }
++      }
++    }
++    auto row = ProjectLiveCommandRow(target, saved_target, at_saved_home);
++    row.title = TabTitle(*contents);
++    row.detail = base::UTF8ToUTF16(contents->GetVisibleURL().spec());
++    if (auto* driver =
++            favicon::ContentFaviconDriver::FromWebContents(contents)) {
++      const auto favicon = driver->GetFavicon();
++      if (!favicon.IsEmpty()) {
++        row.icon = favicon.AsImageSkia();
++      }
++    }
++    return row;
++  }
++
 +  CommandInvocationSnapshot CaptureInvocation(
 +      CommandInvocationMode mode) const {
 +    CommandInvocationSnapshot snapshot;
@@ -7762,27 +7834,12 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_corpus.cc
 +    }
 +    const CommandLiveTarget target{browser->session_id().id(), tab_id.id()};
 +    snapshot.invocation.source_tab = target;
-+    CommandRow row;
-+    row.kind = CommandRowKind::kCurrentTab;
-+    row.provider_id = kBuiltinCommandProvider;
-+    row.target = target;
-+    row.selection_key = LiveIdentity(target);
-+    row.title = TabTitle(*contents);
-+    row.detail = snapshot.text;
-+    row.category = u"Tab";
-+    if (auto* driver =
-+            favicon::ContentFaviconDriver::FromWebContents(contents)) {
-+      const auto favicon = driver->GetFavicon();
-+      if (!favicon.IsEmpty()) {
-+        row.icon = favicon.AsImageSkia();
-+      }
++    auto projected = GetLiveRow(target);
++    if (!projected) {
++      return snapshot;
 +    }
-+    row.primary_verb = u"Switch";
-+    row.primary_icon = CommandPrimaryIcon::kSwitch;
-+    row.activity = LiveActivity(service_ && SavedItemsEligible(browser)
-+                                    ? service_->GetPersistentItemKind(tab)
-+                                    : std::nullopt);
-+    row.has_actions = true;
++    auto row = std::move(*projected);
++    row.kind = CommandRowKind::kCurrentTab;
 +    snapshot.current_tab = std::move(row);
 +    return snapshot;
 +  }
@@ -7870,7 +7927,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_corpus.cc
 +        pin ? CommandPersistentKind::kPin : CommandPersistentKind::kFavorite,
 +        item.space_id, item.id};
 +    CommandRecord record;
-+    record.id = PersistentIdentity(target);
++    record.id = CommandPersistentSelectionKey(target);
 +    record.title =
 +        item.title.empty() ? base::UTF8ToUTF16(item.url.spec()) : item.title;
 +    record.url = base::UTF8ToUTF16(item.url.spec());
@@ -7909,7 +7966,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_corpus.cc
 +      }
 +      const CommandPersistentTarget target{kind, space_id, folder->id};
 +      CommandRecord record;
-+      record.id = PersistentIdentity(target);
++      record.id = CommandPersistentSelectionKey(target);
 +      record.title = folder->title;
 +      record.context = context;
 +      record.category = u"Folder";
@@ -8008,7 +8065,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_corpus.cc
 +                      : CommandPersistentKind::kFavorite,
 +                  pin ? space_id : std::string(), *id};
 +              const auto home =
-+                  saved_homes.find(PersistentIdentity(saved_target));
++                  saved_homes.find(CommandPersistentSelectionKey(saved_target));
 +              if (home != saved_homes.end() && home->second == url) {
 +                // Deduplicate only a represented durable home. A Favorite
 +                // visible in another Space and any away page keep a live row.
@@ -8090,6 +8147,11 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_corpus.cc
 +  return impl_->GetContents(target);
 +}
 +
++std::optional<CommandRow> CommandLocalCorpus::GetLiveRow(
++    const CommandLiveTarget& target) const {
++  return impl_->GetLiveRow(target);
++}
++
 +CommandInvocationSnapshot CommandLocalCorpus::CaptureInvocation(
 +    CommandInvocationMode mode) const {
 +  return impl_->CaptureInvocation(mode);
@@ -8105,7 +8167,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_corpus.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/omnibox/arcium_command_corpus.h
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,68 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -8138,6 +8200,15 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_corpus.h
 +  bool has_actions = true;
 +};
 +
++std::string CommandPersistentSelectionKey(
++    const CommandPersistentTarget& target);
++// An away page keeps its exact live-tab authority while retaining saved
++// presentation. A saved home uses the qualified durable owner identity.
++CommandRow ProjectLiveCommandRow(
++    const CommandLiveTarget& target,
++    std::optional<CommandPersistentTarget> saved_target,
++    bool at_saved_home);
++
 +// Browser-private projection. Model mutations replace the immutable index and
 +// cached native snapshot; queries read them without enumerating saved items.
 +class CommandLocalCorpus {
@@ -8152,6 +8223,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_corpus.h
 +  std::vector<ArciumOmniboxItem> GetNativeItems() const;
 +  std::vector<CommandLiveTarget> FindLiveTargets(const GURL& url) const;
 +  content::WebContents* GetContents(const CommandLiveTarget& target) const;
++  std::optional<CommandRow> GetLiveRow(const CommandLiveTarget& target) const;
 +  CommandInvocationSnapshot CaptureInvocation(CommandInvocationMode mode) const;
 +  base::CallbackListSubscription RegisterChanged(
 +      base::RepeatingClosure callback);
@@ -8340,7 +8412,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_native_result.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/omnibox/arcium_command_native_result.cc
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,198 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -8447,6 +8519,30 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_native_result.cc
 +                                  &IsCommandNativeMatchSupported);
 +}
 +
++std::optional<uint32_t> GetUnprojectedNativeDefaultOrdinal(
++    const AutocompleteResult& result,
++    std::span<const NativeCommandRow> displayed_rows) {
++  const auto* match = result.default_match();
++  if (!match || !IsCommandNativeMatchSupported(*match) ||
++      !match->destination_url.is_valid() || match->arcium_item ||
++      match->type == AutocompleteMatchType::OPEN_TAB ||
++      match->takeover_action) {
++    return std::nullopt;
++  }
++  for (size_t ordinal = 0; ordinal < result.size(); ++ordinal) {
++    if (&result.match_at(ordinal) != match) {
++      continue;
++    }
++    if (std::ranges::any_of(displayed_rows, [ordinal](const auto& row) {
++          return row.ordinal == ordinal;
++        })) {
++      return std::nullopt;
++    }
++    return static_cast<uint32_t>(ordinal);
++  }
++  return std::nullopt;
++}
++
 +bool CommandNativePersistentItemsAllowed(bool feature_enabled,
 +                                         bool preference_enabled,
 +                                         bool off_the_record,
@@ -8519,7 +8615,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_native_result.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/omnibox/arcium_command_native_result.h
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,99 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -8528,6 +8624,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_native_result.h
 +
 +#include <memory>
 +#include <optional>
++#include <span>
 +
 +#include "chrome/browser/ui/omnibox/arcium_command_session.h"
 +#include "components/omnibox/browser/arcium_command_search.h"
@@ -8552,6 +8649,11 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_native_result.h
 +    const AutocompleteResult& result,
 +    base::UnguessableToken revision,
 +    size_t limit = CommandSession::kMaxResults);
++// A typed fallback must never duplicate a displayed native default or relabel
++// a saved item/tab/action with the user's query text.
++std::optional<uint32_t> GetUnprojectedNativeDefaultOrdinal(
++    const AutocompleteResult& result,
++    std::span<const NativeCommandRow> displayed_rows);
 +
 +bool CommandNativePersistentItemsAllowed(bool feature_enabled,
 +                                         bool preference_enabled,
@@ -8617,7 +8719,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/omnibox/arcium_command_providers.cc
-@@ -0,0 +1,877 @@
+@@ -0,0 +1,950 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -8694,6 +8796,38 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
 +constexpr SkColor kYouTubeTint = SkColorSetRGB(0xe3, 0x4b, 0x49);
 +constexpr SkColor kXTint = SkColorSetRGB(0x74, 0x8c, 0xa6);
 +constexpr SkColor kChatGPTTint = SkColorSetRGB(0x53, 0xa9, 0x8c);
++
++SkColor ScopeTint(std::string_view scope_id) {
++  if (scope_id == kSavedScope) {
++    return kSavedTint;
++  }
++  if (scope_id == kYouTubeScope) {
++    return kYouTubeTint;
++  }
++  if (scope_id == kXScope) {
++    return kXTint;
++  }
++  if (scope_id == kChatGPTScope) {
++    return kChatGPTTint;
++  }
++  return kOmniTint;
++}
++
++SkColor WebsiteTint(const GURL& url) {
++  if (!url.is_valid()) {
++    return kOmniTint;
++  }
++  if (url.DomainIs("youtube.com") || url.DomainIs("youtu.be")) {
++    return kYouTubeTint;
++  }
++  if (url.DomainIs("x.com") || url.DomainIs("twitter.com")) {
++    return kXTint;
++  }
++  if (url.DomainIs("chatgpt.com") || url.DomainIs("chat.openai.com")) {
++    return kChatGPTTint;
++  }
++  return kOmniTint;
++}
 +
 +class BrandedScopeIcon final : public gfx::CanvasImageSource {
 + public:
@@ -8870,7 +9004,6 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
 +      : context_(std::move(context)),
 +        engines_(TemplateURLServiceFactory::GetForProfile(
 +            context_->browser()->profile())) {
-+    EnsureController(kOmniScope);
 +    if (engines_) {
 +      engine_observation_.Observe(engines_);
 +      UpdateEngine();
@@ -8910,6 +9043,12 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
 +    // Context/epoch exist before Start's synchronous observer notification.
 +    query_ = std::move(query);
 +    if (!context_->browser()) {
++      publish.Run({});
++      return;
++    }
++    if (query_.scope_id == kOmniScope && query_.text.empty()) {
++      // Empty Omni suggestions read the compact local snapshot. Native
++      // providers are created and started only after the user types.
 +      publish.Run({});
 +      return;
 +    }
@@ -9170,6 +9309,9 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
 +    row.primary_verb =
 +        AutocompleteMatch::IsSearchType(match.type) ? u"Search" : u"Go";
 +    row.has_actions = match.destination_url.is_valid();
++    row.tint = AutocompleteMatch::IsSearchType(match.type)
++                   ? kOmniTint
++                   : WebsiteTint(match.destination_url);
 +    if (match.arcium_item && !match.arcium_item->IsCommand()) {
 +      const auto& item = *match.arcium_item;
 +      const bool pin = item.kind == ArciumOmniboxItem::Kind::kPin;
@@ -9177,8 +9319,10 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
 +      row.target = CommandPersistentTarget{
 +          pin ? CommandPersistentKind::kPin : CommandPersistentKind::kFavorite,
 +          item.space_id, item.id};
-+      row.selection_key = item.Identity();
++      row.selection_key = CommandPersistentSelectionKey(
++          std::get<CommandPersistentTarget>(row.target));
 +      row.category = pin ? u"Pin" : u"Favorite";
++      row.tint = kSavedTint;
 +      row.primary_verb = item.is_live ? u"Switch" : pin ? u"Restore" : u"Open";
 +      row.primary_icon =
 +          item.is_live ? CommandPrimaryIcon::kSwitch : CommandPrimaryIcon::kGo;
@@ -9193,12 +9337,19 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
 +      row.primary_icon = CommandPrimaryIcon::kSwitch;
 +      row.primary_verb = u"Switch";
 +      if (tabs.size() == 1) {
-+        row.provider_id = kBuiltinCommandProvider;
-+        row.target = tabs.front();
-+        row.selection_key =
-+            "tab:" + base::NumberToString(tabs.front().browser_session_id) +
-+            ":" + base::NumberToString(tabs.front().tab_session_id);
-+      } else {
++        if (auto live = context_->corpus.GetLiveRow(tabs.front())) {
++          row.provider_id = live->provider_id;
++          row.target = std::move(live->target);
++          row.selection_key = std::move(live->selection_key);
++          row.category = std::move(live->category);
++          row.activity = live->activity;
++          if (live->tint != SK_ColorTRANSPARENT) {
++            row.tint = live->tint;
++          }
++          row.icon = std::move(live->icon);
++        }
++      }
++      if (std::holds_alternative<CommandNativeTarget>(row.target)) {
 +        row.primary_icon = CommandPrimaryIcon::kAction;
 +        row.primary_verb = u"Choose tab";
 +        row.primary_submenu_id = "tabs";
@@ -9209,10 +9360,12 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
 +    }
 +    const auto refreshed = base::BindRepeating(&NativeQueryProvider::Publish,
 +                                               weak_factory_.GetWeakPtr());
-+    row.icon =
-+        AutocompleteMatch::IsSearchType(match.type)
-+            ? context_->icons.GetEngineIcon(engine_icon_url_, refreshed)
-+            : context_->icons.GetPageIcon(match.destination_url, refreshed);
++    if (row.icon.isNull()) {
++      row.icon =
++          AutocompleteMatch::IsSearchType(match.type)
++              ? context_->icons.GetEngineIcon(engine_icon_url_, refreshed)
++              : context_->icons.GetPageIcon(match.destination_url, refreshed);
++    }
 +    if (row.icon.isNull() && AutocompleteMatch::IsSearchType(match.type)) {
 +      row.icon =
 +          gfx::CreateVectorIcon(vector_icons::kSearchIcon, 16, kOmniTint);
@@ -9226,8 +9379,15 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
 +    CommandProviderResults results;
 +    const auto& native = controller_->result();
 +    const auto* default_match = native.default_match();
-+    const auto native_rows = ProjectSupportedNativeCommandRows(
++    auto native_rows = ProjectSupportedNativeCommandRows(
 +        native, lease_.revision(), query_.limit);
++    const auto typed_ordinal =
++        query_.text.empty()
++            ? std::optional<uint32_t>()
++            : GetUnprojectedNativeDefaultOrdinal(native, native_rows);
++    if (typed_ordinal && native_rows.size() >= CommandSession::kMaxRows) {
++      native_rows.pop_back();
++    }
 +    results.rows.reserve(native_rows.size() + 1);
 +    for (const auto& native_row : native_rows) {
 +      auto row =
@@ -9235,19 +9395,12 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
 +      row.is_default = native_row.is_default;
 +      results.rows.push_back(std::move(row));
 +    }
-+    if (!query_.text.empty() && default_match &&
-+        IsCommandNativeMatchSupported(*default_match)) {
-+      size_t ordinal = 0;
-+      for (; ordinal < native.size(); ++ordinal) {
-+        if (&native.match_at(ordinal) == default_match) {
-+          break;
-+        }
-+      }
++    if (typed_ordinal) {
 +      // The typed row accepts the actual native default; it does not recreate a
 +      // search engine URL or discard the native transition/actions.
-+      CommandRow typed =
-+          Project(*default_match, static_cast<uint32_t>(ordinal));
++      CommandRow typed = Project(*default_match, *typed_ordinal);
 +      typed.kind = CommandRowKind::kTypedSearch;
++      typed.is_default = true;
 +      typed.selection_key = "typed:" + typed.selection_key;
 +      typed.title = query_.text;
 +      typed.detail = AutocompleteMatch::IsSearchType(default_match->type)
@@ -9308,6 +9461,10 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
 +        &LocalQueryProvider::Publish, weak_factory_.GetWeakPtr()));
 +  }
 +  std::string_view id() const override { return kBuiltinCommandProvider; }
++  bool SupportsScope(std::string_view scope_id) const override {
++    return scope_id == kOmniScope ||
++           CommandQueryProvider::SupportsScope(scope_id);
++  }
 +  std::vector<CommandScopeDescriptor> GetScopes() const override {
 +    return {
 +        {kSavedScope, kBuiltinCommandProvider, u"Saved", ScopeIcon(kSavedScope),
@@ -9344,8 +9501,18 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
 +      return;
 +    }
 +    const auto& index = context_->corpus.index();
-+    const auto matches =
-+        index.Search(query_.text, query_.scope_id, query_.limit);
++    if (query_.scope_id == kOmniScope && !query_.text.empty()) {
++      // Native autocomplete owns nonempty Omni order and default selection.
++      PostResults({}, index.revision());
++      return;
++    }
++    const auto search_url =
++        query_.text.empty()
++            ? std::optional<GURL>()
++            : BuildCommandSearchUrl(query_.scope_id, query_.text);
++    const size_t limit = std::min(query_.limit, CommandSession::kMaxRows);
++    const auto matches = index.Search(query_.text, query_.scope_id,
++                                      search_url && limit ? limit - 1 : limit);
 +    CommandProviderResults results;
 +    results.rows.reserve(matches.size() + 1);
 +    for (const auto& match : matches) {
@@ -9361,39 +9528,47 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
 +      row.title = record->title;
 +      row.detail = record->context.empty() ? record->url : record->context;
 +      row.category = record->category;
++      row.tint = record->primary_scope_id == kOmniScope
++                     ? WebsiteTint(GURL(base::UTF16ToUTF8(record->url)))
++                     : ScopeTint(record->primary_scope_id);
 +      row.primary_verb = metadata->primary_verb;
 +      row.primary_icon = metadata->primary_icon;
 +      row.activity = metadata->activity;
 +      row.has_actions = metadata->has_actions;
-+      row.icon = context_->icons.GetPageIcon(
-+          GURL(base::UTF16ToUTF8(record->url)),
-+          base::BindRepeating(&LocalQueryProvider::Publish,
-+                              weak_factory_.GetWeakPtr()));
++      const auto* saved = std::get_if<CommandPersistentTarget>(&row.target);
++      if (saved && (saved->kind == CommandPersistentKind::kPinFolder ||
++                    saved->kind == CommandPersistentKind::kFavoriteFolder)) {
++        row.icon = gfx::CreateVectorIcon(vector_icons::kFolderFilledIcon, 16,
++                                         kSavedTint);
++      } else {
++        row.icon = context_->icons.GetPageIcon(
++            GURL(base::UTF16ToUTF8(record->url)),
++            base::BindRepeating(&LocalQueryProvider::Publish,
++                                weak_factory_.GetWeakPtr()));
++      }
 +      results.rows.push_back(std::move(row));
 +    }
-+    if (!query_.text.empty()) {
-+      if (auto url = BuildCommandSearchUrl(query_.scope_id, query_.text)) {
-+        CommandRow typed;
-+        typed.kind = CommandRowKind::kTypedSearch;
-+        typed.provider_id = kBuiltinCommandProvider;
-+        typed.target = CommandUrlTarget{*url};
-+        typed.selection_key = "typed:" + query_.scope_id;
-+        typed.title = query_.text;
-+        const auto scopes = GetScopes();
-+        for (const auto& scope : scopes) {
-+          if (scope.id == query_.scope_id) {
-+            typed.detail = scope.search_verb;
-+            typed.icon = scope.icon;
-+            typed.tint = scope.tint;
-+            break;
-+          }
++    if (search_url && limit) {
++      CommandRow typed;
++      typed.kind = CommandRowKind::kTypedSearch;
++      typed.provider_id = kBuiltinCommandProvider;
++      typed.target = CommandUrlTarget{*search_url};
++      typed.selection_key = "typed:" + query_.scope_id;
++      typed.title = query_.text;
++      const auto scopes = GetScopes();
++      for (const auto& scope : scopes) {
++        if (scope.id == query_.scope_id) {
++          typed.detail = scope.search_verb;
++          typed.icon = scope.icon;
++          typed.tint = scope.tint;
++          break;
 +        }
-+        typed.primary_verb =
-+            query_.scope_id == kChatGPTScope ? u"Ask" : u"Search";
-+        typed.has_actions = true;
-+        typed.is_default = results.rows.empty();
-+        results.rows.push_back(std::move(typed));
 +      }
++      typed.primary_verb =
++          query_.scope_id == kChatGPTScope ? u"Ask" : u"Search";
++      typed.has_actions = true;
++      typed.is_default = results.rows.empty();
++      results.rows.push_back(std::move(typed));
 +    }
 +    if (!results.rows.empty() && !results.rows.front().is_default) {
 +      results.rows.front().is_default = true;
@@ -9605,7 +9780,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_session.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/omnibox/arcium_command_session.cc
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,293 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -9755,20 +9930,34 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_session.cc
 +    publication->scopes = registry_->GetScopes();
 +    publication->current_tab = invocation_.current_tab;
 +    publication->rows.reserve(kMaxRows);
-+    size_t results = 0;
 +    bool typed_search = false;
-+    // Preserve each owner's published order/default. The production Omni/Web
-+    // scopes have one native owner, whose controller already merges providers.
++    // Preserve owner order/default. Nonempty Omni/Web have one native owner;
++    // empty Omni uses the compact local suggestions.
 +    for (const auto& active : active_) {
 +      publication->done &= active.done;
 +      for (const auto& row : active.rows) {
++        // A native saved match and its exact live alias share one owner. Keep
++        // the first row's rank and preserve the owner's default flag.
++        if (std::holds_alternative<CommandPersistentTarget>(row.target) ||
++            std::holds_alternative<CommandLiveTarget>(row.target)) {
++          const auto duplicate = std::ranges::find_if(
++              publication->rows, [&](const auto& existing) {
++                return existing.target == row.target &&
++                       existing.primary_action_id == row.primary_action_id;
++              });
++          if (duplicate != publication->rows.end()) {
++            duplicate->is_default |= row.is_default;
++            continue;
++          }
++        }
++        if (publication->rows.size() >= kMaxRows) {
++          continue;
++        }
 +        if (row.kind == CommandRowKind::kTypedSearch) {
 +          if (typed_search) {
 +            continue;
 +          }
 +          typed_search = true;
-+        } else if (results++ >= kMaxResults) {
-+          continue;
 +        }
 +        publication->rows.push_back(row);
 +      }
@@ -10080,7 +10269,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_session.h
 +class CommandSession {
 + public:
 +  static constexpr size_t kMaxResults = 8;
-+  static constexpr size_t kMaxRows = kMaxResults + 1;
++  static constexpr size_t kMaxRows = kMaxResults;
 +  static constexpr size_t kMaxMenuEntries = 32;
 +  static constexpr size_t kMaxQueryLength = 2048;
 +  virtual ~CommandSession() = default;
@@ -10103,7 +10292,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
-@@ -0,0 +1,1739 @@
+@@ -0,0 +1,2013 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -10126,11 +10315,13 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
 +#include "base/test/bind.h"
 +#include "base/test/task_environment.h"
 +#include "base/unguessable_token.h"
++#include "chrome/browser/ui/omnibox/arcium_command_corpus.h"
 +#include "chrome/browser/ui/omnibox/arcium_command_icon_cache.h"
 +#include "chrome/browser/ui/omnibox/arcium_command_native_result.h"
 +#include "chrome/browser/ui/omnibox/arcium_command_providers.h"
 +#include "components/omnibox/browser/actions/omnibox_action.h"
 +#include "components/omnibox/browser/actions/omnibox_action_concepts.h"
++#include "components/omnibox/browser/arcium_omnibox_item.h"
 +#include "components/omnibox/browser/autocomplete_controller.h"
 +#include "components/omnibox/browser/autocomplete_controller_config.h"
 +#include "components/omnibox/browser/autocomplete_input.h"
@@ -10603,6 +10794,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
 +
 +  ASSERT_EQ(2u, publications_.size());
 +  for (const auto& publication : publications_) {
++    EXPECT_EQ(8u, CommandSession::kMaxRows);
 +    ASSERT_EQ(CommandSession::kMaxRows, publication->rows.size());
 +    const auto typed_count =
 +        std::count_if(publication->rows.begin(), publication->rows.end(),
@@ -10616,6 +10808,108 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
 +                publication->rows[i].selection_key);
 +    }
 +  }
++}
++
++TEST_F(ArciumCommandSessionTest,
++       CapturedSnapshotKeepsEightNormalRowsAcrossEmptyScopesAndQueryChanges) {
++  const CommandLiveTarget current{11, 12};
++  invocation_snapshot_.invocation.source_tab = current;
++  auto captured = ProjectLiveCommandRow(current, std::nullopt, false);
++  captured.kind = CommandRowKind::kCurrentTab;
++  invocation_snapshot_.current_tab = captured;
++  session_->SetInvocation(CommandInvocationMode::kCurrentTab);
++  auto provider = AddProvider("provider", {kOmniScope, kSavedScope});
++  provider->initial_results.rows.push_back(
++      ProjectLiveCommandRow(current, std::nullopt, false));
++  auto typed = MakeRow("provider", "typed", CommandRowKind::kTypedSearch);
++  typed.is_default = true;
++  provider->initial_results.rows.push_back(std::move(typed));
++  for (size_t i = 0; i < 20; ++i) {
++    provider->initial_results.rows.push_back(
++        MakeRow("provider", "result-" + std::to_string(i)));
++  }
++
++  Search(kOmniScope, u"");
++  Search(kSavedScope, u"");
++  Search(kOmniScope, u"typed");
++  Search(kOmniScope, u"");
++
++  ASSERT_EQ(4u, publications_.size());
++  for (const auto& publication : publications_) {
++    ASSERT_TRUE(publication->current_tab);
++    EXPECT_EQ(captured.target, publication->current_tab->target);
++    EXPECT_FALSE(publication->current_tab->is_default);
++    ASSERT_EQ(8u, publication->rows.size());
++    EXPECT_EQ(captured.target, publication->rows[0].target);
++    EXPECT_FALSE(publication->rows[0].is_default);
++    EXPECT_EQ(CommandRowKind::kTypedSearch, publication->rows[1].kind);
++    EXPECT_TRUE(publication->rows[1].is_default);
++    for (size_t i = 2; i < publication->rows.size(); ++i) {
++      EXPECT_EQ("result-" + std::to_string(i - 2),
++                publication->rows[i].selection_key);
++    }
++  }
++}
++
++TEST_F(ArciumCommandSessionTest,
++       EmptyOmniCombinesNativeAndLocalAndDeduplicatesQualifiedOwners) {
++  const CommandLiveTarget source{11, 12};
++  const CommandPersistentTarget current_pin{CommandPersistentKind::kPin,
++                                            "space-a", "shared-item"};
++  const CommandPersistentTarget other_space_pin{CommandPersistentKind::kPin,
++                                                "space-b", "shared-item"};
++  const CommandPersistentTarget favorite{CommandPersistentKind::kFavorite, "",
++                                         "shared-item"};
++  invocation_snapshot_.invocation.source_tab = source;
++  auto current = ProjectLiveCommandRow(source, current_pin, true);
++  current.kind = CommandRowKind::kCurrentTab;
++  invocation_snapshot_.current_tab = current;
++  session_->SetInvocation(CommandInvocationMode::kCurrentTab);
++  auto native = AddProvider(kNativeCommandProvider, {kOmniScope});
++  auto local = AddProvider(kBuiltinCommandProvider, {kSavedScope});
++  local->additional_supported_scopes.push_back(kOmniScope);
++  local->initial_results.rows = {
++      ProjectLiveCommandRow(source, current_pin, true),
++      ProjectLiveCommandRow({21, 22}, other_space_pin, true),
++      ProjectLiveCommandRow({31, 32}, favorite, true),
++      ProjectLiveCommandRow({41, 42}, current_pin, false)};
++  auto later_duplicate = ProjectLiveCommandRow({51, 52}, other_space_pin, true);
++  later_duplicate.selection_key = "late-alias";
++  later_duplicate.is_default = true;
++  local->initial_results.rows.push_back(std::move(later_duplicate));
++
++  Search(kOmniScope, u"");
++
++  ASSERT_EQ(2u, publications_.size());
++  EXPECT_TRUE(publications_[0]->rows.empty());
++  EXPECT_FALSE(publications_[0]->done);
++  ASSERT_TRUE(publications_[0]->current_tab);
++  EXPECT_EQ(current.target, publications_[0]->current_tab->target);
++  const auto& publication = *publications_[1];
++  EXPECT_TRUE(publication.done);
++  ASSERT_TRUE(publication.current_tab);
++  EXPECT_FALSE(publication.current_tab->is_default);
++  ASSERT_EQ(4u, publication.rows.size());
++  EXPECT_EQ(current.target, publication.rows[0].target);
++  EXPECT_EQ(CommandTarget(other_space_pin), publication.rows[1].target);
++  EXPECT_EQ(CommandPersistentSelectionKey(other_space_pin),
++            publication.rows[1].selection_key);
++  EXPECT_TRUE(publication.rows[1].is_default);
++  EXPECT_EQ(CommandTarget(favorite), publication.rows[2].target);
++  EXPECT_EQ(CommandTarget(CommandLiveTarget{41, 42}),
++            publication.rows[3].target);
++  EXPECT_EQ(1u, native->queries.size());
++  EXPECT_EQ(1u, local->queries.size());
++
++  Search(kOmniScope, u"shared item");
++  ASSERT_EQ(4u, publications_.size());
++  ASSERT_EQ(4u, publications_.back()->rows.size());
++  EXPECT_EQ(current.target, publications_.back()->rows[0].target);
++  session_->SetInvocation(CommandInvocationMode::kNewTab);
++  Search(kOmniScope, u"");
++  ASSERT_EQ(6u, publications_.size());
++  ASSERT_EQ(4u, publications_.back()->rows.size());
++  EXPECT_EQ(current.target, publications_.back()->rows[0].target);
 +}
 +
 +TEST_F(ArciumCommandSessionTest, LateMenusAreBoundedForBothOwners) {
@@ -10773,6 +11067,88 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
 +  EXPECT_FALSE(session_->Execute(intent).success);
 +}
 +
++TEST(ArciumCommandLocalPresentationTest,
++     PersistentKeysKeepEveryOwnerQualifier) {
++  const CommandPersistentTarget pin{CommandPersistentKind::kPin, "a", "bc"};
++  const auto key = CommandPersistentSelectionKey(pin);
++  EXPECT_EQ(key, CommandPersistentSelectionKey(pin));
++  EXPECT_NE(key, CommandPersistentSelectionKey(
++                     {CommandPersistentKind::kPin, "ab", "c"}));
++  EXPECT_NE(key, CommandPersistentSelectionKey(
++                     {CommandPersistentKind::kPin, "another-space", "bc"}));
++  EXPECT_NE(key, CommandPersistentSelectionKey(
++                     {CommandPersistentKind::kFavorite, "a", "bc"}));
++}
++
++TEST(ArciumCommandLocalPresentationTest,
++     SavedHomeRowsUseQualifiedPinAndFavoriteTargets) {
++  const CommandLiveTarget live{11, 12};
++  const CommandPersistentTarget pin{CommandPersistentKind::kPin, "space-a",
++                                    "shared-item"};
++  const CommandPersistentTarget favorite{CommandPersistentKind::kFavorite, "",
++                                         "shared-item"};
++  const auto pin_row = ProjectLiveCommandRow(live, pin, true);
++  EXPECT_EQ(CommandTarget(pin), pin_row.target);
++  EXPECT_EQ(CommandPersistentSelectionKey(pin), pin_row.selection_key);
++  EXPECT_EQ(pin_row.selection_key,
++            ProjectLiveCommandRow({21, 22}, pin, true).selection_key);
++  EXPECT_EQ(u"Pin", pin_row.category);
++  EXPECT_EQ(CommandActivity::kCircleDot, pin_row.activity);
++  EXPECT_EQ(SkColorSetRGB(0xb3, 0x91, 0x65), pin_row.tint);
++  const auto favorite_row = ProjectLiveCommandRow(live, favorite, true);
++  EXPECT_EQ(CommandTarget(favorite), favorite_row.target);
++  EXPECT_EQ(CommandPersistentSelectionKey(favorite),
++            favorite_row.selection_key);
++  EXPECT_EQ(favorite_row.selection_key,
++            ProjectLiveCommandRow({31, 32}, favorite, true).selection_key);
++  EXPECT_EQ(u"Favorite", favorite_row.category);
++  EXPECT_EQ(CommandActivity::kDot, favorite_row.activity);
++  EXPECT_EQ(SkColorSetRGB(0xb3, 0x91, 0x65), favorite_row.tint);
++  EXPECT_NE(pin_row.selection_key, favorite_row.selection_key);
++  EXPECT_EQ(kBuiltinCommandProvider, pin_row.provider_id);
++  EXPECT_EQ(CommandPrimaryIcon::kSwitch, pin_row.primary_icon);
++  EXPECT_EQ(u"Switch", pin_row.primary_verb);
++}
++
++TEST(ArciumCommandLocalPresentationTest,
++     AwayPinAndFavoriteRowsRetainExactLiveTargetsAndSavedPresentation) {
++  const CommandLiveTarget live{11, 12};
++  const auto ordinary = ProjectLiveCommandRow(live, std::nullopt, false);
++  const CommandPersistentTarget pin{CommandPersistentKind::kPin, "space-a",
++                                    "shared-item"};
++  const CommandPersistentTarget favorite{CommandPersistentKind::kFavorite, "",
++                                         "shared-item"};
++  const auto pin_row = ProjectLiveCommandRow(live, pin, false);
++  EXPECT_EQ(CommandTarget(live), pin_row.target);
++  EXPECT_EQ(ordinary.selection_key, pin_row.selection_key);
++  EXPECT_NE(CommandPersistentSelectionKey(pin), pin_row.selection_key);
++  EXPECT_EQ(u"Pin", pin_row.category);
++  EXPECT_EQ(CommandActivity::kCircleDot, pin_row.activity);
++  EXPECT_EQ(SkColorSetRGB(0xb3, 0x91, 0x65), pin_row.tint);
++  const auto favorite_row = ProjectLiveCommandRow(live, favorite, false);
++  EXPECT_EQ(CommandTarget(live), favorite_row.target);
++  EXPECT_EQ(ordinary.selection_key, favorite_row.selection_key);
++  EXPECT_NE(CommandPersistentSelectionKey(favorite),
++            favorite_row.selection_key);
++  EXPECT_EQ(u"Favorite", favorite_row.category);
++  EXPECT_EQ(CommandActivity::kDot, favorite_row.activity);
++  EXPECT_EQ(SkColorSetRGB(0xb3, 0x91, 0x65), favorite_row.tint);
++}
++
++TEST(ArciumCommandLocalPresentationTest, OrdinaryTabsKeepExactLiveIdentity) {
++  const CommandLiveTarget live{11, 12};
++  const auto row = ProjectLiveCommandRow(live, std::nullopt, false);
++  EXPECT_EQ(CommandTarget(live), row.target);
++  EXPECT_EQ(u"Tab", row.category);
++  EXPECT_EQ(CommandActivity::kDot, row.activity);
++  EXPECT_NE(row.selection_key,
++            ProjectLiveCommandRow({21, 12}, std::nullopt, false).selection_key);
++  EXPECT_NE(row.selection_key,
++            ProjectLiveCommandRow({11, 22}, std::nullopt, false).selection_key);
++  EXPECT_EQ(row.selection_key,
++            ProjectLiveCommandRow(live, std::nullopt, true).selection_key);
++}
++
 +AutocompleteMatch MakeNativeMatch(const char* url, int relevance) {
 +  AutocompleteMatch match(nullptr, relevance, false,
 +                          AutocompleteMatchType::HISTORY_URL);
@@ -10925,6 +11301,93 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
 +  EXPECT_EQ(2000, rows[1].relevance);
 +  EXPECT_FALSE(rows[1].allowed_default);
 +  EXPECT_FALSE(rows[1].is_default);
++}
++
++TEST(ArciumCommandNativeMatchTest,
++     DisplayedGetDefaultDoesNotDuplicateOrDropTheSearchAlternative) {
++  auto go = MakeNativeMatch("https://example.test/", 1500);
++  go.fill_into_edit = u"example.test";
++  go.allowed_to_be_default_match = true;
++  auto search = MakeNativeMatch("https://search.test/?q=example.test", 1400);
++  search.type = AutocompleteMatchType::SEARCH_WHAT_YOU_TYPED;
++  search.fill_into_edit = u"example.test";
++  search.allowed_to_be_default_match = true;
++  AutocompleteResult result;
++  result.AppendMatches({go, search});
++  const auto revision = base::UnguessableToken::Create();
++  const auto rows = ProjectSupportedNativeCommandRows(result, revision);
++
++  ASSERT_EQ(2u, rows.size());
++  EXPECT_EQ(0u, rows[0].ordinal);
++  EXPECT_TRUE(rows[0].is_default);
++  EXPECT_EQ(1u, rows[1].ordinal);
++  EXPECT_EQ(static_cast<int>(AutocompleteMatchType::SEARCH_WHAT_YOU_TYPED),
++            rows[1].match_type);
++  EXPECT_FALSE(GetUnprojectedNativeDefaultOrdinal(result, rows));
++}
++
++TEST(ArciumCommandNativeMatchTest,
++     DistinctPostRowsKeepTheirKeysAndFallbackKeepsTheOriginalOrdinal) {
++  auto first =
++      MakeNativePostMatch(u"first terms", "application/test", "q=first");
++  first.allowed_to_be_default_match = true;
++  auto second =
++      MakeNativePostMatch(u"second terms", "application/test", "q=second");
++  second.allowed_to_be_default_match = true;
++  AutocompleteResult result;
++  result.AppendMatches({first, second});
++  CommandNativeResultLease lease;
++  const auto revision = lease.NewRevision();
++  const auto rows = ProjectSupportedNativeCommandRows(result, revision);
++  ASSERT_EQ(2u, rows.size());
++  EXPECT_EQ(0u, rows[0].ordinal);
++  EXPECT_EQ(1u, rows[1].ordinal);
++  EXPECT_NE(CommandNativeSelectionKey(*result.match_at(0), revision, 0),
++            CommandNativeSelectionKey(*result.match_at(1), revision, 1));
++  EXPECT_FALSE(GetUnprojectedNativeDefaultOrdinal(result, rows));
++
++  const std::vector<NativeCommandRow> displayed = {rows[1]};
++  const auto fallback = GetUnprojectedNativeDefaultOrdinal(result, displayed);
++  ASSERT_TRUE(fallback);
++  EXPECT_EQ(0u, *fallback);
++  AutocompleteInput input(u"first terms", metrics::OmniboxEventProto::OTHER,
++                          TestSchemeClassifier());
++  const auto selection =
++      lease.Resolve({revision, *fallback}, result, input, {}, false);
++  ASSERT_TRUE(selection);
++  ASSERT_TRUE(selection->match.post_content);
++  EXPECT_EQ("q=first", selection->match.post_content->second);
++  EXPECT_FALSE(CanCommandNativeOpenUrlCopy(selection->match));
++}
++
++TEST(ArciumCommandNativeMatchTest,
++     SavedItemsOpenTabsAndTakeoversNeverBecomeQueryLabelledAliases) {
++  for (const auto kind :
++       {ArciumOmniboxItem::Kind::kPin, ArciumOmniboxItem::Kind::kFavorite}) {
++    auto saved = MakeNativeMatch("https://saved.test/", 1500);
++    saved.allowed_to_be_default_match = true;
++    saved.arcium_item.emplace();
++    saved.arcium_item->kind = kind;
++    saved.arcium_item->id = "saved-item";
++    AutocompleteResult result;
++    result.AppendMatches({saved});
++    ASSERT_NE(nullptr, result.default_match());
++    EXPECT_FALSE(GetUnprojectedNativeDefaultOrdinal(result, {}));
++  }
++  auto live = MakeNativeMatch("https://live.test/", 1500);
++  live.type = AutocompleteMatchType::OPEN_TAB;
++  live.allowed_to_be_default_match = true;
++  AutocompleteResult live_result;
++  live_result.AppendMatches({live});
++  EXPECT_FALSE(GetUnprojectedNativeDefaultOrdinal(live_result, {}));
++  auto action = MakeNativeMatch("https://action.test/", 1500);
++  action.allowed_to_be_default_match = true;
++  action.takeover_action = base::MakeRefCounted<FakeOmniboxAction>(
++      OmniboxActionId::ACTION_IN_SUGGEST);
++  EXPECT_TRUE(IsCommandNativeMatchSupported(action));
++  AutocompleteResult action_result;
++  action_result.AppendMatches({action});
++  EXPECT_FALSE(GetUnprojectedNativeDefaultOrdinal(action_result, {}));
 +}
 +
 +TEST(ArciumCommandNativeSelectionKeyTest,

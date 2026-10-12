@@ -550,7 +550,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
-@@ -0,0 +1,2216 @@
+@@ -0,0 +1,2234 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -1554,16 +1554,25 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +                                                       : std::string());
 +  rows_.clear();
 +  if (publication_) {
-+    if (current_context_ && scope_ == kOmniScope && publication_->current_tab) {
-+      rows_.push_back({*publication_->current_tab, std::nullopt});
++    const bool show_current = current_context_ && scope_ == kOmniScope &&
++                              publication_->current_tab.has_value();
++    if (show_current) {
++      auto current = *publication_->current_tab;
++      current.is_default = true;
++      rows_.push_back({std::move(current), std::nullopt});
 +    }
 +    for (const auto& data : publication_->rows) {
-+      if (rows_.size() == CommandSession::kMaxRows) {
++      if (rows_.size() >= CommandSession::kMaxRows) {
 +        break;
 +      }
-+      if (current_context_ && publication_->current_tab &&
-+          !data.selection_key.empty() &&
-+          data.selection_key == publication_->current_tab->selection_key) {
++      if (show_current &&
++          (std::holds_alternative<CommandLiveTarget>(
++               publication_->current_tab->target) ||
++           std::holds_alternative<CommandPersistentTarget>(
++               publication_->current_tab->target)) &&
++          data.target == publication_->current_tab->target &&
++          data.primary_action_id ==
++              publication_->current_tab->primary_action_id) {
 +        continue;
 +      }
 +      rows_.push_back({data, std::nullopt});
@@ -2092,10 +2101,13 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  const int cue_width = joined ? 28 : 24;
 +  const std::u16string verb = selected && width >= 330 ? Verb(row) : u"";
 +  const int verb_width =
-+      verb.empty() ? 0 : base::ClampRound(
-+          (gfx::GetStringWidth(verb, Font(12, true)) + 9) * cue_progress);
++      verb.empty()
++          ? 0
++          : base::ClampRound((gfx::GetStringWidth(verb, Font(12, true)) + 9) *
++                             cue_progress);
 +  const int cue_x = width - (joined ? 0 : 11) - cue_width;
-+  const int right = cue_x - verb_width;
++  const int verb_x = cue_x - verb_width;
++  const int right = verb_x - (verb.empty() ? 0 : 12);
 +  const int category_gap = joined ? 20 : 10;
 +  const auto category_font = joined ? Font(11) : Font(10, true);
 +  const int category_width =
@@ -2124,11 +2136,11 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  if (category_width) {
 +    const int label_x = x + title_width + category_gap;
 +    if (appearance_.labels == CommandPanelAppearance::Labels::kPill) {
-+      FillRoundRect(canvas,
-+                    gfx::Rect(label_x, (height - 18) / 2, category_width, 18),
-+                    4, Alpha(appearance_.scope_tints ? tint : SK_ColorWHITE,
-+                             appearance_.scope_tints ? (selected ? 31 : 20)
-+                                                     : (selected ? 10 : 4)));
++      FillRoundRect(
++          canvas, gfx::Rect(label_x, (height - 18) / 2, category_width, 18), 4,
++          Alpha(appearance_.scope_tints ? tint : SK_ColorWHITE,
++                appearance_.scope_tints ? (selected ? 31 : 20)
++                                        : (selected ? 10 : 4)));
 +    }
 +    if (joined) {
 +      canvas->FillRect(gfx::Rect(label_x - 10, (height - 13) / 2, 1, 13),
@@ -2139,16 +2151,22 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +        appearance_.scope_tints
 +            ? Mix(tint, selected ? SkColorSetRGB(214, 227, 224) : tint)
 +            : (selected ? SkColorSetRGB(214, 227, 224) : kMuted),
-+        gfx::Rect(label_x + (appearance_.labels ==
-+                                     CommandPanelAppearance::Labels::kPill
-+                                 ? 6
-+                                 : 0),
-+                  0, category_width, height));
++        gfx::Rect(
++            label_x +
++                (appearance_.labels == CommandPanelAppearance::Labels::kPill
++                     ? 6
++                     : 0),
++            0,
++            category_width -
++                (appearance_.labels == CommandPanelAppearance::Labels::kPill
++                     ? 12
++                     : 0),
++            height));
 +  }
 +  if (verb_width > 9) {
-+    canvas->DrawStringRect(
-+        verb, Font(12, true), Alpha(kText, base::ClampRound(255 * cue_progress)),
-+        gfx::Rect(cue_x - verb_width, 0, verb_width - 9, height));
++    canvas->DrawStringRect(verb, Font(12, true),
++                           Alpha(kText, base::ClampRound(255 * cue_progress)),
++                           gfx::Rect(verb_x, 0, verb_width - 9, height));
 +  }
 +  SkColor cue_color = Blend(SkColorSetRGB(160, 170, 167),
 +                            SkColorSetRGB(225, 232, 229), cue_progress);
@@ -3157,7 +3175,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
-@@ -0,0 +1,1742 @@
+@@ -0,0 +1,1859 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +#include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
@@ -3185,7 +3203,9 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +#include "ui/base/ui_base_features.h"
 +#include "ui/events/event.h"
 +#include "ui/gfx/animation/animation_test_api.h"
++#include "ui/gfx/font_list.h"
 +#include "ui/gfx/scoped_animation_duration_scale_mode.h"
++#include "ui/gfx/text_utils.h"
 +#include "ui/views/accessibility/view_accessibility.h"
 +#include "ui/views/controls/button/button.h"
 +#include "ui/views/controls/scroll_view.h"
@@ -3632,6 +3652,43 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  EXPECT_EQ(panel()->input_for_testing(),
 +            widget_->GetFocusManager()->GetFocusedView());
 +#endif
++}
++TEST_F(ArciumNativePanelTest, CapturedRowCapacityFollowsActualVisibility) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
++  auto alias = state_->current;
++  alias.kind = CommandRowKind::kResult;
++  alias.selection_key = "current-alias";
++  state_->records = {{kSavedScope, alias, true}};
++  for (int i = 1; i < 8; ++i) {
++    const auto id = "saved-" + base::NumberToString(i);
++    auto row = Result(
++        id, u"Saved entry " + base::NumberToString16(i),
++        CommandPersistentTarget{CommandPersistentKind::kPin, "space", id},
++        true);
++    state_->records.push_back({kSavedScope, std::move(row), true});
++  }
++  Open(false);
++  ASSERT_EQ(8u, panel()->row_count_for_testing());
++  EXPECT_EQ("current", panel()->row_for_testing(0).selection_key);
++  EXPECT_EQ(0, panel()->selected_for_testing());
++  EXPECT_EQ("saved-1", panel()->row_for_testing(1).selection_key);
++
++  Key(ui::VKEY_RIGHT);
++  Key(ui::VKEY_RIGHT);
++  ASSERT_EQ(kSavedScope, panel()->scope_for_testing());
++  ASSERT_EQ(8u, panel()->row_count_for_testing());
++  EXPECT_EQ("current-alias", panel()->row_for_testing(0).selection_key);
++  EXPECT_EQ(CommandRowKind::kResult, panel()->row_for_testing(0).kind);
++
++  Open(false);
++  Query(u"saved");
++  Query(u"");
++  ASSERT_EQ(8u, panel()->row_count_for_testing());
++  EXPECT_EQ("current-alias", panel()->row_for_testing(0).selection_key);
++  EXPECT_EQ(CommandRowKind::kResult, panel()->row_for_testing(0).kind);
++  EXPECT_FALSE(PaintPanel().empty());
++  EXPECT_FALSE(widget_->IsVisible());
 +}
 +TEST_F(ArciumNativePanelTest, EmptyAndCapturedPublicationsPaintDuringResize) {
 +  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
@@ -4457,6 +4514,84 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +      EXPECT_FALSE(PaintPanel().empty());
 +      EXPECT_FALSE(widget_->IsVisible());
 +    }
++  }
++}
++TEST_F(ArciumNativePanelTest,
++       SelectedTextCategoryKeepsGapFromVerbAt115Percent) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
++  auto pin = state_->records[2];
++  pin.row.title = std::u16string(200, u'W');
++  pin.row.category = u"Pin";
++  pin.row.primary_verb = u"Restore";
++  state_->records = {pin};
++  Open();
++  for (const auto labels : {CommandPanelAppearance::Labels::kText,
++                            CommandPanelAppearance::Labels::kPill}) {
++    CommandPanelAppearance appearance;
++    appearance.labels = labels;
++    appearance.scope_tints = false;
++    panel()->SetAppearance(appearance);
++    constexpr float scale = 1.15f;
++    panel()->SetUIScale(scale);
++    views::test::RunScheduledLayout(widget_.get());
++    ASSERT_EQ(1u, panel()->row_count_for_testing());
++    ASSERT_EQ(0, panel()->selected_for_testing());
++    ASSERT_EQ(1, panel()->selection_animation_for_testing()->GetCurrentValue());
++
++    const auto* row =
++        panel()->scroll_for_testing()->contents()->children().front().get();
++    gfx::Point origin;
++    views::View::ConvertPointToTarget(row, widget_->GetRootView(), &origin);
++    const int logical_width = base::ClampRound(row->width() / scale);
++    const int logical_height = base::ClampRound(row->height() / scale);
++    const auto font = [](int size) {
++      const gfx::FontList base_font;
++      return base_font.DeriveWithSizeDelta(size - base_font.GetFontSize())
++          .DeriveWithWeight(gfx::Font::Weight::MEDIUM);
++    };
++    EXPECT_GT(gfx::GetStringWidth(pin.row.title, font(14)), logical_width);
++    const int cue_x = logical_width - 11 - 24;
++    const int verb_x =
++        cue_x - gfx::GetStringWidth(pin.row.primary_verb, font(12)) - 9;
++    const int category_right = verb_x - 12;
++    const auto region = [&](int left, int right) {
++      const int top = base::ClampCeil(7 * scale);
++      const int bottom = base::ClampFloor((logical_height - 7) * scale);
++      const int start = base::ClampCeil(left * scale);
++      const int end = base::ClampFloor(right * scale);
++      return gfx::Rect(origin.x() + start, origin.y() + top, end - start,
++                       bottom - top);
++    };
++    // A long title exhausts its ellipsis width. The category must still leave
++    // ten logical pixels of clear space before the selected action verb.
++    const auto gap = region(verb_x - 10, verb_x);
++    const auto category =
++        region(category_right - gfx::GetStringWidth(pin.row.category, font(10)),
++               category_right);
++    const auto verb = region(verb_x, cue_x - 9);
++    const auto bitmap = PaintPanel();
++    const gfx::Rect bitmap_bounds(bitmap.width(), bitmap.height());
++    ASSERT_TRUE(bitmap_bounds.Contains(gap));
++    ASSERT_TRUE(bitmap_bounds.Contains(category));
++    ASSERT_TRUE(bitmap_bounds.Contains(verb));
++    const auto foreground_pixels = [&bitmap](const gfx::Rect& bounds) {
++      int count = 0;
++      for (int y = bounds.y(); y < bounds.bottom(); ++y) {
++        for (int x = bounds.x(); x < bounds.right(); ++x) {
++          const SkColor color = bitmap.getColor(x, y);
++          if (SkColorGetR(color) > 165 && SkColorGetG(color) > 165 &&
++              SkColorGetB(color) > 165) {
++            ++count;
++          }
++        }
++      }
++      return count;
++    };
++    EXPECT_EQ(0, foreground_pixels(gap));
++    EXPECT_GT(foreground_pixels(category), 0);
++    EXPECT_GT(foreground_pixels(verb), 0);
++    EXPECT_FALSE(widget_->IsVisible());
 +  }
 +}
 +TEST_F(ArciumNativePanelTest, SeparateScopesRetainTheMaterialContour) {
