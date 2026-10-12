@@ -1056,11 +1056,12 @@ Index: src/chrome/browser/ui/helium/helium_space.h
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/helium_space.h
 +++ src/chrome/browser/ui/helium/helium_space.h
-@@ -6,38 +6,56 @@
+@@ -6,38 +6,61 @@
  #define CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_H_
  
  #include <string>
 +#include <string_view>
++#include <utility>
  
  #include "base/memory/raw_ptr.h"
 +#include "chrome/browser/ui/helium/helium_persistent_item_model.h"
@@ -1109,6 +1110,10 @@ Index: src/chrome/browser/ui/helium/helium_space.h
    BrowserWindowInterface* ActivateOrCreatePrimaryWindow();
  
   private:
++  friend class HeliumSpaceService;
++
++  // The service publishes both trees in one preference write during a move.
++  void SetPinsWithoutPersist(PersistentNodes pins) { pins_ = std::move(pins); }
 +  void PersistPins();
 +
    raw_ptr<Profile> profile_;
@@ -1123,7 +1128,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/helium_space_service.cc
 +++ src/chrome/browser/ui/helium/helium_space_service.cc
-@@ -4,48 +4,452 @@
+@@ -4,48 +4,501 @@
  
  #include "chrome/browser/ui/helium/helium_space_service.h"
  
@@ -1133,20 +1138,24 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +
 +#include "base/check.h"
 +#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
 +#include "base/strings/strcat.h"
 +#include "base/strings/string_number_conversions.h"
  #include "base/strings/utf_string_conversions.h"
 +#include "base/task/sequenced_task_runner.h"
  #include "base/uuid.h"
++#include "chrome/browser/lifetime/browser_shutdown.h"
  #include "chrome/browser/profiles/profile.h"
  #include "chrome/browser/sessions/session_service.h"
  #include "chrome/browser/sessions/session_service_factory.h"
  #include "chrome/browser/ui/browser.h"
 +#include "chrome/browser/ui/browser_tabstrip.h"
 +#include "chrome/browser/ui/browser_window.h"
++#include "chrome/browser/ui/browser_window/public/browser_collection.h"
  #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
 +#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
  #include "chrome/browser/ui/helium/helium_space.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
 +#include "chrome/browser/ui/tab_ui_helper.h"
 +#include "chrome/browser/ui/tabs/pinned_tab_codec.h"
 +#include "chrome/browser/ui/tabs/tab_strip_model.h"
@@ -1170,6 +1179,51 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +// this record must never grow into a second copy of the sidebar model.
 +constexpr char kUsageCountKey[] = "count";
 +constexpr char kUsageLastUsedKey[] = "last_used";
++
++// Native tab transfers can change indices and selection synchronously. Keep
++// handles so rollback never applies an old index to an unrelated tab.
++struct PinTransferSelection {
++  std::vector<tabs::TabHandle> selected;
++  std::optional<tabs::TabHandle> active;
++  std::optional<tabs::TabHandle> anchor;
++
++  explicit PinTransferSelection(TabStripModel* model) {
++    for (tabs::TabInterface* tab : model->selection_model().selected_tabs()) {
++      selected.push_back(tab->GetHandle());
++    }
++    if (tabs::TabInterface* tab = model->selection_model().active_tab()) {
++      active = tab->GetHandle();
++    }
++    if (tabs::TabInterface* tab = model->selection_model().anchor_tab()) {
++      anchor = tab->GetHandle();
++    }
++  }
++
++  void Restore(TabStripModel* model) const {
++    auto index_for = [model](const std::optional<tabs::TabHandle>& handle) {
++      tabs::TabInterface* tab = handle ? handle->Get() : nullptr;
++      return tab ? model->GetIndexOfTab(tab) : TabStripModel::kNoTab;
++    };
++    const int active_index = index_for(active);
++    if (active_index == TabStripModel::kNoTab) {
++      return;
++    }
++    ui::ListSelectionModel selection;
++    for (const tabs::TabHandle& handle : selected) {
++      tabs::TabInterface* tab = handle.Get();
++      const int index = tab ? model->GetIndexOfTab(tab) : TabStripModel::kNoTab;
++      if (index != TabStripModel::kNoTab) {
++        selection.AddIndexToSelection(index);
++      }
++    }
++    selection.AddIndexToSelection(active_index);
++    selection.set_active(active_index);
++    const int anchor_index = index_for(anchor);
++    selection.set_anchor(anchor_index == TabStripModel::kNoTab ? active_index
++                                                               : anchor_index);
++    model->SetSelectionFromModel(std::move(selection));
++  }
++};
 +
 +using OmniboxItemTier = PersistentOmniboxItem::Tier;
 +
@@ -1590,7 +1644,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
    }
  }
  
-@@ -56,16 +460,8 @@ void HeliumSpaceService::EnsureDefaultSp
+@@ -56,16 +509,8 @@ void HeliumSpaceService::EnsureDefaultSp
      }
      return;
    }
@@ -1609,7 +1663,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
  }
  
  HeliumSpace* HeliumSpaceService::GetDefaultSpace() {
-@@ -79,9 +475,8 @@ const HeliumSpace* HeliumSpaceService::G
+@@ -79,9 +524,8 @@ const HeliumSpace* HeliumSpaceService::G
  
  HeliumSpace* HeliumSpaceService::GetActiveSpace() {
    EnsureDefaultSpace();
@@ -1621,7 +1675,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      return active;
    }
    return spaces_.front().get();
-@@ -100,52 +495,1978 @@ HeliumSpace* HeliumSpaceService::GetOrCr
+@@ -100,52 +544,2689 @@ HeliumSpace* HeliumSpaceService::GetOrCr
                                                    std::u16string name) {
    if (HeliumSpace* existing = GetSpaceById(id)) {
      existing->SetName(std::move(name));
@@ -1743,9 +1797,9 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
    if (GetSpaceById(id)) {
      profile_->GetPrefs()->SetString(kHeliumActiveSpaceIdPref, std::string(id));
 +    NotifyItemsChanged(PersistentItemChange::Global());
-+  }
-+}
-+
+   }
+ }
+ 
 +PersistentNodes HeliumSpaceService::GetFavoritesForSpace(
 +    const HeliumSpace& space) const {
 +  PersistentNodes result = local_favorites_;
@@ -1954,6 +2008,78 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  return std::nullopt;
 +}
 +
++bool HeliumSpaceService::HasNodeId(const PersistentNodes& nodes,
++                                   std::string_view id) const {
++  return PersistentItemCodec::FindLink(nodes, id) ||
++         PersistentItemCodec::FindFolder(nodes, id);
++}
++
++bool HeliumSpaceService::CanRelocatePinNodeInSpace(std::string_view space_id,
++                                                   std::string_view id) const {
++  auto* self = const_cast<HeliumSpaceService*>(this);
++  HeliumSpace* space = self->GetSpaceById(space_id);
++  if (!space) {
++    return false;
++  }
++  auto can_relocate_link = [&](std::string_view link_id) {
++    const std::string key =
++        ItemKeyForSpace(PersistentRecordKind::kPin, space_id, link_id);
++    const auto state = lifecycle_.GetState(key);
++    if (state && (*state == PersistentItemLifecycle::State::kMaterializing ||
++                  *state == PersistentItemLifecycle::State::kClosing)) {
++      return false;
++    }
++    const auto token = lifecycle_.GetLiveTab(key);
++    if (!token) {
++      return !state || *state == PersistentItemLifecycle::State::kDormant;
++    }
++    const auto association = live_associations_.find(*token);
++    const tabs::TabInterface* tab = association == live_associations_.end()
++                                        ? nullptr
++                                        : association->second->tab.get();
++    const BrowserWindowInterface* window =
++        tab ? tab->GetBrowserWindowInterface() : nullptr;
++    Browser* browser =
++        window ? const_cast<Browser*>(window->GetBrowserForMigrationOnly())
++               : nullptr;
++    return tab && !live_pin_space_transfers_.contains(*token) &&
++           association->second->key == key &&
++           association->second->kind == PersistentRecordKind::kPin &&
++           association->second->space_id == space_id &&
++           association->second->item_id == link_id &&
++           FindLiveAssociation(tab) == association->second.get() &&
++           tab->GetProfile() == profile_ && !tab->IsSplit() &&
++           !tab->GetGroup() && IsEligibleBrowser(browser) &&
++           !browser->IsAttemptingToCloseBrowser() &&
++           GetExplicitSpaceIdForBrowser(browser) == space_id &&
++           IsLiveTabInExpectedCollection(PersistentRecordKind::kPin, tab);
++  };
++  if (const PersistentLink* link =
++          PersistentItemCodec::FindLink(space->pins(), id)) {
++    return can_relocate_link(link->id);
++  }
++  const PersistentFolder* folder =
++      PersistentItemCodec::FindFolder(space->pins(), id);
++  if (!folder) {
++    return false;
++  }
++  auto can_relocate_children = [&](auto&& visit,
++                                   const PersistentNodes& children) -> bool {
++    for (const PersistentNode& node : children) {
++      if (const auto* link = std::get_if<PersistentLink>(&node.data)) {
++        if (!can_relocate_link(link->id)) {
++          return false;
++        }
++      } else if (!visit(visit,
++                        std::get<PersistentFolder>(node.data).children)) {
++        return false;
++      }
++    }
++    return true;
++  };
++  return can_relocate_children(can_relocate_children, folder->children);
++}
++
 +HeliumSpace* HeliumSpaceService::ResolvePinOwner(Browser* browser,
 +                                                 std::string_view id) const {
 +  if (!IsEligibleBrowser(browser)) {
@@ -2066,6 +2192,9 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  if (!space || !pin) {
 +    return false;
 +  }
++  if (!CanRelocatePinNodeInSpace(source_space_id, id)) {
++    return false;
++  }
 +
 +  const std::string pin_key =
 +      ItemKeyForSpace(PersistentRecordKind::kPin, source_space_id, id);
@@ -2153,6 +2282,9 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +bool HeliumSpaceService::CreatePinFolderForTab(tabs::TabInterface* tab) {
 +  LiveAssociation* association = FindLiveAssociation(tab);
 +  if (!association || association->kind != PersistentRecordKind::kPin) {
++    return false;
++  }
++  if (!CanRelocatePinNodeInSpace(association->space_id, association->item_id)) {
 +    return false;
 +  }
 +  BrowserWindowInterface* window = tab->GetBrowserWindowInterface();
@@ -2413,7 +2545,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  if (association == live_associations_.end()) {
 +    return;
 +  }
-+  if (persistent_item_drags_.contains(tab)) {
++  if (persistent_item_drags_.contains(tab) ||
++      live_pin_space_transfers_.contains(token)) {
 +    return;
 +  }
 +  BrowserWindowInterface* window = tab->GetBrowserWindowInterface();
@@ -2472,6 +2605,9 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  // after the observer callback so collapsed folders expose only the item
 +  // that is actually active once the selection transition has completed.
 +  const LiveAssociation* association = FindLiveAssociation(tab);
++  if (association && live_pin_space_transfers_.contains(association->token)) {
++    return;
++  }
 +  PersistentItemChange change =
 +      association ? ChangeForAssociation(*association)
 +                  : PersistentItemChange::Global();
@@ -2563,7 +2699,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +bool HeliumSpaceService::CloseLiveInstanceForKey(std::string_view key,
 +                                                 bool close_tab) {
 +  const auto token = lifecycle_.GetLiveTab(key);
-+  if (!token) {
++  if (!token || live_pin_space_transfers_.contains(*token)) {
 +    return false;
 +  }
 +  auto association = live_associations_.find(*token);
@@ -2588,7 +2724,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    lifecycle_.CompleteClose(*token);
 +    NotifyItemsChanged(change);
 +    return true;
-   }
++  }
 +  if (!model || index == TabStripModel::kNoTab) {
 +    const PersistentItemChange change =
 +        ChangeForAssociation(*association->second);
@@ -2645,7 +2781,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    key = ItemKeyForSpace(PersistentRecordKind::kPin, source_space_id, id);
 +  }
 +  const auto token = lifecycle_.GetLiveTab(key);
-+  if (!token) {
++  if (!token || live_pin_space_transfers_.contains(*token)) {
 +    return false;
 +  }
 +  const auto association = live_associations_.find(*token);
@@ -2660,56 +2796,570 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  return true;
 +}
 +
++HeliumSpaceService::ScopedTabStripEmptyCloseDeferral::
++    ScopedTabStripEmptyCloseDeferral(HeliumSpaceService* service,
++                                     Browser* browser)
++    : service_(service->weak_factory_.GetWeakPtr()),
++      browser_session_id_(browser->session_id()) {
++  auto& state = service->empty_tab_strip_close_deferrals_[browser_session_id_];
++  state.browser = browser->AsWeakPtr();
++  ++state.depth;
++}
++
++HeliumSpaceService::ScopedTabStripEmptyCloseDeferral::
++    ~ScopedTabStripEmptyCloseDeferral() {
++  if (!service_) {
++    return;
++  }
++  const auto state =
++      service_->empty_tab_strip_close_deferrals_.find(browser_session_id_);
++  if (state == service_->empty_tab_strip_close_deferrals_.end()) {
++    // The original frame was explicitly destroyed during a transfer.
++    return;
++  }
++  CHECK_GT(state->second.depth, 0u);
++  if (--state->second.depth != 0) {
++    return;
++  }
++  const base::WeakPtr<Browser> browser = state->second.browser;
++  const bool had_pending_close = state->second.pending_close;
++  service_->empty_tab_strip_close_deferrals_.erase(state);
++  if (had_pending_close && browser && browser->tab_strip_model()->empty()) {
++    // Closing may destroy either owner. No member access follows this call.
++    browser->TabStripEmpty();
++  }
++}
++
++void HeliumSpaceService::ScopedTabStripEmptyCloseDeferral::
++    CancelPendingClose() {
++  if (!service_) {
++    return;
++  }
++  const auto state =
++      service_->empty_tab_strip_close_deferrals_.find(browser_session_id_);
++  if (state != service_->empty_tab_strip_close_deferrals_.end()) {
++    state->second.pending_close = false;
++  }
++}
++
++bool HeliumSpaceService::ShouldDeferEmptyTabStripClose(Browser* browser) {
++  if (!browser) {
++    return false;
++  }
++  HeliumSpaceService* service =
++      HeliumSpaceServiceFactory::GetForProfileIfExists(browser->profile());
++  if (!service) {
++    return false;
++  }
++  const auto state =
++      service->empty_tab_strip_close_deferrals_.find(browser->session_id());
++  if (state == service->empty_tab_strip_close_deferrals_.end() ||
++      state->second.depth == 0 || state->second.browser.get() != browser) {
++    return false;
++  }
++  state->second.pending_close = true;
++  return true;
++}
++
++
 +bool HeliumSpaceService::MovePinToSpace(Browser* browser,
 +                                        std::string_view id,
 +                                        std::string_view source_space_id,
 +                                        std::string_view target_space_id) {
-+  if (!IsEligibleBrowser(browser)) {
++  if (!IsEligibleBrowser(browser) || id.empty() || source_space_id.empty() ||
++      target_space_id.empty() || source_space_id == target_space_id ||
++      !live_pin_space_transfers_.empty()) {
 +    return false;
 +  }
-+  if (source_space_id.empty() || target_space_id.empty()) {
-+    return false;
-+  }
-+  HeliumSpace* target_space = GetSpaceById(target_space_id);
-+  HeliumSpace* source_space = GetSpaceById(source_space_id);
-+  if (!source_space || !target_space || source_space == target_space) {
-+    return false;
-+  }
-+  std::optional<PersistentLink> link =
-+      ResolvePinInSpace(source_space->id(), id);
-+  if (!link || ResolvePinInSpace(target_space_id, id)) {
++  // Callers commonly pass strings borrowed from the durable model. Native
++  // callbacks can replace that model while the transaction is in progress.
++  const std::string item_id(id);
++  const std::string source_id(source_space_id);
++  const std::string target_id(target_space_id);
++  HeliumSpace* source_space = GetSpaceById(source_id);
++  HeliumSpace* target_space = GetSpaceById(target_id);
++  const std::optional<PersistentLink> link =
++      ResolvePinInSpace(source_id, item_id);
++  if (!source_space || !target_space || !link ||
++      HasNodeId(target_space->pins(), item_id)) {
 +    return false;
 +  }
 +  const std::string old_key =
-+      ItemKeyForSpace(PersistentRecordKind::kPin, source_space_id, id);
++      ItemKeyForSpace(PersistentRecordKind::kPin, source_id, item_id);
 +  const std::string new_key =
-+      ItemKeyForSpace(PersistentRecordKind::kPin, target_space_id, id);
++      ItemKeyForSpace(PersistentRecordKind::kPin, target_id, item_id);
 +  const auto state = lifecycle_.GetState(old_key);
-+  if (state &&
-+      (*state == PersistentItemLifecycle::State::kLive ||
-+       *state == PersistentItemLifecycle::State::kClosing) &&
-+      !CloseLiveInstanceForKey(old_key, true)) {
++  if ((state && (*state == PersistentItemLifecycle::State::kMaterializing ||
++                 *state == PersistentItemLifecycle::State::kClosing)) ||
++      lifecycle_.GetState(new_key)) {
 +    return false;
 +  }
-+  if (!source_space->RemovePin(id)) {
-+    return false;
-+  }
-+  target_space->AppendPin(*link);
 +
-+  // Space ownership is part of a Pin's stable identity. Carry the bounded
-+  // usage record along with a move without storing any URL or title data.
-+  if (const auto usage = persistent_item_usage_.find(old_key);
-+      usage != persistent_item_usage_.end()) {
-+    persistent_item_usage_.insert_or_assign(new_key, usage->second);
-+    persistent_item_usage_.erase(usage);
-+    PersistPersistentItemUsage();
++  const PersistentNodes original_source_pins = source_space->pins();
++  const PersistentNodes original_target_pins = target_space->pins();
++  PersistentNodes staged_source_pins = original_source_pins;
++  PersistentNodes staged_target_pins = original_target_pins;
++  if (!PersistentItemCodec::RemoveNode(staged_source_pins, item_id)) {
++    return false;
 +  }
-+  RegisterDormantItems();
-+  NotifyItemsChanged(
-+      PersistentItemChange::Space(std::string(source_space_id)));
-+  NotifyItemsChanged(
-+      PersistentItemChange::Space(std::string(target_space_id)));
++  staged_target_pins.push_back(PersistentNode{.data = *link});
++  const base::ListValue original_spaces_pref =
++      profile_->GetPrefs()->GetList(kHeliumSpacesPref).Clone();
++  base::ListValue staged_spaces_pref = original_spaces_pref.Clone();
++  size_t source_records = 0;
++  size_t target_records = 0;
++  for (base::Value& value : staged_spaces_pref) {
++    base::DictValue* record = value.GetIfDict();
++    const std::string* record_id = record ? record->FindString("id") : nullptr;
++    if (record_id && *record_id == source_id) {
++      record->Set("pins", PersistentItemCodec::Encode(staged_source_pins));
++      ++source_records;
++    } else if (record_id && *record_id == target_id) {
++      record->Set("pins", PersistentItemCodec::Encode(staged_target_pins));
++      ++target_records;
++    }
++  }
++  if (source_records != 1 || target_records != 1) {
++    return false;
++  }
++  if (!state && !lifecycle_.AddDormant(old_key)) {
++    return false;
++  }
++
++  const base::WeakPtr<HeliumSpaceService> service = weak_factory_.GetWeakPtr();
++  const base::WeakPtr<Browser> context_browser = browser->AsWeakPtr();
++  auto durable_model_is_unchanged = [&]() {
++    if (!service || !context_browser ||
++        !service->IsEligibleBrowser(context_browser.get()) ||
++        service->profile_->ShutdownStarted() ||
++        browser_shutdown::IsTryingToQuit() ||
++        browser_shutdown::HasShutdownStarted()) {
++      return false;
++    }
++    HeliumSpace* current_source = service->GetSpaceById(source_id);
++    HeliumSpace* current_target = service->GetSpaceById(target_id);
++    return current_source && current_target &&
++           current_source->pins() == original_source_pins &&
++           current_target->pins() == original_target_pins &&
++           service->profile_->GetPrefs()->GetList(kHeliumSpacesPref) ==
++               original_spaces_pref;
++  };
++  auto commit_durable_move = [&]() {
++    HeliumSpace* current_source = service->GetSpaceById(source_id);
++    HeliumSpace* current_target = service->GetSpaceById(target_id);
++    current_source->SetPinsWithoutPersist(std::move(staged_source_pins));
++    current_target->SetPinsWithoutPersist(std::move(staged_target_pins));
++    bool moved_usage = false;
++    if (const auto usage = service->persistent_item_usage_.find(old_key);
++        usage != service->persistent_item_usage_.end()) {
++      service->persistent_item_usage_.insert_or_assign(new_key, usage->second);
++      service->persistent_item_usage_.erase(usage);
++      moved_usage = true;
++    }
++    // Both in-memory trees and the qualified live key are ready before a
++    // preference observer can see the move.
++    service->profile_->GetPrefs()->SetList(kHeliumSpacesPref,
++                                           std::move(staged_spaces_pref));
++    if (!service) {
++      return;
++    }
++    if (moved_usage) {
++      service->PersistPersistentItemUsage();
++    }
++    if (!service) {
++      return;
++    }
++    service->NotifyItemsChanged(PersistentItemChange::Space(source_id));
++    if (service) {
++      service->NotifyItemsChanged(PersistentItemChange::Space(target_id));
++    }
++  };
++
++  const std::optional<uint64_t> token = lifecycle_.GetLiveTab(old_key);
++  if (!token) {
++    if (state && *state != PersistentItemLifecycle::State::kDormant) {
++      return false;
++    }
++    if (!lifecycle_.Rekey(old_key, new_key)) {
++      return false;
++    }
++    commit_durable_move();
++    return true;
++  }
++  const auto association = live_associations_.find(*token);
++  tabs::TabInterface* tab = association == live_associations_.end()
++                                ? nullptr
++                                : association->second->tab.get();
++  BrowserWindowInterface* source_window =
++      tab ? tab->GetBrowserWindowInterface() : nullptr;
++  Browser* source_browser =
++      source_window ? source_window->GetBrowserForMigrationOnly() : nullptr;
++  if (!tab || !IsEligibleBrowser(source_browser) ||
++      source_browser->IsAttemptingToCloseBrowser() ||
++      GetExplicitSpaceIdForBrowser(source_browser) != source_id ||
++      association->second->key != old_key ||
++      association->second->space_id != source_id ||
++      association->second->item_id != item_id ||
++      association->second->kind != PersistentRecordKind::kPin ||
++      FindLiveAssociation(tab) != association->second.get() ||
++      live_pin_space_transfers_.contains(*token) ||
++      tab->GetProfile() != profile_ || tab->IsSplit() || tab->GetGroup() ||
++      tabs::TemporaryTab::IsTemporary(tab->GetContents()) ||
++      !IsLiveTabInExpectedCollection(PersistentRecordKind::kPin, tab)) {
++    return false;
++  }
++  const tabs::TabHandle tab_handle = tab->GetHandle();
++  const base::WeakPtr<Browser> source_browser_weak =
++      source_browser->AsWeakPtr();
++  TabStripModel* source_model = source_browser->tab_strip_model();
++  const int original_tab_index = source_model->GetIndexOfTab(tab);
++  tabs::TabCollection* original_parent =
++      const_cast<tabs::TabCollection*>(tab->GetParentCollection());
++  const auto original_parent_index =
++      original_parent ? original_parent->GetIndexOfTab(tab) : std::nullopt;
++  if (original_tab_index == TabStripModel::kNoTab || !original_parent_index) {
++    return false;
++  }
++  const tabs::TabCollectionHandle original_parent_handle =
++      original_parent->GetHandle();
++  const PinTransferSelection source_selection(source_model);
++  const bool follows_sole_page = source_model->count() == 1 &&
++                                 tab->IsActivated() &&
++                                 source_browser == browser;
++
++  live_pin_space_transfers_.insert(*token);
++  base::ScopedClosureRunner end_transfer(base::BindOnce(
++      [](base::WeakPtr<HeliumSpaceService> owner, uint64_t live_token) {
++        if (owner) {
++          owner->live_pin_space_transfers_.erase(live_token);
++          const auto live = owner->live_associations_.find(live_token);
++          if (live != owner->live_associations_.end() && live->second->tab) {
++            owner->OnLiveTabDidInsert(live_token, live->second->tab);
++          }
++        }
++      },
++      service, *token));
++  auto browser_is_in_space = [&](const base::WeakPtr<Browser>& candidate,
++                                 const std::string& space_id) {
++    return service && candidate &&
++           service->IsEligibleBrowser(candidate.get()) &&
++           !candidate->IsAttemptingToCloseBrowser() &&
++           service->GetExplicitSpaceIdForBrowser(candidate.get()) == space_id &&
++           candidate->tab_strip_model()->Root();
++  };
++  auto find_browser = [&](const std::string& space_id) {
++    base::WeakPtr<Browser> result;
++    if (!service) {
++      return result;
++    }
++    ProfileBrowserCollection::GetForProfile(service->profile_)
++        ->ForEach(
++            [&](BrowserWindowInterface* window) {
++              Browser* candidate = window->GetBrowserForMigrationOnly();
++              if (candidate &&
++                  browser_is_in_space(candidate->AsWeakPtr(), space_id)) {
++                result = candidate->AsWeakPtr();
++                return false;
++              }
++              return true;
++            },
++            BrowserCollection::Order::kActivation);
++    return result;
++  };
++  auto create_browser = [&](const std::string& space_id) {
++    base::WeakPtr<Browser> result;
++    if (!service || service->profile_->ShutdownStarted() ||
++        browser_shutdown::IsTryingToQuit() ||
++        browser_shutdown::HasShutdownStarted() ||
++        Browser::GetCreationStatusForProfile(service->profile_) !=
++            Browser::CreationStatus::kOk) {
++      return result;
++    }
++    Browser* created = nullptr;
++    if (service->pin_space_transfer_browser_factory_for_testing_) {
++      auto factory = service->pin_space_transfer_browser_factory_for_testing_;
++      created = factory.Run(space_id);
++    } else {
++      Browser::CreateParams params(Browser::TYPE_NORMAL, service->profile_,
++                                   true);
++      params.should_trigger_session_restore = false;
++      created = Browser::Create(params);
++    }
++    if (!service || !created || created == source_browser_weak.get() ||
++        !service->IsEligibleBrowser(created) ||
++        created->IsAttemptingToCloseBrowser()) {
++      return result;
++    }
++    if (service->profile_->ShutdownStarted() ||
++        browser_shutdown::IsTryingToQuit() ||
++        browser_shutdown::HasShutdownStarted() ||
++        Browser::GetCreationStatusForProfile(service->profile_) !=
++            Browser::CreationStatus::kOk) {
++      if (created->tab_strip_model()->empty()) {
++        created->window()->Close();
++      }
++      return result;
++    }
++    result = created->AsWeakPtr();
++    service->SetSpaceForBrowser(created, space_id);
++    return result;
++  };
++  base::WeakPtr<Browser> target_browser_weak = find_browser(target_id);
++  const bool created_target = !target_browser_weak;
++  if (created_target) {
++    target_browser_weak = create_browser(target_id);
++  }
++  if (!browser_is_in_space(source_browser_weak, source_id) ||
++      !browser_is_in_space(target_browser_weak, target_id) ||
++      source_browser_weak.get() == target_browser_weak.get() ||
++      !durable_model_is_unchanged()) {
++    if (created_target && target_browser_weak &&
++        target_browser_weak->tab_strip_model()->empty()) {
++      target_browser_weak->window()->Close();
++    }
++    return false;
++  }
++  source_model = source_browser_weak->tab_strip_model();
++  TabStripModel* target_model = target_browser_weak->tab_strip_model();
++  const PinTransferSelection target_selection(target_model);
++  const bool target_was_empty = target_model->empty();
++  // Declare cleanup before the guards so close deferral has already unwound
++  // when an unused newly created destination is closed.
++  base::ScopedClosureRunner cleanup_created_target(base::BindOnce(
++      [](base::WeakPtr<Browser> target, bool was_created) {
++        if (was_created && target && target->tab_strip_model()->empty()) {
++          target->window()->Close();
++        }
++      },
++      target_browser_weak, created_target));
++  ScopedTabStripEmptyCloseDeferral source_close_deferral(
++      service.get(), source_browser_weak.get());
++  ScopedTabStripEmptyCloseDeferral target_close_deferral(
++      service.get(), target_browser_weak.get());
++  std::unique_ptr<tabs::TabModel> detached;
++  base::ScopedClosureRunner retire_unplaced_pin(base::BindOnce(
++      [](std::unique_ptr<tabs::TabModel>* detached_tab,
++         base::WeakPtr<HeliumSpaceService> owner, uint64_t live_token,
++         std::string owner_space_id) {
++        if (*detached_tab && owner) {
++          owner->lifecycle_.BeginClose(live_token);
++          owner->EraseLiveAssociation(live_token);
++          owner->lifecycle_.CompleteClose(live_token);
++          owner->NotifyItemsChanged(
++              PersistentItemChange::Space(std::move(owner_space_id)));
++        }
++      },
++      base::Unretained(&detached), service, *token, source_id));
++
++  auto rollback = [&]() {
++    tabs::TabInterface* current_tab = tab_handle.Get();
++    if (!service || !current_tab) {
++      return;
++    }
++    base::WeakPtr<Browser> rollback_browser = source_browser_weak;
++    if (!browser_is_in_space(rollback_browser, source_id)) {
++      // An explicit frame destruction is outside empty-strip close deferral.
++      // Keep the owned page in its original Space, without recreating content.
++      HeliumSpace* owner = service->GetSpaceById(source_id);
++      rollback_browser = find_browser(source_id);
++      if (!rollback_browser && owner) {
++        rollback_browser = create_browser(source_id);
++      }
++    }
++    if (!browser_is_in_space(rollback_browser, source_id)) {
++      // Profile teardown must not resurrect a frame. Destroy only the owned
++      // detached tab, after removing its borrowed association.
++      return;
++    }
++    TabStripModel* rollback_model = rollback_browser->tab_strip_model();
++    if (!detached) {
++      BrowserWindowInterface* current_window =
++          current_tab->GetBrowserWindowInterface();
++      TabStripModel* current_model =
++          current_window ? current_window->GetTabStripModel() : nullptr;
++      const int current_index = current_model
++                                    ? current_model->GetIndexOfTab(current_tab)
++                                    : TabStripModel::kNoTab;
++      if (!current_model || current_index == TabStripModel::kNoTab ||
++          current_tab->IsSplit() || current_tab->GetGroup()) {
++        return;
++      }
++      if (current_model != rollback_model) {
++        detached = current_model->DetachTabAtForInsertion(current_index);
++        if (!service || !rollback_browser) {
++          return;
++        }
++      }
++    }
++    if (detached) {
++      rollback_model->InsertDetachedTabAt(
++          original_tab_index, std::move(detached), AddTabTypes::ADD_NONE);
++    }
++    current_tab = tab_handle.Get();
++    if (!service || !rollback_browser || !current_tab ||
++        !rollback_browser->tab_strip_model()->Root() ||
++        rollback_browser->tab_strip_model()->GetIndexOfTab(current_tab) ==
++            TabStripModel::kNoTab) {
++      return;
++    }
++    auto* strip = static_cast<tabs::TabStripCollection*>(
++        const_cast<tabs::TabCollection*>(rollback_model->Root()));
++    tabs::TabCollection* parent = original_parent_handle.Get();
++    const tabs::TabCollection* ancestor = parent;
++    while (ancestor && ancestor != strip->pin_collection()) {
++      ancestor = ancestor->GetParentCollection();
++    }
++    if (!ancestor) {
++      parent = strip->pin_collection();
++    }
++    rollback_model->MoveTabToPinCollection(
++        current_tab, parent,
++        std::min(*original_parent_index, parent->ChildCount()));
++    if (!service || !rollback_browser) {
++      return;
++    }
++    source_selection.Restore(rollback_browser->tab_strip_model());
++    if (!service || !rollback_browser) {
++      return;
++    }
++    if (target_browser_weak && !target_was_empty) {
++      target_selection.Restore(target_browser_weak->tab_strip_model());
++    }
++    target_close_deferral.CancelPendingClose();
++    if (service && rollback_browser.get() != source_browser_weak.get()) {
++      service->NotifyItemsChanged(PersistentItemChange::Space(source_id));
++    }
++    if (!source_browser_weak && follows_sole_page && rollback_browser) {
++      rollback_browser->window()->Show();
++    }
++  };
++  auto live_placement_is_valid = [&](bool require_destination = false) {
++    if (!browser_is_in_space(source_browser_weak, source_id) ||
++        !browser_is_in_space(target_browser_weak, target_id) ||
++        !durable_model_is_unchanged()) {
++      return false;
++    }
++    tabs::TabInterface* current_tab = tab_handle.Get();
++    const auto current_association = service->live_associations_.find(*token);
++    if (require_destination) {
++      BrowserWindowInterface* window =
++          current_tab ? current_tab->GetBrowserWindowInterface() : nullptr;
++      if (!window ||
++          window->GetBrowserForMigrationOnly() != target_browser_weak.get() ||
++          window->GetTabStripModel() !=
++              target_browser_weak->tab_strip_model() ||
++          target_browser_weak->tab_strip_model()->GetIndexOfTab(current_tab) ==
++              TabStripModel::kNoTab) {
++        return false;
++      }
++    }
++    return current_tab && current_tab->GetProfile() == service->profile_ &&
++           !current_tab->IsSplit() && !current_tab->GetGroup() &&
++           current_association != service->live_associations_.end() &&
++           current_association->second->tab == current_tab &&
++           current_association->second->key == old_key &&
++           current_association->second->kind == PersistentRecordKind::kPin &&
++           current_association->second->space_id == source_id &&
++           current_association->second->item_id == item_id &&
++           service->FindLiveAssociation(current_tab) ==
++               current_association->second.get() &&
++           service->lifecycle_.GetState(old_key) ==
++               PersistentItemLifecycle::State::kLive &&
++           !service->lifecycle_.GetState(new_key);
++  };
++
++  if (!live_placement_is_valid() || !tab_handle.Get() ||
++      source_model->GetIndexOfTab(tab_handle.Get()) != original_tab_index ||
++      !service->IsLiveTabInExpectedCollection(PersistentRecordKind::kPin,
++                                              tab_handle.Get())) {
++    return false;
++  }
++  detached = source_model->DetachTabAtForInsertion(original_tab_index);
++  if (service && service->pin_space_transfer_hook_for_testing_) {
++    auto hook = service->pin_space_transfer_hook_for_testing_;
++    hook.Run(PinSpaceTransferPhaseForTesting::kAfterDetach);
++  }
++  if (!detached || !live_placement_is_valid()) {
++    rollback();
++    return false;
++  }
++  target_model->InsertDetachedTabAt(target_model->count(), std::move(detached),
++                                    AddTabTypes::ADD_NONE);
++  if (!live_placement_is_valid(/*require_destination=*/true) ||
++      target_browser_weak->tab_strip_model()->GetIndexOfTab(tab_handle.Get()) ==
++          TabStripModel::kNoTab) {
++    rollback();
++    return false;
++  }
++  service->MoveLiveTabToPersistentRegion(PersistentRecordKind::kPin,
++                                         tab_handle.Get());
++  if (service && service->pin_space_transfer_hook_for_testing_) {
++    auto hook = service->pin_space_transfer_hook_for_testing_;
++    hook.Run(PinSpaceTransferPhaseForTesting::kAfterPlacement);
++  }
++  if (!live_placement_is_valid(/*require_destination=*/true) ||
++      !service->IsLiveTabInExpectedCollection(PersistentRecordKind::kPin,
++                                              tab_handle.Get())) {
++    rollback();
++    return false;
++  }
++  // Anchored-home changes can synchronously close a tab or shut down its
++  // service through TabUIChange callbacks. Keep the old qualified identity
++  // until that notification has returned and placement is still valid.
++  service->SeedAnchoredHome(tab_handle.Get(), *link);
++  if (!live_placement_is_valid(/*require_destination=*/true) ||
++      !service->IsLiveTabInExpectedCollection(PersistentRecordKind::kPin,
++                                              tab_handle.Get())) {
++    rollback();
++    return false;
++  }
++  if (follows_sole_page) {
++    // Follow the transferred page before the source's deferred close is
++    // released. Other moves preserve the destination's selected tab.
++    const int index =
++        target_browser_weak->tab_strip_model()->GetIndexOfTab(tab_handle.Get());
++    target_browser_weak->tab_strip_model()->ActivateTabAt(index);
++    if (!live_placement_is_valid(/*require_destination=*/true)) {
++      rollback();
++      return false;
++    }
++  }
++  if (!service->lifecycle_.Rekey(old_key, new_key)) {
++    rollback();
++    return false;
++  }
++  LiveAssociation* moved = service->FindLiveAssociation(tab_handle.Get());
++  moved->key = new_key;
++  moved->space_id = target_id;
++  if (SessionService* sessions =
++          SessionServiceFactory::GetForProfile(service->profile_)) {
++    sessions->AddTabExtraData(
++        target_browser_weak->session_id(),
++        sessions::SessionTabHelper::IdForTab(tab_handle.Get()->GetContents()),
++        kHeliumPersistentItemTabExtraDataKey, new_key);
++  }
++  commit_durable_move();
++  cleanup_created_target.Release();
++  if (follows_sole_page && service && target_browser_weak) {
++    service->SetActiveSpace(target_id);
++    if (service && target_browser_weak && tab_handle.Get()) {
++      target_browser_weak->window()->Show();
++      if (service && target_browser_weak && tab_handle.Get()) {
++        target_browser_weak->window()->Activate();
++      }
++    }
++  }
 +  return true;
++}
++
++void HeliumSpaceService::SetPinSpaceTransferHookForTesting(
++    base::RepeatingCallback<void(PinSpaceTransferPhaseForTesting)> hook) {
++  pin_space_transfer_hook_for_testing_ = std::move(hook);
++}
++
++void HeliumSpaceService::SetPinSpaceTransferBrowserFactoryForTesting(
++    base::RepeatingCallback<Browser*(std::string_view)> factory) {
++  pin_space_transfer_browser_factory_for_testing_ = std::move(factory);
 +}
 +
 +bool HeliumSpaceService::MovePinInSpace(Browser* browser,
@@ -2720,13 +3370,20 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  if (!IsEligibleBrowser(browser) || source_space_id.empty()) {
 +    return false;
 +  }
-+  HeliumSpace* space = GetSpaceById(source_space_id);
-+  if (!space || GetSpaceIdForBrowser(browser) != source_space_id ||
++  const std::string space_id(source_space_id);
++  const base::WeakPtr<HeliumSpaceService> service = weak_factory_.GetWeakPtr();
++  HeliumSpace* space = GetSpaceById(space_id);
++  const std::string key =
++      ItemKeyForSpace(PersistentRecordKind::kPin, space_id, id);
++  const auto token = lifecycle_.GetLiveTab(key);
++  if (!space || !CanRelocatePinNodeInSpace(space_id, id) ||
++      (token && live_pin_space_transfers_.contains(*token)) ||
 +      !space->MovePin(id, parent_id, before_id)) {
 +    return false;
 +  }
-+  NotifyItemsChanged(PersistentItemChange::Space(
-+      std::string(source_space_id)));
++  if (service) {
++    service->NotifyItemsChanged(PersistentItemChange::Space(space_id));
++  }
 +  return true;
 +}
 +
@@ -2814,7 +3471,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  const std::optional<PersistentLink> link =
 +      ResolvePinInSpace(source_space_id, id);
 +  TabStripModel* model = browser->tab_strip_model();
-+  if (!space || !link || !model || !model->Root()) {
++  if (!space || !link || !model || !model->Root() ||
++      !CanRelocatePinNodeInSpace(source_space_id, id)) {
 +    return false;
 +  }
 +  const auto* strip =
@@ -3133,6 +3791,25 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  return true;
 +}
 +
++bool HeliumSpaceService::TogglePinFolderCollapsedInSpace(
++    Browser* context_browser,
++    std::string_view source_space_id,
++    std::string_view folder_id) {
++  if (!IsEligibleBrowser(context_browser) || source_space_id.empty()) {
++    return false;
++  }
++  const std::string space_id(source_space_id);
++  const base::WeakPtr<HeliumSpaceService> service = weak_factory_.GetWeakPtr();
++  HeliumSpace* space = GetSpaceById(space_id);
++  if (!space || !space->ToggleFolderCollapsed(folder_id)) {
++    return false;
++  }
++  if (service) {
++    service->NotifyItemsChanged(PersistentItemChange::Space(space_id));
++  }
++  return true;
++}
++
 +bool HeliumSpaceService::ReplacePersistentItemHome(tabs::TabInterface* tab) {
 +  if (!tab || !tab->GetContents()) {
 +    return false;
@@ -3180,12 +3857,19 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +bool HeliumSpaceService::RemovePersistentItem(Browser* browser,
 +                                              PersistentRecordKind kind,
 +                                              std::string_view id) {
++  if (kind == PersistentRecordKind::kPin) {
++    return RemovePersistentItemInSpace(browser, GetSpaceIdForBrowser(browser),
++                                       id);
++  }
 +  std::optional<PersistentLink> item = ResolveItem(browser, kind, id);
 +  if (!item) {
 +    return false;
 +  }
 +  const std::string key = ItemKey(browser, kind, id);
 +  tabs::TabInterface* live_tab = GetLiveTabForPersistentItem(browser, kind, id);
++  if (live_tab && (live_tab->IsSplit() || live_tab->GetGroup())) {
++    return false;
++  }
 +  bool removed = false;
 +  if (kind == PersistentRecordKind::kFavorite) {
 +    removed = RemoveFavoriteRecord(browser, id);
@@ -3204,6 +3888,74 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
 +      FROM_HERE, base::BindOnce(&HeliumSpaceService::NotifyItemsChanged,
 +                                weak_factory_.GetWeakPtr(), std::move(change)));
++  return true;
++}
++
++bool HeliumSpaceService::RemovePersistentItemInSpace(
++    Browser* context_browser,
++    std::string_view source_space_id,
++    std::string_view id) {
++  if (!IsEligibleBrowser(context_browser) || source_space_id.empty() ||
++      id.empty()) {
++    return false;
++  }
++  const std::string space_id(source_space_id);
++  const std::string item_id(id);
++  HeliumSpace* space = GetSpaceById(space_id);
++  if (!space || !ResolvePinInSpace(space_id, item_id) ||
++      !CanRelocatePinNodeInSpace(space_id, item_id)) {
++    return false;
++  }
++  const std::string key =
++      ItemKeyForSpace(PersistentRecordKind::kPin, space_id, item_id);
++  const auto state = lifecycle_.GetState(key);
++  if (state && (*state == PersistentItemLifecycle::State::kMaterializing ||
++                *state == PersistentItemLifecycle::State::kClosing)) {
++    return false;
++  }
++  const auto token = lifecycle_.GetLiveTab(key);
++  std::optional<tabs::TabHandle> live_tab_handle;
++  if (token) {
++    const auto association = live_associations_.find(*token);
++    if (live_pin_space_transfers_.contains(*token) ||
++        association == live_associations_.end() ||
++        association->second->key != key ||
++        association->second->space_id != space_id ||
++        !association->second->tab) {
++      return false;
++    }
++    tabs::TabInterface* live_tab = association->second->tab;
++    BrowserWindowInterface* window = live_tab->GetBrowserWindowInterface();
++    Browser* owner = window ? window->GetBrowserForMigrationOnly() : nullptr;
++    if (!IsEligibleBrowser(owner) ||
++        GetExplicitSpaceIdForBrowser(owner) != space_id ||
++        !IsLiveTabInExpectedCollection(PersistentRecordKind::kPin, live_tab)) {
++      return false;
++    }
++    live_tab_handle = live_tab->GetHandle();
++  }
++  const base::WeakPtr<HeliumSpaceService> service = weak_factory_.GetWeakPtr();
++  if (!space->RemovePin(item_id)) {
++    return false;
++  }
++  if (!service) {
++    return true;
++  }
++  service->DisassociateLiveTab(live_tab_handle ? live_tab_handle->Get()
++                                               : nullptr);
++  if (!service) {
++    return true;
++  }
++  service->lifecycle_.Forget(key);
++  service->RegisterDormantItems();
++  if (!service) {
++    return true;
++  }
++  // Menus can own the row being removed. Publish after their callbacks unwind.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(&HeliumSpaceService::NotifyItemsChanged, service,
++                     PersistentItemChange::Space(space_id)));
 +  return true;
 +}
 +
@@ -3269,13 +4021,26 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    return;
 +  }
 +  const uint64_t token = association->token;
++  const std::string key = association->key;
++  const tabs::TabHandle tab_handle = tab->GetHandle();
++  const base::WeakPtr<HeliumSpaceService> service = weak_factory_.GetWeakPtr();
 +  if (TabUIHelper* helper = TabUIHelper::From(tab)) {
 +    helper->ClearAnchoredPinnedTabHome();
++  }
++  if (!service) {
++    return;
++  }
++  tab = tab_handle.Get();
++  association = service->FindLiveAssociation(tab);
++  if (!tab || !association || association->token != token ||
++      association->key != key) {
++    // Deletion observers or a reentrant owner mutation completed this work.
++    return;
 +  }
 +  BrowserWindowInterface* window = tab->GetBrowserWindowInterface();
 +  TabStripModel* model = window ? window->GetTabStripModel() : nullptr;
 +  if (SessionService* sessions =
-+          SessionServiceFactory::GetForProfile(profile_)) {
++          SessionServiceFactory::GetForProfile(service->profile_)) {
 +    if (window) {
 +      sessions->AddTabExtraData(
 +          window->GetSessionID(),
@@ -3283,9 +4048,9 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +          kHeliumPersistentItemTabExtraDataKey, std::string());
 +    }
 +  }
-+  lifecycle_.BeginClose(token);
-+  EraseLiveAssociation(token);
-+  lifecycle_.CompleteClose(token);
++  service->lifecycle_.BeginClose(token);
++  service->EraseLiveAssociation(token);
++  service->lifecycle_.CompleteClose(token);
 +  if (!model) {
 +    return;
 +  }
@@ -3575,8 +4340,8 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  }
 +  NotifyItemsChanged(PersistentItemChange::Favorites());
 +  return true;
- }
- 
++}
++
  void HeliumSpaceService::SetSpaceForBrowser(Browser* browser,
                                              std::string_view id) {
 -  if (!browser || browser->profile() != profile_ ||
@@ -3607,7 +4372,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      return false;
    }
    SetSpaceForBrowser(browser, found->second);
-@@ -158,22 +2479,48 @@ void HeliumSpaceService::AddSpaceToSessi
+@@ -158,22 +3239,48 @@ void HeliumSpaceService::AddSpaceToSessi
    if (!extra_data) {
      return;
    }
@@ -3664,7 +4429,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
  std::vector<HeliumSpace*> HeliumSpaceService::GetSpaces() {
    EnsureDefaultSpace();
    std::vector<HeliumSpace*> result;
-@@ -186,33 +2533,77 @@ std::vector<HeliumSpace*> HeliumSpaceSer
+@@ -186,33 +3293,78 @@ std::vector<HeliumSpace*> HeliumSpaceSer
  
  void HeliumSpaceService::OnBrowserCreated(BrowserWindowInterface* window) {
    Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
@@ -3709,6 +4474,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 -    SetActiveSpace(space_id);
 +  if (window && window->GetProfile() == profile_) {
 +    session_space_ids_.erase(window->GetSessionID());
++    empty_tab_strip_close_deferrals_.erase(window->GetSessionID());
    }
  }
  
@@ -3760,10 +4526,11 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/helium_space_service.h
 +++ src/chrome/browser/ui/helium/helium_space_service.h
-@@ -5,47 +5,259 @@
+@@ -5,47 +5,302 @@
  #ifndef CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_SERVICE_H_
  #define CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_SERVICE_H_
  
++#include <cstddef>
 +#include <cstdint>
  #include <map>
  #include <memory>
@@ -3840,6 +4607,11 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +  kAfterPlacement,
 +};
 +
++enum class PinSpaceTransferPhaseForTesting {
++  kAfterDetach,
++  kAfterPlacement,
++};
++
 +enum class PersistentItemChangeScope {
 +  kFavorites,
 +  kSpace,
@@ -3890,6 +4662,29 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +                           public BrowserCollectionObserver,
 +                           public TabStripModelObserver {
   public:
++
++  // A Pin transfer retains its original frame until adoption commits or rolls
++  // back. Guards nest within this profile and never defer an explicit close.
++  class ScopedTabStripEmptyCloseDeferral final {
++   public:
++    ScopedTabStripEmptyCloseDeferral(HeliumSpaceService* service,
++                                     Browser* browser);
++    ScopedTabStripEmptyCloseDeferral(const ScopedTabStripEmptyCloseDeferral&) =
++        delete;
++    ScopedTabStripEmptyCloseDeferral& operator=(
++        const ScopedTabStripEmptyCloseDeferral&) = delete;
++    ~ScopedTabStripEmptyCloseDeferral();
++    void CancelPendingClose();
++
++   private:
++    base::WeakPtr<HeliumSpaceService> service_;
++    SessionID browser_session_id_;
++  };
++
++  // Called only at Browser's empty-strip close boundary. This lookup never
++  // creates a service for ordinary tab closure.
++  static bool ShouldDeferEmptyTabStripClose(Browser* browser);
++
    explicit HeliumSpaceService(Profile* profile);
    HeliumSpaceService(const HeliumSpaceService&) = delete;
    HeliumSpaceService& operator=(const HeliumSpaceService&) = delete;
@@ -3939,6 +4734,11 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +  bool RemovePersistentItem(Browser* browser,
 +                            PersistentRecordKind kind,
 +                            std::string_view id);
++  // Removes an explicitly qualified Pin without creating its owning window.
++  // A live instance becomes an ordinary tab and retains its page state.
++  bool RemovePersistentItemInSpace(Browser* context_browser,
++                                   std::string_view source_space_id,
++                                   std::string_view id);
 +  bool IsPersistentItemTab(const tabs::TabInterface* tab) const;
 +  void SetPersistentItemDragInProgress(tabs::TabInterface* tab,
 +                                       bool in_progress);
@@ -3959,7 +4759,9 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +                              PersistentRecordKind kind,
 +                              std::string_view id) const;
 +  // These operations retain the durable item while changing only its live
-+  // instance or owning Space.
++  // instance or owning Space. A live cross-Space move adopts the existing tab
++  // and WebContents into the destination's primary window. A dormant move
++  // changes only durable ownership and never creates a tab or window.
 +  bool ClosePersistentItemInstance(Browser* browser,
 +                                   PersistentRecordKind kind,
 +                                   std::string_view id,
@@ -3972,6 +4774,10 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +                      std::string_view id,
 +                      std::string_view source_space_id,
 +                      std::string_view target_space_id);
++  void SetPinSpaceTransferHookForTesting(
++      base::RepeatingCallback<void(PinSpaceTransferPhaseForTesting)> hook);
++  void SetPinSpaceTransferBrowserFactoryForTesting(
++      base::RepeatingCallback<Browser*(std::string_view)> factory);
 +  // Atomically moves a Pin tree node within an explicitly qualified Space.
 +  // Empty parent and before ids mean the root and end of that parent,
 +  // respectively. PersistentItemCodec validates every non-empty reference,
@@ -4010,6 +4816,9 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +  bool ToggleFolderCollapsed(Browser* browser,
 +                             PersistentRecordKind kind,
 +                             std::string_view folder_id);
++  bool TogglePinFolderCollapsedInSpace(Browser* context_browser,
++                                       std::string_view source_space_id,
++                                       std::string_view folder_id);
 +
 +  base::CallbackListSubscription RegisterItemsChanged(
 +      base::RepeatingCallback<void(const PersistentItemChange&)> callback);
@@ -4025,7 +4834,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
    void SetSpaceForBrowser(Browser* browser, std::string_view id);
    bool RestoreSpaceForBrowserFromSession(
        Browser* browser,
-@@ -53,24 +265,111 @@ class HeliumSpaceService : public KeyedS
+@@ -53,24 +308,130 @@ class HeliumSpaceService : public KeyedS
    void AddSpaceToSessionExtraData(
        Browser* browser,
        std::map<std::string, std::string>* extra_data) const;
@@ -4050,6 +4859,12 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
   private:
 +  struct LiveAssociation;
 +
++  struct EmptyTabStripCloseDeferral {
++    base::WeakPtr<Browser> browser;
++    size_t depth = 0;
++    bool pending_close = false;
++  };
++
 +  struct UsageEntry {
 +    int count = 0;
 +    base::Time last_used;
@@ -4069,6 +4884,10 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +                                            std::string_view id) const;
 +  std::optional<PersistentLink> ResolvePinInSpace(std::string_view space_id,
 +                                                  std::string_view id) const;
++  // Single-member collection moves cannot preserve an existing saved Split or
++  // group. Folders also check every live descendant before their tree moves.
++  bool CanRelocatePinNodeInSpace(std::string_view space_id,
++                                 std::string_view id) const;
 +  HeliumSpace* ResolvePinOwner(Browser* browser, std::string_view id) const;
 +  std::string ItemKeyForSpace(PersistentRecordKind kind,
 +                              std::string_view space_id,
@@ -4129,7 +4948,16 @@ Index: src/chrome/browser/ui/helium/helium_space_service.h
 +  std::set<tabs::TabInterface*> persistent_item_drags_;
 +  base::RepeatingCallback<void(PinToTabConversionPhaseForTesting)>
 +      pin_to_tab_conversion_hook_for_testing_;
++  // Native adoption emits insertion callbacks before durable ownership can be
++  // committed. This guard preserves the live token through that transaction.
++  std::set<uint64_t> live_pin_space_transfers_;
++  base::RepeatingCallback<void(PinSpaceTransferPhaseForTesting)>
++      pin_space_transfer_hook_for_testing_;
++  base::RepeatingCallback<Browser*(std::string_view)>
++      pin_space_transfer_browser_factory_for_testing_;
 +  std::map<SessionID, std::string> session_space_ids_;
++  std::map<SessionID, EmptyTabStripCloseDeferral>
++      empty_tab_strip_close_deferrals_;
 +  base::RepeatingCallbackList<void(const PersistentItemChange&)>
 +      items_changed_callbacks_;
    base::ScopedObservation<ProfileBrowserCollection, BrowserCollectionObserver>
@@ -4439,7 +5267,82 @@ Index: src/chrome/browser/ui/tab_ui_helper.cc
  
  #include "base/byte_size.h"
  #include "base/callback_list.h"
-@@ -272,6 +273,31 @@ GURL TabUIHelper::GetLastCommittedURL()
+@@ -12,6 +13,7 @@
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_forward.h"
++#include "base/memory/ref_counted.h"
+ #include "base/process/kill.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/favicon/favicon_utils.h"
+@@ -84,8 +86,22 @@ bool ShouldShowAppIcon(web_app::WebAppBr
+ 
+ DEFINE_USER_DATA(TabUIHelper);
+ 
++// A UI callback may destroy its tab and this helper. Notification retains the
++// callback list, while owner_alive suppresses later observers after deletion.
++class TabUIHelper::TabUIChangeCallbacks
++    : public base::RefCounted<TabUIHelper::TabUIChangeCallbacks> {
++ public:
++  base::RepeatingClosureList callbacks;
++  bool owner_alive = true;
++
++ private:
++  friend class base::RefCounted<TabUIChangeCallbacks>;
++  ~TabUIChangeCallbacks() = default;
++};
++
+ TabUIHelper::TabUIHelper(tabs::TabInterface& tab_interface)
+     : ContentsObservingTabFeature(tab_interface),
++      tab_ui_change_callbacks_(base::MakeRefCounted<TabUIChangeCallbacks>()),
+       scoped_unowned_user_data_(tab_interface.GetUnownedUserDataHost(), *this) {
+   // Register for tab pin state change because pin state affects whether the
+   // favicon should show or not.
+@@ -93,7 +109,9 @@ TabUIHelper::TabUIHelper(tabs::TabInterf
+       &TabUIHelper::OnTabPinnedStatusChange, base::Unretained(this)));
+ }
+ 
+-TabUIHelper::~TabUIHelper() = default;
++TabUIHelper::~TabUIHelper() {
++  tab_ui_change_callbacks_->owner_alive = false;
++}
+ 
+ // static
+ const TabUIHelper* TabUIHelper::From(const tabs::TabInterface* tab) {
+@@ -107,7 +125,22 @@ TabUIHelper* TabUIHelper::From(tabs::Tab
+ 
+ base::CallbackListSubscription TabUIHelper::AddTabUIChangeCallback(
+     base::RepeatingClosure callback) {
+-  return tab_ui_change_callbacks_.Add(std::move(callback));
++  return tab_ui_change_callbacks_->callbacks.Add(base::BindRepeating(
++      [](TabUIChangeCallbacks* callbacks,
++         const base::RepeatingClosure& callback) {
++        if (callbacks->owner_alive) {
++          callback.Run();
++        }
++      },
++      base::Unretained(tab_ui_change_callbacks_.get()), std::move(callback)));
++}
++
++void TabUIHelper::NotifyTabUIChangeCallbacks() {
++  // A callback may release the helper's owning reference. Retain only this
++  // notification state, and never access the helper after invoking observers.
++  const scoped_refptr<TabUIChangeCallbacks> callbacks =
++      tab_ui_change_callbacks_;
++  callbacks->callbacks.Notify();
+ }
+ 
+ std::u16string TabUIHelper::GetTitle() const {
+@@ -225,7 +258,7 @@ void TabUIHelper::SetWasActiveAtLeastOnc
+   const bool was_hiding_throbber = ShouldHideThrobber();
+   was_active_at_least_once_ = true;
+   if (was_hiding_throbber != ShouldHideThrobber()) {
+-    tab_ui_change_callbacks_.Notify();
++    NotifyTabUIChangeCallbacks();
+   }
+ }
+ 
+@@ -272,8 +305,33 @@ GURL TabUIHelper::GetLastCommittedURL()
    return tab().GetContents()->GetLastCommittedURL();
  }
  
@@ -4456,7 +5359,7 @@ Index: src/chrome/browser/ui/tab_ui_helper.cc
 +
 +  anchored_pinned_tab_home_url_ = std::move(url);
 +  anchored_pinned_tab_home_title_ = std::move(title);
-+  tab_ui_change_callbacks_.Notify();
++  NotifyTabUIChangeCallbacks();
 +}
 +
 +void TabUIHelper::ClearAnchoredPinnedTabHome() {
@@ -4466,16 +5369,85 @@ Index: src/chrome/browser/ui/tab_ui_helper.cc
 +
 +  anchored_pinned_tab_home_url_ = GURL();
 +  anchored_pinned_tab_home_title_.clear();
-+  tab_ui_change_callbacks_.Notify();
++  NotifyTabUIChangeCallbacks();
 +}
  void TabUIHelper::TitleWasSet(content::NavigationEntry* entry) {
-   tab_ui_change_callbacks_.Notify();
+-  tab_ui_change_callbacks_.Notify();
++  NotifyTabUIChangeCallbacks();
+ }
+ 
+ void TabUIHelper::DidStopLoading() {
+@@ -294,21 +352,21 @@ void TabUIHelper::OnVisibilityChanged(co
+ void TabUIHelper::WasDiscarded() {
+   // Notify observers that the tab should update its UI to show discard status.
+   if (ShouldShowDiscardStatus()) {
+-    tab_ui_change_callbacks_.Notify();
++    NotifyTabUIChangeCallbacks();
+   }
+ }
+ 
+ void TabUIHelper::DidFinishNavigation(
+     content::NavigationHandle* navigation_handle) {
+   // Navigation committed so the visible URL might have changed.
+-  tab_ui_change_callbacks_.Notify();
++  NotifyTabUIChangeCallbacks();
+ }
+ 
+ void TabUIHelper::PrimaryMainFrameRenderProcessGone(
+     base::TerminationStatus status) {
+   // The tab's main frame was crashed so observers should be notified.
+   if (IsCrashed()) {
+-    tab_ui_change_callbacks_.Notify();
++    NotifyTabUIChangeCallbacks();
+   }
+ }
+ 
+@@ -326,7 +384,7 @@ void TabUIHelper::SetCreatedBySessionRes
+   const bool was_hiding_throbber = ShouldHideThrobber();
+   created_by_session_restore_ = created_by_session_restore;
+   if (was_hiding_throbber != ShouldHideThrobber()) {
+-    tab_ui_change_callbacks_.Notify();
++    NotifyTabUIChangeCallbacks();
+   }
+ }
+ 
+@@ -336,7 +394,7 @@ void TabUIHelper::SetNeedsAttention(bool
+   }
+ 
+   needs_attention_ = needs_attention;
+-  tab_ui_change_callbacks_.Notify();
++  NotifyTabUIChangeCallbacks();
+ }
+ 
+ bool TabUIHelper::IsDiscarded() {
+@@ -378,12 +436,12 @@ tabs::TabNetworkState TabUIHelper::GetTa
+ void TabUIHelper::NotifyTabUIChanged(base::PassKey<Browser> pass_key) {
+   // Notify subscribers because data might have updated since the browser is
+   // batching updates.
+-  tab_ui_change_callbacks_.Notify();
++  NotifyTabUIChangeCallbacks();
+ }
+ #endif
+ 
+ void TabUIHelper::OnTabPinnedStatusChange(tabs::TabInterface* tab_interface,
+                                           bool new_pinned_state) {
+   CHECK_EQ(&tab(), tab_interface);
+-  tab_ui_change_callbacks_.Notify();
++  NotifyTabUIChangeCallbacks();
  }
 Index: src/chrome/browser/ui/tab_ui_helper.h
 ===================================================================
 --- src.orig/chrome/browser/ui/tab_ui_helper.h
 +++ src/chrome/browser/ui/tab_ui_helper.h
-@@ -83,6 +83,16 @@ class TabUIHelper : public tabs::Content
+@@ -12,6 +12,7 @@
+ #include "base/byte_size.h"
+ #include "base/callback_list.h"
+ #include "base/functional/callback_forward.h"
++#include "base/memory/scoped_refptr.h"
+ #include "base/types/pass_key.h"
+ #include "chrome/browser/ui/tabs/contents_observing_tab_feature.h"
+ #include "components/tabs/public/tab_network_state.h"
+@@ -83,6 +84,16 @@ class TabUIHelper : public tabs::Content
  
    GURL GetLastCommittedURL();
  
@@ -4492,7 +5464,16 @@ Index: src/chrome/browser/ui/tab_ui_helper.h
    // tabs::ContentsObservingTabFeature override:
    void TitleWasSet(content::NavigationEntry* entry) override;
    void DidStopLoading() override;
-@@ -129,6 +139,9 @@ class TabUIHelper : public tabs::Content
+@@ -123,15 +134,21 @@ class TabUIHelper : public tabs::Content
+ #endif
+ 
+  private:
++  class TabUIChangeCallbacks;
++
++  void NotifyTabUIChangeCallbacks();
+   void OnTabPinnedStatusChange(tabs::TabInterface* tab_interface,
+                                bool new_pinned_state);
+ 
    bool was_active_at_least_once_ = false;
    bool created_by_session_restore_ = false;
    bool needs_attention_ = false;
@@ -4501,7 +5482,11 @@ Index: src/chrome/browser/ui/tab_ui_helper.h
 +
    base::CallbackListSubscription pin_tab_subscription_;
  
-   base::RepeatingClosureList tab_ui_change_callbacks_;
+-  base::RepeatingClosureList tab_ui_change_callbacks_;
++  scoped_refptr<TabUIChangeCallbacks> tab_ui_change_callbacks_;
+ 
+   ui::ScopedUnownedUserData<TabUIHelper> scoped_unowned_user_data_;
+ };
 Index: src/chrome/browser/ui/tabs/BUILD.gn
 ===================================================================
 --- src.orig/chrome/browser/ui/tabs/BUILD.gn
@@ -5355,7 +6340,16 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/tabs/tab_strip_model.cc
 +++ src/chrome/browser/ui/tabs/tab_strip_model.cc
-@@ -60,6 +60,8 @@
+@@ -36,6 +36,8 @@
+ #include "base/notimplemented.h"
+ #include "base/notreached.h"
+ #include "base/observer_list.h"
++#include "base/supports_user_data.h"
++#include "base/task/sequenced_task_runner.h"
+ #include "base/trace_event/common/trace_event_common.h"
+ #include "base/trace_event/trace_event.h"
+ #include "base/types/pass_key.h"
+@@ -60,6 +62,8 @@
  #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
  #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
@@ -5364,7 +6358,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_bubble.h"
  #include "chrome/browser/ui/tab_ui_helper.h"
  #include "chrome/browser/ui/tabs/features.h"
-@@ -102,6 +104,8 @@
+@@ -102,6 +106,8 @@
  #include "components/split_tabs/split_tab_visual_data.h"
  #include "components/tab_groups/tab_group_id.h"
  #include "components/tab_groups/tab_group_visual_data.h"
@@ -5373,7 +6367,70 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  #include "components/tabs/public/pinned_tab_collection.h"
  #include "components/tabs/public/split_tab_collection.h"
  #include "components/tabs/public/split_tab_data.h"
-@@ -1145,6 +1149,57 @@ int TabStripModel::MoveWebContentsAt(
+@@ -133,6 +139,62 @@ namespace {
+ 
+ TabGroupModelFactory* factory_instance = nullptr;
+ 
++const char kSavedSplitCompanionKey = 0;
++
++class SavedSplitCompanionData : public base::SupportsUserData::Data {};
++
++bool IsSavedSplitCompanion(const tabs::TabInterface* tab) {
++  return tab->GetContents()->GetUserData(&kSavedSplitCompanionKey) != nullptr;
++}
++
++void MarkSavedSplitCompanion(tabs::TabInterface* tab) {
++  tab->GetContents()->SetUserData(&kSavedSplitCompanionKey,
++                                  std::make_unique<SavedSplitCompanionData>());
++}
++
++void ClearSavedSplitCompanion(tabs::TabInterface* tab) {
++  tab->GetContents()->RemoveUserData(&kSavedSplitCompanionKey);
++}
++
++const tabs::TabCollection* GetSavedSplitParent(const tabs::TabInterface* tab) {
++  if (!tab || !helium::IsPersistentItemTab(tab)) {
++    return nullptr;
++  }
++  const tabs::TabCollection* parent = tab->GetParentCollection();
++  if (parent && parent->type() == tabs::TabCollection::Type::SPLIT) {
++    parent = parent->GetParentCollection();
++  }
++  if (parent && (parent->type() == tabs::TabCollection::Type::PIN ||
++                 parent->type() == tabs::TabCollection::Type::FOLDER ||
++                 parent->type() == tabs::TabCollection::Type::PINNED)) {
++    return parent;
++  }
++  return nullptr;
++}
++
++tabs::TabInterface* FindSavedSplitSource(
++    base::span<tabs::TabInterface* const> tabs) {
++  for (tabs::TabInterface* tab : tabs) {
++    if (GetSavedSplitParent(tab)) {
++      return tab;
++    }
++  }
++  return nullptr;
++}
++
++bool CanPreserveSavedSplitParent(base::span<tabs::TabInterface* const> tabs) {
++  tabs::TabInterface* saved_source = FindSavedSplitSource(tabs);
++  if (!saved_source) {
++    return true;
++  }
++  const tabs::TabCollection* parent = GetSavedSplitParent(saved_source);
++  return std::ranges::all_of(tabs, [parent](tabs::TabInterface* tab) {
++    return (!helium::IsPersistentItemTab(tab) &&
++            !helium::IsAnchoredPinnedTab(tab)) ||
++           tab->GetParentCollection() == parent;
++  });
++}
++
+ // Works similarly to base::AutoReset but checks for access from the wrong
+ // thread as well as ensuring that the previous value of the re-entrancy guard
+ // variable was false.
+@@ -1145,6 +1207,57 @@ int TabStripModel::MoveWebContentsAt(
    return to_position;
  }
  
@@ -5431,7 +6488,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  void TabStripModel::MoveSelectedTabsTo(
      int index,
      std::optional<tab_groups::TabGroupId> into_group) {
-@@ -1468,9 +1523,20 @@ void TabStripModel::SetTabBlocked(int in
+@@ -1468,9 +1581,20 @@ void TabStripModel::SetTabBlocked(int in
  }
  
  int TabStripModel::SetTabPinned(int index, bool pinned) {
@@ -5453,7 +6510,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
    if (IsTabPinned(index) == pinned) {
      return index;
    }
-@@ -1560,6 +1626,10 @@ int TabStripModel::IndexOfFirstNonPinned
+@@ -1560,6 +1684,10 @@ int TabStripModel::IndexOfFirstNonPinned
    return contents_data_->IndexOfFirstNonPinnedTab();
  }
  
@@ -5464,7 +6521,28 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  void TabStripModel::ExtendSelectionTo(int index) {
    CHECK(ContainsIndex(index));
    tabs::TabStripModelSelectionState new_model = selection_model_;
-@@ -2475,6 +2545,15 @@ bool TabStripModel::IsContextMenuCommand
+@@ -2034,8 +2162,6 @@ split_tabs::SplitTabId TabStripModel::Ad
+   CHECK(active_index() != kNoTab);
+   CHECK(active_index() != indices[0]);
+ 
+-  split_tabs::RecordSplitTabCreated(source, visual_data.split_layout());
+-
+   split_tabs::SplitTabId split_id = split_tabs::SplitTabId::GenerateNew();
+ 
+   // Insert the active index into the sorted `indices`.
+@@ -2044,7 +2170,10 @@ split_tabs::SplitTabId TabStripModel::Ad
+ 
+   AddToSplitImpl(split_id, indices, active_index(), visual_data,
+                  SplitTabChange::SplitTabAddReason::kNewSplitTabAdded);
+-  split_tabs::LogSplitViewCreatedUKM(this, split_id);
++  if (ContainsSplit(split_id)) {
++    split_tabs::RecordSplitTabCreated(source, visual_data.split_layout());
++    split_tabs::LogSplitViewCreatedUKM(this, split_id);
++  }
+   return split_id;
+ }
+ 
+@@ -2475,6 +2604,15 @@ bool TabStripModel::IsContextMenuCommand
      return false;
    }
  
@@ -5480,7 +6558,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
    switch (command_id) {
      case CommandNewTabToRight:
      case CommandCloseTab:
-@@ -2525,10 +2604,25 @@ bool TabStripModel::IsContextMenuCommand
+@@ -2525,10 +2663,25 @@ bool TabStripModel::IsContextMenuCommand
      }
  
      case CommandTogglePinned:
@@ -5508,22 +6586,53 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  
      case CommandSendTabToSelf:
        return true;
-@@ -2539,12 +2633,12 @@ bool TabStripModel::IsContextMenuCommand
+@@ -2539,12 +2692,42 @@ bool TabStripModel::IsContextMenuCommand
      case CommandAddToNewGroup:
      case CommandAddToNewGroupFromMenuItem:
      case CommandAddToExistingGroup:
 -      return SupportsTabGroups();
 +      return SupportsTabGroups() && !selection_contains_anchored_tab();
++
++    case CommandAddToSplit: {
++      if (GetActiveTab()->IsSplit()) {
++        return false;
++      }
++      if (!selection_contains_anchored_tab() &&
++          !GetSavedSplitParent(GetActiveTab())) {
++        return true;
++      }
++      std::vector<int> indices = GetIndicesForCommand(context_index);
++      std::erase(indices, active_index());
++      if (indices.size() > 1u) {
++        return false;
++      }
++      std::vector<tabs::TabInterface*> tabs = {GetActiveTab()};
++      for (int index : indices) {
++        tabs.push_back(GetTabAtIndex(index));
++      }
++      return FindSavedSplitSource(tabs) &&
++             std::ranges::none_of(
++                 tabs,
++                 [](tabs::TabInterface* tab) { return tab->IsSplit(); }) &&
++             CanPreserveSavedSplitParent(tabs);
++    }
  
-     case CommandAddToSplit:
+-    case CommandAddToSplit:
      case CommandSwapWithActiveSplit:
++      if (GetActiveTab()->IsSplit() &&
++          FindSavedSplitSource(
++              GetSplitData(GetActiveTab()->GetSplit().value())->ListTabs())) {
++        return false;
++      }
++      return !selection_contains_anchored_tab();
++
      case CommandArrangeSplit:
 -      return true;
 +      return !selection_contains_anchored_tab();
  
      case CommandRemoveFromGroup:
        return SupportsTabGroups();
-@@ -2734,7 +2828,64 @@ void TabStripModel::ExecuteContextMenuCo
+@@ -2734,7 +2917,64 @@ void TabStripModel::ExecuteContextMenuCo
        break;
      }
  
@@ -5588,7 +6697,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
        base::UmaHistogramCounts1000(
            "Tab.ContextMenu.TogglePinned.SelectedTabsCount",
            selection_model_.size());
-@@ -3470,13 +3621,13 @@ bool TabStripModel::ShouldRunUnloadListe
+@@ -3470,13 +3710,13 @@ bool TabStripModel::ShouldRunUnloadListe
  
  int TabStripModel::ConstrainInsertionIndex(int index, bool pinned_tab) const {
    return pinned_tab ? std::clamp(index, 0, IndexOfFirstNonPinnedTab())
@@ -5604,7 +6713,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  }
  
  std::vector<int> TabStripModel::GetIndicesForCommand(int index) const {
-@@ -3772,8 +3923,25 @@ tabs::TabInterface* TabStripModel::GetTa
+@@ -3772,8 +4012,25 @@ tabs::TabInterface* TabStripModel::GetTa
  void TabStripModel::CloseTabs(base::span<content::WebContents* const> items,
                                uint32_t close_types) {
    std::vector<content::WebContents*> filtered_items;
@@ -5630,6 +6739,246 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
      if (IsTabClosable(tab)) {
        filtered_items.push_back(contents);
      } else {
+@@ -4326,10 +4583,68 @@ split_tabs::SplitTabId TabStripModel::Ad
+     tabs.push_back(tab);
+   }
+ 
+-  // Add the tabs to a split with the active index.
+-  MoveTabsAndSetPropertiesImpl(indices, pivot_index,
+-                               GetTabGroupForTab(pivot_index),
+-                               IsTabPinned(pivot_index));
++  if (!CanPreserveSavedSplitParent(tabs)) {
++    return split_id;
++  }
++
++  if (tabs::TabInterface* saved_source = FindSavedSplitSource(tabs)) {
++    // A Pin's parent can be a folder. The generic move path only understands
++    // native pinning, groups and ordinary tabs, so move the companion instead
++    // of moving the saved source out of its collection.
++    tabs::TabCollection* parent =
++        GetSavedSplitParent(saved_source)->GetHandle().Get();
++    for (tabs::TabInterface* tab : tabs) {
++      if (tab == saved_source) {
++        continue;
++      }
++      if (!helium::IsPersistentItemTab(tab) &&
++          !helium::IsAnchoredPinnedTab(tab)) {
++        MarkSavedSplitCompanion(tab);
++      }
++      if (tab->GetParentCollection() == parent) {
++        continue;
++      }
++      if (parent->type() == tabs::TabCollection::Type::PINNED) {
++        const int initial_index = GetIndexOfTab(tab);
++        const int source_index = GetIndexOfTab(saved_source);
++        MoveTabToIndexImpl(initial_index,
++                           source_index + 1 - (initial_index < source_index),
++                           std::nullopt, true, false);
++      } else {
++        // The recursive move removes an emptied group and notifies its model.
++        // A direct Pin-parent move cannot perform that group cleanup.
++        if (tab->GetGroup()) {
++          const int grouped_index = GetIndexOfTab(tab);
++          MoveTabToIndexImpl(grouped_index, grouped_index, std::nullopt, false,
++                             false);
++        }
++        const int initial_index = GetIndexOfTab(tab);
++        const bool was_pinned = tab->IsPinned();
++        FixOpeners(initial_index);
++        TabStripSelectionChange selection(
++            GetActiveTab(), selection_model().GetListSelectionModel());
++        const int final_index = CompletePinCollectionMove(
++            tab, initial_index,
++            contents_data_->MoveTabToCollection(
++                tab, parent, parent->GetIndexOfTab(saved_source).value() + 1),
++            std::move(selection));
++        if (was_pinned != tab->IsPinned()) {
++          for (auto& observer : observers_) {
++            observer.OnTabPinnedStateChanged(tab, final_index);
++          }
++        }
++      }
++    }
++    std::ranges::sort(tabs,
++                      [this](tabs::TabInterface* a, tabs::TabInterface* b) {
++                        return GetIndexOfTab(a) < GetIndexOfTab(b);
++                      });
++  } else {
++    // Add the tabs to a split with the active index.
++    MoveTabsAndSetPropertiesImpl(indices, pivot_index,
++                                 GetTabGroupForTab(pivot_index),
++                                 IsTabPinned(pivot_index));
++  }
+ 
+   contents_data_->CreateSplit(split_id, tabs, visual_data);
+   selection_model_.InvalidateListSelectionModel(base::PassKey<TabStripModel>());
+@@ -4402,6 +4717,40 @@ void TabStripModel::RemoveSplitImpl(
+   }
+ 
+   NotifySplitTabRemoved(split_id, tabs_with_indices, reason);
++
++  for (const auto& [tab, index] : tabs_with_indices) {
++    if (!IsSavedSplitCompanion(tab)) {
++      continue;
++    }
++    // Unsplitting is often an intermediate step in a move, close or replace.
++    // Those operations still borrow indices, so relocate the companion after
++    // the operation has finished and resolve its current identity again.
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(
++            [](base::WeakPtr<TabStripModel> model, tabs::TabHandle handle) {
++              tabs::TabInterface* companion = handle.Get();
++              if (!model || !companion ||
++                  model->GetIndexOfTab(companion) == TabStripModel::kNoTab ||
++                  !IsSavedSplitCompanion(companion) || companion->IsSplit()) {
++                return;
++              }
++              if (helium::IsPersistentItemTab(companion) ||
++                  helium::IsAnchoredPinnedTab(companion)) {
++                ClearSavedSplitCompanion(companion);
++                return;
++              }
++              if (model->contents_data_->IsPinTab(companion)) {
++                model->MoveTabFromPin(companion);
++              } else if (companion->IsPinned()) {
++                model->SetTabPinned(model->GetIndexOfTab(companion), false);
++              }
++              if ((companion = handle.Get())) {
++                ClearSavedSplitCompanion(companion);
++              }
++            },
++            weak_factory_.GetWeakPtr(), tab->GetHandle()));
++  }
+ }
+ 
+ void TabStripModel::UpdateTabInSplitImpl(tabs::TabInterface* split_tab,
+@@ -4420,6 +4769,125 @@ void TabStripModel::UpdateTabInSplitImpl
+   CHECK(std::any_of(tabs_to_split.begin(), tabs_to_split.end(),
+                     [](tabs::TabInterface* t) { return t->IsActivated(); }));
+ 
++  tabs::TabInterface* update_tab = GetTabAtIndex(update_index);
++  if (FindSavedSplitSource(tabs_to_split) || GetSavedSplitParent(update_tab)) {
++    if (tabs_to_split.size() != 2u || update_tab->IsSplit() ||
++        (helium::IsAnchoredPinnedTab(update_tab) &&
++         !GetSavedSplitParent(update_tab))) {
++      return;
++    }
++    tabs::TabInterface* retained_tab =
++        tabs_to_split[0] == split_tab ? tabs_to_split[1] : tabs_to_split[0];
++    const bool source_on_left = tabs_to_split[0] == retained_tab;
++    const std::vector<tabs::TabInterface*> resulting_tabs = {retained_tab,
++                                                             update_tab};
++    tabs::TabInterface* saved_source = FindSavedSplitSource(resulting_tabs);
++    if (saved_source && helium::IsPersistentItemTab(retained_tab) &&
++        helium::IsPersistentItemTab(update_tab) &&
++        GetSavedSplitParent(retained_tab) != GetSavedSplitParent(update_tab)) {
++      // Two durable tabs with different parents cannot share a split without
++      // changing one of their saved locations.
++      return;
++    }
++
++    const bool outgoing_saved = helium::IsPersistentItemTab(split_tab);
++    const std::optional<tab_groups::TabGroupId> update_group =
++        update_tab->GetGroup();
++    const bool update_pinned = update_tab->IsPinned();
++    tabs::TabInterface* new_active_tab =
++        initial_split_active ? update_tab : retained_tab;
++
++    NotifyInactiveSplitTabWillBecomeHidden(split_id);
++    RemoveSplitImpl(split_id,
++                    SplitTabChange::SplitTabRemoveReason::kSplitTabUpdated);
++
++    if (!outgoing_saved && update_type == SplitUpdateType::kSwap) {
++      MoveTabToIndexImpl(GetIndexOfTab(split_tab), GetIndexOfTab(update_tab),
++                         update_group, update_pinned, false);
++      ClearSavedSplitCompanion(split_tab);
++    }
++
++    if (!saved_source) {
++      // Replacing the saved pane leaves its original tab at home. The remaining
++      // companion and incoming tab have no saved affinity and split as
++      // ordinary tabs.
++      for (tabs::TabInterface* tab : resulting_tabs) {
++        if (contents_data_->IsPinTab(tab)) {
++          const int initial_index = GetIndexOfTab(tab);
++          FixOpeners(initial_index);
++          TabStripSelectionChange selection(
++              GetActiveTab(), selection_model().GetListSelectionModel());
++          CompletePinCollectionMove(tab, initial_index,
++                                    contents_data_->MoveTabFromPin(tab),
++                                    std::move(selection));
++        } else if (tab->IsPinned()) {
++          SetTabPinnedImpl(GetIndexOfTab(tab), false);
++        }
++        ClearSavedSplitCompanion(tab);
++      }
++    } else if (saved_source == retained_tab) {
++      // Preserve which pane the source occupied when replacing its companion.
++      tabs::TabCollection* parent =
++          GetSavedSplitParent(saved_source)->GetHandle().Get();
++      if (parent->type() == tabs::TabCollection::Type::PINNED) {
++        const int initial_index = GetIndexOfTab(update_tab);
++        const int source_index = GetIndexOfTab(saved_source);
++        MoveTabToIndexImpl(initial_index,
++                           source_index + (source_on_left ? 1 : 0) -
++                               (initial_index < source_index),
++                           std::nullopt, true, false);
++      } else {
++        if (update_tab->GetGroup()) {
++          const int grouped_index = GetIndexOfTab(update_tab);
++          MoveTabToIndexImpl(grouped_index, grouped_index, std::nullopt, false,
++                             false);
++        }
++        const int initial_index = GetIndexOfTab(update_tab);
++        const bool was_pinned = update_tab->IsPinned();
++        FixOpeners(initial_index);
++        TabStripSelectionChange selection(
++            GetActiveTab(), selection_model().GetListSelectionModel());
++        const int final_index = CompletePinCollectionMove(
++            update_tab, initial_index,
++            contents_data_->MoveTabToCollection(
++                update_tab, parent,
++                parent->GetIndexOfTab(saved_source).value() +
++                    (source_on_left ? 1 : 0)),
++            std::move(selection));
++        if (was_pinned != update_tab->IsPinned()) {
++          for (auto& observer : observers_) {
++            observer.OnTabPinnedStateChanged(update_tab, final_index);
++          }
++        }
++      }
++    }
++
++    if (!outgoing_saved && update_type == SplitUpdateType::kReplace) {
++      CloseTabs({split_tab->GetContents()}, TabCloseTypes::CLOSE_USER_GESTURE);
++    }
++
++    tabs::TabStripModelSelectionState new_selection = selection_model_;
++    SetSelectedTab(new_selection, new_active_tab);
++    TabStripSelectionChange selection =
++        SetSelection(new_selection, TabStripModelObserver::CHANGE_REASON_NONE,
++                     /*triggered_by_other_operation=*/true);
++    if (selection.active_tab_changed() || selection.selection_changed()) {
++      TabStripModelChange change;
++      OnChange(change, selection);
++    }
++
++    std::vector<int> resulting_indices = {GetIndexOfTab(retained_tab),
++                                          GetIndexOfTab(update_tab)};
++    std::ranges::sort(resulting_indices);
++    AddToSplitImpl(split_id, resulting_indices, GetIndexOfTab(new_active_tab),
++                   split_visual_data,
++                   SplitTabChange::SplitTabAddReason::kSplitTabUpdated);
++    if (ContainsSplit(split_id)) {
++      split_tabs::LogSplitViewUpdatedUKM(this, split_id);
++    }
++    return;
++  }
++
+   // Remove `split_tab` from `tabs_to_split` as it will be replaced or swapped
+   // out of the split and remove the active tab.
+   std::erase_if(tabs_to_split, [split_tab](tabs::TabInterface* tab) {
 Index: src/chrome/browser/ui/tabs/tab_strip_model.h
 ===================================================================
 --- src.orig/chrome/browser/ui/tabs/tab_strip_model.h
@@ -10574,7 +11923,21 @@ Index: src/chrome/browser/ui/helium/helium_space_service_factory.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/helium_space_service_factory.cc
 +++ src/chrome/browser/ui/helium/helium_space_service_factory.cc
-@@ -55,6 +55,9 @@ void HeliumSpaceServiceFactory::Register
+@@ -19,6 +19,13 @@ HeliumSpaceService* HeliumSpaceServiceFa
+ }
+ 
+ // static
++HeliumSpaceService* HeliumSpaceServiceFactory::GetForProfileIfExists(
++    Profile* profile) {
++  return static_cast<HeliumSpaceService*>(
++      GetInstance()->GetServiceForBrowserContext(profile, /*create=*/false));
++}
++
++// static
+ HeliumSpaceServiceFactory* HeliumSpaceServiceFactory::GetInstance() {
+   static base::NoDestructor<HeliumSpaceServiceFactory> instance;
+   return instance.get();
+@@ -55,6 +62,9 @@ void HeliumSpaceServiceFactory::Register
    registry->RegisterStringPref(prefs::kHeliumSpaceName, std::string());
    registry->RegisterListPref(kHeliumSpacesPref);
    registry->RegisterStringPref(kHeliumActiveSpaceIdPref, std::string());
@@ -17694,3 +19057,847 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view_browsert
                         SeparatorVisibilityChangesWithCollapsedState) {
    auto* tabs_separator = region_view()->tabs_separator_for_testing();
  
+Index: src/chrome/browser/ui/browser.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser.cc
++++ src/chrome/browser/ui/browser.cc
+@@ -125,6 +125,7 @@
+ #include "chrome/browser/ui/global_error/global_error.h"
+ #include "chrome/browser/ui/global_error/global_error_service.h"
+ #include "chrome/browser/ui/global_error/global_error_service_factory.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
+ #include "chrome/browser/ui/location_bar/location_bar.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+@@ -1264,6 +1265,9 @@ void Browser::OnTabStripModelChanged(Tab
+ 
+ 
+ void Browser::TabStripEmpty() {
++  if (helium::HeliumSpaceService::ShouldDeferEmptyTabStripClose(this)) {
++    return;
++  }
+   // Note: even though the tab strip is empty, the call to Close() may not
+   // result in closing this Browser. This can happen in the case of closing
+   // the last Browser with ongoing downloads.
+Index: src/chrome/browser/ui/omnibox/arcium_command_split_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/omnibox/arcium_command_split_unittest.cc
+@@ -0,0 +1,804 @@
++// Copyright 2026 The Arcium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include <algorithm>
++#include <map>
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/memory/raw_ptr.h"
++#include "base/run_loop.h"
++#include "base/supports_user_data.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
++#include "chrome/browser/ui/helium/helium_persistent_item_model.h"
++#include "chrome/browser/ui/helium/helium_space.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
++#include "chrome/browser/ui/tab_ui_helper.h"
++#include "chrome/browser/ui/tabs/split_tab_metrics.h"
++#include "chrome/browser/ui/tabs/tab_enums.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "chrome/test/base/browser_with_test_window_test.h"
++#include "chrome/test/base/test_browser_window.h"
++#include "components/split_tabs/split_tab_id.h"
++#include "components/split_tabs/split_tab_visual_data.h"
++#include "components/tabs/public/folder_tab_collection.h"
++#include "components/tabs/public/pin_tab_collection.h"
++#include "components/tabs/public/split_tab_collection.h"
++#include "components/tabs/public/split_tab_data.h"
++#include "components/tabs/public/tab_collection.h"
++#include "components/tabs/public/tab_interface.h"
++#include "components/tabs/public/tab_strip_collection.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/test/navigation_simulator.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace helium {
++namespace {
++
++enum class SavedSourceKind { kRootPin, kFolderPin, kFavorite };
++
++const char kUnsavedPageStateKey = 0;
++
++class UnsavedPageState : public base::SupportsUserData::Data {
++ public:
++  std::string input = "draft still in the page";
++};
++
++struct SavedSourceState {
++  tabs::TabHandle handle;
++  content::WebContents* contents;
++  tabs::TabCollectionHandle parent;
++  PersistentRecordKind kind;
++  PersistentLink link;
++  GURL current_url;
++  int navigation_entry_id;
++  int navigation_count;
++  GURL home_url;
++  std::u16string home_title;
++};
++
++class ActiveSelectionObserver : public TabStripModelObserver {
++ public:
++  explicit ActiveSelectionObserver(TabStripModel* model) : model_(model) {
++    model_->AddObserver(this);
++  }
++  ~ActiveSelectionObserver() override { model_->RemoveObserver(this); }
++
++  void OnTabStripModelChanged(
++      TabStripModel* model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override {
++    if (selection.active_tab_changed() && selection.new_tab) {
++      active_tabs.push_back(selection.new_tab->GetHandle());
++    }
++  }
++
++  std::vector<tabs::TabHandle> active_tabs;
++
++ private:
++  raw_ptr<TabStripModel> model_;
++};
++
++class SavedSourceSplitTest
++    : public BrowserWithTestWindowTest,
++      public testing::WithParamInterface<SavedSourceKind> {
++ protected:
++  // These are model/service tests. Always supply the dummy window; creating a
++  // native BrowserView would make focused test runs appear on the desktop.
++  std::unique_ptr<BrowserWindow> CreateBrowserWindow() override {
++    return std::make_unique<TestBrowserWindow>();
++  }
++
++  TestingProfile::TestingFactories GetTestingFactories() override {
++    return {
++        TestingProfile::TestingFactory{
++            HeliumSpaceServiceFactory::GetInstance(),
++            base::BindOnce([](content::BrowserContext* context)
++                               -> std::unique_ptr<KeyedService> {
++              return std::make_unique<HeliumSpaceService>(
++                  Profile::FromBrowserContext(context));
++            })},
++        // Exercise local grouping without the unrelated saved-group sync
++        // service reconnecting a group after the split has removed it.
++        TestingProfile::TestingFactory{
++            tab_groups::TabGroupSyncServiceFactory::GetInstance(),
++            base::BindOnce(
++                [](content::BrowserContext*) -> std::unique_ptr<KeyedService> {
++                  return nullptr;
++                })}};
++  }
++
++  void SetUp() override {
++    BrowserWithTestWindowTest::SetUp();
++    service_ = HeliumSpaceServiceFactory::GetForProfile(profile());
++    ASSERT_TRUE(service_);
++    space_ = service_->GetDefaultSpace();
++    ASSERT_TRUE(space_);
++    service_->SetSpaceForBrowser(browser(), space_->id());
++    AddOrdinaryTab("https://ordinary.test/");
++  }
++
++  TabStripModel* model() { return browser()->tab_strip_model(); }
++
++  tabs::TabStripCollection* strip() {
++    return static_cast<tabs::TabStripCollection*>(
++        model()->Root()->GetHandle().Get());
++  }
++
++  tabs::TabInterface* AddOrdinaryTab(const char* url) {
++    AddTab(browser(), GURL(url));
++    return model()->GetActiveTab();
++  }
++
++  void PlacePinInDurableFolder(tabs::TabInterface* source) {
++    ASSERT_EQ(1u, space_->pins().size());
++    const auto* folder =
++        std::get_if<PersistentFolder>(&space_->pins().front().data);
++    ASSERT_TRUE(folder);
++    auto* native_folder = strip()->FindOrCreateFolder(
++        strip()->pin_collection(), folder->title, folder->collapsed);
++    model()->MoveTabToPinCollection(source, native_folder, 0);
++  }
++
++  tabs::TabInterface* AddSavedSource() {
++    tabs::TabInterface* source = AddOrdinaryTab("https://saved.test/home");
++    if (GetParam() == SavedSourceKind::kFavorite) {
++      EXPECT_TRUE(MakeFavorite(source));
++    } else {
++      EXPECT_TRUE(MakePin(source));
++      if (GetParam() == SavedSourceKind::kFolderPin) {
++        EXPECT_TRUE(CreatePinFolder(source));
++        PlacePinInDurableFolder(source);
++      }
++    }
++    content::NavigationSimulator::NavigateAndCommitFromBrowser(
++        source->GetContents(), GURL("https://saved.test/edit"));
++    source->GetContents()->SetUserData(&kUnsavedPageStateKey,
++                                       std::make_unique<UnsavedPageState>());
++    return source;
++  }
++
++  SavedSourceState CaptureSavedSource(tabs::TabInterface* source) {
++    const auto id = service_->GetPersistentItemId(source);
++    const auto kind = service_->GetPersistentItemKind(source);
++    EXPECT_TRUE(id);
++    EXPECT_TRUE(kind);
++    const auto favorites = service_->GetFavoritesForBrowser(browser());
++    const PersistentLink* link = PersistentItemCodec::FindLink(
++        kind == PersistentRecordKind::kFavorite ? favorites : space_->pins(),
++        id.value_or(std::string()));
++    EXPECT_TRUE(link);
++    GURL home_url;
++    std::u16string home_title;
++    EXPECT_TRUE(
++        service_->GetPersistentItemHome(source, &home_url, &home_title));
++    return {.handle = source->GetHandle(),
++            .contents = source->GetContents(),
++            .parent = source->GetParentCollection()->GetHandle(),
++            .kind = kind.value_or(PersistentRecordKind::kPin),
++            .link = link ? *link : PersistentLink(),
++            .current_url = source->GetContents()->GetLastCommittedURL(),
++            .navigation_entry_id = source->GetContents()
++                                       ->GetController()
++                                       .GetLastCommittedEntry()
++                                       ->GetUniqueID(),
++            .navigation_count =
++                source->GetContents()->GetController().GetEntryCount(),
++            .home_url = home_url,
++            .home_title = home_title};
++  }
++
++  tabs::TabInterface* AddSavedTargetInDifferentParent() {
++    auto* target = AddOrdinaryTab("https://other-saved.test/");
++    if (GetParam() == SavedSourceKind::kFavorite) {
++      EXPECT_TRUE(MakePin(target));
++    } else {
++      EXPECT_TRUE(MakeFavorite(target));
++    }
++    target->GetContents()->SetUserData(&kUnsavedPageStateKey,
++                                       std::make_unique<UnsavedPageState>());
++    return target;
++  }
++
++  void ExpectSavedSource(const SavedSourceState& state) {
++    tabs::TabInterface* source = state.handle.Get();
++    ASSERT_TRUE(source);
++    EXPECT_EQ(state.contents, source->GetContents());
++    EXPECT_EQ(state.current_url, source->GetContents()->GetLastCommittedURL());
++    EXPECT_EQ(state.navigation_entry_id, source->GetContents()
++                                             ->GetController()
++                                             .GetLastCommittedEntry()
++                                             ->GetUniqueID());
++    EXPECT_EQ(state.navigation_count,
++              source->GetContents()->GetController().GetEntryCount());
++    auto* page_state = static_cast<UnsavedPageState*>(
++        source->GetContents()->GetUserData(&kUnsavedPageStateKey));
++    ASSERT_TRUE(page_state);
++    EXPECT_EQ("draft still in the page", page_state->input);
++    EXPECT_EQ(state.kind, service_->GetPersistentItemKind(source));
++    EXPECT_EQ(state.link.id, service_->GetPersistentItemId(source));
++    EXPECT_EQ(source, service_->GetLiveTabForPersistentItem(
++                          browser(), state.kind, state.link.id));
++    const auto favorites = service_->GetFavoritesForBrowser(browser());
++    const PersistentLink* link = PersistentItemCodec::FindLink(
++        state.kind == PersistentRecordKind::kFavorite ? favorites
++                                                      : space_->pins(),
++        state.link.id);
++    ASSERT_TRUE(link);
++    EXPECT_EQ(state.link, *link);
++    GURL home_url;
++    std::u16string home_title;
++    ASSERT_TRUE(
++        service_->GetPersistentItemHome(source, &home_url, &home_title));
++    EXPECT_EQ(state.home_url, home_url);
++    EXPECT_EQ(state.home_title, home_title);
++    auto* helper = TabUIHelper::From(source);
++    ASSERT_TRUE(helper);
++    EXPECT_TRUE(helper->HasAnchoredPinnedTabHome());
++    EXPECT_EQ(state.home_url, helper->anchored_pinned_tab_home_url());
++    EXPECT_EQ(state.home_title, helper->anchored_pinned_tab_home_title());
++    const tabs::TabCollection* parent = source->GetParentCollection();
++    if (source->IsSplit()) {
++      parent = parent->GetParentCollection();
++    }
++    EXPECT_EQ(state.parent.Get(), parent);
++    EXPECT_EQ(state.kind == PersistentRecordKind::kFavorite,
++              source->IsPinned());
++    EXPECT_EQ(state.kind == PersistentRecordKind::kPin,
++              strip()->IsPinTab(source));
++  }
++
++  split_tabs::SplitTabId SplitWithCopy(tabs::TabInterface* source,
++                                       tabs::TabInterface** companion) {
++    *companion = AddOrdinaryTab("https://destination.test/copy");
++    model()->ActivateTabAt(model()->GetIndexOfTab(source));
++    return model()->AddToNewSplit(
++        {model()->GetIndexOfTab(*companion)}, split_tabs::SplitTabVisualData(),
++        split_tabs::SplitTabCreatedSource::kToolbarButton);
++  }
++
++  void ExpectOrdinary(tabs::TabInterface* tab) {
++    ASSERT_TRUE(tab);
++    EXPECT_FALSE(tab->IsPinned());
++    EXPECT_FALSE(strip()->IsPinTab(tab));
++    EXPECT_FALSE(service_->IsPersistentItemTab(tab));
++    EXPECT_FALSE(TabUIHelper::From(tab)->HasAnchoredPinnedTabHome());
++  }
++
++  raw_ptr<HeliumSpaceService> service_ = nullptr;
++  raw_ptr<HeliumSpace> space_ = nullptr;
++};
++
++TEST_P(SavedSourceSplitTest, SavedParentPageAssociationAndHomeSurviveSplit) {
++  auto* source = AddSavedSource();
++  const auto state = CaptureSavedSource(source);
++  const auto pins = space_->pins();
++  const auto favorites = service_->GetFavoritesForBrowser(browser());
++  tabs::TabInterface* companion;
++  const int initial_count = model()->count();
++  const auto id = SplitWithCopy(source, &companion);
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  base::RunLoop().RunUntilIdle();
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  EXPECT_EQ(initial_count + 1, model()->count());
++  EXPECT_EQ(id, source->GetSplit());
++  EXPECT_EQ(id, companion->GetSplit());
++  EXPECT_FALSE(service_->IsPersistentItemTab(companion));
++  EXPECT_FALSE(TabUIHelper::From(companion)->HasAnchoredPinnedTabHome());
++  EXPECT_EQ(pins, space_->pins());
++  EXPECT_EQ(favorites, service_->GetFavoritesForBrowser(browser()));
++  ExpectSavedSource(state);
++}
++
++TEST_P(SavedSourceSplitTest,
++       NonadjacentSavedSiblingsKeepInterveningTabAndAssociations) {
++  auto* source = AddSavedSource();
++  const auto source_state = CaptureSavedSource(source);
++  std::string folder_id;
++  if (GetParam() == SavedSourceKind::kFolderPin) {
++    const auto* folder =
++        std::get_if<PersistentFolder>(&space_->pins().front().data);
++    ASSERT_TRUE(folder);
++    folder_id = folder->id;
++  }
++
++  auto save_sibling = [this](tabs::TabInterface* tab) {
++    const bool saved = GetParam() == SavedSourceKind::kFavorite
++                           ? MakeFavorite(tab)
++                           : MakePin(tab);
++    EXPECT_TRUE(saved);
++    tab->GetContents()->SetUserData(&kUnsavedPageStateKey,
++                                    std::make_unique<UnsavedPageState>());
++  };
++  auto* intervening = AddOrdinaryTab("https://intervening.test/");
++  save_sibling(intervening);
++  auto* target = AddOrdinaryTab("https://same-parent.test/");
++  save_sibling(target);
++
++  tabs::TabCollection* parent = source_state.parent.Get();
++  ASSERT_TRUE(parent);
++  const std::vector<tabs::TabInterface*> siblings = {source, intervening,
++                                                     target};
++  for (size_t i = 0; i < siblings.size(); ++i) {
++    auto* tab = siblings[i];
++    if (GetParam() == SavedSourceKind::kFavorite) {
++      model()->MoveWebContentsAt(model()->GetIndexOfTab(tab),
++                                 static_cast<int>(i), false);
++    } else {
++      if (!folder_id.empty() && tab != source) {
++        const auto item_id = service_->GetPersistentItemId(tab);
++        ASSERT_TRUE(item_id);
++        ASSERT_TRUE(service_->MovePinInSpace(browser(), space_->id(), *item_id,
++                                             folder_id, {}));
++      }
++      model()->MoveTabToPinCollection(tab, parent, i);
++    }
++    ASSERT_EQ(parent, tab->GetParentCollection());
++    ASSERT_EQ(i, parent->GetIndexOfTab(tab));
++  }
++
++  const auto intervening_state = CaptureSavedSource(intervening);
++  const auto target_state = CaptureSavedSource(target);
++  const auto pins = space_->pins();
++  const auto favorites = service_->GetFavoritesForBrowser(browser());
++  const int count = model()->count();
++  model()->ActivateTabAt(model()->GetIndexOfTab(source));
++  const auto id = model()->AddToNewSplit(
++      {model()->GetIndexOfTab(target)}, split_tabs::SplitTabVisualData(),
++      split_tabs::SplitTabCreatedSource::kToolbarButton);
++  base::RunLoop().RunUntilIdle();
++
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  EXPECT_EQ((std::vector<tabs::TabInterface*>{source, target}),
++            model()->GetSplitData(id)->ListTabs());
++  EXPECT_EQ(parent, source->GetParentCollection()->GetParentCollection());
++  EXPECT_FALSE(intervening->IsSplit());
++  EXPECT_EQ(parent, intervening->GetParentCollection());
++  EXPECT_EQ(count, model()->count());
++  EXPECT_EQ(pins, space_->pins());
++  EXPECT_EQ(favorites, service_->GetFavoritesForBrowser(browser()));
++  ExpectSavedSource(source_state);
++  ExpectSavedSource(target_state);
++  ExpectSavedSource(intervening_state);
++
++  model()->RemoveSplit(id);
++  base::RunLoop().RunUntilIdle();
++  EXPECT_EQ(count, model()->count());
++  EXPECT_FALSE(source->IsSplit());
++  EXPECT_FALSE(target->IsSplit());
++  EXPECT_FALSE(intervening->IsSplit());
++  EXPECT_EQ(pins, space_->pins());
++  EXPECT_EQ(favorites, service_->GetFavoritesForBrowser(browser()));
++  ExpectSavedSource(source_state);
++  ExpectSavedSource(target_state);
++  ExpectSavedSource(intervening_state);
++}
++
++TEST_P(SavedSourceSplitTest,
++       ActiveCompanionUnsplitReturnsOnlyCompanionToOrdinary) {
++  auto* source = AddSavedSource();
++  const auto state = CaptureSavedSource(source);
++  tabs::TabInterface* companion;
++  const auto id = SplitWithCopy(source, &companion);
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  auto* companion_contents = companion->GetContents();
++  model()->ActivateTabAt(model()->GetIndexOfTab(companion));
++  model()->RemoveSplit(id);
++  base::RunLoop().RunUntilIdle();
++  EXPECT_FALSE(source->IsSplit());
++  EXPECT_FALSE(companion->IsSplit());
++  EXPECT_EQ(companion, model()->GetActiveTab());
++  EXPECT_EQ(companion_contents, companion->GetContents());
++  ExpectOrdinary(companion);
++  ExpectSavedSource(state);
++}
++
++TEST_P(SavedSourceSplitTest,
++       ReplacingCompanionKeepsSavedSourceAndExistingSide) {
++  auto* source = AddSavedSource();
++  const auto state = CaptureSavedSource(source);
++  tabs::TabInterface* companion;
++  const auto id = SplitWithCopy(source, &companion);
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  model()->ReverseTabsInSplit(id);
++  ASSERT_EQ(source, model()->GetSplitData(id)->ListTabs()[1]);
++  auto old_companion = companion->GetHandle();
++  auto* copy = AddOrdinaryTab("https://replacement.test/");
++  auto* copy_contents = copy->GetContents();
++  model()->ActivateTabAt(model()->GetIndexOfTab(source));
++  model()->UpdateTabInSplit(companion, model()->GetIndexOfTab(copy),
++                            TabStripModel::SplitUpdateType::kReplace);
++  base::RunLoop().RunUntilIdle();
++  EXPECT_FALSE(old_companion.Get());
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  EXPECT_EQ((std::vector<tabs::TabInterface*>{copy, source}),
++            model()->GetSplitData(id)->ListTabs());
++  EXPECT_EQ(source, model()->GetActiveTab());
++  EXPECT_EQ(copy_contents, copy->GetContents());
++  EXPECT_FALSE(service_->IsPersistentItemTab(copy));
++  ExpectSavedSource(state);
++}
++
++TEST_P(SavedSourceSplitTest,
++       ReplacingSavedPaneKeepsSourceAndFormsOrdinarySplit) {
++  auto* source = AddSavedSource();
++  const auto state = CaptureSavedSource(source);
++  tabs::TabInterface* companion;
++  const auto id = SplitWithCopy(source, &companion);
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  auto* companion_contents = companion->GetContents();
++  auto* copy = AddOrdinaryTab("https://replacement.test/");
++  auto* copy_contents = copy->GetContents();
++  model()->ActivateTabAt(model()->GetIndexOfTab(companion));
++  model()->UpdateTabInSplit(source, model()->GetIndexOfTab(copy),
++                            TabStripModel::SplitUpdateType::kReplace);
++  base::RunLoop().RunUntilIdle();
++  EXPECT_FALSE(source->IsSplit());
++  EXPECT_EQ(id, companion->GetSplit());
++  EXPECT_EQ(id, copy->GetSplit());
++  EXPECT_EQ(companion, model()->GetActiveTab());
++  EXPECT_EQ(companion_contents, companion->GetContents());
++  EXPECT_EQ(copy_contents, copy->GetContents());
++  EXPECT_EQ(4, model()->count());
++  ExpectOrdinary(companion);
++  ExpectOrdinary(copy);
++  ExpectSavedSource(state);
++}
++
++TEST_P(SavedSourceSplitTest,
++       ReplacingActiveSavedPaneReportsIncomingActivation) {
++  auto* source = AddSavedSource();
++  const auto state = CaptureSavedSource(source);
++  tabs::TabInterface* companion;
++  const auto id = SplitWithCopy(source, &companion);
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  auto* copy = AddOrdinaryTab("https://replacement.test/");
++  model()->ActivateTabAt(model()->GetIndexOfTab(source));
++  ActiveSelectionObserver observer(model());
++  model()->UpdateTabInSplit(source, model()->GetIndexOfTab(copy),
++                            TabStripModel::SplitUpdateType::kReplace);
++  base::RunLoop().RunUntilIdle();
++  EXPECT_EQ(copy, model()->GetActiveTab());
++  EXPECT_NE(observer.active_tabs.end(),
++            std::ranges::find(observer.active_tabs, copy->GetHandle()));
++  EXPECT_FALSE(source->IsSplit());
++  EXPECT_EQ(id, companion->GetSplit());
++  EXPECT_EQ(id, copy->GetSplit());
++  ExpectOrdinary(companion);
++  ExpectOrdinary(copy);
++  ExpectSavedSource(state);
++}
++
++TEST_P(SavedSourceSplitTest,
++       ReplacingActiveCompanionReportsIncomingActivation) {
++  auto* source = AddSavedSource();
++  const auto state = CaptureSavedSource(source);
++  tabs::TabInterface* companion;
++  const auto id = SplitWithCopy(source, &companion);
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  auto* copy = AddOrdinaryTab("https://replacement.test/");
++  model()->ActivateTabAt(model()->GetIndexOfTab(companion));
++  ActiveSelectionObserver observer(model());
++  model()->UpdateTabInSplit(companion, model()->GetIndexOfTab(copy),
++                            TabStripModel::SplitUpdateType::kReplace);
++  base::RunLoop().RunUntilIdle();
++  EXPECT_EQ(copy, model()->GetActiveTab());
++  EXPECT_NE(observer.active_tabs.end(),
++            std::ranges::find(observer.active_tabs, copy->GetHandle()));
++  EXPECT_EQ(id, source->GetSplit());
++  EXPECT_EQ(id, copy->GetSplit());
++  ExpectSavedSource(state);
++}
++
++TEST_P(SavedSourceSplitTest, ClosingCompanionPreservesSavedSource) {
++  auto* source = AddSavedSource();
++  const auto state = CaptureSavedSource(source);
++  tabs::TabInterface* companion;
++  const auto id = SplitWithCopy(source, &companion);
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  auto handle = companion->GetHandle();
++  model()->DetachAndDeleteWebContentsAt(model()->GetIndexOfTab(companion));
++  base::RunLoop().RunUntilIdle();
++  EXPECT_FALSE(handle.Get());
++  EXPECT_FALSE(source->IsSplit());
++  ExpectSavedSource(state);
++}
++
++TEST_P(SavedSourceSplitTest, LastGroupedIncomingTabMovesWithoutEmptyGroup) {
++  auto* source = AddSavedSource();
++  const auto state = CaptureSavedSource(source);
++  auto* incoming = AddOrdinaryTab("https://incoming.test/");
++  auto* incoming_contents = incoming->GetContents();
++  const auto pins = space_->pins();
++  const auto favorites = service_->GetFavoritesForBrowser(browser());
++  const int count = model()->count();
++  const auto group = model()->AddToNewGroup({model()->GetIndexOfTab(incoming)});
++  model()->ActivateTabAt(model()->GetIndexOfTab(source));
++  const auto id = model()->AddToNewSplit(
++      {model()->GetIndexOfTab(incoming)}, split_tabs::SplitTabVisualData(),
++      split_tabs::SplitTabCreatedSource::kToolbarButton);
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  EXPECT_EQ(id, source->GetSplit());
++  EXPECT_EQ(id, incoming->GetSplit());
++  EXPECT_FALSE(incoming->GetGroup());
++  EXPECT_FALSE(model()->group_model()->ContainsTabGroup(group));
++  base::RunLoop().RunUntilIdle();
++  EXPECT_EQ(incoming_contents, incoming->GetContents());
++  EXPECT_EQ(GURL("https://incoming.test/"),
++            incoming->GetContents()->GetLastCommittedURL());
++  EXPECT_EQ(count, model()->count());
++  EXPECT_FALSE(service_->IsPersistentItemTab(incoming));
++  EXPECT_FALSE(TabUIHelper::From(incoming)->HasAnchoredPinnedTabHome());
++  EXPECT_EQ(pins, space_->pins());
++  EXPECT_EQ(favorites, service_->GetFavoritesForBrowser(browser()));
++  ExpectSavedSource(state);
++}
++
++TEST_P(SavedSourceSplitTest, NativePinnedIncomingBeforeSourceKeepsPaneOrder) {
++  auto* source = AddSavedSource();
++  const auto state = CaptureSavedSource(source);
++  tabs::TabInterface* companion;
++  const auto id = SplitWithCopy(source, &companion);
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  auto* ordinary = model()->GetTabsAtIndices({model()->count() - 1})[0];
++  ASSERT_EQ(GURL("https://ordinary.test/"),
++            ordinary->GetContents()->GetLastCommittedURL());
++  model()->DetachAndDeleteWebContentsAt(model()->GetIndexOfTab(ordinary));
++  model()->InsertWebContentsAt(
++      0,
++      content::WebContents::Create(
++          content::WebContents::CreateParams(profile())),
++      AddTabTypes::ADD_PINNED);
++  auto* incoming = model()->GetTabAtIndex(0);
++  ASSERT_FALSE(service_->IsPersistentItemTab(incoming));
++  model()->ActivateTabAt(model()->GetIndexOfTab(source));
++  model()->UpdateTabInSplit(companion, model()->GetIndexOfTab(incoming),
++                            TabStripModel::SplitUpdateType::kSwap);
++  base::RunLoop().RunUntilIdle();
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  EXPECT_EQ((std::vector<tabs::TabInterface*>{source, incoming}),
++            model()->GetSplitData(id)->ListTabs());
++  EXPECT_FALSE(companion->IsSplit());
++  EXPECT_TRUE(companion->IsPinned());
++  EXPECT_FALSE(service_->IsPersistentItemTab(companion));
++  ExpectSavedSource(state);
++}
++
++TEST_P(SavedSourceSplitTest, SwappingCompanionPreservesBothLivePages) {
++  auto* source = AddSavedSource();
++  const auto state = CaptureSavedSource(source);
++  tabs::TabInterface* companion;
++  const auto id = SplitWithCopy(source, &companion);
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  auto* companion_contents = companion->GetContents();
++  auto* incoming = AddOrdinaryTab("https://incoming.test/");
++  auto* incoming_contents = incoming->GetContents();
++  model()->ActivateTabAt(model()->GetIndexOfTab(source));
++  model()->UpdateTabInSplit(companion, model()->GetIndexOfTab(incoming),
++                            TabStripModel::SplitUpdateType::kSwap);
++  base::RunLoop().RunUntilIdle();
++  EXPECT_EQ(id, source->GetSplit());
++  EXPECT_EQ(id, incoming->GetSplit());
++  EXPECT_FALSE(companion->IsSplit());
++  EXPECT_EQ(companion_contents, companion->GetContents());
++  EXPECT_EQ(incoming_contents, incoming->GetContents());
++  ExpectOrdinary(companion);
++  ExpectSavedSource(state);
++}
++
++TEST_P(SavedSourceSplitTest, SwappingSavedPaneLeavesItsOriginalTabAtHome) {
++  auto* source = AddSavedSource();
++  const auto state = CaptureSavedSource(source);
++  tabs::TabInterface* companion;
++  const auto id = SplitWithCopy(source, &companion);
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  auto* incoming = AddOrdinaryTab("https://incoming.test/");
++  model()->ActivateTabAt(model()->GetIndexOfTab(companion));
++  model()->UpdateTabInSplit(source, model()->GetIndexOfTab(incoming),
++                            TabStripModel::SplitUpdateType::kSwap);
++  base::RunLoop().RunUntilIdle();
++  EXPECT_FALSE(source->IsSplit());
++  EXPECT_EQ(id, companion->GetSplit());
++  EXPECT_EQ(id, incoming->GetSplit());
++  ExpectOrdinary(companion);
++  ExpectOrdinary(incoming);
++  ExpectSavedSource(state);
++}
++
++TEST_P(SavedSourceSplitTest, ClosingSourceReturnsLiveCompanionToOrdinary) {
++  auto* source = AddSavedSource();
++  const auto state = CaptureSavedSource(source);
++  tabs::TabInterface* companion;
++  const auto id = SplitWithCopy(source, &companion);
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  auto* companion_contents = companion->GetContents();
++  model()->DetachAndDeleteWebContentsAt(model()->GetIndexOfTab(source));
++  base::RunLoop().RunUntilIdle();
++  EXPECT_FALSE(state.handle.Get());
++  EXPECT_FALSE(service_->GetLiveTabForPersistentItem(browser(), state.kind,
++                                                     state.link.id));
++  EXPECT_FALSE(companion->IsSplit());
++  EXPECT_EQ(companion_contents, companion->GetContents());
++  ExpectOrdinary(companion);
++  const auto favorites = service_->GetFavoritesForBrowser(browser());
++  EXPECT_TRUE(PersistentItemCodec::FindLink(
++      state.kind == PersistentRecordKind::kFavorite ? favorites
++                                                    : space_->pins(),
++      state.link.id));
++}
++
++TEST_P(SavedSourceSplitTest, QueuedCleanupToleratesClosedAndResplitCompanions) {
++  auto* source = AddSavedSource();
++  const auto state = CaptureSavedSource(source);
++  tabs::TabInterface* companion;
++  const auto first_id = SplitWithCopy(source, &companion);
++  ASSERT_TRUE(model()->ContainsSplit(first_id));
++  model()->RemoveSplit(first_id);
++  model()->ActivateTabAt(model()->GetIndexOfTab(source));
++  const auto second_id = model()->AddToNewSplit(
++      {model()->GetIndexOfTab(companion)}, split_tabs::SplitTabVisualData(),
++      split_tabs::SplitTabCreatedSource::kToolbarButton);
++  base::RunLoop().RunUntilIdle();
++  EXPECT_EQ(second_id, companion->GetSplit());
++  ExpectSavedSource(state);
++  model()->RemoveSplit(second_id);
++  auto handle = companion->GetHandle();
++  model()->DetachAndDeleteWebContentsAt(model()->GetIndexOfTab(companion));
++  base::RunLoop().RunUntilIdle();
++  EXPECT_FALSE(handle.Get());
++  ExpectSavedSource(state);
++}
++
++TEST_P(SavedSourceSplitTest, QueuedCleanupKeepsNewlySavedCompanion) {
++  auto* source = AddSavedSource();
++  const auto state = CaptureSavedSource(source);
++  tabs::TabInterface* companion;
++  const auto id = SplitWithCopy(source, &companion);
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  model()->RemoveSplit(id);
++  ASSERT_TRUE(service_->AddFavoriteFromTab(companion));
++  const auto companion_id = service_->GetPersistentItemId(companion);
++  base::RunLoop().RunUntilIdle();
++  EXPECT_TRUE(companion->IsPinned());
++  EXPECT_EQ(PersistentRecordKind::kFavorite,
++            service_->GetPersistentItemKind(companion));
++  EXPECT_EQ(companion_id, service_->GetPersistentItemId(companion));
++  ExpectSavedSource(state);
++}
++
++TEST_P(SavedSourceSplitTest, RestoreRebuildsAffinityAndTransientCleanup) {
++  auto* original_source = AddSavedSource();
++  const auto original_state = CaptureSavedSource(original_source);
++  std::map<std::string, std::string> extra_data;
++  service_->AddPersistentItemToSessionExtraData(original_source, &extra_data);
++  ASSERT_FALSE(extra_data.empty());
++  model()->DetachAndDeleteWebContentsAt(
++      model()->GetIndexOfTab(original_source));
++  base::RunLoop().RunUntilIdle();
++  ASSERT_FALSE(original_state.handle.Get());
++
++  // Match session restoration order: restore each saved association and native
++  // placement before restoring its split. The companion has no runtime marker.
++  auto* source = AddOrdinaryTab("https://saved.test/edit");
++  ASSERT_TRUE(service_->RestorePersistentItemFromSession(source, extra_data));
++  if (GetParam() == SavedSourceKind::kFolderPin) {
++    PlacePinInDurableFolder(source);
++  }
++  source->GetContents()->SetUserData(&kUnsavedPageStateKey,
++                                     std::make_unique<UnsavedPageState>());
++  const auto restored_state = CaptureSavedSource(source);
++  auto* companion = AddOrdinaryTab("https://destination.test/copy");
++  auto* companion_contents = companion->GetContents();
++  const auto id = split_tabs::SplitTabId::GenerateNew();
++  std::vector<int> indices = {model()->GetIndexOfTab(companion),
++                              model()->GetIndexOfTab(source)};
++  std::ranges::sort(indices);
++  const split_tabs::SplitTabVisualData visuals(
++      split_tabs::SplitTabLayout::kStacked, 0.4);
++  model()->RestoreSplit(id, indices, visuals);
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  EXPECT_EQ(visuals, *model()->GetSplitData(id)->visual_data());
++  ExpectSavedSource(restored_state);
++  EXPECT_EQ(original_state.link, restored_state.link);
++  model()->RemoveSplit(id);
++  base::RunLoop().RunUntilIdle();
++  EXPECT_EQ(companion_contents, companion->GetContents());
++  ExpectOrdinary(companion);
++  ExpectSavedSource(restored_state);
++}
++
++TEST_P(SavedSourceSplitTest, SavedContextSplitAllowsSelfAndOrdinaryTarget) {
++  auto* source = AddSavedSource();
++  EXPECT_TRUE(model()->IsContextMenuCommandEnabled(
++      model()->GetIndexOfTab(source), TabStripModel::CommandAddToSplit));
++  auto* companion = AddOrdinaryTab("https://destination.test/copy");
++  model()->ActivateTabAt(model()->GetIndexOfTab(source));
++  EXPECT_TRUE(model()->IsContextMenuCommandEnabled(
++      model()->GetIndexOfTab(companion), TabStripModel::CommandAddToSplit));
++}
++
++TEST_P(SavedSourceSplitTest, DifferentSavedParentsAreRejectedAtomically) {
++  auto* source = AddSavedSource();
++  const auto source_state = CaptureSavedSource(source);
++  auto* target = AddSavedTargetInDifferentParent();
++  const auto target_state = CaptureSavedSource(target);
++  model()->ActivateTabAt(model()->GetIndexOfTab(source));
++  const int count = model()->count();
++  EXPECT_FALSE(model()->IsContextMenuCommandEnabled(
++      model()->GetIndexOfTab(target), TabStripModel::CommandAddToSplit));
++  const auto rejected_id = model()->AddToNewSplit(
++      {model()->GetIndexOfTab(target)}, split_tabs::SplitTabVisualData(),
++      split_tabs::SplitTabCreatedSource::kToolbarButton);
++  EXPECT_FALSE(model()->ContainsSplit(rejected_id));
++  EXPECT_EQ(count, model()->count());
++  EXPECT_EQ(source, model()->GetActiveTab());
++  ExpectSavedSource(source_state);
++  ExpectSavedSource(target_state);
++
++  tabs::TabInterface* companion;
++  const auto id = SplitWithCopy(source, &companion);
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  const int split_count = model()->count();
++  model()->UpdateTabInSplit(companion, model()->GetIndexOfTab(target),
++                            TabStripModel::SplitUpdateType::kReplace);
++  base::RunLoop().RunUntilIdle();
++  EXPECT_EQ(split_count, model()->count());
++  EXPECT_EQ(id, source->GetSplit());
++  EXPECT_EQ(id, companion->GetSplit());
++  EXPECT_FALSE(target->IsSplit());
++  ExpectSavedSource(source_state);
++  ExpectSavedSource(target_state);
++}
++
++TEST_P(SavedSourceSplitTest,
++       IncomingSplitMemberIsRejectedWithoutChangingSource) {
++  auto* source = AddSavedSource();
++  const auto state = CaptureSavedSource(source);
++  tabs::TabInterface* companion;
++  const auto id = SplitWithCopy(source, &companion);
++  ASSERT_TRUE(model()->ContainsSplit(id));
++  auto* other_a = AddOrdinaryTab("https://other-a.test/");
++  auto* other_b = AddOrdinaryTab("https://other-b.test/");
++  const auto other_id = model()->AddToNewSplit(
++      {model()->GetIndexOfTab(other_a)}, split_tabs::SplitTabVisualData(),
++      split_tabs::SplitTabCreatedSource::kToolbarButton);
++  ASSERT_EQ(other_id, other_b->GetSplit());
++  model()->ActivateTabAt(model()->GetIndexOfTab(source));
++  model()->UpdateTabInSplit(companion, model()->GetIndexOfTab(other_a),
++                            TabStripModel::SplitUpdateType::kReplace);
++  base::RunLoop().RunUntilIdle();
++  EXPECT_EQ(id, source->GetSplit());
++  EXPECT_EQ(id, companion->GetSplit());
++  EXPECT_EQ(other_id, other_a->GetSplit());
++  EXPECT_EQ(other_id, other_b->GetSplit());
++  ExpectSavedSource(state);
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    SavedSourceKinds,
++    SavedSourceSplitTest,
++    testing::Values(SavedSourceKind::kRootPin,
++                    SavedSourceKind::kFolderPin,
++                    SavedSourceKind::kFavorite),
++    [](const testing::TestParamInfo<SavedSourceKind>& info) {
++      if (info.param == SavedSourceKind::kRootPin) {
++        return "RootPin";
++      }
++      return info.param == SavedSourceKind::kFolderPin ? "FolderPin"
++                                                       : "Favorite";
++    });
++
++}  // namespace
++}  // namespace helium
+Index: src/chrome/browser/ui/helium/helium_space_service_factory.h
+===================================================================
+--- src.orig/chrome/browser/ui/helium/helium_space_service_factory.h
++++ src/chrome/browser/ui/helium/helium_space_service_factory.h
+@@ -23,6 +23,8 @@ class HeliumSpaceService;
+ class HeliumSpaceServiceFactory : public ProfileKeyedServiceFactory {
+  public:
+   static HeliumSpaceService* GetForProfile(Profile* profile);
++  // Empty-tab closure must never create a profile's sidebar service.
++  static HeliumSpaceService* GetForProfileIfExists(Profile* profile);
+   static HeliumSpaceServiceFactory* GetInstance();
+ 
+   HeliumSpaceServiceFactory(const HeliumSpaceServiceFactory&) = delete;
