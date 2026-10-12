@@ -29,13 +29,13 @@ Index: src/chrome/browser/ui/BUILD.gn
    if (is_win && is_chrome_branded) {
      deps += [ "//chrome/browser/win/installer_downloader:prefs" ]
    }
-+  if (is_mac) {
++  if (toolkit_views) {
 +    deps += [ ":glass_surface_configuration" ]
 +  }
  }
  
  source_set("browser_otr_state") {
-@@ -3794,6 +3813,7 @@ static_library("ui") {
+@@ -3802,6 +3821,7 @@ static_library("ui") {
    }
  
    if (toolkit_views) {
@@ -51,22 +51,22 @@ Index: src/chrome/browser/ui/browser_ui_prefs.cc
  #include "build/build_config.h"
  #include "chrome/browser/profiles/profile.h"
  #include "chrome/browser/ui/ui_features.h"
-+#if BUILDFLAG(IS_MAC)
++#if defined(TOOLKIT_VIEWS)
 +#include "chrome/browser/ui/views/helium/glass_surface_configuration.h"
 +#endif
  #include "chrome/browser/upgrade_detector/upgrade_detector.h"
  #include "chrome/common/buildflags.h"
  #include "chrome/common/pref_names.h"
-@@ -130,6 +133,13 @@
+@@ -130,6 +133,13 @@ void RegisterBrowserUserPrefs(user_prefs
  
    registry->RegisterBooleanPref(prefs::kHeliumRoundedFrame, true);
  
-+#if BUILDFLAG(IS_MAC)
++#if defined(TOOLKIT_VIEWS)
 +  registry->RegisterDictionaryPref(
 +      helium::kArciumChromeAppearancePref,
 +      helium::SerializeGlassSurfaceConfiguration(
 +          helium::DefaultGlassSurfaceConfiguration()));
-+#endif  // BUILDFLAG(IS_MAC)
++#endif  // defined(TOOLKIT_VIEWS)
 +
    registry->RegisterBooleanPref(prefs::kHeliumCenteredLocationBar, false);
  
@@ -1372,7 +1372,7 @@ Index: src/chrome/browser/ui/views/helium/native_frame_materials.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/helium/native_frame_materials.cc
 +++ src/chrome/browser/ui/views/helium/native_frame_materials.cc
-@@ -5,28 +5,85 @@
+@@ -5,35 +5,92 @@
  #include "chrome/browser/ui/views/helium/native_frame_materials.h"
  
  #include "build/build_config.h"
@@ -1384,7 +1384,11 @@ Index: src/chrome/browser/ui/views/helium/native_frame_materials.cc
  #include "ui/views/view.h"
  #include "ui/views/widget/widget.h"
  
-+namespace helium {
+-#if BUILDFLAG(IS_MAC)
+-#include "chrome/browser/ui/views/helium/glass_surface.h"
+-#endif
+-
+ namespace helium {
 +namespace {
 +
 +const PrefService* ChromeAppearancePrefs(const BrowserView* browser_view) {
@@ -1418,6 +1422,15 @@ Index: src/chrome/browser/ui/views/helium/native_frame_materials.cc
 +  return selection;
 +}
 +
++GlassSurfaceResolution ResolveNativeFrameGlass(
++    const BrowserView* browser_view,
++    const GlassBackendAvailability& availability) {
++  return ResolveGlassSurfaceConfiguration(
++      ReadMaterialSelection(ChromeAppearancePrefs(browser_view)),
++      GetRequestedGlassBackend(), availability.native_liquid_glass,
++      availability.native_material, availability.reduce_transparency);
++}
++
 +}  // namespace
 +
 +GlassSurfaceConfiguration GetNativeFrameGlassConfiguration(
@@ -1429,25 +1442,12 @@ Index: src/chrome/browser/ui/views/helium/native_frame_materials.cc
 +
 +GlassSurfaceResolution GetNativeFrameGlassResolution(
 +    const BrowserView* browser_view) {
-+  const GlassSurfaceConfiguration selection =
-+      ReadMaterialSelection(ChromeAppearancePrefs(browser_view));
- #if BUILDFLAG(IS_MAC)
--#include "chrome/browser/ui/views/helium/glass_surface.h"
-+  const GlassBackendAvailability availability =
-+      GetNativeFrameGlassAvailability();
-+  return ResolveGlassSurfaceConfiguration(
-+      selection, GetRequestedGlassBackend(), availability.native_liquid_glass,
-+      availability.native_material, availability.reduce_transparency);
-+#else
-+  return ResolveGlassSurfaceConfiguration(selection, GlassBackend::kAuto, false,
-+                                          false, false);
- #endif
--
--namespace helium {
++  return ResolveNativeFrameGlass(browser_view,
++                                 GetNativeFrameGlassAvailability());
 +}
  
  bool ShouldUseNativeFrameGlass(const BrowserView* browser_view) {
- #if BUILDFLAG(IS_MAC)
+-#if BUILDFLAG(IS_MAC)
 -  if (!browser_view) {
 +  if (!browser_view || browser_view->GetIsWebAppType()) {
      return false;
@@ -1455,18 +1455,29 @@ Index: src/chrome/browser/ui/views/helium/native_frame_materials.cc
 -
 -  // Web app windows use their app-defined frame appearance.
 -  if (browser_view->GetIsWebAppType()) {
--    return false;
-+  const GlassSurfaceResolution resolution =
-+      GetNativeFrameGlassResolution(browser_view);
-+  if (resolution.enabled) {
-+    return resolution.paints_chrome_transparent;
++  const GlassBackendAvailability availability =
++      GetNativeFrameGlassAvailability();
++  if (!availability.native_liquid_glass && !availability.native_material) {
+     return false;
    }
 -
++  const GlassSurfaceResolution resolution =
++      ResolveNativeFrameGlass(browser_view, availability);
++  if (resolution.enabled) {
++    return resolution.paints_chrome_transparent;
++  }
 +  // Uncustomized windows, including Little Arc and other popups, keep the
 +  // existing native material policy.
    const GlassBackend backend =
        ResolveGlassSurface(GlassHost::kNativeFrame).resolved;
    return backend == GlassBackend::kNativeLiquidGlass ||
+          backend == GlassBackend::kNativeMaterial;
+-#else
+-  return false;
+-#endif
+ }
+ 
+ bool ShouldUseNativeFrameGlass(const BrowserWindowInterface* browser) {
 @@ -49,4 +106,10 @@ bool ShouldUseNativeFrameGlass(const vie
               : nullptr);
  }
@@ -1520,7 +1531,7 @@ Index: src/chrome/test/BUILD.gn
 ===================================================================
 --- src.orig/chrome/test/BUILD.gn
 +++ src/chrome/test/BUILD.gn
-@@ -11291,3 +11291,22 @@ test("captcha_provider_fuzztests") {
+@@ -11360,3 +11360,22 @@ test("captcha_provider_fuzztests") {
      "//url",
    ]
  }
