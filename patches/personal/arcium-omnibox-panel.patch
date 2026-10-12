@@ -550,7 +550,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
-@@ -0,0 +1,2049 @@
+@@ -0,0 +1,2055 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -637,15 +637,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  return SkColorSetA(color, alpha);
 +}
 +SkColor Blend(SkColor from, SkColor to, float progress) {
-+  return SkColorSetARGB(
-+      base::ClampRound(SkColorGetA(from) +
-+                       (SkColorGetA(to) - SkColorGetA(from)) * progress),
-+      base::ClampRound(SkColorGetR(from) +
-+                       (SkColorGetR(to) - SkColorGetR(from)) * progress),
-+      base::ClampRound(SkColorGetG(from) +
-+                       (SkColorGetG(to) - SkColorGetG(from)) * progress),
-+      base::ClampRound(SkColorGetB(from) +
-+                       (SkColorGetB(to) - SkColorGetB(from)) * progress));
++  return gfx::Tween::ColorValueBetween(std::clamp(progress, 0.f, 1.f), from, to);
 +}
 +SkColor Mix(SkColor tint, SkColor base) {
 +  return SkColorSetRGB((SkColorGetR(tint) + 4 * SkColorGetR(base)) / 5,
@@ -1287,6 +1279,18 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  return result;
 +}
 +
++class CommandTextfield : public views::Textfield {
++  METADATA_HEADER(CommandTextfield, views::Textfield)
++ public:
++  bool SkipDefaultKeyEventProcessing(const ui::KeyEvent& event) override {
++    if (event.key_code() == ui::VKEY_TAB && !event.IsCommandDown() &&
++        !event.IsControlDown() && !event.IsAltDown()) {
++      return true;
++    }
++    return Textfield::SkipDefaultKeyEventProcessing(event);
++  }
++};
++
 +class CommandPanelView::ResultsView : public views::View {
 +  METADATA_HEADER(ResultsView, views::View)
 + public:
@@ -1485,7 +1489,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    scope_buttons_.push_back(
 +        AddChildView(std::make_unique<ScopeButton>(this, scope)));
 +  }
-+  input_ = AddChildView(std::make_unique<views::Textfield>());
++  input_ = AddChildView(std::make_unique<CommandTextfield>());
 +  input_->set_controller(this);
 +  input_->SetBorder(views::CreateEmptyBorder(0));
 +  input_->SetBackgroundColor(SK_ColorTRANSPARENT);
@@ -2597,6 +2601,8 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +END_METADATA
 +BEGIN_METADATA(CommandPanelView, BackButton)
 +END_METADATA
++BEGIN_METADATA(CommandTextfield)
++END_METADATA
 +BEGIN_METADATA(CommandPanelView)
 +END_METADATA
 +}  // namespace arcium
@@ -2604,7 +2610,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,179 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -2683,6 +2689,9 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 +  SearchScope scope_for_testing() const { return scope_; }
 +  int selected_for_testing() const { return selected_; }
 +  int hovered_for_testing() const { return hovered_; }
++  gfx::SlideAnimation* selection_animation_for_testing() {
++    return &selection_animation_;
++  }
 +  gfx::SlideAnimation* scope_selection_animation_for_testing() {
 +    return &scope_selection_animation_;
 +  }
@@ -2923,7 +2932,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
-@@ -0,0 +1,554 @@
+@@ -0,0 +1,621 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +#include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
@@ -2938,6 +2947,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +#include "chrome/browser/ui/views/frame/browser_view.h"
 +#include "chrome/browser/ui/views/frame/test_with_browser_view.h"
 +#include "extensions/buildflags/buildflags.h"
++#include "third_party/skia/include/core/SkBitmap.h"
 +#include "ui/accessibility/ax_node_data.h"
 +#include "ui/base/ime/composition_text.h"
 +#include "ui/base/ime/text_edit_commands.h"
@@ -2949,6 +2959,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +#include "ui/views/controls/textfield/textfield.h"
 +#include "ui/views/focus/focus_manager.h"
 +#include "ui/views/test/button_test_api.h"
++#include "ui/views/test/views_drawing_test_utils.h"
 +#include "ui/views/test/views_test_utils.h"
 +#include "ui/views/test/widget_test.h"
 +#include "ui/views/view_tracker.h"
@@ -3237,6 +3248,71 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  EXPECT_EQ(arcium::SearchScope::kEverything, panel()->scope_for_testing());
 +  EXPECT_EQ(u"reference", input->GetText());
 +  EXPECT_EQ(input, panel()->GetFocusManager()->GetFocusedView());
++  Close();
++}
++TEST_F(ArciumNativePanelTest, TabBypassesFocusTraversalBeforeTextfieldDispatch) {
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  Query(u"reference");
++  auto* input = panel()->input_for_testing();
++  input->SetSelectedRange(gfx::Range(2, 5));
++  auto dispatch_tab = [&](int flags) {
++    ui::KeyEvent event(ui::EventType::kKeyPressed, ui::VKEY_TAB, flags);
++    // NativeWidgetMac runs the focus manager before dispatching to the view.
++    ASSERT_TRUE(panel()->GetFocusManager()->OnKeyEvent(event));
++    panel()->GetWidget()->OnKeyEvent(&event);
++    EXPECT_TRUE(event.handled());
++    views::test::RunScheduledLayout(panel());
++  };
++  dispatch_tab(0);
++  EXPECT_EQ(arcium::SearchScope::kWeb, panel()->scope_for_testing());
++  Key(ui::VKEY_DOWN);
++  dispatch_tab(0);
++  EXPECT_EQ(arcium::SearchScope::kSaved, panel()->scope_for_testing());
++  dispatch_tab(ui::EF_SHIFT_DOWN);
++  EXPECT_EQ(arcium::SearchScope::kWeb, panel()->scope_for_testing());
++  Key(ui::VKEY_DOWN);
++  Key(ui::VKEY_K, kActionModifier);
++  Query(u"pin");
++  dispatch_tab(ui::EF_SHIFT_DOWN);
++  EXPECT_FALSE(panel()->actions_visible_for_testing());
++  EXPECT_EQ(arcium::SearchScope::kEverything, panel()->scope_for_testing());
++  EXPECT_EQ(u"reference", input->GetText());
++  EXPECT_EQ(gfx::Range(2, 5), input->GetSelectedRange());
++  EXPECT_EQ(input, panel()->GetFocusManager()->GetFocusedView());
++  Close();
++}
++TEST_F(ArciumNativePanelTest, TintsOffSelectionPaintsEveryCueAndCategoryStyle) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_ENABLED);
++  gfx::ScopedAnimationDurationScaleMode duration(
++      gfx::ScopedAnimationDurationScaleMode::NORMAL_DURATION);
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  arcium::CommandPanelAppearance appearance;
++  appearance.scope_tints = false;
++  appearance.activity_dots = true;
++  for (auto labels : {arcium::CommandPanelAppearance::Labels::kPill,
++                      arcium::CommandPanelAppearance::Labels::kText,
++                      arcium::CommandPanelAppearance::Labels::kJoined}) {
++    for (auto icons : {arcium::CommandPanelAppearance::Icons::kActions,
++                       arcium::CommandPanelAppearance::Icons::kArrows,
++                       arcium::CommandPanelAppearance::Icons::kGoSwitch,
++                       arcium::CommandPanelAppearance::Icons::kReturn}) {
++      appearance.labels = labels;
++      appearance.icons = icons;
++      panel()->SetAppearance(appearance);
++      Query(u"");
++      Key(ui::VKEY_DOWN);
++      gfx::AnimationTestApi api(panel()->selection_animation_for_testing());
++      const auto start = base::TimeTicks::Now();
++      api.SetStartTime(start);
++      for (int milliseconds : {0, 40, 80}) {
++        api.Step(start + base::Milliseconds(milliseconds));
++        const SkBitmap bitmap = views::test::PaintViewToBitmap(
++            panel()->GetWidget()->GetRootView());
++        ASSERT_FALSE(bitmap.empty());
++      }
++    }
++  }
 +  Close();
 +}
 +TEST_F(ArciumNativePanelTest, HiddenScopesRevealOnWheelAndLeaveNoHiddenOptions) {
