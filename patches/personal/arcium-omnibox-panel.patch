@@ -550,7 +550,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
-@@ -0,0 +1,2055 @@
+@@ -0,0 +1,2101 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -1295,10 +1295,37 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  METADATA_HEADER(ResultsView, views::View)
 + public:
 +  explicit ResultsView(CommandPanelView* panel) : panel_(panel) {}
-+  bool OnMouseWheel(const ui::MouseWheelEvent& event) override {
-+    return panel_->HandleScopeWheel(event) || views::View::OnMouseWheel(event);
-+  }
 +  void OnPaint(gfx::Canvas* canvas) override;
++
++ private:
++  raw_ptr<CommandPanelView> panel_;
++};
++class CommandPanelView::ResultsScrollView : public views::ScrollView {
++  METADATA_HEADER(ResultsScrollView, views::ScrollView)
++ public:
++  explicit ResultsScrollView(CommandPanelView* panel) : panel_(panel) {}
++  bool OnMouseWheel(const ui::MouseWheelEvent& event) override {
++    return panel_->HandleScopeScroll(event.y_offset()) ||
++           ScrollView::OnMouseWheel(event);
++  }
++  void OnScrollEvent(ui::ScrollEvent* event) override {
++    // Native trackpad events must reach scope reveal before compositor scrolling
++    // consumes them, including at the top boundary.
++    if (panel_->HandleScopeScroll(*event)) {
++      event->SetHandled();
++      event->StopPropagation();
++      return;
++    }
++    ScrollView::OnScrollEvent(event);
++    if (event->type() == ui::EventType::kScroll && !event->handled()) {
++      // Keep the wheel fallback local: Widget's conversion loses momentum phase
++      // and would retry the scope policy instead of only scrolling results.
++      ui::MouseWheelEvent wheel(*event);
++      ScrollView::OnMouseWheel(wheel);
++      event->SetHandled();
++      event->StopPropagation();
++    }
++  }
 +
 + private:
 +  raw_ptr<CommandPanelView> panel_;
@@ -1499,7 +1526,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +      ax::mojom::Role::kTextFieldWithComboBox);
 +  input_->GetViewAccessibility().SetName(u"Search everything or enter URL");
 +  input_->GetViewAccessibility().SetHasPopup(ax::mojom::HasPopup::kListbox);
-+  scroll_ = AddChildView(std::make_unique<views::ScrollView>());
++  scroll_ = AddChildView(std::make_unique<ResultsScrollView>(this));
 +  scroll_->SetBackgroundColor(std::nullopt);
 +  scroll_->SetDrawOverflowIndicator(false);
 +  scroll_->SetHorizontalScrollBarMode(
@@ -2417,20 +2444,26 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    content_animation_.Show();
 +  }
 +}
-+bool CommandPanelView::HandleScopeWheel(const ui::MouseWheelEvent& event) {
-+  if (actions_visible_ || results_view_->GetVisibleBounds().y() != 0) {
++bool CommandPanelView::HandleScopeScroll(float vertical_delta) {
++  if (actions_visible_ || scroll_->CurrentOffset().y() > 0) {
 +    return false;
 +  }
-+  if (event.y_offset() > 0 && !scope_browsing_) {
++  if (vertical_delta > 0 && !scope_browsing_) {
 +    BrowseScopes(true);
 +    return true;
 +  }
-+  if (event.y_offset() < 0 && scope_browsing_) {
++  if (vertical_delta < 0 && scope_browsing_) {
 +    BrowseScopes(false);
 +    Select(0, false);
 +    return true;
 +  }
 +  return false;
++}
++bool CommandPanelView::HandleScopeScroll(const ui::ScrollEvent& event) {
++  return event.type() == ui::EventType::kScroll &&
++         event.momentum_phase() != ui::EventMomentumPhase::BEGAN &&
++         event.momentum_phase() != ui::EventMomentumPhase::INERTIAL_UPDATE &&
++         HandleScopeScroll(event.y_offset());
 +}
 +void CommandPanelView::ShowActions(bool enabled) {
 +  if (enabled == actions_visible_) {
@@ -2567,7 +2600,18 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  return false;
 +}
 +bool CommandPanelView::OnMouseWheel(const ui::MouseWheelEvent& event) {
-+  return HandleScopeWheel(event) || views::View::OnMouseWheel(event);
++  return HandleScopeScroll(event.y_offset()) || views::View::OnMouseWheel(event);
++}
++void CommandPanelView::OnScrollEvent(ui::ScrollEvent* event) {
++  if (event->type() != ui::EventType::kScroll || event->y_offset() == 0) {
++    views::View::OnScrollEvent(event);
++    return;
++  }
++  HandleScopeScroll(*event);
++  // Input and footer chrome do not scroll vertically. Preserve native precision
++  // here, and prevent rejected momentum from returning as a wheel event.
++  event->SetHandled();
++  event->StopPropagation();
 +}
 +void CommandPanelView::AnimationProgressed(const gfx::Animation* animation) {
 +  if (animation == &scope_animation_ || animation == &scope_selection_animation_) {
@@ -2593,6 +2637,8 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +}
 +BEGIN_METADATA(CommandPanelView, ResultsView)
 +END_METADATA
++BEGIN_METADATA(CommandPanelView, ResultsScrollView)
++END_METADATA
 +BEGIN_METADATA(CommandPanelView, Row)
 +END_METADATA
 +BEGIN_METADATA(CommandPanelView, ScopeButton)
@@ -2610,7 +2656,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,183 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -2681,6 +2727,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 +  SkPath GetContourPath() const;
 +
 +  views::Textfield* input_for_testing() const { return input_; }
++  views::ScrollView* scroll_for_testing() const { return scroll_; }
 +  size_t row_count_for_testing() const { return rows_.size(); }
 +  size_t action_resolutions_for_testing() const { return action_resolutions_; }
 +  const CommandSearchIndex& corpus_for_testing() const;
@@ -2707,10 +2754,12 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 +  void OnPaint(gfx::Canvas*) override;
 +  bool OnMousePressed(const ui::MouseEvent&) override;
 +  bool OnMouseWheel(const ui::MouseWheelEvent&) override;
++  void OnScrollEvent(ui::ScrollEvent*) override;
 +
 + private:
 +  class Row;
 +  class ResultsView;
++  class ResultsScrollView;
 +  class ScopeButton;
 +  class FooterButton;
 +  class BackButton;
@@ -2729,7 +2778,8 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 +  void BrowseScopes(bool enabled);
 +  void HoverScopes(bool enabled);
 +  void UpdateScopeReveal();
-+  bool HandleScopeWheel(const ui::MouseWheelEvent&);
++  bool HandleScopeScroll(float vertical_delta);
++  bool HandleScopeScroll(const ui::ScrollEvent&);
 +  float ScopeWeight(SearchScope scope) const;
 +  float ScopeLabelProgress() const;
 +  void RevealContent(int direction);
@@ -2932,13 +2982,14 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
-@@ -0,0 +1,621 @@
+@@ -0,0 +1,749 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +#include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
 +
 +#include "base/functional/bind.h"
 +#include "base/run_loop.h"
++#include "base/test/scoped_feature_list.h"
 +#include "build/build_config.h"
 +#include "chrome/app/chrome_command_ids.h"
 +#include "chrome/browser/ui/browser.h"
@@ -2951,11 +3002,13 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +#include "ui/accessibility/ax_node_data.h"
 +#include "ui/base/ime/composition_text.h"
 +#include "ui/base/ime/text_edit_commands.h"
++#include "ui/base/ui_base_features.h"
 +#include "ui/events/event.h"
 +#include "ui/gfx/animation/animation_test_api.h"
 +#include "ui/gfx/scoped_animation_duration_scale_mode.h"
 +#include "ui/views/accessibility/view_accessibility.h"
 +#include "ui/views/controls/button/button.h"
++#include "ui/views/controls/scroll_view.h"
 +#include "ui/views/controls/textfield/textfield.h"
 +#include "ui/views/focus/focus_manager.h"
 +#include "ui/views/test/button_test_api.h"
@@ -3010,6 +3063,30 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +    panel()->input_for_testing()->SetText(text);
 +    panel()->ContentsChanged(panel()->input_for_testing(), text);
 +    views::test::RunScheduledLayout(panel());
++  }
++  void Scroll(float vertical_delta,
++              ui::EventMomentumPhase phase = ui::EventMomentumPhase::NONE) {
++    views::View* row = panel()->scroll_for_testing()->contents()->children()[0];
++    ScrollAt(row, vertical_delta, phase);
++  }
++  void ScrollAt(views::View* target,
++                float vertical_delta,
++                ui::EventMomentumPhase phase = ui::EventMomentumPhase::NONE) {
++    auto* widget = panel()->GetWidget();
++    gfx::Point point = target->GetLocalBounds().CenterPoint();
++    views::View::ConvertPointToTarget(target, widget->GetRootView(), &point);
++    ui::ScrollEvent event(ui::EventType::kScroll, gfx::PointF(point),
++                          gfx::PointF(point), base::TimeTicks::Now(), 0, 0,
++                          vertical_delta, 0, vertical_delta, 2, phase);
++    widget->OnScrollEvent(&event);
++    views::test::RunScheduledLayout(panel());
++  }
++  void ConstrainResultsViewport() {
++    auto* widget = panel()->GetWidget();
++    auto bounds = widget->GetWindowBoundsInScreen();
++    bounds.set_height(400);
++    widget->SetBounds(bounds);
++    widget->GetRootView()->DeprecatedLayoutImmediately();
 +  }
 +  void Close() {
 +    auto* widget = panel()->GetWidget();
@@ -3334,6 +3411,107 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  EXPECT_FALSE(panel()->children()[0]->GetVisible());
 +  Key(ui::VKEY_RIGHT);
 +  EXPECT_TRUE(panel()->children()[1]->GetVisible());
++  Close();
++}
++TEST_F(ArciumNativePanelTest, NativeScrollRevealsBeforeCompositorConsumesIt) {
++  base::test::ScopedFeatureList feature_list;
++  feature_list.InitAndEnableFeature(features::kUiCompositorScrollWithLayers);
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  arcium::CommandPanelAppearance appearance;
++  appearance.reveal = arcium::CommandPanelAppearance::Reveal::kHidden;
++  panel()->SetAppearance(appearance);
++  views::test::RunScheduledLayout(panel());
++  for (auto phase : {ui::EventMomentumPhase::NONE,
++                     ui::EventMomentumPhase::MAY_BEGIN,
++                     ui::EventMomentumPhase::END}) {
++    Scroll(0.25f, phase);
++    EXPECT_TRUE(panel()->scopes_focused_for_testing());
++    EXPECT_TRUE(panel()->children()[0]->GetVisible());
++    Scroll(-0.25f, phase);
++    EXPECT_FALSE(panel()->scopes_focused_for_testing());
++    EXPECT_FALSE(panel()->children()[0]->GetVisible());
++  }
++  for (auto phase : {ui::EventMomentumPhase::BEGAN,
++                     ui::EventMomentumPhase::INERTIAL_UPDATE}) {
++    Scroll(20, phase);
++    EXPECT_FALSE(panel()->scopes_focused_for_testing());
++  }
++  Close();
++}
++TEST_F(ArciumNativePanelTest, NativeScrollAwayFromTopDoesNotChangeScope) {
++  base::test::ScopedFeatureList feature_list;
++  feature_list.InitAndEnableFeature(features::kUiCompositorScrollWithLayers);
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  arcium::CommandPanelAppearance appearance;
++  appearance.reveal = arcium::CommandPanelAppearance::Reveal::kHidden;
++  panel()->SetAppearance(appearance);
++  Query(u"reference");
++  ConstrainResultsViewport();
++  auto* scroll = panel()->scroll_for_testing();
++  ASSERT_LT(scroll->GetVisibleRect().height(), scroll->contents()->height());
++  scroll->ScrollToPosition(scroll->vertical_scroll_bar(), 20);
++  ASSERT_GT(scroll->CurrentOffset().y(), 0);
++  Scroll(0.25f);
++  EXPECT_FALSE(panel()->scopes_focused_for_testing());
++  EXPECT_GT(scroll->CurrentOffset().y(), 0);
++  scroll->ScrollToPosition(scroll->vertical_scroll_bar(), 0);
++  Scroll(0.25f);
++  EXPECT_TRUE(panel()->scopes_focused_for_testing());
++  Close();
++}
++TEST_F(ArciumNativePanelTest, NativeScrollOverChromePreservesScopeIntent) {
++  base::test::ScopedFeatureList feature_list;
++  feature_list.InitAndDisableFeature(features::kUiCompositorScrollWithLayers);
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  arcium::CommandPanelAppearance appearance;
++  appearance.reveal = arcium::CommandPanelAppearance::Reveal::kHidden;
++  panel()->SetAppearance(appearance);
++  views::test::RunScheduledLayout(panel());
++  for (views::View* target :
++       {static_cast<views::View*>(panel()->input_for_testing()),
++        panel()->children().back().get(),
++        panel()->scroll_for_testing()->contents()->children()[0].get()}) {
++    ScrollAt(target, 0.25f);
++    EXPECT_TRUE(panel()->scopes_focused_for_testing());
++    ScrollAt(target, -0.25f);
++    EXPECT_FALSE(panel()->scopes_focused_for_testing());
++    for (auto phase : {ui::EventMomentumPhase::BEGAN,
++                       ui::EventMomentumPhase::INERTIAL_UPDATE}) {
++      ScrollAt(target, 20, phase);
++      EXPECT_FALSE(panel()->scopes_focused_for_testing());
++    }
++  }
++  Close();
++}
++TEST_F(ArciumNativePanelTest, NativeScrollFallbackPreservesResultScrolling) {
++  base::test::ScopedFeatureList feature_list;
++  feature_list.InitAndDisableFeature(features::kUiCompositorScrollWithLayers);
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
++  ASSERT_TRUE(browser_view()->ShowArciumCommandBar(true));
++  arcium::CommandPanelAppearance appearance;
++  appearance.reveal = arcium::CommandPanelAppearance::Reveal::kHidden;
++  panel()->SetAppearance(appearance);
++  Query(u"reference");
++  ConstrainResultsViewport();
++  auto* scroll = panel()->scroll_for_testing();
++  ASSERT_LT(scroll->GetVisibleRect().height(), scroll->contents()->height());
++  scroll->ScrollToPosition(scroll->vertical_scroll_bar(), 20);
++  Scroll(-120, ui::EventMomentumPhase::INERTIAL_UPDATE);
++  EXPECT_FALSE(panel()->scopes_focused_for_testing());
++  EXPECT_GT(scroll->CurrentOffset().y(), 20);
++  scroll->ScrollToPosition(scroll->vertical_scroll_bar(), 20);
++  Scroll(120);
++  EXPECT_FALSE(panel()->scopes_focused_for_testing());
++  EXPECT_EQ(0, scroll->CurrentOffset().y());
++  Scroll(0.25f);
++  EXPECT_TRUE(panel()->scopes_focused_for_testing());
 +  Close();
 +}
 +TEST_F(ArciumNativePanelTest, ScopeEnterPreviewsTypedSearchInOnePress) {
