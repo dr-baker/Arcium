@@ -9,7 +9,7 @@
  #include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
  #include "chrome/browser/ui/helium/helium_space.h"
  #include "chrome/browser/ui/helium/helium_space_service_factory.h"
-@@ -236,6 +237,25 @@
+@@ -236,6 +237,40 @@ class HeliumSpaceServiceTest : public Br
      service_->SetSpaceForBrowser(browser(), space_->id());
    }
  
@@ -26,16 +26,31 @@
 +    BrowserWithTestWindowTest::TearDown();
 +  }
 +
-+  Browser* CreateSecondaryBrowser() {
++  Browser* CreateSecondaryBrowser(Profile* owner_profile = nullptr) {
 +    secondary_browsers_.push_back(
-+        CreateBrowser(profile(), Browser::TYPE_NORMAL, /*hosted_app=*/false));
++        CreateBrowser(owner_profile ? owner_profile : profile(),
++                      Browser::TYPE_NORMAL, /*hosted_app=*/false));
 +    return secondary_browsers_.back().get();
++  }
++
++  void DestroySecondaryBrowser(Browser* target) {
++    for (auto current = secondary_browsers_.begin();
++         current != secondary_browsers_.end(); ++current) {
++      if (current->get() != target) {
++        continue;
++      }
++      (*current)->tab_strip_model()->CloseAllTabs();
++      (*current)->GetFeatures().TearDownPreBrowserWindowDestruction();
++      secondary_browsers_.erase(current);
++      return;
++    }
++    ADD_FAILURE() << "Secondary browser was not found";
 +  }
 +
    tabs::TabInterface* AddOrdinaryTab(const char* url) {
      AddTab(browser(), GURL(url));
      content::WebContents* contents =
-@@ -276,6 +296,7 @@
+@@ -276,6 +311,7 @@ class HeliumSpaceServiceTest : public Br
      EXPECT_EQ(original_index, *original_parent->GetIndexOfTab(tab));
    }
  
@@ -43,7 +58,7 @@
    raw_ptr<HeliumSpaceService> service_ = nullptr;
    raw_ptr<HeliumSpace> space_ = nullptr;
  };
-@@ -368,25 +389,27 @@
+@@ -412,25 +448,27 @@ TEST_F(HeliumSpaceServiceTest, EmitsScop
  }
  
  TEST_F(HeliumSpaceServiceTest,
@@ -57,14 +72,13 @@
 -  std::unique_ptr<Browser> unassigned_browser =
 -      CreateBrowser(profile(), Browser::TYPE_NORMAL, /*hosted_app=*/false);
 -  ASSERT_TRUE(unassigned_browser);
--
--  EXPECT_TRUE(
--      service_->GetExplicitSpaceIdForBrowser(unassigned_browser.get()).empty());
 +  Browser* assigned_browser = CreateSecondaryBrowser();
 +  ASSERT_TRUE(assigned_browser);
 +  ASSERT_EQ(other_space->id(),
 +            service_->GetExplicitSpaceIdForBrowser(assigned_browser));
-+
+ 
+-  EXPECT_TRUE(
+-      service_->GetExplicitSpaceIdForBrowser(unassigned_browser.get()).empty());
 +  // Window ownership follows its creation Space when another Space is active.
 +  service_->SetActiveSpace(space_->id());
    EXPECT_EQ(other_space->id(),
@@ -81,7 +95,7 @@
  }
  
  TEST_F(HeliumSpaceServiceTest,
-@@ -596,11 +619,10 @@
+@@ -640,11 +678,10 @@ TEST_F(HeliumSpaceServiceTest,
    HeliumSpace* other_space =
        service_->GetOrCreateSpace("other-space", u"Other Space");
    ASSERT_TRUE(other_space);
