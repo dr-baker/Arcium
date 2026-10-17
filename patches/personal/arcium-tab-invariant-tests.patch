@@ -1,18 +1,18 @@
 --- a/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
 +++ b/chrome/browser/ui/helium/helium_persistent_item_model_unittest.cc
-@@ -3,6 +3,11 @@
- // the terms of the GPL-3.0 license that can be found in the LICENSE file.
+@@ -4,6 +4,11 @@
  
  #include "chrome/browser/ui/helium/helium_persistent_item_model.h"
-+
+ 
 +#include <array>
 +#include <random>
 +#include <set>
 +#include <string>
- 
++
  #include "testing/gtest/include/gtest/gtest.h"
  
-@@ -312,5 +317,144 @@
+ namespace helium {
+@@ -312,5 +317,144 @@ TEST(PersistentGridPackingTest,
              PackPersistentGridChildren(restored));
  }
  
@@ -169,7 +169,7 @@
  #include <map>
  #include <memory>
  #include <vector>
-@@ -588,5 +591,86 @@
+@@ -632,5 +635,86 @@ TEST_F(HeliumSpaceServiceTest, LivePinMi
                          original_pins, original_pref);
  }
  
@@ -258,17 +258,33 @@
  }  // namespace helium
 --- a/chrome/browser/ui/views/tabs/common/tab_view_browsertest.cc
 +++ b/chrome/browser/ui/views/tabs/common/tab_view_browsertest.cc
-@@ -3,6 +3,9 @@
- // found in the LICENSE file.
+@@ -4,11 +4,15 @@
  
  #include "chrome/browser/ui/views/tabs/common/tab_view.h"
-+
+ 
 +#include <map>
 +#include <string>
- 
++
  #include "base/functional/callback_helpers.h"
  #include "base/run_loop.h"
-@@ -145,6 +148,58 @@
+ #include "base/test/metrics/histogram_tester.h"
+ #include "base/test/metrics/user_action_tester.h"
+ #include "base/test/run_until.h"
++#include "base/time/time.h"
+ #include "chrome/browser/media/webrtc/media_capture_devices_dispatcher.h"
+ #include "chrome/browser/performance_manager/public/user_tuning/user_performance_tuning_manager.h"
+ #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
+@@ -49,7 +53,9 @@
+ #include "media/base/media_switches.h"
+ #include "net/test/embedded_test_server/embedded_test_server.h"
+ #include "ui/base/l10n/l10n_util.h"
++#include "ui/events/event.h"
+ #include "ui/events/test/event_generator.h"
++#include "ui/events/types/event_type.h"
+ #include "ui/views/controls/button/button_controller.h"
+ #include "ui/views/controls/label.h"
+ #include "ui/views/widget/widget_utils.h"
+@@ -145,6 +151,58 @@ class HeliumPersistentTabViewTest : publ
      ASSERT_TRUE(default_space);
      service->SetSpaceForBrowser(browser(), default_space->id());
    }
@@ -327,11 +343,82 @@
  };
  
  IN_PROC_BROWSER_TEST_F(TabViewTest, IconDataChanged) {
-@@ -1019,3 +1074,61 @@
+@@ -1019,3 +1077,132 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Aler
                                    tab_bounds.height() / 2, 0, 0);
    EXPECT_EQ(expected_bounds, alert_indicator->bounds());
  }
 +
++
++IN_PROC_BROWSER_TEST_F(HeliumPersistentTabViewTest,
++                       InactiveFavoriteIconPreservesPageBeforeReturningHome) {
++  ASSERT_TRUE(embedded_test_server()->Start());
++  const GURL home_url = embedded_test_server()->GetURL("/title1.html");
++  const GURL away_url = embedded_test_server()->GetURL("/title2.html");
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), home_url));
++
++  auto* favorite = tab_strip_model()->GetActiveTab();
++  content::WebContents* contents = favorite->GetContents();
++  auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(
++      browser()->profile());
++  ASSERT_TRUE(service->AddFavoriteFromTab(favorite));
++  ASSERT_NO_FATAL_FAILURE(WaitForSidebarAgreement());
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), away_url));
++  ASSERT_TRUE(content::ExecJs(contents,
++      "document.body.innerHTML = '<input id=unsaved>';"
++      "document.getElementById('unsaved').value = 'keep this';"));
++
++  AppendTab();
++  ASSERT_NO_FATAL_FAILURE(WaitForSidebarAgreement());
++  ASSERT_NE(favorite, tab_strip_model()->GetActiveTab());
++  const int tab_count = tab_strip_model()->count();
++  auto click_favorite_icon = [&]() {
++    RunScheduledLayouts();
++    auto* node = root_node()->GetNodeForHandle(favorite->GetHandle());
++    ASSERT_TRUE(node);
++    auto* view = views::AsViewClass<TabView>(node->view());
++    ASSERT_TRUE(view);
++    auto* icon = views::AsViewClass<TabIcon>(
++        view->GetViewByElementId(kTabIconElementId));
++    ASSERT_TRUE(icon);
++    ASSERT_NO_FATAL_FAILURE(WaitForLayout(view));
++    ASSERT_TRUE(view->GetVisible());
++    ASSERT_FALSE(icon->bounds().IsEmpty());
++    views::View* target = view;
++    ASSERT_TRUE(base::test::RunUntil([&]() {
++      RunScheduledLayouts();
++      return !view->needs_layout() &&
++             target->HitTestPoint(icon->bounds().CenterPoint());
++    })) << "tab=" << view->bounds().ToString()
++        << " icon=" << icon->bounds().ToString();
++    const gfx::Point point = icon->bounds().CenterPoint();
++    ui::MouseEvent press(ui::EventType::kMousePressed, point, point,
++                         base::TimeTicks(), ui::EF_LEFT_MOUSE_BUTTON,
++                         ui::EF_LEFT_MOUSE_BUTTON);
++    ui::MouseEvent release(ui::EventType::kMouseReleased, point, point,
++                           base::TimeTicks(), ui::EF_LEFT_MOUSE_BUTTON,
++                           ui::EF_LEFT_MOUSE_BUTTON);
++    ASSERT_TRUE(target->OnMousePressed(press));
++    target->OnMouseReleased(release);
++  };
++
++  ASSERT_NO_FATAL_FAILURE(click_favorite_icon());
++  ASSERT_TRUE(content::WaitForLoadStop(contents));
++  EXPECT_EQ(favorite, tab_strip_model()->GetActiveTab());
++  EXPECT_EQ(contents, favorite->GetContents());
++  EXPECT_EQ(tab_count, tab_strip_model()->count());
++  EXPECT_EQ(away_url, contents->GetLastCommittedURL());
++  EXPECT_EQ("keep this", content::EvalJs(contents,
++      "document.getElementById('unsaved')?.value ?? 'missing'"));
++
++  // An explicit second click on the active Favorite retains return-home.
++  ASSERT_EQ(favorite, tab_strip_model()->GetActiveTab());
++  ASSERT_NO_FATAL_FAILURE(click_favorite_icon());
++  ASSERT_TRUE(content::WaitForLoadStop(contents));
++  EXPECT_EQ(home_url, contents->GetLastCommittedURL());
++  EXPECT_EQ(contents, favorite->GetContents());
++  EXPECT_EQ(favorite, tab_strip_model()->GetActiveTab());
++  EXPECT_EQ(tab_count, tab_strip_model()->count());
++}
 +
 +// These sequences deliberately interleave active and background operations.
 +// The page owns a sentinel, so retaining a URL but replacing the WebContents
