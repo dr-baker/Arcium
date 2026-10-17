@@ -2,10 +2,11 @@
 # Validate visible row identities and explicit native interaction preconditions.
 --- a/chrome/browser/ui/views/tabs/common/tab_view_browsertest.cc
 +++ b/chrome/browser/ui/views/tabs/common/tab_view_browsertest.cc
-@@ -5,8 +5,13 @@
+@@ -5,8 +5,14 @@
  #include "chrome/browser/ui/views/tabs/common/tab_view.h"
  
  #include <map>
++#include <memory>
 +#include <set>
  #include <string>
 +#include <utility>
@@ -16,24 +17,43 @@
  #include "base/functional/callback_helpers.h"
  #include "base/run_loop.h"
  #include "base/test/metrics/histogram_tester.h"
-@@ -14,7 +19,7 @@
+@@ -14,7 +20,8 @@
  #include "base/test/run_until.h"
  #include "base/time/time.h"
  #include "chrome/browser/media/webrtc/media_capture_devices_dispatcher.h"
 -#include "chrome/browser/performance_manager/public/user_tuning/user_performance_tuning_manager.h"
 +#include "chrome/browser/performance_manager/policies/page_discarding_helper.h"
++#include "chrome/browser/profiles/profile.h"
  #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
  #include "chrome/browser/ui/animation/browser_animation_controller.h"
  #include "chrome/browser/ui/browser.h"
-@@ -45,6 +50,7 @@
+@@ -30,6 +37,7 @@
+ #include "chrome/browser/ui/views/animations/tab_strip_animations.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
++#include "chrome/browser/ui/views/helium/arcium_chrome_ui_scale.h"
+ #include "chrome/browser/ui/views/interaction/browser_elements_views.h"
+ #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
+ #include "chrome/browser/ui/views/tabs/common/persistent_tab_view.h"
+@@ -45,6 +53,8 @@
  #include "chrome/test/base/in_process_browser_test.h"
  #include "chrome/test/base/ui_test_utils.h"
  #include "components/data_sharing/public/features.h"
 +#include "components/performance_manager/public/performance_manager.h"
++#include "components/prefs/pref_service.h"
  #include "components/tabs/public/tab_alert.h"
  #include "content/public/browser/web_contents.h"
  #include "content/public/browser/web_contents_observer.h"
-@@ -104,11 +110,15 @@ class NewTabTitleObserver : public TabSt
+@@ -58,6 +68,8 @@
+ #include "ui/events/types/event_type.h"
+ #include "ui/views/controls/button/button_controller.h"
+ #include "ui/views/controls/label.h"
++#include "ui/views/view.h"
++#include "ui/views/widget/widget.h"
+ #include "ui/views/widget/widget_utils.h"
+ 
+ class TestWebContentsObserver : public content::WebContentsObserver {
+@@ -104,11 +116,15 @@ class NewTabTitleObserver : public TabSt
      if (change.type() == TabStripModelChange::kInserted) {
        const auto& insert = *change.GetInsert();
        const auto& content = insert.contents[0];
@@ -50,7 +70,7 @@
        views::PropertyChangedCallback callback =
            base::BindRepeating(
                [](views::Label* title) { return title->GetText(); }, title)
-@@ -131,6 +141,66 @@ class TabViewTest : public VerticalTabsB
+@@ -131,6 +147,66 @@ class TabViewTest : public VerticalTabsB
    void WaitForLayout(views::View* view) {
      ASSERT_TRUE(base::test::RunUntil([&]() { return !view->needs_layout(); }));
    }
@@ -117,7 +137,7 @@
  };
  
  class HeliumPersistentTabViewTest : public TabViewTest {
-@@ -155,43 +225,105 @@ class HeliumPersistentTabViewTest : publ
+@@ -155,43 +231,105 @@ class HeliumPersistentTabViewTest : publ
    // Check actual rendered rows, including retiring native views. Checking only
    // collection nodes would miss a stale Favorite still parented in the UI.
    testing::AssertionResult SidebarMatchesModel() {
@@ -248,7 +268,75 @@
               << "; persistent rows=" << testing::PrintToString(persistent_rows)
               << " expected=" << testing::PrintToString(expected_persistent);
      }
-@@ -231,6 +363,9 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Icon
+@@ -205,6 +343,67 @@ class HeliumPersistentTabViewTest : publ
+ 
+ };
+ 
++IN_PROC_BROWSER_TEST_F(TabViewTest,
++                       ChromeScaleCacheTracksWidgetsAndPreferences) {
++  views::View detached;
++  EXPECT_DOUBLE_EQ(1.0, arcium::GetChromeUIScale(&detached));
++  BrowserView* initial = BrowserView::GetBrowserViewForBrowser(browser());
++  ASSERT_TRUE(initial);
++  EXPECT_DOUBLE_EQ(1.0, arcium::GetChromeUIScale(initial));
++
++  PrefService* prefs = browser()->profile()->GetPrefs();
++  prefs->SetInteger(arcium::kChromeUIScalePref, 115);
++  EXPECT_DOUBLE_EQ(1.15, arcium::GetChromeUIScale(initial));
++  Browser* second_browser = CreateBrowser(browser()->profile());
++  BrowserView* second =
++      BrowserView::GetBrowserViewForBrowser(second_browser);
++  ASSERT_TRUE(second);
++  EXPECT_DOUBLE_EQ(1.15, arcium::GetChromeUIScale(second));
++
++  auto make_widget = [](views::Widget* parent) {
++    auto widget = std::make_unique<views::Widget>();
++    views::Widget::InitParams params(
++        views::Widget::InitParams::CLIENT_OWNS_WIDGET,
++        views::Widget::InitParams::TYPE_POPUP);
++    if (parent) {
++      params.SetParent(parent);
++    }
++    widget->Init(std::move(params));
++    widget->SetContentsView(std::make_unique<views::View>());
++    return widget;
++  };
++  auto popup = make_widget(second->GetWidget());
++  ASSERT_EQ(second->GetWidget(), popup->parent());
++  auto plain = make_widget(nullptr);
++  auto* moving = popup->GetContentsView()->AddChildView(
++      std::make_unique<views::View>());
++  EXPECT_DOUBLE_EQ(1.15, arcium::GetChromeUIScale(moving));
++  EXPECT_DOUBLE_EQ(1.0,
++                   arcium::GetChromeUIScale(plain->GetContentsView()));
++
++  prefs->SetInteger(arcium::kChromeUIScalePref, 125);
++  EXPECT_DOUBLE_EQ(1.25, arcium::GetChromeUIScale(initial));
++  EXPECT_DOUBLE_EQ(1.25, arcium::GetChromeUIScale(second));
++  EXPECT_DOUBLE_EQ(1.25, arcium::GetChromeUIScale(moving));
++
++  auto ownership = popup->GetContentsView()->RemoveChildViewT(moving);
++  EXPECT_DOUBLE_EQ(1.0, arcium::GetChromeUIScale(moving));
++  plain->GetContentsView()->AddChildView(std::move(ownership));
++  EXPECT_DOUBLE_EQ(1.0, arcium::GetChromeUIScale(moving));
++  ownership = plain->GetContentsView()->RemoveChildViewT(moving);
++  popup->GetContentsView()->AddChildView(std::move(ownership));
++  EXPECT_DOUBLE_EQ(1.25, arcium::GetChromeUIScale(moving));
++
++  prefs->SetInteger(arcium::kChromeUIScalePref, 0);
++  EXPECT_DOUBLE_EQ(0.8, arcium::GetChromeUIScale(moving));
++  prefs->SetInteger(arcium::kChromeUIScalePref, 100);
++  EXPECT_DOUBLE_EQ(1.0, arcium::GetChromeUIScale(initial));
++  EXPECT_DOUBLE_EQ(1.0, arcium::GetChromeUIScale(second));
++  EXPECT_DOUBLE_EQ(1.0, arcium::GetChromeUIScale(moving));
++  popup->CloseNow();
++  plain->CloseNow();
++}
++
+ IN_PROC_BROWSER_TEST_F(TabViewTest, IconDataChanged) {
+   ASSERT_TRUE(embedded_test_server()->Start());
+ 
+@@ -231,6 +430,9 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Icon
    run_loop.Run();
    EXPECT_TRUE(icon->GetShowingLoadingAnimation());
  
@@ -258,7 +346,7 @@
    // After setting the tab as blocked, expect the attention indicator to not be
    // showing because the tab is active.
    tab_strip_model()->SetTabBlocked(0, true);
-@@ -254,8 +389,19 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Icon
+@@ -254,8 +456,19 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Icon
  
    // After discarding the tab, the icon should show the discard indicator.
    tabs::TabInterface* tab = tab_strip_model()->GetTabAtIndex(0);
@@ -280,7 +368,7 @@
    EXPECT_TRUE(base::test::RunUntil(
        [&]() { return icon->GetShowingDiscardIndicator(); }));
  }
-@@ -348,8 +494,7 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Aler
+@@ -348,8 +561,7 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Aler
    EXPECT_EQ(tabs::TabAlert::kAudioMuting,
              alert_indicator->showing_alert_state());
  
@@ -290,7 +378,7 @@
    scoped_closure_runner.RunAndReset();
    // There is a 2 second hysteresis for the audible state, controlled by
    // RecentlyAudibleHelper. Fire the timer manually to remove the tab alert.
-@@ -360,13 +505,24 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Aler
+@@ -360,13 +572,24 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Aler
    tab_strip_model()->NotifyTabChanged(tab_strip_model()->GetActiveTab(),
                                        TabChangeType::kAll);
    WaitForLayout(tab_view);
@@ -319,7 +407,7 @@
    TabCollectionNode* tab_node = unpinned_collection_node()->children()[0].get();
    TabView* tab_view = views::AsViewClass<TabView>(tab_node->view());
    auto* alert_indicator =
-@@ -397,6 +553,9 @@ class TabViewTabMutingEnabledTest : publ
+@@ -397,6 +620,9 @@ class TabViewTabMutingEnabledTest : publ
  };
  
  IN_PROC_BROWSER_TEST_F(TabViewTabMutingEnabledTest, AlertIndicatorMuteEnabled) {
@@ -329,7 +417,7 @@
    TabCollectionNode* tab_node = unpinned_collection_node()->children()[0].get();
    TabView* tab_view = views::AsViewClass<TabView>(tab_node->view());
    auto* alert_indicator =
-@@ -421,24 +580,43 @@ IN_PROC_BROWSER_TEST_F(TabViewTabMutingE
+@@ -421,24 +647,43 @@ IN_PROC_BROWSER_TEST_F(TabViewTabMutingE
  
    // Initially the audio playing indicator should be visible and enabled.
    set_tab_width(kEnabledWidth);
@@ -382,7 +470,7 @@
  }
  
  IN_PROC_BROWSER_TEST_F(TabViewTabMutingEnabledTest, AlertIndicatorMuteToggle) {
-@@ -490,18 +668,22 @@ IN_PROC_BROWSER_TEST_F(TabViewTabMutingE
+@@ -490,18 +735,22 @@ IN_PROC_BROWSER_TEST_F(TabViewTabMutingE
  }
  
  IN_PROC_BROWSER_TEST_F(TabViewTest, CloseButtonVisibilityActiveTab) {
@@ -408,7 +496,7 @@
  }
  
  IN_PROC_BROWSER_TEST_F(TabViewTest, CloseButtonVisibilityHover) {
-@@ -587,11 +769,17 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Clos
+@@ -587,11 +836,17 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Clos
    // Add a second tab.
    AppendTab();
  
@@ -427,7 +515,7 @@
  
    // Expect there to be two tabs initially.
    ASSERT_EQ(2, tab_strip_model()->count());
-@@ -808,11 +996,12 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Logs
+@@ -808,11 +1063,12 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Logs
    base::UserActionTester user_action_tester;
  
    AppendTab();

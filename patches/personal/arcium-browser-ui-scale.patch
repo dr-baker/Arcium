@@ -1,6 +1,6 @@
 --- a/chrome/browser/ui/BUILD.gn
 +++ b/chrome/browser/ui/BUILD.gn
-@@ -4208,7 +4208,8 @@ static_library("ui") {
+@@ -4224,7 +4224,8 @@ static_library("ui") {
        "views/fullscreen_control/fullscreen_control_host.h",
        "views/global_error_bubble_view.cc",
        "views/global_error_bubble_view.h",
@@ -430,7 +430,7 @@
  #if BUILDFLAG(IS_MAC)
  #include "chrome/browser/ui/browser_shortcuts/browser_shortcut_platform_mac.h"
  #endif
-@@ -1429,6 +1430,9 @@ BrowserView::BrowserView(Browser* browse
+@@ -1433,6 +1434,9 @@ BrowserView::BrowserView(Browser* browse
  
    registrar_.Init(GetProfile()->GetPrefs());
    registrar_.Add(
@@ -440,7 +440,16 @@
        prefs::kFullscreenAllowed,
        base::BindRepeating(&BrowserView::UpdateFullscreenAllowedFromPolicy,
                            base::Unretained(this), CanFullscreen()));
-@@ -6141,6 +6145,11 @@ void BrowserView::AddedToWidget() {
+@@ -5981,6 +5985,8 @@ void BrowserView::ViewHierarchyChanged(
+ }
+ 
+ void BrowserView::AddedToWidget() {
++  arcium::UpdateChromeUIScaleCache(
++      GetWidget(), GetIsNormalType() ? GetProfile() : nullptr);
+   // BrowserView may be added to a widget more than once if the user changes
+   // themes after starting the browser. Do not re-initialize BrowserView in
+   // this case.
+@@ -6187,9 +6193,15 @@ void BrowserView::AddedToWidget() {
        kBrowserDialogAnchorElementId, *this);
  
    initialized_ = true;
@@ -452,6 +461,10 @@
  }
  
  void BrowserView::RemovedFromWidget() {
++  arcium::UpdateChromeUIScaleCache(GetWidget(), nullptr);
+   zen_mode_event_monitor_.reset();
+   app_menu_control_observation_.Reset();
+   CHECK(GetFocusManager());
 --- a/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
 +++ b/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
 @@ -29,6 +29,7 @@
@@ -876,7 +889,7 @@
    tabs::VerticalTabStripState target_collapse_state_for_testing() {
 --- /dev/null
 +++ b/chrome/browser/ui/views/helium/arcium_chrome_ui_scale.cc
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,79 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license found in the LICENSE file.
@@ -889,8 +902,14 @@
 +#include "chrome/browser/ui/views/frame/browser_view.h"
 +#include "chrome/browser/ui/views/helium/arcium_chrome_ui_scale.h"
 +#include "components/prefs/pref_service.h"
++#include "ui/base/class_property.h"
 +#include "ui/views/view.h"
 +#include "ui/views/widget/widget.h"
++
++namespace {
++// Zero leaves child widgets free to inherit their browser window's scale.
++DEFINE_UI_CLASS_PROPERTY_KEY(int, kChromeUIScalePercentKey, 0)
++}  // namespace
 +
 +namespace arcium {
 +double GetChromeUIScale(const Profile* profile) {
@@ -907,13 +926,20 @@
 +double GetChromeUIScale(const views::View* view) {
 +  for (const views::Widget* widget = view ? view->GetWidget() : nullptr;
 +       widget; widget = widget->parent()) {
-+    const BrowserView* browser_view =
-+        BrowserView::GetBrowserViewForNativeWindow(widget->GetNativeWindow());
-+    if (browser_view && browser_view->GetIsNormalType()) {
-+      return GetChromeUIScale(browser_view->GetProfile());
++    const int percent = widget->GetProperty(kChromeUIScalePercentKey);
++    if (percent) {
++      return percent / 100.0;
 +    }
 +  }
 +  return 1.0;
++}
++
++void UpdateChromeUIScaleCache(views::Widget* widget, const Profile* profile) {
++  if (widget) {
++    widget->SetProperty(
++        kChromeUIScalePercentKey,
++        profile ? base::ClampRound(GetChromeUIScale(profile) * 100) : 0);
++  }
 +}
 +
 +int ScaleChromeDip(const views::View* view, int value) {
@@ -928,6 +954,7 @@
 +      !browser_view->GetIsNormalType()) {
 +    return;
 +  }
++  UpdateChromeUIScaleCache(browser_view->GetWidget(), browser_view->GetProfile());
 +  // Theme propagation refreshes cached icons and padding. Recompute layout
 +  // without changing page zoom or the display device scale factor.
 +  browser_view->GetWidget()->ThemeChanged();
@@ -944,7 +971,7 @@
 +}  // namespace arcium
 --- /dev/null
 +++ b/chrome/browser/ui/views/helium/arcium_chrome_ui_scale.h
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,34 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license found in the LICENSE file.
@@ -957,6 +984,7 @@
 +enum class LayoutConstant;
 +namespace views {
 +class View;
++class Widget;
 +}
 +
 +namespace arcium {
@@ -969,6 +997,9 @@
 +// Original-profile preference; no display scale or WebContents zoom changes.
 +double GetChromeUIScale(const Profile* profile);
 +double GetChromeUIScale(const views::View* view);
++// Publish before theme/layout notifications. A null profile clears the cache
++// when BrowserView leaves its widget; child widgets inherit without copies.
++void UpdateChromeUIScaleCache(views::Widget* widget, const Profile* profile);
 +int ScaleChromeDip(const views::View* view, int value);
 +int GetChromeLayoutConstant(const views::View* view, LayoutConstant constant);
 +void RefreshChromeUI(BrowserView* browser_view);
@@ -1008,7 +1039,7 @@
  #include "chrome/browser/ui/views/location_bar/content_setting_image_view.h"
  #include "chrome/browser/ui/views/location_bar/intent_chip_button.h"
  #include "chrome/browser/ui/views/location_bar/location_bar_layout.h"
-@@ -172,6 +173,7 @@
+@@ -174,6 +175,7 @@
  #include "ui/events/event.h"
  #include "ui/gfx/animation/slide_animation.h"
  #include "ui/gfx/canvas.h"
@@ -1016,7 +1047,7 @@
  #include "ui/gfx/geometry/skia_conversions.h"
  #include "ui/gfx/image/image.h"
  #include "ui/gfx/paint_vector_icon.h"
-@@ -207,6 +209,25 @@ int IncrementalMinimumWidth(const views:
+@@ -214,6 +216,25 @@ int IncrementalMinimumWidth(const views:
    return (view && view->GetVisible()) ? view->GetMinimumSize().width() : 0;
  }
  
@@ -1042,7 +1073,7 @@
  // The padding between the intent chip and the other trailing decorations.
  constexpr int kIntentChipIntraItemPadding = 4;
  
-@@ -346,13 +367,13 @@ void LocationBarView::Init() {
+@@ -353,13 +374,13 @@ void LocationBarView::Init() {
    }
  
    const auto& typography_provider = views::TypographyProvider::Get();
@@ -1062,7 +1093,7 @@
  
    auto location_icon_view =
        std::make_unique<LocationIconView>(omnibox_chip_font_list, this, this);
-@@ -511,11 +532,13 @@ void LocationBarView::Init() {
+@@ -525,11 +546,13 @@ void LocationBarView::Init() {
    // if all page actions (i.e. up to bookmark star) are migrated.
    const bool should_bridge_containers =
        !IsPageActionMigrated(PageActionIconType::kBookmarkStar);
@@ -1080,7 +1111,7 @@
        .between_icon_spacing = kBetweenIconSpacing,
        .icon_label_bubble_delegate = this,
        .font_list = &page_action_font_list,
-@@ -752,14 +775,15 @@ bool LocationBarView::HasFocus() const {
+@@ -766,14 +789,15 @@ bool LocationBarView::HasFocus() const {
  }
  
  gfx::Size LocationBarView::GetMinimumSize() const {
@@ -1099,7 +1130,7 @@
    const int leading_width = GetMinimumLeadingWidth();
    const int omnibox_width = omnibox_view_->GetMinimumSize().width();
    const int trailing_width = GetMinimumTrailingWidth();
-@@ -779,7 +803,8 @@ gfx::Size LocationBarView::GetMinimumSiz
+@@ -800,7 +824,8 @@ gfx::Size LocationBarView::GetMinimumSiz
  
  gfx::Size LocationBarView::CalculatePreferredSize(
      const views::SizeBounds& available_size) const {
@@ -1109,7 +1140,7 @@
    if (!IsInitialized()) {
      return gfx::Size(0, height);
    }
-@@ -794,8 +819,8 @@ gfx::Size LocationBarView::CalculatePref
+@@ -821,8 +846,8 @@ gfx::Size LocationBarView::CalculatePref
    }
  
    const int inset_width = GetInsets().width();
@@ -1120,7 +1151,7 @@
    const int leading_width = GetMinimumLeadingWidth();
    const int omnibox_min_width = omnibox_view_->GetMinimumSize().width();
    const int trailing_width = GetMinimumTrailingWidth();
-@@ -826,9 +851,9 @@ void LocationBarView::Layout(PassKey) {
+@@ -872,9 +897,9 @@ void LocationBarView::Layout(PassKey) {
    // TODO(manukh): Move constants to layout_constants.cc.
    // The padding between the left edges of the location bar and the LHS icon,
    // e.g. the page info icon, the google G icon, the selected suggestion icon.
@@ -1132,7 +1163,7 @@
  
    // Apply indentation to align the omnibox input icon and the text with those
    // of the suggestions in the popup. However, there are two exceptions where
-@@ -848,20 +873,23 @@ void LocationBarView::Layout(PassKey) {
+@@ -894,20 +919,23 @@ void LocationBarView::Layout(PassKey) {
                               !ShouldShowKeywordBubble();
    if (should_indent) {
      icon_left += 0 /*icon_indent*/;
@@ -1165,7 +1196,7 @@
      text_left += 0; /*text_indent_keyword_mode*/
    }
  
-@@ -869,18 +897,18 @@ void LocationBarView::Layout(PassKey) {
+@@ -915,18 +943,18 @@ void LocationBarView::Layout(PassKey) {
                                          text_left);
    LocationBarLayout trailing_decorations(
        LocationBarLayout::Position::kRightEdge,
@@ -1190,7 +1221,7 @@
  
    const int location_height = std::max(height() - (vertical_padding * 2), 0);
    // The largest fraction of the omnibox that can be taken by the EV or search
-@@ -949,12 +977,12 @@ void LocationBarView::Layout(PassKey) {
+@@ -995,12 +1023,12 @@ void LocationBarView::Layout(PassKey) {
    const int kTrailingEdgePaddingForAim =
        IsPageActionMigrated(PageActionIconType::kAiMode) &&
                !all_page_actions_migrated
@@ -1206,7 +1237,7 @@
            : trailing_decorations_edge_padding;
    add_trailing_decoration(page_action_icon_container_,
                            /*intra_item_padding=*/0,
-@@ -968,13 +996,15 @@ void LocationBarView::Layout(PassKey) {
+@@ -1014,13 +1042,15 @@ void LocationBarView::Layout(PassKey) {
    add_trailing_decoration(ai_mode_hint_label_, /*intra_item_padding=*/0,
                            /*edge_padding=*/trailing_decorations_edge_padding);
    for (ContentSettingImageView* view : base::Reversed(content_setting_views_)) {
@@ -1224,7 +1255,7 @@
      add_trailing_decoration(intent_chip_, intra_item_padding,
                              /*edge_padding=*/trailing_decorations_edge_padding);
    }
-@@ -990,8 +1020,8 @@ void LocationBarView::Layout(PassKey) {
+@@ -1036,8 +1066,8 @@ void LocationBarView::Layout(PassKey) {
    // TODO(crbug.com/350541615): This can be removed once current non-resizable
    // decorations are updated to support LocationBayLayout::auto_collapse.
    const int inset_width = GetInsets().width();
@@ -1235,7 +1266,7 @@
    const int unelided_omnibox_width = omnibox_view_->GetUnelidedTextWidth();
    const int reserved_width = unelided_omnibox_width + inset_width + padding * 2;
  
-@@ -1097,6 +1127,7 @@ void LocationBarView::OnThemeChanged() {
+@@ -1149,6 +1179,7 @@ void LocationBarView::OnThemeChanged() {
  
    RefreshBackground();
    RefreshClearAllButtonIcon();
@@ -1243,7 +1274,7 @@
  }
  
  void LocationBarView::ChildPreferredSizeChanged(views::View* child) {
-@@ -1309,6 +1340,17 @@ WebContents* LocationBarView::GetWebCont
+@@ -1364,6 +1395,17 @@ WebContents* LocationBarView::GetWebCont
    return GetWebContents();
  }
  
@@ -1261,7 +1292,7 @@
  bool LocationBarView::ShouldHidePageActionIcons() const {
    if (!omnibox_view_) {
      return false;
-@@ -1484,7 +1526,8 @@ int LocationBarView::GetMinimumLeadingWi
+@@ -1543,7 +1585,8 @@ int LocationBarView::GetMinimumLeadingWi
      return location_icon_view_->GetMinimumLabelTextWidth();
    }
  
@@ -1271,7 +1302,7 @@
           location_icon_view_->GetMinimumSize().width();
  }
  
-@@ -1692,9 +1735,12 @@ void LocationBarView::RefreshClearAllBut
+@@ -1789,9 +1832,12 @@ void LocationBarView::RefreshClearAllBut
    SetImageFromVectorIconWithColor(
        clear_all_button_, icon,
        {kColorLocationBarClearAllButtonIcon,
@@ -1287,7 +1318,7 @@
  }
  
  bool LocationBarView::ShouldShowKeywordBubble() const {
-@@ -2112,8 +2158,10 @@ void LocationBarView::OnOmniboxHovered(b
+@@ -2220,8 +2266,10 @@ void LocationBarView::OnOmniboxHovered(b
  }
  
  void LocationBarView::OnTouchUiChanged() {
@@ -1300,7 +1331,7 @@
    location_icon_view_->SetFontList(font_list);
    omnibox_view_->SetFontList(font_list);
    ime_inline_autocomplete_view_->SetFontList(font_list);
-@@ -2122,7 +2170,18 @@ void LocationBarView::OnTouchUiChanged()
+@@ -2230,7 +2278,18 @@ void LocationBarView::OnTouchUiChanged()
    for (ContentSettingImageView* view : content_setting_views_) {
      view->SetFontList(font_list);
    }
@@ -1319,7 +1350,7 @@
    location_icon_view_->Update(
        /*suppress_animations=*/false, GetOmniboxController()->IsPopupOpen());
    PreferredSizeChanged();
-@@ -2332,7 +2391,8 @@ ui::ImageModel LocationBarView::GetLocat
+@@ -2441,7 +2500,8 @@ ui::ImageModel LocationBarView::GetLocat
            background->color().ResolveToSkColor(color_provider));
      }
    }
@@ -1331,7 +1362,7 @@
      return GetOmniboxController()->edit_model()->GetAddContextIcon(dip_size);
 --- a/chrome/browser/ui/views/location_bar/location_bar_view.h
 +++ b/chrome/browser/ui/views/location_bar/location_bar_view.h
-@@ -453,6 +453,9 @@ class LocationBarView
+@@ -458,6 +458,9 @@ class LocationBarView
  
    // PageActionIconView::Delegate:
    content::WebContents* GetWebContentsForPageActionIconView() override;
@@ -1567,7 +1598,7 @@
    const int title_height = title_->GetLineHeight();
    title_->SetBounds(title_x,
                      contents.y() + (contents.height() - title_height) / 2,
-@@ -252,14 +256,16 @@ gfx::Size PersistentTabView::CalculatePr
+@@ -252,14 +256,18 @@ gfx::Size PersistentTabView::CalculatePr
      const views::SizeBounds& available_size) const {
    if (presentation_mode_ == PresentationMode::kCompactGrid) {
      return gfx::Size(
@@ -1584,14 +1615,16 @@
 -  return gfx::Size(width,
 -                   GetLayoutConstant(LayoutConstant::kVerticalTabHeight));
 +  const int width =
-+      available_size.width().value_or(arcium::GetChromeLayoutConstant(
-+          this, LayoutConstant::kVerticalTabMinWidth));
++      available_size.width().is_bounded()
++          ? available_size.width().value()
++          : arcium::GetChromeLayoutConstant(
++                this, LayoutConstant::kVerticalTabMinWidth);
 +  return gfx::Size(width, arcium::GetChromeLayoutConstant(
 +                              this, LayoutConstant::kVerticalTabHeight));
  }
  
  void PersistentTabView::PaintButtonContents(gfx::Canvas* canvas) {
-@@ -274,9 +280,10 @@ void PersistentTabView::PaintButtonConte
+@@ -274,9 +282,10 @@ void PersistentTabView::PaintButtonConte
      flags.setColor(tab_style_->GetCurrentTabBackgroundColor(
          selection_state, hovered, hovered ? 1.0f : 0.0f, IsFrameActive(),
          GetColorProvider()));
@@ -1605,7 +1638,7 @@
    }
  
    views::Button::PaintButtonContents(canvas);
-@@ -297,7 +304,13 @@ void PersistentTabView::RemovedFromWidge
+@@ -297,7 +306,13 @@ void PersistentTabView::RemovedFromWidge
  
  void PersistentTabView::OnThemeChanged() {
    views::Button::OnThemeChanged();
@@ -2183,7 +2216,7 @@
    }
  
    // Ordered vector of children to be rendered in the tab.
-@@ -731,17 +735,28 @@ void TabView::UpdateLayerRoundedCorners(
+@@ -734,17 +738,28 @@ void TabView::UpdateLayerRoundedCorners(
  
  void TabView::OnThemeChanged() {
    views::View::OnThemeChanged();
@@ -2213,7 +2246,7 @@
      // The only expandable view is the views::Label. Just get the line height to
      // make calculating bounds cheaper.
      views::Label* label = views::AsViewClass<views::Label>(config.view);
-@@ -756,7 +771,7 @@ gfx::Rect TabView::GetChildBounds(const
+@@ -759,7 +774,7 @@ gfx::Rect TabView::GetChildBounds(const
    // Some icons have larger sizes to account for decoration. Make a distinction
    // between the design width and the actual width.
    const int design_width =
@@ -2222,7 +2255,7 @@
  
    int x = container.x();
    if (center) {
-@@ -808,9 +823,9 @@ bool TabView::IsChildVisible(const views
+@@ -811,9 +826,9 @@ bool TabView::IsChildVisible(const views
      // button on active non-hovered tabs a little bit sooner than reaching the
      // uncollapsed min width, because otherwise the close buttons in a grouped
      // split tab will visibly show up at different times due to rounding.
@@ -2234,7 +2267,7 @@
        return active_ && (hovered_ || HasFocus() ||
                           (close_button_ && close_button_->HasFocus()));
      }
-@@ -824,16 +839,17 @@ bool TabView::IsChildVisible(const views
+@@ -827,16 +842,17 @@ bool TabView::IsChildVisible(const views
  
  views::ProposedLayout TabView::CalculateProposedLayout(
      const views::SizeBounds& size_bounds) const {
@@ -2258,7 +2291,7 @@
  
    // If the tab is collapsed but animating with a wider width then we shouldn't
    // center the contents.
-@@ -842,10 +858,11 @@ views::ProposedLayout TabView::Calculate
+@@ -845,10 +861,11 @@ views::ProposedLayout TabView::Calculate
    int placed_children = 0;
    for (const auto& child : tab_children_configs_) {
      const bool can_render_child =
@@ -2274,7 +2307,7 @@
      const bool is_child_visible = IsChildVisible(child.view, width);
      if (is_child_visible && can_render_child) {
        layouts.child_layouts.emplace_back(
-@@ -855,8 +872,12 @@ views::ProposedLayout TabView::Calculate
+@@ -858,8 +875,12 @@ views::ProposedLayout TabView::Calculate
        if (!is_centered) {
          bounds_remaining.Inset(
              child.align_leading
@@ -2289,7 +2322,7 @@
        }
  
        placed_children += 1;
-@@ -1156,12 +1177,15 @@ void TabView::UpdateBorder() {
+@@ -1160,12 +1181,15 @@ void TabView::UpdateBorder() {
    if (pinned_) {
      if (split_) {
        // Insets for border handled by the `SplitTabView`.
@@ -2309,7 +2342,7 @@
            IsFrameActive() ? kColorVerticalTabPinnedOutline
                            : kColorTabDividerFrameInactive));
      }
-@@ -1285,13 +1309,15 @@ float TabView::GetHoverOpacity() const {
+@@ -1289,13 +1313,15 @@ float TabView::GetHoverOpacity() const {
    // that most tabs will fall on the low end of the opacity range, but very
    // narrow tabs will still stand out on the high end.
    // TODO(crbug.com/457525745): Determine what the min and max widths should be.
@@ -2331,7 +2364,7 @@
    return gfx::Tween::FloatValueBetween(t * t, hover_opacity_min_,
                                         hover_opacity_max_);
  }
-@@ -1331,22 +1357,23 @@ bool TabView::IsDragging() const {
+@@ -1335,22 +1361,23 @@ bool TabView::IsDragging() const {
               *this);
  }
  
@@ -2366,7 +2399,7 @@
  }
  
  bool TabView::IsInExpandOnHover(int width) const {
-@@ -1370,9 +1397,9 @@ void TabView::UpdateHoverCard(HoverCardA
+@@ -1374,9 +1401,9 @@ void TabView::UpdateHoverCard(HoverCardA
  }
  
  SkScalar TabView::GetCornerRadius() const {
@@ -4846,7 +4879,7 @@
  #include "chrome/browser/ui/views/omnibox/omnibox_view_views.h"
  #include "chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.h"
  #include "chrome/browser/ui/views/page_action/page_action_container_view.h"
-@@ -33,16 +36,20 @@
+@@ -33,6 +36,7 @@
  #include "components/omnibox/browser/fake_autocomplete_provider.h"
  #include "components/omnibox/browser/omnibox_client.h"
  #include "components/omnibox/browser/shortcuts_backend.h"
@@ -4854,7 +4887,7 @@
  #include "content/public/browser/web_contents.h"
  #include "content/public/test/navigation_simulator.h"
  #include "extensions/buildflags/buildflags.h"
- #include "net/http/http_response_headers.h"
+@@ -40,9 +44,12 @@
  #include "ui/accessibility/ax_node_data.h"
  #include "ui/events/event.h"
  #include "ui/events/keycodes/dom/dom_code.h"
@@ -4867,7 +4900,7 @@
  #include "ui/views/test/views_test_utils.h"
  #include "ui/views/test/widget_test.h"
  #include "ui/views/view_utils.h"
-@@ -463,3 +470,22 @@
+@@ -531,3 +538,22 @@ TEST_F(ArciumCommandBarTest, HttpZeroSug
    navigation->Commit();
    EXPECT_TRUE(backend->shortcuts_map().empty());
  }
@@ -4900,7 +4933,7 @@
  #include "components/omnibox/browser/omnibox_field_trial.h"
  #include "components/omnibox/common/omnibox_features.h"
  #include "ui/base/metadata/metadata_impl_macros.h"
-@@ -278,10 +279,12 @@ std::unique_ptr<gfx::RenderText> Omnibox
+@@ -293,10 +294,12 @@ std::unique_ptr<gfx::RenderText> Omnibox
    render_text->SetElideBehavior(gfx::ELIDE_TAIL);
    const gfx::FontList& font = views::TypographyProvider::Get().GetFont(
        CONTEXT_OMNIBOX_POPUP, kTextStyle);
