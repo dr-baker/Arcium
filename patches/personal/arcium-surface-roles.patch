@@ -1296,7 +1296,7 @@ Index: src/chrome/browser/ui/views/helium/surface_style.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/helium/surface_style.cc
-@@ -0,0 +1,444 @@
+@@ -0,0 +1,452 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license found in the LICENSE file.
@@ -1430,6 +1430,9 @@ Index: src/chrome/browser/ui/views/helium/surface_style.cc
 +  if (value == kPanelMaterialLiquid) {
 +    return PanelMaterial::kLiquid;
 +  }
++  if (value == kPanelMaterialSystemLiquid) {
++    return PanelMaterial::kSystemLiquid;
++  }
 +  if (value == kPanelMaterialFrosted) {
 +    return PanelMaterial::kFrosted;
 +  }
@@ -1447,6 +1450,8 @@ Index: src/chrome/browser/ui/views/helium/surface_style.cc
 +      return kPanelMaterialFast;
 +    case PanelMaterial::kLiquid:
 +      return kPanelMaterialLiquid;
++    case PanelMaterial::kSystemLiquid:
++      return kPanelMaterialSystemLiquid;
 +    case PanelMaterial::kFrosted:
 +      return kPanelMaterialFrosted;
 +    case PanelMaterial::kGlassmorphic:
@@ -1652,7 +1657,7 @@ Index: src/chrome/browser/ui/views/helium/surface_style.cc
 +      style.panel_material = PanelMaterial::kSolid;
 +      break;
 +    case PanelChoice::kGlass:
-+      // An explicit glass choice keeps the preset's glass, or Liquid.
++      // An explicit glass choice keeps the preset's glass, or Clear.
 +      style.panel_material = tuning.panel_material == PanelMaterial::kSolid
 +                                 ? PanelMaterial::kLiquid
 +                                 : tuning.panel_material;
@@ -1662,7 +1667,10 @@ Index: src/chrome/browser/ui/views/helium/surface_style.cc
 +      break;
 +  }
 +  style.panel_glass = style.panel_material != PanelMaterial::kSolid;
-+  style.panel_tint = static_cast<float>(tuning.panel_tint);
++  // Frosted is an untinted material. Retain the shared saved tint for when
++  // another panel material is selected.
++  style.panel_tint = style.panel_material == PanelMaterial::kFrosted
++                         ? 0.f : static_cast<float>(tuning.panel_tint);
 +  style.panel_blur = static_cast<float>(tuning.panel_blur);
 +  style.panel_tint_color = tuning.panel_tint_color ? tuning.panel_tint_color
 +                                                : inputs.window_tint_color;
@@ -1745,7 +1753,7 @@ Index: src/chrome/browser/ui/views/helium/surface_style.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/helium/surface_style.h
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,228 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license found in the LICENSE file.
@@ -1794,7 +1802,9 @@ Index: src/chrome/browser/ui/views/helium/surface_style.h
 +
 +inline constexpr char kPanelMaterialSolid[] = "solid";
 +inline constexpr char kPanelMaterialFast[] = "fast";
++// Legacy saved ID: the existing AppKit material is displayed as Clear.
 +inline constexpr char kPanelMaterialLiquid[] = "liquid";
++inline constexpr char kPanelMaterialSystemLiquid[] = "systemLiquid";
 +inline constexpr char kPanelMaterialFrosted[] = "frosted";
 +inline constexpr char kPanelMaterialGlassmorphic[] = "glassmorphic";
 +
@@ -1830,8 +1840,10 @@ Index: src/chrome/browser/ui/views/helium/surface_style.h
 +  kSolid,
 +  // A system blur material: cheap and stable, with no live refraction.
 +  kFast,
-+  // Clear native Liquid Glass, always drawn in its active state.
++  // Clear: the existing active AppKit material, with saved ID "liquid".
 +  kLiquid,
++  // Liquid: public SwiftUI Glass.regular and glassEffect, with native tint.
++  kSystemLiquid,
 +  // Clear native Liquid Glass, always drawn in its inactive, frostier state.
 +  kFrosted,
 +  // Chromium's refraction shader. Only the switcher, which can live inside the
@@ -1974,7 +1986,7 @@ Index: src/chrome/browser/ui/views/helium/surface_style_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/helium/surface_style_unittest.cc
-@@ -0,0 +1,358 @@
+@@ -0,0 +1,395 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license found in the LICENSE file.
@@ -2172,7 +2184,7 @@ Index: src/chrome/browser/ui/views/helium/surface_style_unittest.cc
 +
 +TEST(SurfaceStyleTest, CustomValuesDriveEveryRole) {
 +  SurfaceTuning tuning;
-+  tuning.panel_material = PanelMaterial::kFrosted;
++  tuning.panel_material = PanelMaterial::kSystemLiquid;
 +  tuning.panel_tint = 0.1;
 +  tuning.panel_tint_color = SK_ColorRED;
 +  tuning.panel_shadow = false;
@@ -2184,7 +2196,7 @@ Index: src/chrome/browser/ui/views/helium/surface_style_unittest.cc
 +  const SurfaceStyle style =
 +      ResolveSurfaceStyle({.set = SurfaceSet::kCustom, .tuning = tuning});
 +  EXPECT_TRUE(style.panel_glass);
-+  EXPECT_EQ(style.panel_material, PanelMaterial::kFrosted);
++  EXPECT_EQ(style.panel_material, PanelMaterial::kSystemLiquid);
 +  EXPECT_EQ(style.embedded_panel, SurfaceFinish::kGlass);
 +  EXPECT_FLOAT_EQ(style.panel_tint, 0.1f);
 +  EXPECT_EQ(style.panel_tint_color, SK_ColorRED);
@@ -2209,10 +2221,47 @@ Index: src/chrome/browser/ui/views/helium/surface_style_unittest.cc
 +TEST(SurfaceStyleTest, MaterialNamesRoundTrip) {
 +  for (PanelMaterial material :
 +       {PanelMaterial::kSolid, PanelMaterial::kFast, PanelMaterial::kLiquid,
-+        PanelMaterial::kFrosted, PanelMaterial::kGlassmorphic}) {
++        PanelMaterial::kSystemLiquid, PanelMaterial::kFrosted,
++        PanelMaterial::kGlassmorphic}) {
 +    EXPECT_EQ(ParsePanelMaterial(PanelMaterialString(material)), material);
 +  }
 +  EXPECT_FALSE(ParsePanelMaterial("ribbon"));
++}
++
++TEST(SurfaceStyleTest, PublicLiquidKeepsTintAndLegacyClearIdentifier) {
++  EXPECT_EQ(ParsePanelMaterial("liquid"), PanelMaterial::kLiquid);
++  SurfaceTuning tuning = PresetSurfaceTuning(SurfaceSet::kGlass);
++  tuning.panel_material = PanelMaterial::kSystemLiquid;
++  tuning.panel_tint = .65;
++  tuning.panel_tint_color = SK_ColorRED;
++  const auto saved = SerializeSurfaceTuning(tuning);
++  EXPECT_EQ(*saved.FindString(kSurfaceTuningPanelMaterialKey), "systemLiquid");
++  EXPECT_EQ(ParseSurfaceTuningStrict(saved), tuning);
++  const auto style = ResolveSurfaceStyle({.set = SurfaceSet::kCustom,
++                                          .tuning = tuning});
++  EXPECT_TRUE(style.panel_glass);
++  EXPECT_FLOAT_EQ(style.panel_tint, .65f);
++  EXPECT_EQ(style.panel_tint_color, SK_ColorRED);
++  const auto panel = PanelGlassConfiguration(DefaultGlassSurfaceConfiguration(),
++                                              style);
++  EXPECT_EQ(panel.material, GlassSurfaceMaterial::kLiquidGlass);
++  EXPECT_DOUBLE_EQ(panel.glass_tint_opacity, style.panel_tint);
++}
++
++TEST(SurfaceStyleTest, FrostedIgnoresTintWithoutErasingTheSavedChoice) {
++  SurfaceTuning tuning = PresetSurfaceTuning(SurfaceSet::kGlass);
++  tuning.panel_tint = .8;
++  tuning.panel_tint_color = SK_ColorRED;
++  tuning.panel_material = PanelMaterial::kFrosted;
++  const auto saved = SerializeSurfaceTuning(tuning);
++  const auto style = ResolveSurfaceStyle({.set = SurfaceSet::kCustom,
++                                          .tuning = tuning});
++  EXPECT_FLOAT_EQ(style.panel_tint, 0.f);
++  EXPECT_EQ(PanelSolidColor(style), kPanelSolidColor);
++  EXPECT_EQ(ParseSurfaceTuningStrict(saved), tuning);
++  tuning.panel_material = PanelMaterial::kSystemLiquid;
++  EXPECT_FLOAT_EQ(ResolveSurfaceStyle({.set = SurfaceSet::kCustom,
++                                       .tuning = tuning}).panel_tint, .8f);
 +}
 +
 +TEST(SurfaceStyleTest, TuningParsersClampAndValidate) {
