@@ -1231,7 +1231,7 @@ Index: src/chrome/browser/ui/views/helium/surface_style.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/helium/surface_style.cc
-@@ -0,0 +1,422 @@
+@@ -0,0 +1,425 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license found in the LICENSE file.
@@ -1550,20 +1550,22 @@ Index: src/chrome/browser/ui/views/helium/surface_style.cc
 +
 +SurfaceInputs ReadSurfaceInputs(const PrefService* prefs) {
 +  const SurfaceSet set = ReadSurfaceSet(prefs);
-+  SurfaceTuning tuning = ReadSurfaceTuning(prefs, set);
++  const SurfaceTuning tuning = ReadSurfaceTuning(prefs, set);
++  std::optional<SkColor> window_tint_color;
 +  if (!tuning.panel_tint_color && prefs &&
 +      prefs->FindPreference(kArciumChromeAppearancePref)) {
 +    // Follow an actual window glass color without copying it into the saved
 +    // panel tuning, so editing or removing that color updates every panel.
 +    const auto window = ReadGlassSurfaceConfiguration(prefs);
 +    if (window.point_count > 0) {
-+      tuning.panel_tint_color = window.points[0].color.toSkColor();
++      window_tint_color = window.points[0].color.toSkColor();
 +    }
 +  }
 +  return {
 +      .set = set,
 +      .panel = ReadPanelChoice(prefs),
 +      .tuning = tuning,
++      .window_tint_color = window_tint_color,
 +  };
 +}
 +
@@ -1586,7 +1588,8 @@ Index: src/chrome/browser/ui/views/helium/surface_style.cc
 +  }
 +  style.panel_glass = style.panel_material != PanelMaterial::kSolid;
 +  style.panel_tint = static_cast<float>(tuning.panel_tint);
-+  style.panel_tint_color = tuning.panel_tint_color;
++  style.panel_tint_color = tuning.panel_tint_color ? tuning.panel_tint_color
++                                                : inputs.window_tint_color;
 +  style.panel_shadow = tuning.panel_shadow;
 +  style.control_tint = static_cast<float>(tuning.control_tint);
 +  style.control_edge_alpha =
@@ -1658,7 +1661,7 @@ Index: src/chrome/browser/ui/views/helium/surface_style.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/helium/surface_style.h
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,216 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license found in the LICENSE file.
@@ -1796,6 +1799,9 @@ Index: src/chrome/browser/ui/views/helium/surface_style.h
 +  bool embedded_glass_available = true;
 +  // The values for `set`; Custom's are read from the profile.
 +  SurfaceTuning tuning;
++  // A rendering fallback, kept separate so Settings still sees an empty
++  // panel_tint_color as Window tint rather than as an explicit custom color.
++  std::optional<SkColor> window_tint_color;
 +};
 +
 +struct SurfaceStyle {
@@ -1876,7 +1882,7 @@ Index: src/chrome/browser/ui/views/helium/surface_style_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/helium/surface_style_unittest.cc
-@@ -0,0 +1,314 @@
+@@ -0,0 +1,317 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license found in the LICENSE file.
@@ -1954,6 +1960,9 @@ Index: src/chrome/browser/ui/views/helium/surface_style_unittest.cc
 +  EXPECT_EQ(ResolveSurfaceStyle(ReadSurfaceInputs(&prefs)).panel_tint_color,
 +            SK_ColorRED);
 +  EXPECT_FALSE(ReadSurfaceTuning(&prefs, SurfaceSet::kGlass).panel_tint_color);
++  // Settings serializes the input tuning; a resolved window color must not
++  // turn the Window tint choice into a custom color in its snapshot.
++  EXPECT_FALSE(ReadSurfaceInputs(&prefs).tuning.panel_tint_color);
 +
 +  // Editing the window color changes the tint without saving a panel color.
 +  window.points[0].color = SkColor4f::FromColor(SK_ColorBLUE);
