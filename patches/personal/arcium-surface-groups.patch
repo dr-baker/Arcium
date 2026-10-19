@@ -684,23 +684,28 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.cc
    void ApplyStyle() {
      const float blur = style_.scrim.blur_sigma;
      backdrop_view_->layer()->SetLayerBlur(blur);
-@@ -237,26 +375,78 @@ class PeekOverlayView : public views::Vi
+@@ -237,26 +375,83 @@ class PeekOverlayView : public views::Vi
      } else if (blur == 0.0f) {
        backdrop_cache_.reset();
      }
 +    EnsureNativeControls();
 +    const bool native_container =
 +        native_container_ &&
-+        native_container_->Update(container_style_, 16 + kContainerRim);
++        native_container_->Update(container_style_, 16 + kContainerRim,
++                                  kContainerRim);
 +    native_glass_host_->SetVisible(native_container);
 +    container_glass_->SetVisible(!native_container &&
 +                                 container_style_.embedded_panel !=
 +                                     SurfaceFinish::kSolid);
-+    container_fill_->SetVisible(!native_container &&
-+                                container_style_.embedded_panel ==
-+                                    SurfaceFinish::kSolid);
++    // Keep the shadow in the browser underlay even when native glass supplies
++    // the rim. A native host above the live page would cast shadow through its
++    // transparent center and dim the document.
++    container_fill_->SetVisible(native_container ||
++                               container_style_.embedded_panel == SurfaceFinish::kSolid);
 +    container_fill_->SetBackground(views::CreateRoundedRectBackground(
-+        PanelSolidColor(container_style_), 16 + kContainerRim));
++        native_container ? SK_ColorTRANSPARENT : PanelSolidColor(container_style_),
++        16 + kContainerRim));
++
 +    const auto update_shadow =
 +        [this](views::View* view, std::unique_ptr<views::ViewShadow>& shadow) {
 +          if (container_style_.panel_shadow && view->GetVisible()) {
@@ -771,7 +776,7 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.cc
      }
      if (GetWidget()) {
        UpdateColors();
-@@ -269,13 +459,28 @@ class PeekOverlayView : public views::Vi
+@@ -269,13 +464,28 @@ class PeekOverlayView : public views::Vi
      scrim_->SetBackground(views::CreateSolidBackground(
          SkColorSetA(tint, style_.scrim.dim_alpha)));
      const SkColor surface = colors->GetColor(kColorArciumPanel);
@@ -805,7 +810,7 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.cc
      }
    }
  
-@@ -289,16 +494,33 @@ class PeekOverlayView : public views::Vi
+@@ -289,16 +499,33 @@ class PeekOverlayView : public views::Vi
      backdrop_view_->SetBoundsRect(bounds);
      scrim_->SetBoundsRect(bounds);
      const gfx::Rect card = GetPeekCardBounds(bounds);
@@ -841,7 +846,7 @@ Index: src/chrome/browser/ui/views/helium/peek_controller.cc
      close_callback_.Run();
      return true;
    }
-@@ -306,12 +528,23 @@ class PeekOverlayView : public views::Vi
+@@ -306,12 +533,23 @@ class PeekOverlayView : public views::Vi
    raw_ptr<views::WebView> backdrop_view_ = nullptr;
    std::unique_ptr<ui::ScopedCacheRenderSurfaceLock> backdrop_cache_;
    raw_ptr<views::View> scrim_ = nullptr;
@@ -1341,17 +1346,19 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_bar_material.h
  #include "ui/views/widget/widget_observer.h"
  
  class PrefService;
-@@ -45,6 +46,20 @@ std::unique_ptr<CommandBarNativeBackgrou
+@@ -45,6 +46,22 @@ std::unique_ptr<CommandBarNativeBackgrou
      views::Widget* widget,
      base::RepeatingClosure appearance_changed);
  
-+// Host-local glass sits between native WebContents views. Its outer NSView is
-+// unmarked, so it follows the host's order instead of the window background.
++// Host-local glass surrounds live native content. Its material is clipped to
++// a rim so native subview sorting cannot obscure the live page.
 +class EmbeddedSurfaceMaterial {
 + public:
 +  virtual ~EmbeddedSurfaceMaterial() = default;
 +  virtual gfx::NativeView native_view() const = 0;
-+  virtual bool Update(const helium::SurfaceStyle& style, float radius) = 0;
++  virtual bool Update(const helium::SurfaceStyle& style,
++                      float radius,
++                      float rim_width) = 0;
 +  virtual void SetOpacity(float opacity, float duration_seconds) = 0;
 +};
 +
@@ -1362,7 +1369,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_bar_material.h
  // Search and results use the same observer and material implementation, with
  // their own widget-local clipping. Changes affect paint without rebuilding
  // the input or results, so focus, query and selection survive live edits.
-@@ -62,7 +77,8 @@ class CommandBarMaterial : public views:
+@@ -62,7 +79,8 @@ class CommandBarMaterial : public views:
        PrefService* prefs,
        base::RepeatingCallback<Clip()> clip_provider,
        base::RepeatingCallback<void(bool)> paint_changed,
@@ -1372,7 +1379,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_bar_material.h
    CommandBarMaterial(const CommandBarMaterial&) = delete;
    CommandBarMaterial& operator=(const CommandBarMaterial&) = delete;
    ~CommandBarMaterial() override;
-@@ -83,6 +99,7 @@ class CommandBarMaterial : public views:
+@@ -83,6 +101,7 @@ class CommandBarMaterial : public views:
   private:
    raw_ptr<views::Widget> widget_;
    raw_ptr<PrefService> prefs_;
