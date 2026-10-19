@@ -230,7 +230,15 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/browser_view.cc
 +++ src/chrome/browser/ui/views/frame/browser_view.cc
-@@ -190,6 +190,7 @@
+@@ -42,6 +42,7 @@
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/trace_event/trace_event.h"
+ #include "build/build_config.h"
++#include "cc/paint/paint_flags.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/actor/ui/actor_overlay_web_view.h"
+ #include "chrome/browser/app_mode/app_mode_utils.h"
+@@ -190,6 +191,7 @@
  #include "chrome/browser/ui/views/global_media_controls/media_toolbar_button_view.h"
  #include "chrome/browser/ui/views/hats/hats_next_web_dialog.h"
  #include "chrome/browser/ui/views/helium/glass_surface.h"
@@ -238,7 +246,15 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  #include "chrome/browser/ui/views/helium/peek_controller.h"
  #include "chrome/browser/ui/views/incognito_clear_browsing_data_dialog_coordinator.h"
  #include "chrome/browser/ui/views/infobars/infobar_container_view.h"
-@@ -342,6 +343,7 @@
+@@ -321,6 +323,7 @@
+ #include "media/capture/capture_switches.h"
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/common/permissions/permission_utils.h"
++#include "third_party/skia/include/core/SkRRect.h"
+ #include "ui/accessibility/ax_enums.mojom-shared.h"
+ #include "ui/accessibility/ax_node_data.h"
+ #include "ui/accessibility/platform/assistive_tech.h"
+@@ -342,6 +345,7 @@
  #include "ui/base/window_open_disposition.h"
  #include "ui/base/window_open_disposition_utils.h"
  #include "ui/color/color_id.h"
@@ -246,13 +262,31 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  #include "ui/compositor/layer.h"
  #include "ui/compositor/paint_recorder.h"
  #include "ui/content_accelerators/accelerator_util.h"
-@@ -943,12 +945,21 @@ gfx::Size CalculateMRUPreviewSize(Browse
+@@ -359,8 +363,11 @@
+ #include "ui/gfx/geometry/rect.h"
+ #include "ui/gfx/geometry/rect_conversions.h"
+ #include "ui/gfx/geometry/size.h"
++#include "ui/gfx/geometry/skia_conversions.h"
+ #include "ui/gfx/scoped_canvas.h"
+ #include "ui/gfx/scrollbar_size.h"
++#include "ui/gfx/shadow_value.h"
++#include "ui/gfx/skia_paint_util.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/accessibility/view_accessibility_utils.h"
+ #include "ui/views/animation/compositor_animation_runner.h"
+@@ -943,12 +950,27 @@ gfx::Size CalculateMRUPreviewSize(Browse
    return gfx::Size(width, height);
  }
  
 -// Displays the selected tab while Ctrl+Tab walks a stable MRU snapshot.
 -class MRUTabSwitcherOverlay : public views::ViewObserver {
 +constexpr int kMRUCornerRadius = 12;
++// The switcher's own window draws a soft shadow in a transparent margin. The
++// window server's shadow has a hard rim that shows through clear glass.
++constexpr int kMRUShadowInset = 60;
++constexpr int kMRUShadowBlur = 48;
++constexpr int kMRUShadowOffsetY = 10;
++constexpr SkAlpha kMRUShadowAlpha = 0x40;
 +
 +// Displays the selected tab while Ctrl+Tab walks a stable MRU snapshot. The
 +// switcher is a floating panel, like the command bar: with native panel glass
@@ -272,7 +306,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    }
    MRUTabSwitcherOverlay(const MRUTabSwitcherOverlay&) = delete;
    MRUTabSwitcherOverlay& operator=(const MRUTabSwitcherOverlay&) = delete;
-@@ -957,6 +968,13 @@ class MRUTabSwitcherOverlay : public vie
+@@ -957,6 +979,13 @@ class MRUTabSwitcherOverlay : public vie
      if (bubble_) {
        TRACE_EVENT_INSTANT("ui", "Arcium.MRU.Visibility", "visible", false,
                            "glass", use_glass_);
@@ -286,7 +320,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
        auto* bubble = bubble_.get();
        bubble_ = nullptr;
        browser_view_->RemoveChildViewT(bubble);
-@@ -979,47 +997,130 @@ class MRUTabSwitcherOverlay : public vie
+@@ -979,47 +1008,165 @@ class MRUTabSwitcherOverlay : public vie
      EnsureView();
      bubble_->Update(tabs_, selected_index_);
      PositionView();
@@ -371,6 +405,8 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +        shadow_ = std::make_unique<views::ViewShadow>(
 +            this, helium::kPanelShadowElevation);
 +        shadow_->SetRoundedCornerRadius(kMRUCornerRadius);
++      } else {
++        SetBorder(views::CreateEmptyBorder(kMRUShadowInset));
 +      }
 +      if (finish_ && *finish_ != helium::SurfaceFinish::kSolid) {
 +        glass_surface_ = AddChildView(std::make_unique<helium::GlassSurfaceView>(
@@ -417,7 +453,40 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +    }
 +
 +   private:
++    void OnPaint(gfx::Canvas* canvas) override {
++      views::View::OnPaint(canvas);
++      if (finish_) {
++        return;
++      }
++      const SkRRect panel = SkRRect::MakeRectXY(
++          gfx::RectToSkRect(GetContentsBounds()), kMRUCornerRadius,
++          kMRUCornerRadius);
++      {
++        // Only the shadow outside the panel; the glass shows inside it.
++        gfx::ScopedCanvas scoped(canvas);
++        canvas->sk_canvas()->clipRRect(panel, SkClipOp::kDifference, true);
++        cc::PaintFlags shadow;
++        shadow.setAntiAlias(true);
++        shadow.setColor(SK_ColorBLACK);
++        shadow.setLooper(gfx::CreateShadowDrawLooper({gfx::ShadowValue(
++            gfx::Vector2d(0, kMRUShadowOffsetY), kMRUShadowBlur,
++            SkColorSetA(SK_ColorBLACK, kMRUShadowAlpha))}));
++        canvas->sk_canvas()->drawRRect(panel, shadow);
++      }
++      if (!native_material_) {
++        cc::PaintFlags fill;
++        fill.setAntiAlias(true);
++        fill.setColor(helium::kPanelSolidColor);
++        canvas->sk_canvas()->drawRRect(panel, fill);
++      }
++    }
++
 +    void UpdateFill() {
++      if (!finish_) {
++        // The window paints its own fill and shadow.
++        SchedulePaint();
++        return;
++      }
 +      // Glass and native material show through; a solid panel uses the
 +      // command panel's color.
 +      if (UsesBackdrop()) {
@@ -435,7 +504,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
          background = browser_view_->GetColorProvider()->GetColor(
              kColorTabHoverCardBackground);
          auto* page = browser_view_->GetActiveWebContents();
-@@ -1030,16 +1131,19 @@ class MRUTabSwitcherOverlay : public vie
+@@ -1030,16 +1177,19 @@ class MRUTabSwitcherOverlay : public vie
                  color_utils::GetResultingPaintColor(*color, background);
            }
          }
@@ -458,7 +527,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
      std::unique_ptr<views::ViewShadow> shadow_;
    };
  
-@@ -1055,34 +1159,125 @@ class MRUTabSwitcherOverlay : public vie
+@@ -1055,34 +1205,128 @@ class MRUTabSwitcherOverlay : public vie
      }
    }
  
@@ -511,6 +580,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +    // monitor commits or cancels cycling.
 +    params.activatable = views::Widget::InitParams::Activatable::kNo;
 +    params.accept_events = false;
++    params.shadow_type = views::Widget::InitParams::ShadowType::kNone;
 +    params.parent = browser_view_->GetWidget()->GetNativeView();
 +    params.bounds = gfx::Rect(browser_view_->GetBoundsInScreen().CenterPoint(),
 +                              gfx::Size(1, 1));
@@ -532,6 +602,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +    material_ = std::make_unique<arcium::CommandBarMaterial>(
 +        widget_.get(), prefs, base::BindRepeating([] {
 +          arcium::CommandBarMaterial::Clip clip;
++          clip.insets = gfx::Insets(kMRUShadowInset);
 +          clip.corner_radii = gfx::RoundedCornersF(kMRUCornerRadius);
 +          return clip;
 +        }),
@@ -555,7 +626,8 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 -    bubble_->SetBoundsRect(bounds);
 +    if (preview_) {
 +      // Near the top, where Settings is least likely to cover it.
-+      bounds.set_y(area.y() + std::min(72, area.height() / 8));
++      bounds.set_y(area.y() + std::min(72, area.height() / 8) -
++                   (widget_ ? kMRUShadowInset : 0));
 +    }
 +    if (widget_) {
 +      widget_->SetBounds(bounds);
@@ -594,7 +666,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    base::WeakPtrFactory<MRUTabSwitcherOverlay> weak_factory_{this};
  };
  
-@@ -1204,13 +1399,83 @@ void UpdateMRUTabSwitcherVisualizer(
+@@ -1204,13 +1448,83 @@ void UpdateMRUTabSwitcherVisualizer(
      content::WebContents* selected_tab) {
    auto& visualizer = GetMRUTabSwitcherVisualizers()[browser_view];
    if (!visualizer) {
