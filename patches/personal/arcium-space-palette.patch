@@ -3122,3 +3122,115 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration_unittest.c
        {kGlassAppearanceColorHarmonyComplementary,
         GlassSurfaceColorHarmony::kComplementary},
        {kGlassAppearanceColorHarmonySplitComplementary,
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
+@@ -15,6 +15,7 @@
+ #include "base/test/bind.h"
+ #include "base/test/scoped_feature_list.h"
+ #include "build/build_config.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
+ #include "chrome/browser/ui/views/helium/arcium_chrome_ui_scale.h"
+ #include "chrome/browser/ui/views/helium/surface_style.h"
+@@ -26,7 +27,12 @@
+ #include "ui/base/ime/text_edit_commands.h"
+ #include "ui/base/ui_base_features.h"
+ #include "ui/events/event.h"
++#include "ui/color/color_mixer.h"
++#include "ui/color/color_provider.h"
+ #include "ui/color/color_provider_key.h"
++#include "ui/color/color_provider_manager.h"
++#include "ui/color/color_recipe.h"
++#include "ui/color/color_transform.h"
+ #include "ui/gfx/animation/animation_test_api.h"
+ #include "ui/gfx/font_list.h"
+ #include "ui/gfx/color_utils.h"
+@@ -357,10 +363,28 @@ class ArciumNativePanelTest : public vie
+     feature_list_.InitAndDisableFeature(
+         ::features::kUiCompositorScrollWithLayers);
+     views::ViewsTestBase::SetUp();
++    // Standalone Views widgets have system colors but no Chrome mixers. Give
++    // the presenter controlled semantic roles, matching its production inputs.
++    ui::ColorProviderManager::Get().AppendColorProviderInitializer(
++        base::BindRepeating(
++            [](ArciumNativePanelTest* test, ui::ColorProvider* provider,
++               const ui::ColorProviderKey&) {
++              auto& mixer = provider->AddMixer();
++              mixer[kColorArciumPanel] = {test->test_panel_color_};
++              mixer[kColorArciumPanelBackground] = {test->test_panel_color_};
++              mixer[kColorArciumText] = {test->test_text_color_};
++              mixer[kColorOmniboxResultsTextSelected] = {test->test_text_color_};
++              mixer[kColorArciumMutedText] = {test->test_muted_color_};
++              mixer[kColorOmniboxResultsBackgroundSelected] = {
++                  ui::AlphaBlend(ui::kColorSysPrimary, kColorArciumPanel,
++                                 SkAlpha{89})};
++            },
++            base::Unretained(this)));
+     state_ = TestState();
+   }
+   void TearDown() override {
+     Close();
++    ui::ColorProviderManager::ResetForTesting();
+     views::ViewsTestBase::TearDown();
+   }
+   void Open(bool new_tab = true) {
+@@ -437,6 +461,16 @@ class ArciumNativePanelTest : public vie
+     publication->revision = base::UnguessableToken::Create();
+     return publication;
+   }
++  void SetTestPanelColors(SkColor background, SkColor foreground) {
++    test_panel_color_ = background;
++    test_text_color_ = foreground;
++    test_muted_color_ = color_utils::AlphaBlend(foreground, background, 0.7f);
++    ui::ColorProviderManager::Get().ResetColorProviderCache();
++    widget_->ThemeChanged();
++  }
++  SkColor test_panel_color_ = SkColorSetRGB(29, 30, 28);
++  SkColor test_text_color_ = SkColorSetRGB(242, 242, 240);
++  SkColor test_muted_color_ = SkColorSetRGB(137, 154, 147);
+   base::test::ScopedFeatureList feature_list_;
+   std::shared_ptr<FakeState> state_;
+   std::unique_ptr<views::Widget> widget_;
+@@ -527,7 +561,7 @@ TEST_F(ArciumNativePanelTest, ThemeAccen
+                      panel()->selected_for_testing()].get());
+ }
+ 
+-TEST_F(ArciumNativePanelTest, SolidTintUpdatesLiveWithoutReplacingInput) {
++TEST_F(ArciumNativePanelTest, SemanticColorsUpdateLiveWithoutReplacingInput) {
+   TestingPrefServiceSimple prefs;
+   prefs.registry()->RegisterDictionaryPref(kCommandPanelLayoutPref);
+   prefs.registry()->RegisterIntegerPref(kChromeUIScalePref, kChromeUIScaleDefault);
+@@ -543,10 +577,10 @@ TEST_F(ArciumNativePanelTest, SolidTintU
+   input->SetSelectedRange(gfx::Range(2, 5));
+   helium::SurfaceTuning tuning;
+   tuning.panel_material = helium::PanelMaterial::kSolid;
+-  tuning.panel_tint_color = SK_ColorWHITE;
+   tuning.panel_tint = 1;
+   prefs.SetDict(helium::kArciumSurfaceTuningPref,
+                 helium::SerializeSurfaceTuning(tuning));
++  SetTestPanelColors(SK_ColorWHITE, SkColorSetRGB(24, 24, 24));
+   EXPECT_EQ(SK_ColorWHITE, PaintPanel().getColor(50, 100));
+   EXPECT_GT(color_utils::GetContrastRatio(input->GetTextColor(), SK_ColorWHITE),
+             4.5f);
+@@ -554,14 +588,12 @@ TEST_F(ArciumNativePanelTest, SolidTintU
+   EXPECT_EQ(u"retained query", input->GetText());
+   EXPECT_EQ(gfx::Range(2, 5), input->GetSelectedRange());
+ 
+-  tuning.panel_tint_color.reset();
+-  prefs.SetDict(helium::kArciumSurfaceTuningPref,
+-                helium::SerializeSurfaceTuning(tuning));
+-  auto window = helium::DefaultGlassSurfaceConfiguration();
+-  window.points[0].color = SkColor4f::FromColor(SK_ColorBLUE);
+-  prefs.SetDict(helium::kArciumChromeAppearancePref,
+-                helium::SerializeGlassSurfaceConfiguration(window));
++  SetTestPanelColors(SK_ColorBLUE, SkColorSetRGB(242, 242, 240));
+   EXPECT_EQ(SK_ColorBLUE, PaintPanel().getColor(50, 100));
++  EXPECT_GT(color_utils::GetContrastRatio(input->GetTextColor(), SK_ColorBLUE),
++            4.5f);
++  EXPECT_EQ(input, panel()->input_for_testing());
++  EXPECT_EQ(gfx::Range(2, 5), input->GetSelectedRange());
+   EXPECT_EQ(u"retained query", input->GetText());
+   widget_.reset();
+ }
