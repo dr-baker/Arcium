@@ -320,7 +320,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
        auto* bubble = bubble_.get();
        bubble_ = nullptr;
        browser_view_->RemoveChildViewT(bubble);
-@@ -979,47 +1008,185 @@ class MRUTabSwitcherOverlay : public vie
+@@ -979,47 +1008,178 @@ class MRUTabSwitcherOverlay : public vie
      EnsureView();
      bubble_->Update(tabs_, selected_index_);
      PositionView();
@@ -412,15 +412,8 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +            this, helium::kPanelShadowElevation);
 +        shadow_->SetRoundedCornerRadius(kMRUCornerRadius);
 +      }
-+      if (finish_ == helium::SurfaceFinish::kRefractive) {
-+        // Glassmorphic keeps the switcher's original refraction look.
-+        helium::GlassSurfaceParams params;
-+        params.preset = helium::GlassSurfacePreset::kGlassmorphic;
-+        params.opaque_color = helium::kPanelSolidColor;
-+        params.corner_radii = gfx::RoundedCornersF(kMRUCornerRadius);
-+        glass_surface_ =
-+            AddChildView(std::make_unique<helium::GlassSurfaceView>(params));
-+      } else if (finish_ == helium::SurfaceFinish::kGlass) {
++      if (finish_ == helium::SurfaceFinish::kRefractive ||
++          finish_ == helium::SurfaceFinish::kGlass) {
 +        glass_surface_ = AddChildView(std::make_unique<helium::GlassSurfaceView>(
 +            helium::EmbeddedGlassParams(
 +                *finish_, tint_color_.value_or(helium::kPanelSolidColor),
@@ -458,9 +451,9 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
 +   private:
 +    void OnThemeChanged() override {
 +      views::View::OnThemeChanged();
-+      // Plain glass follows the theme unless a tint color is chosen.
-+      if (glass_surface_ && finish_ == helium::SurfaceFinish::kGlass &&
-+          !tint_color_) {
++      // Both Chromium materials follow the theme when no window or custom
++      // tint color is available.
++      if (glass_surface_ && !tint_color_) {
 +        glass_surface_->SetTintColor(
 +            GetColorProvider()->GetColor(kColorToolbar));
 +      }
@@ -524,15 +517,12 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
          background = browser_view_->GetColorProvider()->GetColor(
              kColorTabHoverCardBackground);
          auto* page = browser_view_->GetActiveWebContents();
-@@ -1030,14 +1197,21 @@ class MRUTabSwitcherOverlay : public vie
+@@ -1030,14 +1190,18 @@ class MRUTabSwitcherOverlay : public vie
                  color_utils::GetResultingPaintColor(*color, background);
            }
          }
-+        if (finish_ == helium::SurfaceFinish::kGlass) {
-+          background = color_utils::AlphaBlend(
-+              tint_color_.value_or(helium::kPanelSolidColor), background,
-+              tint_);
-+        }
++        background = color_utils::AlphaBlend(
++            tint_color_.value_or(helium::kPanelSolidColor), background, tint_);
        }
        rail_->SetLabelContrast(background, uses_backdrop);
      }
@@ -549,7 +539,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
      raw_ptr<helium::GlassSurfaceView> glass_surface_ = nullptr;
      raw_ptr<MRUTabPreviewRail> rail_ = nullptr;
      std::unique_ptr<views::ViewShadow> shadow_;
-@@ -1055,34 +1229,123 @@ class MRUTabSwitcherOverlay : public vie
+@@ -1055,34 +1219,123 @@ class MRUTabSwitcherOverlay : public vie
      }
    }
  
@@ -683,7 +673,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    base::WeakPtrFactory<MRUTabSwitcherOverlay> weak_factory_{this};
  };
  
-@@ -1204,13 +1467,83 @@ void UpdateMRUTabSwitcherVisualizer(
+@@ -1204,13 +1457,83 @@ void UpdateMRUTabSwitcherVisualizer(
      content::WebContents* selected_tab) {
    auto& visualizer = GetMRUTabSwitcherVisualizers()[browser_view];
    if (!visualizer) {
@@ -818,7 +808,15 @@ Index: src/chrome/browser/ui/views/helium/glass_surface.cc
        opacity_(ClampUnit(params.opacity)),
        opaque_color_(params.opaque_color),
        corner_radii_(params.corner_radii) {
-@@ -255,9 +281,11 @@ void GlassSurfaceView::UpdateLayer() {
+@@ -250,14 +276,18 @@ void GlassSurfaceView::UpdateLayer() {
+     params.edge_width = tuning.edge_width;
+     params.refraction = tuning.refraction;
+     params.dispersion = tuning.dispersion;
+-    params.tint_strength = ClampUnit(tuning.tint_strength + tint_strength_);
++    params.tint_strength = tint_replaces_preset_
++                               ? tint_strength_
++                               : ClampUnit(tuning.tint_strength + tint_strength_);
+     params.saturation = tuning.saturation;
      params.specular = tuning.specular;
      params.grain = tuning.grain;
      const SkColor4f external = SkColor4f::FromColor(tint_color_);
@@ -869,8 +867,8 @@ Index: src/chrome/browser/ui/views/helium/glass_surface.h
    GlassSurfacePreset preset = GlassSurfacePreset::kBasic;
    SkColor tint_color = SK_ColorWHITE;
    float tint_strength = 0.0f;
-+  // Replaces the preset's own tint color instead of multiplying it, so a
-+  // surface can follow the browser theme.
++  // Replaces the preset's tint color and strength, so a surface can follow
++  // its chosen window or custom tint exactly.
 +  bool tint_replaces_preset = false;
    float opacity = 1.0f;
    SkColor opaque_color = SkColorSetRGB(28, 28, 30);
@@ -1233,7 +1231,7 @@ Index: src/chrome/browser/ui/views/helium/surface_style.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/helium/surface_style.cc
-@@ -0,0 +1,412 @@
+@@ -0,0 +1,422 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license found in the LICENSE file.
@@ -1281,7 +1279,7 @@ Index: src/chrome/browser/ui/views/helium/surface_style.cc
 +  NOTREACHED();
 +}
 +
-+// Tint colors are stored as "#RRGGBB"; an empty string follows the theme.
++// Tint colors are stored as "#RRGGBB"; empty follows the window glass color.
 +std::optional<std::optional<SkColor>> ParseTintColor(std::string_view value) {
 +  if (value.empty()) {
 +    return std::optional<SkColor>();
@@ -1552,10 +1550,20 @@ Index: src/chrome/browser/ui/views/helium/surface_style.cc
 +
 +SurfaceInputs ReadSurfaceInputs(const PrefService* prefs) {
 +  const SurfaceSet set = ReadSurfaceSet(prefs);
++  SurfaceTuning tuning = ReadSurfaceTuning(prefs, set);
++  if (!tuning.panel_tint_color && prefs &&
++      prefs->FindPreference(kArciumChromeAppearancePref)) {
++    // Follow an actual window glass color without copying it into the saved
++    // panel tuning, so editing or removing that color updates every panel.
++    const auto window = ReadGlassSurfaceConfiguration(prefs);
++    if (window.point_count > 0) {
++      tuning.panel_tint_color = window.points[0].color.toSkColor();
++    }
++  }
 +  return {
 +      .set = set,
 +      .panel = ReadPanelChoice(prefs),
-+      .tuning = ReadSurfaceTuning(prefs, set),
++      .tuning = tuning,
 +  };
 +}
 +
@@ -1650,7 +1658,7 @@ Index: src/chrome/browser/ui/views/helium/surface_style.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/helium/surface_style.h
-@@ -0,0 +1,212 @@
+@@ -0,0 +1,213 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license found in the LICENSE file.
@@ -1757,7 +1765,8 @@ Index: src/chrome/browser/ui/views/helium/surface_style.h
 +  PanelMaterial panel_material = PanelMaterial::kLiquid;
 +  // Opacity of the tint over panel glass; 1 is opaque.
 +  double panel_tint = 0.3;
-+  // The tint color; nullopt follows the browser theme.
++  // The tint color; nullopt follows the first window glass color, or the
++  // browser theme when the window has no color points.
 +  std::optional<SkColor> panel_tint_color;
 +  // A soft drop shadow around the panel.
 +  bool panel_shadow = true;
@@ -1867,7 +1876,7 @@ Index: src/chrome/browser/ui/views/helium/surface_style_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/helium/surface_style_unittest.cc
-@@ -0,0 +1,272 @@
+@@ -0,0 +1,314 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license found in the LICENSE file.
@@ -1928,6 +1937,48 @@ Index: src/chrome/browser/ui/views/helium/surface_style_unittest.cc
 +  prefs.SetInteger(arcium::kCommandBarAppearancePref,
 +                   arcium::kCommandBarAppearanceGlass);
 +  EXPECT_EQ(ReadPanelChoice(&prefs), PanelChoice::kGlass);
++}
++
++TEST(SurfaceStyleTest, PanelTintFollowsEditableWindowColorAndKeepsCustomOverride) {
++  TestingPrefServiceSimple prefs;
++  prefs.registry()->RegisterStringPref(kArciumSurfaceSetPref, kSurfaceSetGlass);
++  prefs.registry()->RegisterDictionaryPref(kArciumSurfaceTuningPref);
++  prefs.registry()->RegisterDictionaryPref(kArciumChromeAppearancePref);
++
++  auto window = DefaultGlassSurfaceConfiguration();
++  window.point_count = 2;
++  window.points[0].color = SkColor4f::FromColor(SK_ColorRED);
++  window.points[1].color = SkColor4f::FromColor(SK_ColorGREEN);
++  prefs.SetDict(kArciumChromeAppearancePref,
++                SerializeGlassSurfaceConfiguration(window));
++  EXPECT_EQ(ResolveSurfaceStyle(ReadSurfaceInputs(&prefs)).panel_tint_color,
++            SK_ColorRED);
++  EXPECT_FALSE(ReadSurfaceTuning(&prefs, SurfaceSet::kGlass).panel_tint_color);
++
++  // Editing the window color changes the tint without saving a panel color.
++  window.points[0].color = SkColor4f::FromColor(SK_ColorBLUE);
++  prefs.SetDict(kArciumChromeAppearancePref,
++                SerializeGlassSurfaceConfiguration(window));
++  EXPECT_EQ(ResolveSurfaceStyle(ReadSurfaceInputs(&prefs)).panel_tint_color,
++            SK_ColorBLUE);
++
++  prefs.SetString(kArciumSurfaceSetPref, kSurfaceSetCustom);
++  SurfaceTuning tuning;
++  tuning.panel_tint_color = SK_ColorYELLOW;
++  prefs.SetDict(kArciumSurfaceTuningPref, SerializeSurfaceTuning(tuning));
++  EXPECT_EQ(ResolveSurfaceStyle(ReadSurfaceInputs(&prefs)).panel_tint_color,
++            SK_ColorYELLOW);
++
++  // Re-enabling Window tint follows the palette again; removing all colors
++  // leaves the color unset for the renderer's browser-theme fallback.
++  tuning.panel_tint_color.reset();
++  prefs.SetDict(kArciumSurfaceTuningPref, SerializeSurfaceTuning(tuning));
++  EXPECT_EQ(ResolveSurfaceStyle(ReadSurfaceInputs(&prefs)).panel_tint_color,
++            SK_ColorBLUE);
++  window.point_count = 0;
++  prefs.SetDict(kArciumChromeAppearancePref,
++                SerializeGlassSurfaceConfiguration(window));
++  EXPECT_FALSE(ResolveSurfaceStyle(ReadSurfaceInputs(&prefs)).panel_tint_color);
 +}
 +
 +TEST(SurfaceStyleTest, PresetsChooseEveryRole) {
