@@ -52,7 +52,7 @@ Index: src/chrome/browser/ui/color/arcium_space_color_mixer.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/color/arcium_space_color_mixer.cc
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,220 @@
 +// Copyright 2026 The Helium Authors
 +// SPDX-License-Identifier: GPL-3.0-only
 +#include "chrome/browser/ui/color/arcium_space_color_mixer.h"
@@ -189,6 +189,7 @@ Index: src/chrome/browser/ui/color/arcium_space_color_mixer.cc
 +  mixer[kColorArciumPanelBackground] = {colors.panel_background};
 +  mixer[kColorArciumText] = {colors.text};
 +  mixer[kColorArciumMutedText] = {colors.muted_text};
++  mixer[kColorNewTabPageBackground] = {colors.content_canvas};
 +  mixer[kColorToolbar] = {colors.chrome};
 +  mixer[ui::kColorFrameActive] = {colors.chrome};
 +  mixer[ui::kColorFrameInactive] = {colors.chrome};
@@ -276,7 +277,7 @@ Index: src/chrome/browser/ui/color/arcium_space_color_mixer.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/color/arcium_space_color_mixer.h
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,57 @@
 +// Copyright 2026 The Helium Authors
 +// SPDX-License-Identifier: GPL-3.0-only
 +
@@ -317,6 +318,11 @@ Index: src/chrome/browser/ui/color/arcium_space_color_mixer.h
 +  SkColor outline;
 +  SkColor accent;
 +  SkColor on_accent;
++  // Large content surfaces retain only a restrained tint from the Space.
++  SkColor content_canvas;
++  SkColor content_panel;
++  SkColor content_field;
++  SkColor content_hovered;
 +};
 +
 +SpacePaletteColors GenerateSpacePalette(
@@ -333,7 +339,7 @@ Index: src/chrome/browser/ui/color/arcium_space_palette.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/color/arcium_space_palette.cc
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,210 @@
 +// Copyright 2026 The Helium Authors
 +// SPDX-License-Identifier: GPL-3.0-only
 +
@@ -503,6 +509,19 @@ Index: src/chrome/browser/ui/color/arcium_space_palette.cc
 +  const Oklch seed = ColorToOklch(input.seed);
 +  const double panels = input.panels_chroma / 100.0;
 +  SpacePaletteColors colors;
++  // Keep the large page and Settings surfaces near neutral even when the
++  // authored glows and chrome are vivid. Preserve hue and role lightness;
++  // only content chroma is capped, independently of controls and decoration.
++  auto content_tone = [seed, panels](double lightness) {
++    const double chroma = std::min(
++        seed.chroma * panels * 0.15 *
++            std::sin(std::numbers::pi * lightness), 0.012);
++    return OklchToColor({lightness, chroma, seed.hue});
++  };
++  colors.content_canvas = content_tone(dark ? 0.16 : 0.965);
++  colors.content_panel = content_tone(dark ? 0.22 : 0.975);
++  colors.content_field = content_tone(dark ? 0.24 : 0.925);
++  colors.content_hovered = content_tone(dark ? 0.28 : 0.90);
 +  colors.chrome = Tone(seed, dark ? 0.16 : 0.965, panels);
 +  colors.field = Tone(seed, dark ? 0.24 : 0.925, panels);
 +  colors.field_hovered = Tone(seed, dark ? 0.28 : 0.90, panels);
@@ -510,8 +529,12 @@ Index: src/chrome/browser/ui/color/arcium_space_palette.cc
 +  const std::array<SkColor, 3> backgrounds = {
 +      colors.chrome, colors.field_hovered, colors.panel};
 +  colors.text = Foreground(seed, dark ? 0.94 : 0.19, dark, 7, backgrounds);
-+  colors.muted_text = Foreground(seed, dark ? 0.73 : 0.40, dark, 4.5,
-+                                  backgrounds);
++  const SkColor floor_muted_text =
++      Foreground(seed, dark ? 0.73 : 0.40, dark, 4.5, backgrounds);
++  // Add headroom for secondary labels over authored glows without weakening
++  // the existing backdrop floor or changing the decorative colors.
++  colors.muted_text = dark ? Foreground(seed, 0.75, true, 4.5, backgrounds)
++                           : floor_muted_text;
 +  colors.outline = Foreground(seed, dark ? 0.61 : 0.50, dark, 3, backgrounds);
 +  colors.accent = Tone(seed, dark ? 0.78 : 0.46,
 +                        input.controls_chroma / 100.0);
@@ -519,9 +542,9 @@ Index: src/chrome/browser/ui/color/arcium_space_palette.cc
 +      seed, dark ? 0.16 : 0.98, !dark, 4.5,
 +      {colors.accent, colors.accent, colors.accent});
 +  colors.chrome_background =
-+      ReadablePanelBackground(colors.chrome, colors.text, colors.muted_text);
++      ReadablePanelBackground(colors.chrome, colors.text, floor_muted_text);
 +  colors.panel_background =
-+      ReadablePanelBackground(colors.panel, colors.text, colors.muted_text);
++      ReadablePanelBackground(colors.panel, colors.text, floor_muted_text);
 +  return colors;
 +}
 +
@@ -531,7 +554,7 @@ Index: src/chrome/browser/ui/color/arcium_space_palette_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/color/arcium_space_palette_unittest.cc
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,145 @@
 +// Copyright 2026 The Helium Authors
 +// SPDX-License-Identifier: GPL-3.0-only
 +#include "chrome/browser/ui/color/arcium_space_color_mixer.h"
@@ -569,7 +592,9 @@ Index: src/chrome/browser/ui/color/arcium_space_palette_unittest.cc
 +            input.panels_chroma = panels;
 +            const auto colors = GenerateSpacePalette(input, dark);
 +            for (SkColor background : {colors.chrome, colors.field,
-+                                       colors.field_hovered, colors.panel}) {
++                                       colors.field_hovered, colors.panel,
++                                       colors.content_canvas, colors.content_panel,
++                                       colors.content_field, colors.content_hovered}) {
 +              EXPECT_GE(ContrastRatio(colors.text, background), 7);
 +              EXPECT_GE(ContrastRatio(colors.muted_text, background), 4.5);
 +              EXPECT_GE(ContrastRatio(colors.outline, background), 3);
@@ -588,6 +613,39 @@ Index: src/chrome/browser/ui/color/arcium_space_palette_unittest.cc
 +      }
 +    }
 +  }
++}
++
++TEST(ArciumSpacePalette, LargeSurfacesKeepOnlyARestainedTint) {
++  for (int hue = 0; hue < 360; hue += 15) {
++    for (bool dark : {false, true}) {
++      ui::ArciumPalette input;
++      input.seed = OklchToColor({.65, .4, double(hue)});
++      input.panels_chroma = 200;
++      const auto colors = GenerateSpacePalette(input, dark);
++      for (SkColor surface : {colors.content_canvas, colors.content_panel,
++                             colors.content_field, colors.content_hovered}) {
++        // Allow for the quantization of the 8-bit display color.
++        EXPECT_LE(ColorToOklch(surface).chroma, .016);
++      }
++      EXPECT_LE(ColorToOklch(colors.content_canvas).chroma,
++                ColorToOklch(colors.chrome).chroma + .004);
++      EXPECT_LE(ColorToOklch(colors.content_panel).chroma,
++                ColorToOklch(colors.panel).chroma + .004);
++      input.panels_chroma = 0;
++      EXPECT_LT(ColorToOklch(GenerateSpacePalette(input, dark).content_canvas)
++                    .chroma, .001);
++    }
++  }
++}
++
++TEST(ArciumSpacePalette, MutedTextOnAuthoredGlowCapture) {
++  ui::ArciumPalette input;
++  input.seed = SkColorSetRGB(255, 48, 224);
++  const auto colors = GenerateSpacePalette(input, true);
++  // Solid adjacent background pixels from the native secondary-glow capture.
++  EXPECT_GE(ContrastRatio(colors.muted_text, SkColorSetRGB(52, 63, 78)), 4.5);
++  EXPECT_LT(ColorToOklch(colors.muted_text).lightness,
++            ColorToOklch(colors.text).lightness);
 +}
 +
 +TEST(ArciumSpacePalette, GamutMappingPreservesLightnessAndRampOrder) {
@@ -723,7 +781,7 @@ Index: src/chrome/browser/ui/helium/arcium_settings_model.cc
    shortcut_service_ =
        browser_shortcuts::BrowserShortcutServiceFactory::GetForProfile(profile_);
    if (shortcut_service_) {
-@@ -557,15 +566,127 @@ bool ArciumSettingsModel::SetCommandPane
+@@ -557,15 +566,135 @@ bool ArciumSettingsModel::SetCommandPane
    return true;
  }
  
@@ -781,12 +839,20 @@ Index: src/chrome/browser/ui/helium/arcium_settings_model.cc
 +               .muted_text = provider->GetColor(kColorOmniboxTextDimmed),
 +               .outline = provider->GetColor(ui::kColorSysOutline),
 +               .accent = provider->GetColor(ui::kColorSysPrimary),
-+               .on_accent = provider->GetColor(ui::kColorSysOnPrimary)};
++               .on_accent = provider->GetColor(ui::kColorSysOnPrimary),
++               .content_canvas = provider->GetColor(kColorToolbar),
++               .content_panel = provider->GetColor(kColorOmniboxResultsBackground),
++               .content_field = provider->GetColor(kColorLocationBarBackground),
++               .content_hovered = provider->GetColor(kColorLocationBarBackgroundHovered)};
 +      dark = light;
 +    }
 +  }
 +  auto roles = [](const arcium::SpacePaletteColors& colors) {
 +    return base::DictValue()
++        .Set("canvas", ColorString(colors.content_canvas))
++        .Set("canvasPanel", ColorString(colors.content_panel))
++        .Set("canvasField", ColorString(colors.content_field))
++        .Set("canvasHover", ColorString(colors.content_hovered))
 +        .Set("chrome", ColorString(colors.chrome))
 +        .Set("field", ColorString(colors.field))
 +        .Set("hover", ColorString(colors.field_hovered))
@@ -857,7 +923,7 @@ Index: src/chrome/browser/ui/helium/arcium_settings_model.cc
  }
  
  std::string ArciumSettingsModel::GetSurfaceSet() const {
-@@ -619,7 +740,8 @@ void ArciumSettingsModel::RefreshSurface
+@@ -619,7 +748,8 @@ void ArciumSettingsModel::RefreshSurface
      return;
    }
    // Showing again keeps a preview that already matches the current style.
@@ -867,7 +933,7 @@ Index: src/chrome/browser/ui/helium/arcium_settings_model.cc
    BrowserView* browser_view =
        browser ? BrowserView::GetBrowserViewForBrowser(browser) : nullptr;
    // Follow the most recently active window; leave no preview behind.
-@@ -631,43 +753,61 @@ void ArciumSettingsModel::RefreshSurface
+@@ -631,43 +761,61 @@ void ArciumSettingsModel::RefreshSurface
  
  bool ArciumSettingsModel::SetChromeAppearance(
      const base::DictValue& configuration) {
@@ -948,7 +1014,7 @@ Index: src/chrome/browser/ui/helium/arcium_settings_model.cc
  }
  
  bool ArciumSettingsModel::IsAppearanceManaged() const {
-@@ -686,8 +826,15 @@ bool ArciumSettingsModel::SetAppearanceM
+@@ -686,8 +834,15 @@ bool ArciumSettingsModel::SetAppearanceM
    if (mode < system || mode > dark) {
      return false;
    }
@@ -966,7 +1032,7 @@ Index: src/chrome/browser/ui/helium/arcium_settings_model.cc
    return true;
  }
  
-@@ -746,63 +893,13 @@ base::DictValue ArciumSettingsModel::Get
+@@ -746,63 +901,13 @@ base::DictValue ArciumSettingsModel::Get
    return result;
  }
  
@@ -2641,7 +2707,7 @@ Index: src/chrome/browser/ui/color/arcium_space_color_mixer_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/color/arcium_space_color_mixer_unittest.cc
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,72 @@
 +// Copyright 2026 The Helium Authors
 +// SPDX-License-Identifier: GPL-3.0-only
 +#include "chrome/browser/ui/color/arcium_space_color_mixer.h"
@@ -2682,7 +2748,9 @@ Index: src/chrome/browser/ui/color/arcium_space_color_mixer_unittest.cc
 +    key.app_controller->AddColorMixers(&provider, key);
 +    provider.GenerateColorMapForTesting();
 +    const auto expected = arcium::GenerateSpacePalette(input, dark);
++    EXPECT_EQ(provider.GetColor(kColorNewTabPageBackground), expected.content_canvas);
 +    EXPECT_EQ(provider.GetColor(kColorArciumChrome), expected.chrome);
++    EXPECT_EQ(provider.GetColor(kColorToolbar), expected.chrome);
 +    EXPECT_EQ(provider.GetColor(kColorArciumPanelBackground), expected.panel_background);
 +    EXPECT_EQ(provider.GetColor(kColorOmniboxResultsBackgroundSelected), expected.accent);
 +    EXPECT_EQ(provider.GetColor(kColorOmniboxResultsTextSelected), expected.on_accent);
