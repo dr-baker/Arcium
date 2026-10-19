@@ -276,7 +276,7 @@ Index: src/chrome/browser/ui/color/arcium_space_color_mixer.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/color/arcium_space_color_mixer.h
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,52 @@
 +// Copyright 2026 The Helium Authors
 +// SPDX-License-Identifier: GPL-3.0-only
 +
@@ -304,7 +304,6 @@ Index: src/chrome/browser/ui/color/arcium_space_color_mixer.h
 +Oklch ColorToOklch(SkColor color);
 +SkColor OklchToColor(Oklch color);
 +double ContrastRatio(SkColor a, SkColor b);
-+SkColor SpaceGlowColor(SkColor seed, int panels_chroma, bool dark);
 +
 +struct SpacePaletteColors {
 +  SkColor chrome;
@@ -334,7 +333,7 @@ Index: src/chrome/browser/ui/color/arcium_space_palette.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/color/arcium_space_palette.cc
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,193 @@
 +// Copyright 2026 The Helium Authors
 +// SPDX-License-Identifier: GPL-3.0-only
 +
@@ -498,11 +497,6 @@ Index: src/chrome/browser/ui/color/arcium_space_palette.cc
 +         (std::min(first, second) + 0.05);
 +}
 +
-+SkColor SpaceGlowColor(SkColor seed, int panels_chroma, bool dark) {
-+  return Tone(ColorToOklch(seed), dark ? 0.28 : 0.90,
-+              std::clamp(panels_chroma, 0, 200) / 100.0);
-+}
-+
 +SpacePaletteColors GenerateSpacePalette(
 +    const ui::ArciumPalette& input,
 +    bool dark) {
@@ -537,7 +531,7 @@ Index: src/chrome/browser/ui/color/arcium_space_palette_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/color/arcium_space_palette_unittest.cc
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,110 @@
 +// Copyright 2026 The Helium Authors
 +// SPDX-License-Identifier: GPL-3.0-only
 +#include "chrome/browser/ui/color/arcium_space_color_mixer.h"
@@ -581,12 +575,6 @@ Index: src/chrome/browser/ui/color/arcium_space_palette_unittest.cc
 +              EXPECT_GE(ContrastRatio(colors.outline, background), 3);
 +            }
 +            EXPECT_GE(ContrastRatio(colors.on_accent, colors.accent), 4.5);
-+            for (int glow_hue = 0; glow_hue < 360; glow_hue += 15) {
-+              const auto glow = SpaceGlowColor(
-+                  OklchToColor({.65, .4, double(glow_hue)}), panels, dark);
-+              EXPECT_GE(ContrastRatio(colors.text, glow), 4.5);
-+              EXPECT_GE(ContrastRatio(colors.muted_text, glow), 4.5);
-+            }
 +            for (SkColor backdrop : {SK_ColorBLACK, SK_ColorWHITE}) {
 +              const auto chrome = Composite(colors.chrome_background, backdrop);
 +              EXPECT_GE(ContrastRatio(colors.text, chrome), 4.5);
@@ -1257,7 +1245,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
  #include "chrome/browser/ui/helium/helium_space_service_factory.h"
  #include "chrome/browser/ui/tab_ui_helper.h"
  #include "chrome/browser/ui/tabs/pinned_tab_codec.h"
-@@ -1913,4 +1914,67 @@ TEST_F(HeliumSpaceServiceTest,
+@@ -1913,4 +1914,107 @@ TEST_F(HeliumSpaceServiceTest,
  }
  
  }  // namespace
@@ -1300,6 +1288,46 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +  EXPECT_EQ(space_->theme(), saved);
 +}
 +
++TEST_F(HeliumSpaceServiceTest, PaletteRenderingPreservesAuthoredGlows) {
++  auto recipe = DefaultGlassSurfaceConfiguration();
++  recipe.enabled = true;
++  recipe.material_opacity = .63;
++  recipe.glass_tint_opacity = .17;
++  recipe.tint_strength = .83;
++  recipe.grain = .12;
++  recipe.match_color_adjustments = false;
++  recipe.point_count = 3;
++  recipe.points[0] = {.id = "primary",
++                      .color = SkColor4f::FromColor(SkColorSetRGB(250, 142, 255)),
++                      .x = .13, .y = .81, .radius = .67, .opacity = .42};
++  recipe.points[1] = {.id = "companion",
++                      .color = SkColor4f::FromColor(SkColorSetRGB(95, 221, 109)),
++                      .x = .87, .y = .22, .radius = 1.24, .opacity = .79};
++  recipe.points[2] = {.id = "third",
++                      .color = SkColor4f::FromColor(SkColorSetRGB(23, 33, 68)),
++                      .x = .41, .y = .53, .radius = .32, .opacity = .61};
++  for (bool dark : {false, true}) {
++    for (int panels : {0, 200}) {
++      SCOPED_TRACE(testing::Message() << dark << ',' << panels);
++      auto theme = WithSpacePaletteAppearance(SpaceTheme(), recipe);
++      theme.panels_chroma = panels;
++      theme.background->color_harmony = "triadic";
++      const auto saved = theme;
++      auto expected = SpacePaletteAppearance(&theme, recipe);
++      auto rendering = expected;
++      ApplySpacePaletteForRendering(rendering, &theme, dark);
++      ASSERT_TRUE(rendering.chrome_contrast_floor);
++      expected.chrome_contrast_floor = rendering.chrome_contrast_floor;
++      EXPECT_EQ(rendering, expected);
++      EXPECT_EQ(theme, saved);
++      const auto key = SpacePaletteKey(&theme, rendering);
++      EXPECT_EQ(key.seed, recipe.points[0].color.toSkColor());
++      EXPECT_EQ(key.companion, recipe.points[1].color.toSkColor());
++      EXPECT_EQ(key.panels_chroma, panels);
++    }
++  }
++}
++
 +TEST_F(HeliumSpaceServiceTest, PaletteRenderingPreservesDisabledEffects) {
 +  auto recipe = DefaultGlassSurfaceConfiguration();
 +  recipe.enabled = false;
@@ -1329,7 +1357,7 @@ Index: src/chrome/browser/ui/helium/space_palette.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/space_palette.h
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,134 @@
 +// Copyright 2026 The Helium Authors
 +// SPDX-License-Identifier: GPL-3.0-only
 +
@@ -1442,8 +1470,8 @@ Index: src/chrome/browser/ui/helium/space_palette.h
 +  return theme;
 +}
 +
-+// Only the renderer maps decorative seeds to safe surface lightness. The
-+// editor continues to show the original picked colors, IDs and harmony.
++// The palette derives from the authored glows. Add readability support below
++// them without recoloring or changing their placement, size, or intensity.
 +inline void ApplySpacePaletteForRendering(
 +    GlassSurfaceConfiguration& configuration,
 +    const SpaceTheme* theme,
@@ -1458,10 +1486,6 @@ Index: src/chrome/browser/ui/helium/space_palette.h
 +    configuration.point_count = 0;
 +    configuration.grain = 0;
 +    return;
-+  }
-+  for (size_t i = 0; i < configuration.point_count; ++i) {
-+    configuration.points[i].color = SkColor4f::FromColor(arcium::SpaceGlowColor(
-+        configuration.points[i].color.toSkColor(), input.panels_chroma, dark));
 +  }
 +}
 +
