@@ -2,7 +2,7 @@ Index: src/chrome/browser/ui/BUILD.gn
 ===================================================================
 --- src.orig/chrome/browser/ui/BUILD.gn
 +++ src/chrome/browser/ui/BUILD.gn
-@@ -3578,6 +3578,7 @@ static_library("ui") {
+@@ -3582,6 +3582,7 @@ static_library("ui") {
        "views/frame/immersive_mode_controller_mac.mm",
        "views/frame/immersive_mode_overlay_views_mac.h",
        "views/frame/immersive_mode_overlay_views_mac.mm",
@@ -10,7 +10,7 @@ Index: src/chrome/browser/ui/BUILD.gn
        "views/helium/frame_corner_radius_mac.mm",
        "views/helium/glass_surface_mac.h",
        "views/helium/glass_surface_mac.mm",
-@@ -4084,6 +4085,10 @@ static_library("ui") {
+@@ -4098,6 +4099,10 @@ static_library("ui") {
        "views/frame/browser_root_view.cc",
        "views/frame/browser_view.cc",
        "views/frame/browser_view.h",
@@ -23,9 +23,9 @@ Index: src/chrome/browser/ui/BUILD.gn
        "views/frame/browser_window_factory.cc",
 Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
 ===================================================================
---- a/chrome/browser/ui/tabs/tab_strip_model.cc
-+++ b/chrome/browser/ui/tabs/tab_strip_model.cc
-@@ -83,6 +83,7 @@
+--- src.orig/chrome/browser/ui/tabs/tab_strip_model.cc
++++ src/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -85,6 +85,7 @@
  #include "chrome/browser/ui/ui_features.h"
  #include "chrome/browser/ui/user_education/browser_user_education_interface.h"
  #include "chrome/browser/ui/views/frame/browser_view.h"
@@ -33,7 +33,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  #include "chrome/browser/ui/web_applications/web_app_dialog_utils.h"
  #include "chrome/browser/ui/web_applications/web_app_launch_utils.h"
  #include "chrome/browser/ui/web_applications/web_app_tabbed_utils.h"
-@@ -770,6 +771,10 @@
+@@ -828,6 +829,10 @@ tabs::TabModel* TabStripModel::GetActive
  
  void TabStripModel::OnChange(const TabStripModelChange& change,
                               const TabStripSelectionChange& selection) {
@@ -44,7 +44,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
    CompleteModelUpdateTransaction();
    OnActiveTabChanged(selection);
  
-@@ -4228,51 +4233,117 @@
+@@ -4317,51 +4322,117 @@ void TabStripModel::SelectRelativeTabCyc
        profile_->GetPrefs()->GetBoolean(prefs::kTabCyclingMRU);
  
    if (enable_mru) {
@@ -55,13 +55,20 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
    }
  }
  
+-void TabStripModel::SelectMRUTab(TabRelativeDirection direction,
 +void TabStripModel::PreviewMRUTab(TabRelativeDirection direction,
-+                                 TabStripUserGestureDetails detail) {
+                                  TabStripUserGestureDetails detail) {
+-  if (mru_cycle_list_.empty()) {
+-    BrowserWindowInterface* browser =
+-        GlobalBrowserCollection::GetInstance()->FindBrowserWithTab(
+-          GetWebContentsAt(0));
+-    if (!browser) {
+-      return;
+-    }
 +  SelectMRUTab(direction, detail, true);
 +}
-+
- void TabStripModel::SelectMRUTab(TabRelativeDirection direction,
--                                 TabStripUserGestureDetails detail) {
+ 
++void TabStripModel::SelectMRUTab(TabRelativeDirection direction,
 +                                 TabStripUserGestureDetails detail,
 +                                 bool preview_only) {
 +  if (!preview_only) {
@@ -73,15 +80,25 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
 +
 +  const bool starting_cycle = mru_cycle_list_.empty();
 +  if (starting_cycle) {
-+    for (int i = 0; i < count(); ++i) {
+     for (int i = 0; i < count(); ++i) {
+-      mru_cycle_list_.push_back(i);
 +      if (!tabs::TemporaryTab::IsTemporary(GetWebContentsAt(i))) {
 +        mru_cycle_list_.push_back(GetTabAtIndex(i)->GetHandle());
 +      }
-+    }
-+
+     }
+ 
+-    std::sort(mru_cycle_list_.begin(), mru_cycle_list_.end(),
+-              [this](int a, int b) {
+-                return GetWebContentsAt(a)->GetLastActiveTimeTicks() >
+-                       GetWebContentsAt(b)->GetLastActiveTimeTicks();
+-              });
+-
+-    if (BrowserView* browser_view =
+-            BrowserView::GetBrowserViewForBrowser(browser)) {
+-      browser_view->StartTabCycling();
 +    if (mru_cycle_list_.empty()) {
 +      return;
-+    }
+     }
 +    auto* active_tab = GetActiveTab();
 +    if (const auto* marker =
 +            tabs::TemporaryTab::FromWebContents(active_tab->GetContents());
@@ -101,16 +118,21 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
 +                              b.Get()->GetContents()->GetLastActiveTimeTicks();
 +                     });
 +    mru_cycle_index_ = 0;
-+  }
-+
-+  if (direction == TabRelativeDirection::kNext) {
+   }
+ 
+   if (direction == TabRelativeDirection::kNext) {
+-    std::rotate(mru_cycle_list_.begin(), mru_cycle_list_.begin() + 1,
+-                mru_cycle_list_.end());
 +    mru_cycle_index_ = (mru_cycle_index_ + 1) % mru_cycle_list_.size();
-+  } else {
+   } else {
+-    std::rotate(mru_cycle_list_.rbegin(), mru_cycle_list_.rbegin() + 1,
+-                mru_cycle_list_.rend());
 +    mru_cycle_index_ =
 +        (mru_cycle_index_ + mru_cycle_list_.size() - 1) % mru_cycle_list_.size();
-+  }
+   }
 +  mru_cycle_gesture_ = detail;
-+
+ 
+-  ActivateTabAt(mru_cycle_list_[0], detail);
 +  if (!preview_only) {
 +    CommitMRUCycling();
 +    return;
@@ -144,39 +166,7 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
 +}
 +
 +void TabStripModel::CommitMRUCycling() {
-   if (mru_cycle_list_.empty()) {
--    BrowserWindowInterface* browser =
--        GlobalBrowserCollection::GetInstance()->FindBrowserWithTab(
--          GetWebContentsAt(0));
--    if (!browser) {
--      return;
--    }
--
--    for (int i = 0; i < count(); ++i) {
--      mru_cycle_list_.push_back(i);
--    }
--
--    std::sort(mru_cycle_list_.begin(), mru_cycle_list_.end(),
--              [this](int a, int b) {
--                return GetWebContentsAt(a)->GetLastActiveTimeTicks() >
--                       GetWebContentsAt(b)->GetLastActiveTimeTicks();
--              });
--
--    if (BrowserView* browser_view =
--            BrowserView::GetBrowserViewForBrowser(browser)) {
--      browser_view->StartTabCycling();
--    }
--  }
--
--  if (direction == TabRelativeDirection::kNext) {
--    std::rotate(mru_cycle_list_.begin(), mru_cycle_list_.begin() + 1,
--                mru_cycle_list_.end());
--  } else {
--    std::rotate(mru_cycle_list_.rbegin(), mru_cycle_list_.rbegin() + 1,
--                mru_cycle_list_.rend());
--  }
--
--  ActivateTabAt(mru_cycle_list_[0], detail);
++  if (mru_cycle_list_.empty()) {
 +    return;
 +  }
 +  auto* tab = mru_cycle_list_[mru_cycle_index_].Get();
@@ -232,7 +222,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  #include "base/task/sequenced_task_runner.h"
  #include "base/task/single_thread_task_runner.h"
  #include "base/trace_event/trace_event.h"
-@@ -126,6 +130,7 @@
+@@ -127,6 +131,7 @@
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
  #include "chrome/browser/ui/tabs/tab_strip_prefs.h"
  #include "chrome/browser/ui/tabs/tab_utils.h"
@@ -240,7 +230,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  #include "chrome/browser/ui/tabs/vertical_tab_strip_metrics.h"
  #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
  #include "chrome/browser/ui/toasts/toast_view.h"
-@@ -162,9 +167,15 @@
+@@ -163,9 +168,15 @@
  #include "chrome/browser/ui/views/frame/layout/browser_view_layout.h"
  #include "chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.h"
  #include "chrome/browser/ui/views/frame/main_background_region_view.h"
@@ -256,7 +246,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  #include "chrome/browser/ui/views/frame/scrim_view.h"
  #include "chrome/browser/ui/views/frame/shadow_overlay_view.h"
  #include "chrome/browser/ui/views/frame/tab_modal_dialog_host.h"
-@@ -350,14 +361,20 @@
+@@ -351,14 +362,20 @@
  #include "ui/views/accessibility/view_accessibility.h"
  #include "ui/views/accessibility/view_accessibility_utils.h"
  #include "ui/views/animation/compositor_animation_runner.h"
@@ -277,7 +267,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  #include "ui/views/view.h"
  #include "ui/views/view_class_properties.h"
  #include "ui/views/view_utils.h"
-@@ -892,6 +909,154 @@ class BrowserView::PipExclusionObserverI
+@@ -918,6 +935,154 @@ class BrowserView::PipExclusionObserverI
  };
  #endif
  
@@ -432,7 +422,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  // Handles events during MRU tab cycling to start/stop tab cycling.
  class TabCyclingEventHandler : public ui::EventObserver,
                                 public views::WidgetObserver {
-@@ -901,7 +1066,7 @@ class TabCyclingEventHandler : public ui
+@@ -927,7 +1092,7 @@ class TabCyclingEventHandler : public ui
      Start();
    }
  
@@ -441,7 +431,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  
    TabCyclingEventHandler(const TabCyclingEventHandler&) = delete;
    TabCyclingEventHandler& operator=(const TabCyclingEventHandler&) = delete;
-@@ -909,15 +1074,22 @@ class TabCyclingEventHandler : public ui
+@@ -935,15 +1100,22 @@ class TabCyclingEventHandler : public ui
   private:
    // ui::EventObserver overrides:
    void OnEvent(const ui::Event& event) override {
@@ -467,7 +457,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
      }
    }
  
-@@ -925,12 +1097,12 @@ class TabCyclingEventHandler : public ui
+@@ -951,12 +1123,12 @@ class TabCyclingEventHandler : public ui
    void OnWidgetActivationChanged(views::Widget* widget, bool active) override {
      // We should stop cycling if other application gets active state.
      if (!active) {
@@ -482,7 +472,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  
    void Start() {
      // Add the event handler.
-@@ -938,37 +1110,80 @@ class TabCyclingEventHandler : public ui
+@@ -964,37 +1136,80 @@ class TabCyclingEventHandler : public ui
      if (widget->GetNativeWindow()) {
        monitor_ = views::EventMonitor::CreateWindowMonitor(
            this, widget->GetNativeWindow(),
@@ -566,7 +556,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  ///////////////////////////////////////////////////////////////////////////////
  // BrowserView, public:
  
-@@ -1016,6 +1231,27 @@ BrowserView::BrowserView(Browser* browse
+@@ -1042,6 +1257,27 @@ BrowserView::BrowserView(Browser* browse
    zen_side_chrome_animation_.Reset(1);
  
    browser_->tab_strip_model()->AddObserver(this);
@@ -594,7 +584,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
  
    main_background_region_ =
        AddChildView(std::make_unique<MainBackgroundRegionView>(*this));
-@@ -1212,8 +1448,11 @@ BrowserView::BrowserView(Browser* browse
+@@ -1238,6 +1474,9 @@ BrowserView::BrowserView(Browser* browse
  }
  
  BrowserView::~BrowserView() {
@@ -604,9 +594,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    peek_controller_.reset();
  
    if (browser_shortcut_service_) {
-     browser_shortcut_service_->RemoveObserver(this);
-     browser_shortcut_service_ = nullptr;
-@@ -4107,10 +4346,20 @@ void BrowserView::OnTabChangedAt(tabs::T
+@@ -4286,10 +4525,20 @@ void BrowserView::OnTabChangedAt(tabs::T
    UpdateAccessibleURLForRootView(contents->GetURL());
  }
  
@@ -627,7 +615,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    // When the active tab changes, elements in the omnibox can change, which
    // can change its preferred size. Re-lay-out the toolbar to reflect the
    // possible change.
-@@ -5816,6 +6065,26 @@ bool BrowserView::AcceleratorPressed(con
+@@ -6009,6 +6258,26 @@ bool BrowserView::AcceleratorPressed(con
  
    UpdateAcceleratorMetrics(accelerator, command_id);
  
@@ -654,7 +642,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    if (command_id == IDC_CLEAR_BROWSING_DATA) {
      views::ElementTrackerViews::GetInstance()->NotifyCustomEvent(
          browsing_data_important_sites_util::
-@@ -6196,6 +6465,16 @@ void BrowserView::LoadAccelerators() {
+@@ -6389,6 +6658,16 @@ void BrowserView::LoadAccelerators() {
        browser_->GetProfile()->GetOTRProfileID().IsCaptivePortal();
  #endif
    std::vector<AcceleratorMapping> accelerator_list(GetAcceleratorList());
@@ -671,7 +659,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.cc
    if (browser_shortcut_service_ &&
        base::FeatureList::IsEnabled(features::kCustomizableBrowserShortcuts)) {
      std::erase_if(accelerator_list, [this](const AcceleratorMapping& entry) {
-@@ -6239,8 +6518,18 @@ void BrowserView::LoadAccelerators() {
+@@ -6432,8 +6711,18 @@ void BrowserView::LoadAccelerators() {
      accelerator_table_[accelerator] = entry.command_id;
  
      if (!already_registered) {
@@ -1259,7 +1247,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.h
  class MultiContentsView;
  class ProjectsPanelView;
  class ScrimView;
-@@ -602,7 +603,9 @@ class BrowserView : public BrowserWindow
+@@ -606,7 +607,9 @@ class BrowserView : public BrowserWindow
    BrowserView* AsBrowserView() override;
    void ShowUpdateChromeDialog() override;
    void StartTabCycling();
@@ -1269,7 +1257,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.h
    void ShowIntentPickerBubble(
        std::vector<IntentPickerBubbleView::AppInfo> app_info,
        bool show_stay_in_chrome,
-@@ -673,6 +676,7 @@ class BrowserView : public BrowserWindow
+@@ -677,6 +680,7 @@ class BrowserView : public BrowserWindow
        bool is_tab_modal_popup_deprecated) override;
  
    // TabStripModelObserver:
@@ -1277,7 +1265,7 @@ Index: src/chrome/browser/ui/views/frame/browser_view.h
    void OnTabStripModelChanged(
        TabStripModel* tab_strip_model,
        const TabStripModelChange& change,
-@@ -1479,6 +1483,8 @@ class BrowserView : public BrowserWindow
+@@ -1493,6 +1497,8 @@ class BrowserView : public BrowserWindow
        tab_strip_web_apps_reparented_state_;
  
    std::unique_ptr<TabCyclingEventHandler> tab_cycling_event_handler_;
@@ -1502,7 +1490,7 @@ Index: src/chrome/browser/ui/thumbnails/thumbnail_image_unittest.cc
    EXPECT_FALSE(is_being_observed());
 Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
 ===================================================================
---- src.orig/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
+--- /dev/null
 +++ src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
 @@ -0,0 +1,427 @@
 +// Copyright 2026 The Chromium Authors
@@ -2373,7 +2361,7 @@ Index: src/chrome/test/BUILD.gn
 ===================================================================
 --- src.orig/chrome/test/BUILD.gn
 +++ src/chrome/test/BUILD.gn
-@@ -8895,6 +8895,7 @@ test("unit_tests") {
+@@ -8961,6 +8961,7 @@ test("unit_tests") {
        "../browser/ui/views/extensions/extensions_toolbar_unittest.h",
        "../browser/ui/views/frame/browser_frame_view_unittest.cc",
        "../browser/ui/views/frame/browser_view_unittest.cc",
@@ -2385,7 +2373,7 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_rail.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/frame/mru_tab_preview_rail.cc
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,210 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -2510,6 +2498,7 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_rail.cc
 +    icon->SetImage(favicon);
 +    icon->SetImageSize(gfx::Size(kIconSize, kIconSize));
 +    auto* label = metadata->AddChildView(std::make_unique<views::Label>(title));
++    label->SetFontList(label->font_list().DeriveWithSizeDelta(2));
 +    label->SetSubpixelRenderingEnabled(false);
 +    label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
 +    label->SetElideBehavior(gfx::ELIDE_TAIL);
@@ -2572,23 +2561,24 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_rail.cc
 +  background_ = background;
 +  shadow_ = shadow;
 +  const SkColor foreground = color_utils::GetColorWithMaxContrast(background);
-+  auto style = [&](views::Label* label) {
++  const SkColor backing = color_utils::GetColorWithMaxContrast(foreground);
++  auto style = [&](views::Label* label, bool text_shadow) {
 +    label->SetBackgroundColor(background);
 +    label->SetEnabledColor(foreground);
-+    label->SetShadows(shadow ? gfx::ShadowValues{gfx::ShadowValue(
++    label->SetShadows(text_shadow ? gfx::ShadowValues{gfx::ShadowValue(
 +        gfx::Vector2d(0, 1), 2, SkColorSetA(
 +            color_utils::GetColorWithMaxContrast(foreground), 0x99))}
 +                            : gfx::ShadowValues());
 +  };
-+  style(position_);
++  style(position_, shadow);
 +  for (auto& card : cards_) {
-+    style(card.title);
-+    card.container->SetBackground(card.selected
-+        ? views::CreateRoundedRectBackground(SkColorSetA(foreground, 36), kCornerRadius)
-+        : nullptr);
-+    card.container->SetBorder(card.selected
-+        ? views::CreateRoundedRectBorder(2, kCornerRadius, SkColorSetA(foreground, 160))
-+        : views::CreateEmptyBorder(2));
++    style(card.title, true);
++    // Give every title a quiet backing while keeping the glass visible.
++    // Reverse the fill with label contrast so light solid panels work too.
++    card.container->SetBackground(views::CreateRoundedRectBackground(
++        SkColorSetA(backing, card.selected ? 56 : 36), kCornerRadius));
++    card.container->SetBorder(views::CreateRoundedRectBorder(
++        2, kCornerRadius, SkColorSetA(foreground, card.selected ? 160 : 16)));
 +  }
 +}
 +
