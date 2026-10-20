@@ -1,0 +1,311 @@
+Index: src/chrome/browser/ui/views/helium/arcium_space_editor_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/arcium_space_editor_view.cc
++++ src/chrome/browser/ui/views/helium/arcium_space_editor_view.cc
+@@ -141,12 +141,14 @@ ArciumSpaceEditorView::ArciumSpaceEditor
+     Profile* space_profile,
+     std::string space_id,
+     PreviewThemeCallback preview_theme,
+-    base::RepeatingClosure close)
++    base::RepeatingClosure close,
++    FullThemeEditorCallback full_theme_editor)
+     : browser_(browser),
+       space_profile_(space_profile),
+       space_id_(std::move(space_id)),
+       preview_theme_(std::move(preview_theme)),
+-      close_(std::move(close)) {
++      close_(std::move(close)),
++      full_theme_editor_(std::move(full_theme_editor)) {
+   if (space_profile_ && space_profile_ != browser_->GetProfile()) {
+     // Reuses the Arcium Settings origin: both are Arcium UI that edits a
+     // profile from outside its windows.
+@@ -231,7 +233,10 @@ ArciumSpaceEditorView::ArciumSpaceEditor
+   UpdateSubmitButton();
+ }
+ 
+-ArciumSpaceEditorView::~ArciumSpaceEditorView() = default;
++ArciumSpaceEditorView::~ArciumSpaceEditorView() {
++  weak_factory_.InvalidateWeakPtrs();
++  close_full_theme_editor_.RunAndReset();
++}
+ 
+ void ArciumSpaceEditorView::FocusName() {
+   name_field_->RequestFocus();
+@@ -340,7 +345,11 @@ std::unique_ptr<views::View> ArciumSpace
+   auto editor = std::make_unique<ArciumSpaceThemeEditor>(
+       theme_, profile->GetPrefs(),
+       base::BindRepeating(&ArciumSpaceEditorView::OnThemeChanged,
+-                          base::Unretained(this)));
++                          base::Unretained(this)),
++      full_theme_editor_
++          ? base::BindRepeating(&ArciumSpaceEditorView::OpenFullThemeEditor,
++                                weak_factory_.GetWeakPtr())
++          : base::RepeatingClosure());
+   theme_editor_ = editor.get();
+   return editor;
+ }
+@@ -372,6 +381,22 @@ void ArciumSpaceEditorView::OnThemeChang
+   UpdateThemeControls();
+ }
+ 
++void ArciumSpaceEditorView::OpenFullThemeEditor() {
++  close_full_theme_editor_.RunAndReset();
++  close_full_theme_editor_ = full_theme_editor_.Run(
++      is_creating() ? SelectedProfile() : space_profile_.get(), theme_,
++      base::BindRepeating(&ArciumSpaceEditorView::ApplyFullTheme,
++                          weak_factory_.GetWeakPtr()));
++}
++
++void ArciumSpaceEditorView::ApplyFullTheme(const helium::SpaceTheme& theme) {
++  theme_ = theme;
++  // The compact editor keeps a copy. Synchronize it before another inline
++  // adjustment so it cannot restore the pre-sheet palette.
++  theme_editor_->SetTheme(theme_);
++  UpdateThemeControls();
++}
++
+ void ArciumSpaceEditorView::UpdateThemeControls() {
+   // Editing another window's Space would preview on the wrong window.
+   auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(
+@@ -395,6 +420,7 @@ Profile* ArciumSpaceEditorView::Selected
+ }
+ 
+ void ArciumSpaceEditorView::OnProfileSelected() {
++  close_full_theme_editor_.RunAndReset();
+   // A new Space inherits the selected profile's background, or the defaults
+   // for a profile that does not exist yet. A profile that is not open yet is
+   // loaded to read it.
+@@ -486,6 +512,7 @@ void ArciumSpaceEditorView::Submit() {
+   if (name.empty()) {
+     return;
+   }
++  close_full_theme_editor_.RunAndReset();
+   if (is_creating()) {
+     const std::optional<helium::SpaceWindowPlacement> placement =
+         helium::GetSpaceWindowPlacement(browser_);
+@@ -620,6 +647,7 @@ void ArciumSpaceEditorView::ConfirmDelet
+ }
+ 
+ void ArciumSpaceEditorView::Cancel() {
++  close_full_theme_editor_.RunAndReset();
+   preview_theme_.Run(std::nullopt);
+   close_.Run();
+ }
+Index: src/chrome/browser/ui/views/helium/arcium_space_editor_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/arcium_space_editor_view.h
++++ src/chrome/browser/ui/views/helium/arcium_space_editor_view.h
+@@ -13,6 +13,7 @@
+ 
+ #include "base/files/file_path.h"
+ #include "base/functional/callback.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "chrome/browser/ui/helium/helium_space.h"
+@@ -45,6 +46,10 @@ class ArciumSpaceEditorView : public vie
+   using PreviewThemeCallback =
+       base::RepeatingCallback<void(std::optional<helium::SpaceTheme>)>;
+ 
++  using FullThemeEditorCallback = base::RepeatingCallback<base::ScopedClosureRunner(
++      Profile*, const helium::SpaceTheme&,
++      base::RepeatingCallback<void(const helium::SpaceTheme&)>)>;
++
+   // Creates a Space when `space_id` is empty; otherwise edits that Space of
+   // `space_profile`. `preview_theme` shows the chosen theme on this window
+   // while the form is open; `close` removes the form.
+@@ -52,7 +57,8 @@ class ArciumSpaceEditorView : public vie
+                         Profile* space_profile,
+                         std::string space_id,
+                         PreviewThemeCallback preview_theme,
+-                        base::RepeatingClosure close);
++                        base::RepeatingClosure close,
++                        FullThemeEditorCallback full_theme_editor = {});
+   ArciumSpaceEditorView(const ArciumSpaceEditorView&) = delete;
+   ArciumSpaceEditorView& operator=(const ArciumSpaceEditorView&) = delete;
+   ~ArciumSpaceEditorView() override;
+@@ -82,6 +88,8 @@ class ArciumSpaceEditorView : public vie
+   void OnIconPicked(const std::string& icon);
+   void OnIconPickerClosed();
+   void OnThemeChanged(const helium::SpaceTheme& theme);
++  void OpenFullThemeEditor();
++  void ApplyFullTheme(const helium::SpaceTheme& theme);
+   void UpdateThemeControls();
+   helium::SpaceTheme PreviewForSelectedProfile() const;
+   Profile* SelectedProfile() const;
+@@ -102,6 +110,8 @@ class ArciumSpaceEditorView : public vie
+   const std::string space_id_;
+   PreviewThemeCallback preview_theme_;
+   base::RepeatingClosure close_;
++  FullThemeEditorCallback full_theme_editor_;
++  base::ScopedClosureRunner close_full_theme_editor_;
+ 
+   std::string icon_;
+   helium::SpaceTheme theme_;
+Index: src/chrome/browser/ui/views/helium/arcium_space_theme_editor.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/arcium_space_theme_editor.cc
++++ src/chrome/browser/ui/views/helium/arcium_space_theme_editor.cc
+@@ -32,6 +32,7 @@
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/background.h"
+ #include "ui/views/controls/image_view.h"
++#include "ui/views/controls/button/md_text_button.h"
+ #include "ui/views/controls/label.h"
+ #include "ui/views/layout/box_layout_view.h"
+ #include "ui/views/layout/box_layout.h"
+@@ -373,7 +374,8 @@ END_METADATA
+ 
+ ArciumSpaceThemeEditor::ArciumSpaceThemeEditor(helium::SpaceTheme theme,
+                                                const PrefService* profile_prefs,
+-                                               ChangedCallback changed)
++                                               ChangedCallback changed,
++                                               base::RepeatingClosure open_full_editor)
+     : theme_(std::move(theme)),
+       profile_background_(ProfileBackground(profile_prefs)),
+       changed_(std::move(changed)) {
+@@ -395,6 +397,13 @@ ArciumSpaceThemeEditor::ArciumSpaceTheme
+       u"Theme", views::style::CONTEXT_LABEL, views::style::STYLE_PRIMARY));
+   title->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+   header->SetFlexForView(title, 1);
++  if (open_full_editor) {
++    auto* full_editor = header->AddChildView(
++        std::make_unique<views::MdTextButton>(std::move(open_full_editor),
++                                             u"Full editor…"));
++    full_editor->SetStyle(ui::ButtonStyle::kText);
++    full_editor->SetTooltipText(u"Open the full Space palette editor");
++  }
+   // Keyboard and screen reader route to the preview's click-to-add.
+   add_glow_ = header->AddChildView(std::make_unique<ArciumSpaceIconButton>(
+       base::BindRepeating(
+@@ -514,6 +523,25 @@ void ArciumSpaceThemeEditor::SetProfileP
+   UpdateControls();
+ }
+ 
++void ArciumSpaceThemeEditor::SetTheme(const helium::SpaceTheme& theme) {
++  std::string selected_id;
++  if (selected_glow_ && *selected_glow_ < shown_background().glows.size()) {
++    selected_id = shown_background().glows[*selected_glow_].id;
++  }
++  theme_ = theme;
++  if (!selected_id.empty()) {
++    selected_glow_.reset();
++    const auto& glows = shown_background().glows;
++    for (size_t i = 0; i < glows.size(); ++i) {
++      if (glows[i].id == selected_id) {
++        selected_glow_ = i;
++        break;
++      }
++    }
++  }
++  UpdateControls();
++}
++
+ const helium::SpaceBackground& ArciumSpaceThemeEditor::shown_background()
+     const {
+   return theme_.background ? *theme_.background : profile_background_;
+Index: src/chrome/browser/ui/views/helium/arcium_space_theme_editor.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/arcium_space_theme_editor.h
++++ src/chrome/browser/ui/views/helium/arcium_space_theme_editor.h
+@@ -36,7 +36,8 @@ class ArciumSpaceThemeEditor : public vi
+   // when a Space first gets its own.
+   ArciumSpaceThemeEditor(helium::SpaceTheme theme,
+                          const PrefService* profile_prefs,
+-                         ChangedCallback changed);
++                         ChangedCallback changed,
++                         base::RepeatingClosure open_full_editor = {});
+   ArciumSpaceThemeEditor(const ArciumSpaceThemeEditor&) = delete;
+   ArciumSpaceThemeEditor& operator=(const ArciumSpaceThemeEditor&) = delete;
+   ~ArciumSpaceThemeEditor() override;
+@@ -48,6 +49,7 @@ class ArciumSpaceThemeEditor : public vi
+   // The profile whose background the Space inherits changed, as when the
+   // form's profile selection changes.
+   void SetProfilePrefs(const PrefService* profile_prefs);
++  void SetTheme(const helium::SpaceTheme& theme);
+ 
+   // views::SliderListener:
+   void SliderValueChanged(views::Slider* sender,
+Index: src/chrome/browser/ui/helium/arcium_settings_model.cc
+===================================================================
+--- src.orig/chrome/browser/ui/helium/arcium_settings_model.cc
++++ src/chrome/browser/ui/helium/arcium_settings_model.cc
+@@ -632,22 +632,7 @@ base::DictValue ArciumSettingsModel::Get
+       dark = light;
+     }
+   }
+-  auto roles = [](const arcium::SpacePaletteColors& colors) {
+-    return base::DictValue()
+-        .Set("canvas", ColorString(colors.content_canvas))
+-        .Set("canvasPanel", ColorString(colors.content_panel))
+-        .Set("canvasField", ColorString(colors.content_field))
+-        .Set("canvasHover", ColorString(colors.content_hovered))
+-        .Set("chrome", ColorString(colors.chrome))
+-        .Set("field", ColorString(colors.field))
+-        .Set("hover", ColorString(colors.field_hovered))
+-        .Set("panel", ColorString(colors.panel))
+-        .Set("text", ColorString(colors.text))
+-        .Set("mutedText", ColorString(colors.muted_text))
+-        .Set("outline", ColorString(colors.outline))
+-        .Set("accent", ColorString(colors.accent))
+-        .Set("onAccent", ColorString(colors.on_accent));
+-  };
++
+   return base::DictValue()
+       .Set("available", !IsAppearanceManaged())
+       .Set("renderingActive", rendering_active)
+@@ -664,8 +649,8 @@ base::DictValue ArciumSettingsModel::Get
+           light.panel_background) / 255.0)
+       .Set("darkPanelOpacity", SkColorGetA(
+           dark.panel_background) / 255.0)
+-      .Set("light", roles(light))
+-      .Set("dark", roles(dark));
++      .Set("light", helium::SpacePaletteRoles(light))
++      .Set("dark", helium::SpacePaletteRoles(dark));
+ }
+ 
+ bool ArciumSettingsModel::SetSpaceAccent(std::string_view glow_id) {
+Index: src/chrome/browser/ui/helium/space_palette.h
+===================================================================
+--- src.orig/chrome/browser/ui/helium/space_palette.h
++++ src/chrome/browser/ui/helium/space_palette.h
+@@ -7,6 +7,8 @@
+ #include <algorithm>
+ 
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/stringprintf.h"
++#include "base/values.h"
+ #include "chrome/browser/ui/helium/helium_space.h"
+ #include "chrome/browser/ui/color/arcium_space_color_mixer.h"
+ #include "chrome/browser/ui/views/helium/glass_surface_configuration.h"
+@@ -14,6 +16,30 @@
+ 
+ namespace helium {
+ 
++// Native palette editors consume the same resolved roles for saved Spaces and
++// creation drafts. Color generation remains in GenerateSpacePalette().
++inline base::DictValue SpacePaletteRoles(const arcium::SpacePaletteColors& colors) {
++  auto ColorString = [](SkColor color) {
++    return base::StringPrintf("#%02X%02X%02X", SkColorGetR(color),
++                             SkColorGetG(color), SkColorGetB(color));
++  };
++
++    return base::DictValue()
++        .Set("canvas", ColorString(colors.content_canvas))
++        .Set("canvasPanel", ColorString(colors.content_panel))
++        .Set("canvasField", ColorString(colors.content_field))
++        .Set("canvasHover", ColorString(colors.content_hovered))
++        .Set("chrome", ColorString(colors.chrome))
++        .Set("field", ColorString(colors.field))
++        .Set("hover", ColorString(colors.field_hovered))
++        .Set("panel", ColorString(colors.panel))
++        .Set("text", ColorString(colors.text))
++        .Set("mutedText", ColorString(colors.muted_text))
++        .Set("outline", ColorString(colors.outline))
++        .Set("accent", ColorString(colors.accent))
++        .Set("onAccent", ColorString(colors.on_accent));
++}
++
+ // The single migration/resolution path for legacy Space colors and profile
+ // glows. The old profile Controls accent is deliberately not a color source.
+ inline SpaceBackground ResolveSpacePaletteBackground(
