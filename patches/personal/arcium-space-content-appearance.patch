@@ -85,30 +85,30 @@ Index: src/chrome/browser/ui/helium/arcium_settings_model.cc
    return true;
  }
  
-+bool ArciumSettingsModel::IsContentAppearanceAvailable() const {
++bool ArciumSettingsModel::IsWebAppearanceAvailable() const {
 +  return !shutting_down_ && prefs_ && GetAppearanceSpace() &&
 +         prefs_->FindPreference(helium::kHeliumSpacesPref);
 +}
 +
-+int ArciumSettingsModel::GetContentAppearanceMode() const {
++int ArciumSettingsModel::GetWebAppearanceMode() const {
 +  const auto* space = GetAppearanceSpace();
 +  if (!space ||
-+      space->theme().content_mode == helium::SpaceTheme::Mode::kAuto) {
++      space->theme().web_mode == helium::SpaceTheme::Mode::kAuto) {
 +    return static_cast<int>(ThemeService::BrowserColorScheme::kSystem);
 +  }
-+  return static_cast<int>(space->theme().content_mode ==
++  return static_cast<int>(space->theme().web_mode ==
 +                                  helium::SpaceTheme::Mode::kDark
 +                              ? ThemeService::BrowserColorScheme::kDark
 +                              : ThemeService::BrowserColorScheme::kLight);
 +}
 +
-+bool ArciumSettingsModel::IsContentAppearanceManaged() const {
-+  return !IsContentAppearanceAvailable() ||
++bool ArciumSettingsModel::IsWebAppearanceManaged() const {
++  return !IsWebAppearanceAvailable() ||
 +         !prefs_->IsUserModifiablePreference(helium::kHeliumSpacesPref);
 +}
 +
-+bool ArciumSettingsModel::SetContentAppearanceMode(int mode) {
-+  if (IsContentAppearanceManaged()) {
++bool ArciumSettingsModel::SetWebAppearanceMode(int mode) {
++  if (IsWebAppearanceManaged()) {
 +    return false;
 +  }
 +  const int system =
@@ -119,7 +119,7 @@ Index: src/chrome/browser/ui/helium/arcium_settings_model.cc
 +  }
 +  auto* space = GetAppearanceSpace();
 +  auto theme = space->theme();
-+  theme.content_mode = mode == system ? helium::SpaceTheme::Mode::kAuto
++  theme.web_mode = mode == system ? helium::SpaceTheme::Mode::kAuto
 +                       : mode == dark ? helium::SpaceTheme::Mode::kDark
 +                                      : helium::SpaceTheme::Mode::kLight;
 +  space_service_->SetSpaceTheme(space->id(), std::move(theme));
@@ -140,71 +140,20 @@ Index: src/chrome/browser/ui/helium/arcium_settings_model.h
 -  // Browser appearance mode is owned by ThemeService. The integer values
 -  // match ThemeService::BrowserColorScheme and are exposed only to the
 -  // SettingsUI bridge.
-+  // Window chrome and browser-page appearance belong to the captured Space.
++  // Window chrome and website appearance belong to the captured Space.
 +  // Values match ThemeService::BrowserColorScheme for the SettingsUI bridge;
-+  // system means follow window chrome for browser-page appearance.
++  // system means follow window chrome for websites, New Tab and Settings.
    bool IsAppearanceAvailable() const;
    int GetAppearanceMode() const;
    bool IsAppearanceManaged() const;
    bool SetAppearanceMode(int mode);
-+  bool IsContentAppearanceAvailable() const;
-+  int GetContentAppearanceMode() const;
-+  bool IsContentAppearanceManaged() const;
-+  bool SetContentAppearanceMode(int mode);
++  bool IsWebAppearanceAvailable() const;
++  int GetWebAppearanceMode() const;
++  bool IsWebAppearanceManaged() const;
++  bool SetWebAppearanceMode(int mode);
  
    // The palette dictionary stores SettingsPaletteConfiguration JSON together
    // with its resolved browser colors. Effective state is returned only when
-Index: src/chrome/browser/ui/helium/helium_space.cc
-===================================================================
---- src.orig/chrome/browser/ui/helium/helium_space.cc
-+++ src/chrome/browser/ui/helium/helium_space.cc
-@@ -47,6 +47,7 @@ constexpr char kPinsCollapsedKey[] = "pi
- constexpr char kThemeColorKey[] = "color";
- constexpr char kThemeModeKey[] = "mode";
- constexpr char kThemeWebModeKey[] = "web_mode";
-+constexpr char kThemeContentModeKey[] = "content_mode";
- constexpr char kThemeBackgroundKey[] = "background";
- constexpr char kBackgroundGlowsKey[] = "glows";
- constexpr char kBackgroundTintKey[] = "tint_strength";
-@@ -170,6 +171,7 @@ SpaceTheme SpaceTheme::FromDict(const ba
-   theme.color = ParseColor(dict->FindString(kThemeColorKey));
-   theme.mode = ParseMode(dict->FindString(kThemeModeKey));
-   theme.web_mode = ParseMode(dict->FindString(kThemeWebModeKey));
-+  theme.content_mode = ParseMode(dict->FindString(kThemeContentModeKey));
-   theme.background = ParseBackground(dict->FindDict(kThemeBackgroundKey));
-   if (const auto* id = dict->FindString("accent_glow_id"); id && id->size() <= 128) {
-     theme.accent_glow_id = *id;
-@@ -187,6 +189,7 @@ base::DictValue SpaceTheme::ToDict() con
-   }
-   dict.Set(kThemeModeKey, ModeString(mode));
-   dict.Set(kThemeWebModeKey, ModeString(web_mode));
-+  dict.Set(kThemeContentModeKey, ModeString(content_mode));
-   dict.Set("palette_version", 1);
-   dict.Set("accent_glow_id", accent_glow_id);
-   dict.Set("controls_chroma", controls_chroma);
-Index: src/chrome/browser/ui/helium/helium_space.h
-===================================================================
---- src.orig/chrome/browser/ui/helium/helium_space.h
-+++ src/chrome/browser/ui/helium/helium_space.h
-@@ -58,7 +58,8 @@ struct SpaceTheme {
-   base::DictValue ToDict() const;
-   bool IsDefault() const {
-     return !color && mode == Mode::kAuto && web_mode == Mode::kAuto &&
--           !background && accent_glow_id.empty() && controls_chroma == 100 &&
-+           content_mode == Mode::kAuto && !background &&
-+           accent_glow_id.empty() && controls_chroma == 100 &&
-            panels_chroma == 35;
-   }
- 
-@@ -73,6 +74,8 @@ struct SpaceTheme {
-   Mode mode = Mode::kAuto;
-   // Light or dark web pages; kAuto follows the chrome.
-   Mode web_mode = Mode::kAuto;
-+  // New Tab and native Settings content; kAuto follows window chrome.
-+  Mode content_mode = Mode::kAuto;
-   std::optional<SpaceBackground> background;
-   // Stable palette source; absent or deleted selections use the first glow.
-   std::string accent_glow_id;
 Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/helium_space_service_unittest.cc
@@ -225,12 +174,12 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
  #include "chrome/browser/ui/tab_ui_helper.h"
  #include "chrome/browser/ui/tabs/pinned_tab_codec.h"
  #include "chrome/browser/ui/tabs/split_tab_metrics.h"
-@@ -2087,5 +2088,85 @@ TEST_F(HeliumSpaceServiceTest, AccentMod
+@@ -2087,5 +2088,82 @@ TEST_F(HeliumSpaceServiceTest, AccentMod
    EXPECT_FALSE(model.SetSpaceAccent(recipe.points[0].id));
    EXPECT_EQ(service_->GetSpaceById(space_id)->theme(), selected);
  }
 +TEST_F(HeliumSpaceServiceTest,
-+       ContentModeKeepsTargetRecipeAndIndependentPolicy) {
++       WebModeKeepsTargetRecipeAndIndependentPolicy) {
 +  const int follow =
 +      static_cast<int>(ThemeService::BrowserColorScheme::kSystem);
 +  const int light = static_cast<int>(ThemeService::BrowserColorScheme::kLight);
@@ -238,10 +187,10 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +  auto theme = WithSpacePaletteAppearance(SpaceTheme(),
 +                                          DefaultGlassSurfaceConfiguration());
 +  theme.mode = SpaceTheme::Mode::kDark;
-+  theme.web_mode = SpaceTheme::Mode::kLight;
++  theme.web_mode = SpaceTheme::Mode::kAuto;
 +  const auto target_id = space_->id();
 +  const auto other_id =
-+      service_->GetOrCreateSpace("content-other", u"Other")->id();
++      service_->GetOrCreateSpace("web-other", u"Other")->id();
 +  service_->SetSpaceTheme(target_id, theme);
 +  const auto original = service_->GetSpaceById(target_id)->theme();
 +  const auto other_original = service_->GetSpaceById(other_id)->theme();
@@ -249,65 +198,62 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +                                             base::DoNothing());
 +  ASSERT_TRUE(model.SetAppearanceSpace(target_id));
 +  service_->SetActiveSpace(other_id);
-+  ASSERT_TRUE(model.IsContentAppearanceAvailable());
-+  EXPECT_FALSE(model.IsContentAppearanceManaged());
-+  EXPECT_EQ(model.GetContentAppearanceMode(), follow);
++  ASSERT_TRUE(model.IsWebAppearanceAvailable());
++  EXPECT_FALSE(model.IsWebAppearanceManaged());
++  EXPECT_EQ(model.GetWebAppearanceMode(), follow);
 +  auto expected = original;
 +  for (int mode : {light, dark, follow}) {
-+    ASSERT_TRUE(model.SetContentAppearanceMode(mode));
-+    expected.content_mode = mode == follow ? SpaceTheme::Mode::kAuto
++    ASSERT_TRUE(model.SetWebAppearanceMode(mode));
++    expected.web_mode = mode == follow ? SpaceTheme::Mode::kAuto
 +                            : mode == dark ? SpaceTheme::Mode::kDark
 +                                           : SpaceTheme::Mode::kLight;
 +    EXPECT_EQ(service_->GetSpaceById(target_id)->theme(), expected);
 +    EXPECT_EQ(service_->GetSpaceById(other_id)->theme(), other_original);
-+    EXPECT_EQ(model.GetContentAppearanceMode(), mode);
++    EXPECT_EQ(model.GetWebAppearanceMode(), mode);
 +    EXPECT_EQ(model.GetAppearanceMode(), dark);
 +  }
-+  EXPECT_FALSE(model.SetContentAppearanceMode(-1));
-+  EXPECT_FALSE(model.SetContentAppearanceMode(dark + 1));
++  EXPECT_FALSE(model.SetWebAppearanceMode(-1));
++  EXPECT_FALSE(model.SetWebAppearanceMode(dark + 1));
 +  EXPECT_EQ(service_->GetSpaceById(target_id)->theme(), expected);
 +  auto* test_prefs = profile()->GetTestingPrefService();
 +  test_prefs->SetManagedPref(prefs::kBrowserColorScheme, base::Value(follow));
-+  EXPECT_FALSE(model.IsContentAppearanceManaged());
-+  ASSERT_TRUE(model.SetContentAppearanceMode(light));
-+  expected.content_mode = SpaceTheme::Mode::kLight;
++  EXPECT_FALSE(model.IsWebAppearanceManaged());
++  ASSERT_TRUE(model.SetWebAppearanceMode(light));
++  expected.web_mode = SpaceTheme::Mode::kLight;
 +  EXPECT_EQ(service_->GetSpaceById(target_id)->theme(), expected);
 +  test_prefs->RemoveManagedPref(prefs::kBrowserColorScheme);
 +  test_prefs->SetManagedPref(
 +      kHeliumSpacesPref,
 +      base::Value(test_prefs->GetList(kHeliumSpacesPref).Clone()));
-+  EXPECT_TRUE(model.IsContentAppearanceManaged());
-+  EXPECT_FALSE(model.SetContentAppearanceMode(dark));
++  EXPECT_TRUE(model.IsWebAppearanceManaged());
++  EXPECT_FALSE(model.SetWebAppearanceMode(dark));
 +  test_prefs->RemoveManagedPref(kHeliumSpacesPref);
 +  EXPECT_EQ(service_->GetSpaceById(target_id)->theme(), expected);
 +  ASSERT_TRUE(model.SetAppearanceSpace(other_id));
 +  ASSERT_TRUE(service_->DeleteSpace(other_id));
-+  EXPECT_FALSE(model.IsContentAppearanceAvailable());
-+  EXPECT_FALSE(model.SetContentAppearanceMode(dark));
++  EXPECT_FALSE(model.IsWebAppearanceAvailable());
++  EXPECT_FALSE(model.SetWebAppearanceMode(dark));
 +  EXPECT_EQ(service_->GetSpaceById(target_id)->theme(), expected);
 +}
 +
-+TEST_F(HeliumSpaceServiceTest, ContentModeDefaultsAndRoundTripsIndependently) {
++TEST_F(HeliumSpaceServiceTest, WebModeDefaultsAndRoundTripsIndependently) {
 +  base::DictValue legacy;
 +  legacy.Set("mode", "dark");
-+  legacy.Set("web_mode", "light");
 +  auto theme = SpaceTheme::FromDict(&legacy);
-+  EXPECT_EQ(theme.content_mode, SpaceTheme::Mode::kAuto);
++  EXPECT_EQ(theme.web_mode, SpaceTheme::Mode::kAuto);
 +  EXPECT_EQ(theme.mode, SpaceTheme::Mode::kDark);
-+  EXPECT_EQ(theme.web_mode, SpaceTheme::Mode::kLight);
-+  theme.content_mode = SpaceTheme::Mode::kLight;
++  theme.web_mode = SpaceTheme::Mode::kLight;
 +  const auto saved = theme.ToDict();
 +  EXPECT_EQ(SpaceTheme::FromDict(&saved), theme);
 +  auto invalid = saved.Clone();
-+  invalid.Set("content_mode", "unknown");
++  invalid.Set("web_mode", "unknown");
 +  const auto restored = SpaceTheme::FromDict(&invalid);
-+  EXPECT_EQ(restored.content_mode, SpaceTheme::Mode::kAuto);
++  EXPECT_EQ(restored.web_mode, SpaceTheme::Mode::kAuto);
 +  EXPECT_EQ(restored.mode, theme.mode);
-+  EXPECT_EQ(restored.web_mode, theme.web_mode);
-+  SpaceTheme only_content;
-+  EXPECT_TRUE(only_content.IsDefault());
-+  only_content.content_mode = SpaceTheme::Mode::kDark;
-+  EXPECT_FALSE(only_content.IsDefault());
++  SpaceTheme only_web;
++  EXPECT_TRUE(only_web.IsDefault());
++  only_web.web_mode = SpaceTheme::Mode::kDark;
++  EXPECT_FALSE(only_web.IsDefault());
 +}
  
  }  // namespace helium
@@ -383,8 +329,8 @@ Index: src/chrome/browser/ui/helium/space_content_appearance.cc
 +      key.contrast_mode == ui::ColorProviderKey::ContrastMode::kHigh) {
 +    return std::nullopt;
 +  }
-+  if (theme->content_mode != SpaceTheme::Mode::kAuto) {
-+    key.color_mode = theme->content_mode == SpaceTheme::Mode::kDark
++  if (theme->web_mode != SpaceTheme::Mode::kAuto) {
++    key.color_mode = theme->web_mode == SpaceTheme::Mode::kDark
 +                         ? ui::ColorProviderKey::ColorMode::kDark
 +                         : ui::ColorProviderKey::ColorMode::kLight;
 +  }
@@ -457,16 +403,6 @@ Index: src/chrome/browser/ui/views/frame/browser_widget.cc
  void BrowserWidget::RefreshSpacePalette() {
    auto* spaces = helium::HeliumSpaceServiceFactory::GetForProfileIfExists(
        browser_view_->GetProfile());
-@@ -295,7 +299,8 @@ void BrowserWidget::RefreshSpacePalette(
-       widget->ThemeChanged();
-     }
-   }
--  if (before.mode != after.mode || before.web_mode != after.web_mode) {
-+  if (before.mode != after.mode || before.web_mode != after.web_mode ||
-+      before.content_mode != after.content_mode) {
-     auto* tabs = browser_view_->browser()->tab_strip_model();
-     for (int i = 0; i < tabs->count(); ++i) {
-       tabs->GetWebContentsAt(i)->NotifyPreferencesChanged();
 Index: src/chrome/browser/ui/webui/new_tab_page/new_tab_page_handler.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/webui/new_tab_page/new_tab_page_handler.cc
