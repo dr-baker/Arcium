@@ -1,0 +1,1542 @@
+Index: src/chrome/browser/ui/views/helium/surface_style.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/surface_style.h
++++ src/chrome/browser/ui/views/helium/surface_style.h
+@@ -36,6 +36,10 @@ inline constexpr char kSurfaceSetCustom[
+ 
+ inline constexpr char kSurfaceTuningPanelMaterialKey[] = "panelMaterial";
+ inline constexpr char kSurfaceTuningPanelTintKey[] = "panelTint";
++inline constexpr char kSurfaceTuningPanelOpacityKey[] = "panelOpacity";
++inline constexpr char kSurfaceTuningTextMaterialKey[] = "textMaterial";
++inline constexpr char kSurfaceTuningTextTintKey[] = "textTint";
++inline constexpr char kSurfaceTuningTextOpacityKey[] = "textOpacity";
+ inline constexpr char kSurfaceTuningPanelBlurKey[] = "panelBlur";
+ inline constexpr char kSurfaceTuningPanelTintColorKey[] = "panelTintColor";
+ inline constexpr char kSurfaceTuningPanelShadowKey[] = "panelShadow";
+@@ -80,7 +84,7 @@ enum class PanelChoice {
+   kAutomatic,
+ };
+ 
+-// How a panel (the command bar and the Ctrl+Tab switcher) is drawn.
++// The material used by a text surface or container.
+ enum class PanelMaterial {
+   kSolid,
+   // A system blur material: cheap and stable, with no live refraction.
+@@ -89,8 +93,6 @@ enum class PanelMaterial {
+   kLiquid,
+   // Liquid: public SwiftUI Glass.regular and glassEffect, with native tint.
+   kSystemLiquid,
+-  // Clear native Liquid Glass, always drawn in its inactive, frostier state.
+-  kFrosted,
+   // Chromium's refraction shader. Only the switcher, which can live inside the
+   // browser window, can use it; the command bar draws Liquid instead.
+   kGlassmorphic,
+@@ -106,10 +108,12 @@ enum class SurfaceFinish {
+ 
+ // The values a preset fills in, and that Custom stores.
+ struct SurfaceTuning {
+-  // Panels: the command bar, its results, and the Ctrl+Tab switcher.
++  // Containers: the Ctrl+Tab switcher and Peek card.
+   PanelMaterial panel_material = PanelMaterial::kLiquid;
+   // Opacity of the tint over panel glass; 1 is opaque.
+-  double panel_tint = 0.3;
++  double panel_tint = 0.6;
++  // Neutral backing, independent of theme tint.
++  double panel_opacity = 0.2;
+   // Extra Chromium backdrop blur, independent of the tint.
+   double panel_blur = 9.0;
+   // The tint color; nullopt follows the first window glass color, or the
+@@ -119,8 +123,12 @@ struct SurfaceTuning {
+   bool panel_shadow = true;
+   // Controls: floating buttons over page content, such as Peek's actions.
+   SurfaceFinish control = SurfaceFinish::kGlass;
+-  double control_tint = 0.55;
++  double control_tint = 0.4;
+   double control_edge = 0.38;
++  // Text surfaces: command bar and floating action buttons.
++  PanelMaterial text_material = PanelMaterial::kSystemLiquid;
++  double text_tint = 0.4;
++  double text_opacity = 0.05;
+   // Scrims: the page behind a modal surface, such as Peek's source.
+   double scrim_blur = 9.0;
+   double scrim_dim = 0.28;
+@@ -138,6 +146,7 @@ struct ScrimStyle {
+ struct SurfaceInputs {
+   SurfaceSet set = SurfaceSet::kGlass;
+   PanelChoice panel = PanelChoice::kAutomatic;
++  SurfaceGroup group = SurfaceGroup::kContainer;
+   // False when Reduce Transparency or a renderer override leaves Chromium
+   // without its live-backdrop renderer.
+   bool embedded_glass_available = true;
+@@ -154,7 +163,9 @@ struct SurfaceStyle {
+   bool panel_glass = false;
+   PanelMaterial panel_material = PanelMaterial::kSolid;
+   SurfaceFinish embedded_panel = SurfaceFinish::kSolid;
+-  float panel_tint = 0.3f;
++  float panel_tint = 0.4f;
++  float panel_opacity = 0.05f;
++  SkColor neutral_base = SkColorSetRGB(29, 30, 28);
+   float panel_blur = 9.0f;
+   std::optional<SkColor> panel_tint_color;
+   std::optional<SkColor> panel_base;
+@@ -198,19 +209,22 @@ SurfaceTuning ReadSurfaceTuning(const Pr
+ 
+ // The profile's preset, panel choice, and values. Renderer availability is
+ // left to the caller.
+-SurfaceInputs ReadSurfaceInputs(const PrefService* prefs);
++SurfaceInputs ReadSurfaceInputs(const PrefService* prefs,
++                                SurfaceGroup group = SurfaceGroup::kText);
+ 
+ SurfaceStyle ResolveSurfaceStyle(const SurfaceInputs& inputs);
+ // Materials come from prefs; every color comes from the owning Space provider.
+-SurfaceStyle ResolveSurfaceStyleForWidget(const views::Widget* widget,
+-                                         const PrefService* prefs);
++SurfaceStyle ResolveSurfaceStyleForWidget(
++    const views::Widget* widget,
++    const PrefService* prefs,
++    SurfaceGroup group = SurfaceGroup::kText);
+ 
+ // Opaque panel/fallback fill with the same tint color and strength as glass.
+ SkColor PanelSolidColor(const SurfaceStyle& style);
+ 
+ // The window's glass configuration for a panel, used to resolve renderer
+-// availability and fallbacks: native Liquid Glass for Liquid, Frosted, and
+-// Glassmorphic, and the system blur material for Fast, with the panel's tint
++// availability and fallbacks: native Liquid Glass for Clear, Liquid, and
++// Glassmorphic, and the system blur material for Flat, with the panel's tint
+ // and without color points or grain. `enabled` reports whether the panel
+ // requested glass.
+ GlassSurfaceConfiguration PanelGlassConfiguration(
+@@ -222,12 +236,15 @@ GlassSurfaceConfiguration ReadPanelGlass
+ 
+ // Embedded Chromium glass for a finish other than kSolid. The tint replaces
+ // the preset's own color so surfaces follow the browser theme.
+-GlassSurfaceParams EmbeddedGlassParams(SurfaceFinish finish,
+-                                       SkColor tint,
+-                                       float tint_strength,
+-                                       SkColor opaque_color,
+-                                       const gfx::RoundedCornersF& radii,
+-                                       float backdrop_blur_sigma = 0.0f);
++GlassSurfaceParams EmbeddedGlassParams(
++    SurfaceFinish finish,
++    SkColor tint,
++    float tint_strength,
++    SkColor opaque_color,
++    const gfx::RoundedCornersF& radii,
++    float backdrop_blur_sigma = 0.0f,
++    float neutral_opacity = 0.0f,
++    SkColor neutral_color = kPanelSolidColor);
+ 
+ }  // namespace helium
+ 
+Index: src/chrome/browser/ui/views/frame/browser_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_view.cc
++++ src/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1042,10 +1042,12 @@ class MRUTabSwitcherOverlay : public vie
+     if (UsesWidget(prefs) != !!widget_) {
+       return false;
+     }
+-    const helium::SurfaceStyle style =
+-        helium::ResolveSurfaceStyleForWidget(browser_view_->GetWidget(), prefs);
++    const helium::SurfaceStyle style = helium::ResolveSurfaceStyleForWidget(
++        browser_view_->GetWidget(), prefs, helium::SurfaceGroup::kContainer);
+     if (style.panel_shadow != built_style_.panel_shadow ||
+         style.panel_tint != built_style_.panel_tint ||
++        style.panel_opacity != built_style_.panel_opacity ||
++        style.neutral_base != built_style_.neutral_base ||
+         style.panel_tint_color != built_style_.panel_tint_color) {
+       return false;
+     }
+@@ -1087,18 +1089,16 @@ class MRUTabSwitcherOverlay : public vie
+       }
+       if (finish_ == helium::SurfaceFinish::kRefractive ||
+           finish_ == helium::SurfaceFinish::kGlass) {
+-        glass_surface_ = AddChildView(std::make_unique<helium::GlassSurfaceView>(
+-            helium::EmbeddedGlassParams(
+-                *finish_, tint_color_.value_or(helium::kPanelSolidColor),
+-                tint_, helium::kPanelSolidColor,
+-                gfx::RoundedCornersF(kMRUCornerRadius),
+-                style.panel_material == helium::PanelMaterial::kGlassmorphic
+-                    ? style.panel_blur : 0.0f)));
+-      }
+-      if (glass_surface_) {
+-        contrast_floor_ = AddChildView(std::make_unique<views::View>());
+-        contrast_floor_->SetPaintToLayer();
+-        contrast_floor_->layer()->SetFillsBoundsOpaquely(false);
++        glass_surface_ =
++            AddChildView(std::make_unique<helium::GlassSurfaceView>(
++                helium::EmbeddedGlassParams(
++                    *finish_, tint_color_.value_or(helium::kPanelSolidColor),
++                    tint_, helium::kPanelSolidColor,
++                    gfx::RoundedCornersF(kMRUCornerRadius),
++                    style.panel_material == helium::PanelMaterial::kGlassmorphic
++                        ? style.panel_blur
++                        : 0.0f,
++                    style.panel_opacity, style.neutral_base)));
+       }
+       rail_ = AddChildView(std::make_unique<MRUTabPreviewRail>(browser_view));
+       // Keep card content above the glass layer, in the browser's render pass.
+@@ -1159,8 +1159,13 @@ class MRUTabSwitcherOverlay : public vie
+       }
+       cc::PaintFlags fill;
+       fill.setAntiAlias(true);
+-      fill.setColor(GetColorProvider()->GetColor(
+-          native_material_ ? kColorArciumPanelBackground : kColorArciumPanel));
++      fill.setColor(
++          native_material_
++              ? SK_ColorTRANSPARENT
++              : helium::PanelSolidColor(helium::ResolveSurfaceStyleForWidget(
++                    browser_view_->GetWidget(),
++                    browser_view_->GetProfile()->GetPrefs(),
++                    helium::SurfaceGroup::kContainer)));
+       canvas->sk_canvas()->drawRRect(panel, fill);
+     }
+ 
+@@ -1172,20 +1177,22 @@ class MRUTabSwitcherOverlay : public vie
+         SchedulePaint();
+         return;
+       }
+-      if (contrast_floor_) {
+-        contrast_floor_->SetBackground(views::CreateRoundedRectBackground(
+-            kColorArciumPanelBackground, kMRUCornerRadius));
+-      }
+-      SetBackground(UsesBackdrop() ? nullptr
+-          : views::CreateRoundedRectBackground(kColorArciumPanel, kMRUCornerRadius));
++      SetBackground(UsesBackdrop()
++                        ? nullptr
++                        : views::CreateRoundedRectBackground(
++                              helium::PanelSolidColor(
++                                  helium::ResolveSurfaceStyleForWidget(
++                                      browser_view_->GetWidget(),
++                                      browser_view_->GetProfile()->GetPrefs(),
++                                      helium::SurfaceGroup::kContainer)),
++                              kMRUCornerRadius));
+     }
+ 
+     void UpdateLabelContrast() {
+-      rail_->SetLabelContrast(
+-          GetColorProvider()->GetColor(kColorArciumPanel), UsesBackdrop());
++      rail_->SetLabelContrast(GetColorProvider()->GetColor(kColorArciumPanel),
++                              UsesBackdrop());
+     }
+ 
+-    raw_ptr<views::View> contrast_floor_ = nullptr;
+     const raw_ptr<BrowserView> browser_view_;
+     const std::optional<helium::SurfaceFinish> finish_;
+     const float tint_;
+@@ -1221,8 +1228,8 @@ class MRUTabSwitcherOverlay : public vie
+     if (UsesWidget(prefs)) {
+       CreateWidget(prefs);
+     } else {
+-      const helium::SurfaceStyle style =
+-          helium::ResolveSurfaceStyleForWidget(browser_view_->GetWidget(), prefs);
++      const helium::SurfaceStyle style = helium::ResolveSurfaceStyleForWidget(
++          browser_view_->GetWidget(), prefs, helium::SurfaceGroup::kContainer);
+       built_style_ = style;
+       auto bubble = std::make_unique<BubbleView>(browser_view_,
+                                                  style.embedded_panel, style);
+@@ -1259,8 +1266,8 @@ class MRUTabSwitcherOverlay : public vie
+       // it. Clicks still pass through to Settings.
+       widget_->SetZOrderLevel(ui::ZOrderLevel::kFloatingWindow);
+     }
+-    const helium::SurfaceStyle style =
+-        helium::ResolveSurfaceStyleForWidget(browser_view_->GetWidget(), prefs);
++    const helium::SurfaceStyle style = helium::ResolveSurfaceStyleForWidget(
++        browser_view_->GetWidget(), prefs, helium::SurfaceGroup::kContainer);
+     built_style_ = style;
+     bubble_ = widget_->SetContentsView(
+         std::make_unique<BubbleView>(browser_view_, std::nullopt, style));
+@@ -1278,7 +1285,8 @@ class MRUTabSwitcherOverlay : public vie
+                 overlay->use_glass_ = native;
+               }
+             },
+-            weak_factory_.GetWeakPtr()));
++            weak_factory_.GetWeakPtr()),
++        nullptr, helium::SurfaceGroup::kContainer);
+     material_->Refresh();
+   }
+ 
+@@ -1306,9 +1314,13 @@ class MRUTabSwitcherOverlay : public vie
+   // Native panel glass needs its own window. A preview also hosts a solid
+   // panel there, so it can float above Settings.
+   bool UsesWidget(PrefService* prefs) const {
+-    return helium::CanUseNativePanelGlass(prefs) ||
+-           (preview_ && helium::ResolveSurfaceStyleForWidget(browser_view_->GetWidget(), prefs)
+-                                .embedded_panel == helium::SurfaceFinish::kSolid);
++    return helium::CanUseNativePanelGlass(prefs,
++                                          helium::SurfaceGroup::kContainer) ||
++           (preview_ &&
++            helium::ResolveSurfaceStyleForWidget(
++                browser_view_->GetWidget(), prefs,
++                helium::SurfaceGroup::kContainer)
++                    .embedded_panel == helium::SurfaceFinish::kSolid);
+   }
+ 
+   const raw_ptr<BrowserView> browser_view_;
+Index: src/chrome/browser/ui/views/helium/glass_surface.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/glass_surface.cc
++++ src/chrome/browser/ui/views/helium/glass_surface.cc
+@@ -168,8 +168,9 @@ const char* GlassBackendName(GlassBacken
+   NOTREACHED();
+ }
+ 
+-SurfaceStyle ResolveProfileSurfaceStyle(const PrefService* prefs) {
+-  SurfaceInputs inputs = ReadSurfaceInputs(prefs);
++SurfaceStyle ResolveProfileSurfaceStyle(const PrefService* prefs,
++                                        SurfaceGroup group) {
++  SurfaceInputs inputs = ReadSurfaceInputs(prefs, group);
+   inputs.embedded_glass_available =
+       ResolveGlassSurface(GlassHost::kEmbedded).resolved !=
+       GlassBackend::kOpaque;
+@@ -177,9 +178,14 @@ SurfaceStyle ResolveProfileSurfaceStyle(
+ }
+ 
+ SurfaceStyle ResolveSurfaceStyleForWidget(const views::Widget* widget,
+-                                         const PrefService* prefs) {
+-  auto style = ResolveProfileSurfaceStyle(prefs);
++                                          const PrefService* prefs,
++                                          SurfaceGroup group) {
++  auto style = ResolveProfileSurfaceStyle(prefs, group);
+   if (widget) {
++    const bool dark =
++        widget->GetColorMode() == ui::ColorProviderKey::ColorMode::kDark;
++    style.neutral_base =
++        dark ? SkColorSetRGB(29, 30, 28) : SkColorSetRGB(242, 242, 240);
+     const auto* colors = widget->GetColorProvider();
+     style.panel_tint_color = colors->GetColor(kColorArciumPanel);
+     style.panel_base = colors->GetColor(kColorArciumPanel);
+@@ -188,8 +194,8 @@ SurfaceStyle ResolveSurfaceStyleForWidge
+   return style;
+ }
+ 
+-bool CanUseNativePanelGlass(const PrefService* prefs) {
+-  const SurfaceStyle style = ResolveProfileSurfaceStyle(prefs);
++bool CanUseNativePanelGlass(const PrefService* prefs, SurfaceGroup group) {
++  const SurfaceStyle style = ResolveProfileSurfaceStyle(prefs, group);
+   // Glassmorphic is Chromium's shader, drawn inside the browser window.
+   if (!style.panel_glass ||
+       style.panel_material == PanelMaterial::kGlassmorphic) {
+@@ -211,10 +217,12 @@ GlassSurfaceView::GlassSurfaceView(const
+       tint_strength_(ClampUnit(params.tint_strength)),
+       tint_replaces_preset_(params.tint_replaces_preset),
+       opacity_(ClampUnit(params.opacity)),
+-      backdrop_blur_sigma_(std::isfinite(params.backdrop_blur_sigma)
+-                               ? std::clamp(params.backdrop_blur_sigma, 0.0f, 30.0f)
+-                               : 0.0f),
++      backdrop_blur_sigma_(
++          std::isfinite(params.backdrop_blur_sigma)
++              ? std::clamp(params.backdrop_blur_sigma, 0.0f, 30.0f)
++              : 0.0f),
+       opaque_color_(params.opaque_color),
++      backing_color_(params.backing_color),
+       corner_radii_(params.corner_radii) {
+   SetCanProcessEventsWithinSubtree(false);
+   // A transparent solid layer supplies drawable bounds for backdrop filtering.
+@@ -258,6 +266,23 @@ void GlassSurfaceView::SetOpacity(float
+   UpdateLayer();
+ }
+ 
++void GlassSurfaceView::SetBackingColor(SkColor color) {
++  if (backing_color_ == color) {
++    return;
++  }
++  backing_color_ = color;
++  UpdateLayer();
++}
++
++void GlassSurfaceView::SetBackdropBlur(float sigma) {
++  sigma = std::isfinite(sigma) ? std::clamp(sigma, 0.0f, 30.0f) : 0.0f;
++  if (backdrop_blur_sigma_ == sigma) {
++    return;
++  }
++  backdrop_blur_sigma_ = sigma;
++  UpdateLayer();
++}
++
+ void GlassSurfaceView::SetCornerRadii(
+     const gfx::RoundedCornersF& corner_radii) {
+   if (corner_radii_ == corner_radii) {
+@@ -277,7 +302,7 @@ void GlassSurfaceView::UpdateLayer() {
+   const MaterialTuning& tuning = GetMaterialTuning(preset_);
+   layer()->SetOpacity(1.0f);
+   layer()->SetColor(backend_ == GlassBackend::kOpaque ? opaque_color_
+-                                                      : SK_ColorTRANSPARENT);
++                                                      : backing_color_);
+   // Keep the glass filter at the root: Viz applies its local transform there.
+   // A separate layer blur wraps it in a composed filter and crops its inputs.
+   layer()->SetBackgroundBlur(0.0f);
+Index: src/chrome/browser/ui/views/helium/glass_surface.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/glass_surface.h
++++ src/chrome/browser/ui/views/helium/glass_surface.h
+@@ -14,6 +14,9 @@ class PrefService;
+ 
+ namespace helium {
+ 
++// Settings are shared by visual purpose, independently of host geometry.
++enum class SurfaceGroup { kText, kContainer };
++
+ struct SurfaceStyle;
+ 
+ inline constexpr char kArciumGlassBackendSwitch[] = "arcium-glass-backend";
+@@ -57,11 +60,14 @@ bool GlassReduceTransparency();
+ 
+ // Resolves the profile's surface roles against the renderers available to
+ // this process. See surface_style.h.
+-SurfaceStyle ResolveProfileSurfaceStyle(const PrefService* prefs);
++SurfaceStyle ResolveProfileSurfaceStyle(
++    const PrefService* prefs,
++    SurfaceGroup group = SurfaceGroup::kText);
+ 
+ // Whether a panel hosted in its own window draws native glass for this
+ // profile. Embedded panels cannot use native glass.
+-bool CanUseNativePanelGlass(const PrefService* prefs);
++bool CanUseNativePanelGlass(const PrefService* prefs,
++                            SurfaceGroup group = SurfaceGroup::kText);
+ 
+ // Fixed, reviewed materials for browser chrome. The shader lab exposes more
+ // knobs, but product code intentionally selects a material rather than
+@@ -82,6 +88,7 @@ struct GlassSurfaceParams {
+   // Preblur the backdrop before both sharp and softened shader samples.
+   float backdrop_blur_sigma = 0.0f;
+   SkColor opaque_color = SkColorSetRGB(28, 28, 30);
++  SkColor backing_color = SK_ColorTRANSPARENT;
+   gfx::RoundedCornersF corner_radii = gfx::RoundedCornersF();
+ };
+ 
+@@ -101,6 +108,8 @@ class GlassSurfaceView : public views::V
+   void SetTintColor(SkColor tint_color);
+   void SetTintStrength(float tint_strength);
+   void SetOpacity(float opacity);
++  void SetBackingColor(SkColor color);
++  void SetBackdropBlur(float sigma);
+   void SetCornerRadii(const gfx::RoundedCornersF& corner_radii);
+ 
+   bool uses_backdrop() const { return backend_ != GlassBackend::kOpaque; }
+@@ -120,8 +129,9 @@ class GlassSurfaceView : public views::V
+   float tint_strength_;
+   bool tint_replaces_preset_;
+   float opacity_;
+-  const float backdrop_blur_sigma_;
++  float backdrop_blur_sigma_;
+   SkColor opaque_color_;
++  SkColor backing_color_;
+   gfx::RoundedCornersF corner_radii_;
+ };
+ 
+Index: src/chrome/browser/ui/views/helium/peek_controller.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/peek_controller.cc
++++ src/chrome/browser/ui/views/helium/peek_controller.cc
+@@ -6,9 +6,11 @@
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <utility>
+ #include <vector>
+ 
++#include "base/auto_reset.h"
+ #include "base/functional/bind.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/time.h"
+@@ -16,6 +18,7 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
+ #include "chrome/browser/ui/tabs/tab_close_types_data.h"
+ #include "chrome/browser/ui/tabs/tab_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -24,6 +27,7 @@
+ #include "chrome/browser/ui/views/frame/contents_web_view.h"
+ #include "chrome/browser/ui/views/helium/glass_surface.h"
+ #include "chrome/browser/ui/views/helium/surface_style.h"
++#include "chrome/browser/ui/views/omnibox/arcium_command_bar_material.h"
+ #include "chrome/common/pref_names.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/javascript_dialogs/app_modal_dialog_controller.h"
+@@ -59,11 +63,14 @@
+ #include "ui/views/controls/button/image_button.h"
+ #include "ui/views/controls/button/image_button_factory.h"
+ #include "ui/views/controls/highlight_path_generator.h"
++#include "ui/views/controls/native/native_view_host.h"
+ #include "ui/views/controls/webview/webview.h"
++#include "ui/views/layout/fill_layout.h"
+ #include "ui/views/vector_icons.h"
+ #include "ui/views/view.h"
+ #include "ui/views/view_shadow.h"
+ #include "ui/views/view_tracker.h"
++#include "ui/views/widget/widget.h"
+ 
+ namespace helium {
+ namespace {
+@@ -75,6 +82,8 @@ constexpr int kControlSize = 40;
+ constexpr int kControlIconSize = 20;
+ constexpr int kControlGap = 10;
+ constexpr int kControlRailGap = 14;
++constexpr int kContainerRim = 4;
++constexpr int kControlShadowInset = 8;
+ 
+ std::unique_ptr<views::ImageButton> CreatePeekActionButton(
+     views::Button::PressedCallback callback,
+@@ -160,6 +169,8 @@ class PeekOverlayView : public views::Vi
+       : close_callback_(close_callback),
+         prefs_(profile->GetOriginalProfile()->GetPrefs()),
+         style_(ResolveProfileSurfaceStyle(prefs_)),
++        container_style_(
++            ResolveProfileSurfaceStyle(prefs_, SurfaceGroup::kContainer)),
+         card_reveal_(preview, card) {
+     // The blur clamps at the page edges; clip its overflow to the contents.
+     SetPaintToLayer();
+@@ -175,6 +186,18 @@ class PeekOverlayView : public views::Vi
+     scrim_->SetCanProcessEventsWithinSubtree(false);
+     scrim_->SetPaintToLayer();
+     scrim_->layer()->SetFillsBoundsOpaquely(false);
++    container_fill_ = AddChildView(std::make_unique<views::View>());
++    container_fill_->SetCanProcessEventsWithinSubtree(false);
++    container_fill_->SetPaintToLayer();
++    container_fill_->layer()->SetFillsBoundsOpaquely(false);
++    container_glass_ = AddChildView(std::make_unique<GlassSurfaceView>(
++        EmbeddedGlassParams(SurfaceFinish::kGlass, SK_ColorWHITE, 0.6f,
++                            kPanelSolidColor, gfx::RoundedCornersF(20))));
++    native_glass_host_ =
++        AddChildView(std::make_unique<views::NativeViewHost>());
++    native_glass_host_->SetCanProcessEventsWithinSubtree(false);
++    native_glass_host_->SetFocusBehavior(FocusBehavior::NEVER);
++    controls_.reserve(3);
+     AddControl(std::move(close_callback), views::kCloseIcon,
+                l10n_util::GetStringUTF16(IDS_HELIUM_PEEK_CLOSE));
+     AddControl(std::move(open_in_tab_callback), views::kOpenInNewIcon,
+@@ -185,46 +208,161 @@ class PeekOverlayView : public views::Vi
+ 
+     // Settings edits apply to an open Peek, so they can be judged live.
+     pref_registrar_.Init(prefs_);
+-    for (const char* name : {kArciumSurfaceSetPref, kArciumSurfaceTuningPref}) {
++    for (const char* name : {kArciumSurfaceSetPref, kArciumSurfaceTuningPref,
++                             arcium::kCommandBarAppearancePref}) {
+       if (prefs_->FindPreference(name)) {
+-        pref_registrar_.Add(name,
+-                            base::BindRepeating(&PeekOverlayView::OnStyleChanged,
+-                                                base::Unretained(this)));
++        pref_registrar_.Add(
++            name, base::BindRepeating(&PeekOverlayView::OnStyleChanged,
++                                      base::Unretained(this)));
+       }
+     }
+   }
+ 
++  ~PeekOverlayView() override {
++    weak_factory_.InvalidateWeakPtrs();
++    ReleaseNativeViews();
++  }
++
+   views::WebView* backdrop_view() const { return backdrop_view_; }
+ 
+-  void FadeIn() { AnimateOpacity(layer(), 1.0f, kOverlayFadeDuration); }
++  void FadeIn() {
++    buttons_revealed_ = true;
++    AnimateOpacity(layer(), 1.0f, kOverlayFadeDuration);
++    if (native_container_) {
++      native_container_->SetOpacity(1.0f, kOverlayFadeDuration.InSecondsF());
++    }
++    UpdateColors();
++  }
+ 
+  private:
+   struct Control {
+     raw_ptr<GlassSurfaceView> glass = nullptr;
+     std::unique_ptr<views::ViewShadow> shadow;
+     raw_ptr<views::ImageButton> button = nullptr;
++    const gfx::VectorIcon* icon = nullptr;
++    // Passive native windows supply only pixels. The original button remains
++    // the sole input, focus, callback, and accessibility target in this view.
++    std::unique_ptr<views::Widget> widget;
++    raw_ptr<views::ImageButton> visual = nullptr;
++    std::unique_ptr<arcium::CommandBarMaterial> material;
++    std::unique_ptr<views::ViewShadow> native_shadow;
++    bool native_active = false;
+   };
+ 
+   void AddControl(views::Button::PressedCallback callback,
+                   const gfx::VectorIcon& icon,
+                   const std::u16string& accessible_name) {
+     Control& control = controls_.emplace_back();
+-    control.glass = AddChildView(std::make_unique<GlassSurfaceView>(
+-        EmbeddedGlassParams(SurfaceFinish::kGlass, SK_ColorWHITE,
+-                            style_.control_tint, SK_ColorBLACK,
+-                            gfx::RoundedCornersF(kControlSize / 2))));
+-    control.button = AddChildView(CreatePeekActionButton(
+-        std::move(callback), icon, accessible_name));
++    control.icon = &icon;
++    control.glass =
++        AddChildView(std::make_unique<GlassSurfaceView>(EmbeddedGlassParams(
++            SurfaceFinish::kGlass, SK_ColorWHITE, style_.control_tint,
++            SK_ColorBLACK, gfx::RoundedCornersF(kControlSize / 2))));
++    control.button = AddChildView(
++        CreatePeekActionButton(std::move(callback), icon, accessible_name));
+     // The icon draws above the glass layer.
+     control.button->SetPaintToLayer();
+     control.button->layer()->SetFillsBoundsOpaquely(false);
+   }
+ 
+   void OnStyleChanged() {
+-    style_ = ResolveSurfaceStyleForWidget(GetWidget(), prefs_);
++    if (applying_style_)
++      return;
++    base::AutoReset<bool> applying(&applying_style_, true);
++    style_ =
++        ResolveSurfaceStyleForWidget(GetWidget(), prefs_, SurfaceGroup::kText);
++    container_style_ = ResolveSurfaceStyleForWidget(GetWidget(), prefs_,
++                                                    SurfaceGroup::kContainer);
+     ApplyStyle();
+   }
+ 
++  void AddedToWidget() override {
++    views::View::AddedToWidget();
++    native_container_ = arcium::CreateEmbeddedSurfaceMaterial(
++        GetWidget(), base::BindRepeating(&PeekOverlayView::OnStyleChanged,
++                                         weak_factory_.GetWeakPtr()));
++    if (native_container_) {
++      native_glass_host_->Attach(native_container_->native_view());
++      native_container_->SetOpacity(buttons_revealed_ ? 1.0f : 0.0f, 0.0f);
++    }
++    OnStyleChanged();
++  }
++
++  void RemovedFromWidget() override {
++    ReleaseNativeViews();
++    views::View::RemovedFromWidget();
++  }
++
++  void ReleaseNativeViews() {
++    for (Control& control : controls_) {
++      control.native_shadow.reset();
++      control.material.reset();
++      control.visual = nullptr;
++      control.widget.reset();
++      control.native_active = false;
++    }
++    if (native_glass_host_ && native_glass_host_->native_view()) {
++      native_glass_host_->Detach();
++    }
++    native_container_.reset();
++  }
++
++  void EnsureNativeControls() {
++    native_controls_requested_ =
++        GetWidget() && CanUseNativePanelGlass(prefs_, SurfaceGroup::kText);
++    for (size_t index = 0; index < controls_.size(); ++index) {
++      Control& control = controls_[index];
++      if (!native_controls_requested_) {
++        control.native_active = false;
++        if (control.widget)
++          control.widget->Hide();
++        continue;
++      }
++      if (!control.widget) {
++        control.widget = std::make_unique<views::Widget>();
++        views::Widget::InitParams params(
++            views::Widget::InitParams::CLIENT_OWNS_WIDGET,
++            views::Widget::InitParams::TYPE_POPUP);
++        params.activatable = views::Widget::InitParams::Activatable::kNo;
++        params.accept_events = false;
++        params.opacity = views::Widget::InitParams::WindowOpacity::kTranslucent;
++        params.shadow_type = views::Widget::InitParams::ShadowType::kNone;
++        params.parent = GetWidget()->GetNativeView();
++        params.bounds =
++            gfx::Rect(GetBoundsInScreen().origin(), gfx::Size(1, 1));
++        params.name = "ArciumPeekControlMaterial";
++        control.widget->Init(std::move(params));
++        auto root = std::make_unique<views::View>();
++        root->SetCanProcessEventsWithinSubtree(false);
++        root->GetViewAccessibility().SetIsIgnored(true);
++        root->SetBorder(views::CreateEmptyBorder(kControlShadowInset));
++        root->SetLayoutManager(std::make_unique<views::FillLayout>());
++        control.visual = root->AddChildView(
++            CreatePeekActionButton({}, *control.icon, std::u16string()));
++        control.visual->GetViewAccessibility().SetIsIgnored(true);
++        control.visual->SetFocusBehavior(FocusBehavior::NEVER);
++        control.widget->SetContentsView(std::move(root));
++        control.material = std::make_unique<arcium::CommandBarMaterial>(
++            control.widget.get(), prefs_, base::BindRepeating([] {
++              arcium::CommandBarMaterial::Clip clip;
++              clip.insets = gfx::Insets(kControlShadowInset);
++              clip.corner_radii = gfx::RoundedCornersF(kControlSize / 2);
++              return clip;
++            }),
++            base::BindRepeating(&PeekOverlayView::OnControlMaterialChanged,
++                                weak_factory_.GetWeakPtr(), index));
++      }
++      control.material->Refresh();
++      control.native_active = native_controls_requested_ &&
++                              control.material->uses_native_material();
++    }
++  }
++
++  void OnControlMaterialChanged(size_t index, bool native) {
++    controls_[index].native_active = native && native_controls_requested_;
++    OnStyleChanged();
++  }
++
+   void ApplyStyle() {
+     const float blur = style_.scrim.blur_sigma;
+     backdrop_view_->layer()->SetLayerBlur(blur);
+@@ -237,26 +375,83 @@ class PeekOverlayView : public views::Vi
+     } else if (blur == 0.0f) {
+       backdrop_cache_.reset();
+     }
++    EnsureNativeControls();
++    const bool native_container =
++        native_container_ &&
++        native_container_->Update(container_style_, 16 + kContainerRim,
++                                  kContainerRim);
++    native_glass_host_->SetVisible(native_container);
++    container_glass_->SetVisible(!native_container &&
++                                 container_style_.embedded_panel !=
++                                     SurfaceFinish::kSolid);
++    // Keep the shadow in the browser underlay even when native glass supplies
++    // the rim. A native host above the live page would cast shadow through its
++    // transparent center and dim the document.
++    container_fill_->SetVisible(native_container ||
++                               container_style_.embedded_panel == SurfaceFinish::kSolid);
++    container_fill_->SetBackground(views::CreateRoundedRectBackground(
++        native_container ? SK_ColorTRANSPARENT : PanelSolidColor(container_style_),
++        16 + kContainerRim));
++
++    const auto update_shadow =
++        [this](views::View* view, std::unique_ptr<views::ViewShadow>& shadow) {
++          if (container_style_.panel_shadow && view->GetVisible()) {
++            if (!shadow) {
++              shadow = std::make_unique<views::ViewShadow>(
++                  view, kControlShadowElevation);
++              shadow->SetRoundedCornerRadius(16 + kContainerRim);
++            }
++          } else {
++            shadow.reset();
++          }
++        };
++    update_shadow(container_fill_, container_fill_shadow_);
++    update_shadow(container_glass_, container_glass_shadow_);
++    container_glass_->SetPreset(container_style_.embedded_panel ==
++                                        SurfaceFinish::kRefractive
++                                    ? GlassSurfacePreset::kGlassmorphic
++                                    : GlassSurfacePreset::kBasic);
++    container_glass_->SetTintStrength(container_style_.panel_tint);
++    container_glass_->SetBackdropBlur(container_style_.panel_blur);
++    container_glass_->SetBackingColor(
++        SkColorSetA(container_style_.neutral_base,
++                    static_cast<SkAlpha>(
++                        std::lround(container_style_.panel_opacity * 255))));
+     const bool glass = style_.control != SurfaceFinish::kSolid;
+     for (Control& control : controls_) {
+-      control.glass->SetVisible(glass);
++      control.glass->SetVisible(glass && !control.native_active);
+       control.glass->SetPreset(style_.control == SurfaceFinish::kRefractive
+                                    ? GlassSurfacePreset::kGlassmorphic
+                                    : GlassSurfacePreset::kBasic);
+       control.glass->SetTintStrength(style_.control_tint);
+-      if (glass && !control.shadow) {
++      control.glass->SetBackingColor(SkColorSetA(
++          style_.neutral_base,
++          static_cast<SkAlpha>(std::lround(style_.panel_opacity * 255))));
++      if (control.native_active && style_.panel_shadow &&
++          !control.native_shadow) {
++        control.native_shadow = std::make_unique<views::ViewShadow>(
++            control.visual, kControlShadowElevation);
++        control.native_shadow->SetRoundedCornerRadius(kControlSize / 2);
++      } else if (!control.native_active || !style_.panel_shadow) {
++        control.native_shadow.reset();
++      }
++      if (glass && !control.native_active && style_.panel_shadow &&
++          !control.shadow) {
+         control.shadow = std::make_unique<views::ViewShadow>(
+             control.glass, kControlShadowElevation);
+         control.shadow->SetRoundedCornerRadius(kControlSize / 2);
+-      } else if (!glass) {
++      } else if (!glass || control.native_active || !style_.panel_shadow) {
+         control.shadow.reset();
+       }
+       control.button->SetBorder(
+-          glass ? views::CreateRoundedRectBorder(
+-                      1, kControlSize / 2,
+-                      SkColorSetA(GetWidget() ? GetColorProvider()->GetColor(kColorArciumText)
+-                                               : SK_ColorWHITE, style_.control_edge_alpha))
+-                : nullptr);
++          glass && !control.native_active
++              ? views::CreateRoundedRectBorder(
++                    1, kControlSize / 2,
++                    SkColorSetA(GetWidget() ? GetColorProvider()->GetColor(
++                                                  kColorArciumText)
++                                            : SK_ColorWHITE,
++                                style_.control_edge_alpha))
++              : nullptr);
+     }
+     if (GetWidget()) {
+       UpdateColors();
+@@ -269,13 +464,28 @@ class PeekOverlayView : public views::Vi
+     scrim_->SetBackground(views::CreateSolidBackground(
+         SkColorSetA(tint, style_.scrim.dim_alpha)));
+     const SkColor surface = colors->GetColor(kColorArciumPanel);
+-    for (const Control& control : controls_) {
++    container_glass_->SetTintColor(surface);
++    for (Control& control : controls_) {
+       control.glass->SetTintColor(surface);
++      control.button->SetImageModel(
++          views::Button::STATE_NORMAL,
++          control.native_active
++              ? ui::ImageModel()
++              : ui::ImageModel::FromVectorIcon(*control.icon, kColorArciumText,
++                                               kControlIconSize));
+       control.button->SetBackground(
+-          views::CreateRoundedRectBackground(
+-              style_.control == SurfaceFinish::kSolid
+-                  ? kColorArciumPanel : kColorArciumPanelBackground,
+-              kControlSize / 2));
++          !control.native_active && style_.control == SurfaceFinish::kSolid
++              ? views::CreateRoundedRectBackground(PanelSolidColor(style_),
++                                                   kControlSize / 2)
++              : nullptr);
++      if (control.widget) {
++        if (control.native_active && buttons_revealed_ && IsDrawn() &&
++            !control.button->bounds().IsEmpty()) {
++          control.widget->ShowInactive();
++        } else {
++          control.widget->Hide();
++        }
++      }
+     }
+   }
+ 
+@@ -289,16 +499,33 @@ class PeekOverlayView : public views::Vi
+     backdrop_view_->SetBoundsRect(bounds);
+     scrim_->SetBoundsRect(bounds);
+     const gfx::Rect card = GetPeekCardBounds(bounds);
++    gfx::Rect rim = card;
++    rim.Inset(gfx::Insets(-kContainerRim));
++    container_fill_->SetBoundsRect(rim);
++    container_glass_->SetBoundsRect(rim);
++    native_glass_host_->SetBoundsRect(rim);
+     gfx::Rect control_bounds(card.right() + kControlRailGap, card.y(),
+                              kControlSize, kControlSize);
+-    for (const Control& control : controls_) {
++    for (Control& control : controls_) {
+       control.button->SetBoundsRect(control_bounds);
+       control.glass->SetBoundsRect(control_bounds);
++      if (control.widget) {
++        gfx::Rect screen = control_bounds;
++        views::View::ConvertRectToScreen(this, &screen);
++        screen.Inset(gfx::Insets(-kControlShadowInset));
++        control.widget->SetBounds(screen);
++      }
+       control_bounds.Offset(0, kControlSize + kControlGap);
+     }
++    if (GetWidget())
++      UpdateColors();
+   }
+ 
+-  bool OnMousePressed(const ui::MouseEvent&) override {
++  bool OnMousePressed(const ui::MouseEvent& event) override {
++    gfx::Rect rim = GetPeekCardBounds(GetContentsBounds());
++    rim.Inset(gfx::Insets(-kContainerRim));
++    if (rim.Contains(event.location()))
++      return true;
+     close_callback_.Run();
+     return true;
+   }
+@@ -306,12 +533,23 @@ class PeekOverlayView : public views::Vi
+   raw_ptr<views::WebView> backdrop_view_ = nullptr;
+   std::unique_ptr<ui::ScopedCacheRenderSurfaceLock> backdrop_cache_;
+   raw_ptr<views::View> scrim_ = nullptr;
++  raw_ptr<views::View> container_fill_ = nullptr;
++  raw_ptr<GlassSurfaceView> container_glass_ = nullptr;
++  raw_ptr<views::NativeViewHost> native_glass_host_ = nullptr;
++  std::unique_ptr<arcium::EmbeddedSurfaceMaterial> native_container_;
++  std::unique_ptr<views::ViewShadow> container_fill_shadow_;
++  std::unique_ptr<views::ViewShadow> container_glass_shadow_;
+   std::vector<Control> controls_;
++  bool native_controls_requested_ = false;
++  bool buttons_revealed_ = false;
++  bool applying_style_ = false;
+   base::RepeatingClosure close_callback_;
+   const raw_ptr<PrefService> prefs_;
+   PrefChangeRegistrar pref_registrar_;
+   SurfaceStyle style_;
++  SurfaceStyle container_style_;
+   CardReveal card_reveal_;
++  base::WeakPtrFactory<PeekOverlayView> weak_factory_{this};
+ };
+ 
+ BEGIN_METADATA(PeekOverlayView)
+Index: src/chrome/browser/ui/views/helium/surface_style.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/surface_style.cc
++++ src/chrome/browser/ui/views/helium/surface_style.cc
+@@ -125,7 +125,7 @@ std::optional<PanelMaterial> ParsePanelM
+   if (value == kPanelMaterialSolid) {
+     return PanelMaterial::kSolid;
+   }
+-  if (value == kPanelMaterialFast) {
++  if (value == kPanelMaterialFast || value == "flat") {
+     return PanelMaterial::kFast;
+   }
+   if (value == kPanelMaterialLiquid) {
+@@ -135,7 +135,8 @@ std::optional<PanelMaterial> ParsePanelM
+     return PanelMaterial::kSystemLiquid;
+   }
+   if (value == kPanelMaterialFrosted) {
+-    return PanelMaterial::kFrosted;
++    // Frosted was removed; retain the closest supported native material.
++    return PanelMaterial::kLiquid;
+   }
+   if (value == kPanelMaterialGlassmorphic) {
+     return PanelMaterial::kGlassmorphic;
+@@ -153,8 +154,6 @@ const char* PanelMaterialString(PanelMat
+       return kPanelMaterialLiquid;
+     case PanelMaterial::kSystemLiquid:
+       return kPanelMaterialSystemLiquid;
+-    case PanelMaterial::kFrosted:
+-      return kPanelMaterialFrosted;
+     case PanelMaterial::kGlassmorphic:
+       return kPanelMaterialGlassmorphic;
+   }
+@@ -198,11 +197,13 @@ SurfaceTuning PresetSurfaceTuning(Surfac
+       break;
+     case SurfaceSet::kRefractive:
+       tuning.panel_material = PanelMaterial::kGlassmorphic;
++      tuning.text_material = PanelMaterial::kGlassmorphic;
+       tuning.control = SurfaceFinish::kRefractive;
+       tuning.control_tint = 0.4;
+       break;
+     case SurfaceSet::kQuiet:
+-      tuning.panel_material = PanelMaterial::kSolid;
++      tuning.panel_material = PanelMaterial::kFast;
++      tuning.text_material = PanelMaterial::kSolid;
+       tuning.control_tint = 0.6;
+       tuning.control_edge = 0.3;
+       tuning.scrim_blur = 4.0;
+@@ -210,6 +211,7 @@ SurfaceTuning PresetSurfaceTuning(Surfac
+       break;
+     case SurfaceSet::kSolid:
+       tuning.panel_material = PanelMaterial::kSolid;
++      tuning.text_material = PanelMaterial::kSolid;
+       tuning.control = SurfaceFinish::kSolid;
+       tuning.scrim_blur = 0.0;
+       tuning.scrim_dim = 0.72;
+@@ -230,6 +232,17 @@ SurfaceTuning ParseSurfaceTuning(const b
+   } else if (dict.FindBool("panelRefractive") == true) {
+     tuning.panel_material = PanelMaterial::kGlassmorphic;
+   }
++  if (const std::string* material =
++          dict.FindString(kSurfaceTuningTextMaterialKey)) {
++    tuning.text_material =
++        ParsePanelMaterial(*material).value_or(tuning.text_material);
++  }
++  tuning.panel_opacity = Clamped(dict.FindDouble(kSurfaceTuningPanelOpacityKey),
++                                 tuning.panel_opacity, 1.0);
++  tuning.text_tint = Clamped(dict.FindDouble(kSurfaceTuningTextTintKey),
++                             tuning.text_tint, 1.0);
++  tuning.text_opacity = Clamped(dict.FindDouble(kSurfaceTuningTextOpacityKey),
++                                tuning.text_opacity, 1.0);
+   tuning.panel_blur = Clamped(dict.FindDouble(kSurfaceTuningPanelBlurKey),
+                               tuning.panel_blur, kMaxScrimBlur);
+   tuning.panel_tint = Clamped(dict.FindDouble(kSurfaceTuningPanelTintKey),
+@@ -258,10 +271,36 @@ SurfaceTuning ParseSurfaceTuning(const b
+ 
+ std::optional<SurfaceTuning> ParseSurfaceTuningStrict(
+     const base::DictValue& dict) {
+-  if ((dict.size() != 9 && dict.size() != 10) ||
+-      (dict.size() == 10 && !dict.Find(kSurfaceTuningPanelBlurKey))) {
++  // The original nine fields remain required. New fields are optional for
++  // older clients; counting every recognized optional key rejects unknown keys.
++  size_t expected_size = 9;
++  for (const char* key :
++       {kSurfaceTuningPanelBlurKey, kSurfaceTuningPanelOpacityKey,
++        kSurfaceTuningTextMaterialKey, kSurfaceTuningTextTintKey,
++        kSurfaceTuningTextOpacityKey}) {
++    expected_size += dict.contains(key);
++  }
++  if (dict.size() != expected_size) {
+     return std::nullopt;
+   }
++  const SurfaceTuning defaults;
++  const auto optional_number = [&](const char* key, double fallback) {
++    return dict.contains(key) ? StrictNumber(dict, key, 1.0)
++                              : std::optional<double>(fallback);
++  };
++  const auto text_material =
++      dict.contains(kSurfaceTuningTextMaterialKey)
++          ? (dict.FindString(kSurfaceTuningTextMaterialKey)
++                 ? ParsePanelMaterial(
++                       *dict.FindString(kSurfaceTuningTextMaterialKey))
++                 : std::nullopt)
++          : std::optional<PanelMaterial>(defaults.text_material);
++  const auto panel_opacity =
++      optional_number(kSurfaceTuningPanelOpacityKey, defaults.panel_opacity);
++  const auto text_tint =
++      optional_number(kSurfaceTuningTextTintKey, defaults.text_tint);
++  const auto text_opacity =
++      optional_number(kSurfaceTuningTextOpacityKey, defaults.text_opacity);
+   const std::string* material_name =
+       dict.FindString(kSurfaceTuningPanelMaterialKey);
+   const std::optional<PanelMaterial> material =
+@@ -288,18 +327,24 @@ std::optional<SurfaceTuning> ParseSurfac
+       StrictNumber(dict, kSurfaceTuningScrimBlurKey, kMaxScrimBlur);
+   const auto scrim_dim = StrictNumber(dict, kSurfaceTuningScrimDimKey, 1.0);
+   if (!material || !tint_color || !panel_shadow || !control || !panel_tint ||
+-      !panel_blur || !control_tint || !control_edge || !scrim_blur || !scrim_dim) {
++      !panel_blur || !control_tint || !control_edge || !scrim_blur ||
++      !scrim_dim || !text_material || !panel_opacity || !text_tint ||
++      !text_opacity) {
+     return std::nullopt;
+   }
+   return SurfaceTuning{
+       .panel_material = *material,
+       .panel_tint = *panel_tint,
++      .panel_opacity = *panel_opacity,
+       .panel_blur = *panel_blur,
+       .panel_tint_color = *tint_color,
+       .panel_shadow = *panel_shadow,
+       .control = *control,
+       .control_tint = *control_tint,
+       .control_edge = *control_edge,
++      .text_material = *text_material,
++      .text_tint = *text_tint,
++      .text_opacity = *text_opacity,
+       .scrim_blur = *scrim_blur,
+       .scrim_dim = *scrim_dim,
+   };
+@@ -310,6 +355,11 @@ base::DictValue SerializeSurfaceTuning(c
+       .Set(kSurfaceTuningPanelMaterialKey,
+            PanelMaterialString(tuning.panel_material))
+       .Set(kSurfaceTuningPanelTintKey, tuning.panel_tint)
++      .Set(kSurfaceTuningPanelOpacityKey, tuning.panel_opacity)
++      .Set(kSurfaceTuningTextMaterialKey,
++           PanelMaterialString(tuning.text_material))
++      .Set(kSurfaceTuningTextTintKey, tuning.text_tint)
++      .Set(kSurfaceTuningTextOpacityKey, tuning.text_opacity)
+       .Set(kSurfaceTuningPanelBlurKey, tuning.panel_blur)
+       .Set(kSurfaceTuningPanelTintColorKey,
+            TintColorString(tuning.panel_tint_color))
+@@ -329,41 +379,49 @@ SurfaceTuning ReadSurfaceTuning(const Pr
+   return ParseSurfaceTuning(prefs->GetDict(kArciumSurfaceTuningPref));
+ }
+ 
+-SurfaceInputs ReadSurfaceInputs(const PrefService* prefs) {
++SurfaceInputs ReadSurfaceInputs(const PrefService* prefs, SurfaceGroup group) {
+   const SurfaceSet set = ReadSurfaceSet(prefs);
+   auto tuning = ReadSurfaceTuning(prefs, set);
+   // Old independent tint colors are read only as legacy data, never rendered.
+   tuning.panel_tint_color.reset();
+-  return {.set = set, .panel = ReadPanelChoice(prefs), .tuning = tuning};
++  return {.set = set,
++          .panel = group == SurfaceGroup::kText ? ReadPanelChoice(prefs)
++                                                : PanelChoice::kAutomatic,
++          .group = group,
++          .tuning = tuning};
+ }
+ 
+ SurfaceStyle ResolveSurfaceStyle(const SurfaceInputs& inputs) {
+   const SurfaceTuning& tuning = inputs.tuning;
+   SurfaceStyle style;
++  const bool container = inputs.group == SurfaceGroup::kContainer;
++  const PanelMaterial material =
++      container ? tuning.panel_material : tuning.text_material;
+   switch (inputs.panel) {
+     case PanelChoice::kSolid:
+       style.panel_material = PanelMaterial::kSolid;
+       break;
+     case PanelChoice::kGlass:
+       // An explicit glass choice keeps the preset's glass, or Clear.
+-      style.panel_material = tuning.panel_material == PanelMaterial::kSolid
+-                                 ? PanelMaterial::kLiquid
+-                                 : tuning.panel_material;
++      style.panel_material = material == PanelMaterial::kSolid
++                                 ? (container ? PanelMaterial::kLiquid
++                                              : PanelMaterial::kSystemLiquid)
++                                 : material;
+       break;
+     case PanelChoice::kAutomatic:
+-      style.panel_material = tuning.panel_material;
++      style.panel_material = material;
+       break;
+   }
+   style.panel_glass = style.panel_material != PanelMaterial::kSolid;
+-  // Frosted is an untinted material. Retain the shared saved tint for when
+-  // another panel material is selected.
+-  style.panel_tint = style.panel_material == PanelMaterial::kFrosted
+-                         ? 0.f : static_cast<float>(tuning.panel_tint);
++  style.panel_tint =
++      static_cast<float>(container ? tuning.panel_tint : tuning.text_tint);
++  style.panel_opacity = static_cast<float>(container ? tuning.panel_opacity
++                                                     : tuning.text_opacity);
+   style.panel_blur = static_cast<float>(tuning.panel_blur);
+   style.panel_tint_color = tuning.panel_tint_color ? tuning.panel_tint_color
+-                                                : inputs.window_tint_color;
++                                                   : inputs.window_tint_color;
+   style.panel_shadow = tuning.panel_shadow;
+-  style.control_tint = static_cast<float>(tuning.control_tint);
++  style.control_tint = static_cast<float>(tuning.text_tint);
+   style.control_edge_alpha =
+       static_cast<SkAlpha>(std::lround(tuning.control_edge * 255));
+ 
+@@ -376,7 +434,13 @@ SurfaceStyle ResolveSurfaceStyle(const S
+                                ? SurfaceFinish::kRefractive
+                                : SurfaceFinish::kGlass;
+   }
+-  style.control = tuning.control;
++  const PanelMaterial control_material =
++      container ? tuning.text_material : style.panel_material;
++  style.control = control_material == PanelMaterial::kSolid
++                      ? SurfaceFinish::kSolid
++                  : control_material == PanelMaterial::kGlassmorphic
++                      ? SurfaceFinish::kRefractive
++                      : SurfaceFinish::kGlass;
+   style.scrim = {
+       .blur_sigma = static_cast<float>(tuning.scrim_blur),
+       .dim_alpha = static_cast<SkAlpha>(std::lround(tuning.scrim_dim * 255)),
+@@ -384,14 +448,12 @@ SurfaceStyle ResolveSurfaceStyle(const S
+   return style;
+ }
+ 
+-
+ SkColor PanelSolidColor(const SurfaceStyle& style) {
+-  if (style.panel_base) {
+-    return *style.panel_base;
+-  }
+-  return color_utils::AlphaBlend(
+-      style.panel_tint_color.value_or(kPanelSolidColor), kPanelSolidColor,
++  const SkColor tinted = color_utils::AlphaBlend(
++      style.panel_tint_color.value_or(style.neutral_base), style.neutral_base,
+       style.panel_tint);
++  return color_utils::AlphaBlend(style.neutral_base, tinted,
++                                 style.panel_opacity);
+ }
+ 
+ GlassSurfaceConfiguration PanelGlassConfiguration(
+@@ -426,7 +488,9 @@ GlassSurfaceParams EmbeddedGlassParams(S
+                                        float tint_strength,
+                                        SkColor opaque_color,
+                                        const gfx::RoundedCornersF& radii,
+-                                       float backdrop_blur_sigma) {
++                                       float backdrop_blur_sigma,
++                                       float neutral_opacity,
++                                       SkColor neutral_color) {
+   GlassSurfaceParams params;
+   params.backdrop_blur_sigma = backdrop_blur_sigma;
+   params.preset = finish == SurfaceFinish::kRefractive
+@@ -436,6 +500,11 @@ GlassSurfaceParams EmbeddedGlassParams(S
+   params.tint_strength = tint_strength;
+   params.tint_replaces_preset = true;
+   params.opaque_color = opaque_color;
++  const float opacity = std::isfinite(neutral_opacity)
++                            ? std::clamp(neutral_opacity, 0.0f, 1.0f)
++                            : 0.0f;
++  params.backing_color = SkColorSetA(
++      neutral_color, static_cast<SkAlpha>(std::lround(opacity * 255)));
+   params.corner_radii = radii;
+   return params;
+ }
+Index: src/chrome/browser/ui/views/helium/surface_style_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/surface_style_unittest.cc
++++ src/chrome/browser/ui/views/helium/surface_style_unittest.cc
+@@ -88,12 +88,13 @@ TEST(SurfaceStyleTest, RuntimeIgnoresInd
+   resolved.panel_base = SK_ColorMAGENTA;
+   resolved.panel_tint_color = SK_ColorYELLOW;
+   resolved.panel_tint = 0;
+-  EXPECT_EQ(PanelSolidColor(resolved), SK_ColorMAGENTA);
++  EXPECT_EQ(PanelSolidColor(resolved), kPanelSolidColor);
+ }
+ 
+ TEST(SurfaceStyleTest, SolidFillUsesTintAndChromiumBlurStaysIndependent) {
+   SurfaceInputs inputs;
+   inputs.set = SurfaceSet::kCustom;
++  inputs.tuning.panel_opacity = 0;
+   inputs.tuning.panel_material = PanelMaterial::kSolid;
+   inputs.tuning.panel_tint_color = SK_ColorWHITE;
+   inputs.tuning.panel_tint = 0;
+@@ -147,9 +148,15 @@ TEST(SurfaceStyleTest, PresetsChooseEver
+   EXPECT_EQ(refractive.control, SurfaceFinish::kRefractive);
+ 
+   const SurfaceStyle quiet = Resolve(SurfaceSet::kQuiet);
+-  EXPECT_FALSE(quiet.panel_glass);
+-  EXPECT_EQ(quiet.embedded_panel, SurfaceFinish::kSolid);
+-  EXPECT_EQ(quiet.control, SurfaceFinish::kGlass);
++  EXPECT_TRUE(quiet.panel_glass);
++  EXPECT_EQ(quiet.panel_material, PanelMaterial::kFast);
++  EXPECT_EQ(quiet.embedded_panel, SurfaceFinish::kGlass);
++  EXPECT_EQ(quiet.control, SurfaceFinish::kSolid);
++  const SurfaceStyle quiet_text = ResolveSurfaceStyle(
++      {.group = SurfaceGroup::kText,
++       .tuning = PresetSurfaceTuning(SurfaceSet::kQuiet)});
++  EXPECT_FALSE(quiet_text.panel_glass);
++  EXPECT_EQ(quiet_text.panel_material, PanelMaterial::kSolid);
+   EXPECT_GT(quiet.scrim.blur_sigma, 0.0f);
+   EXPECT_LT(quiet.scrim.blur_sigma, glass.scrim.blur_sigma);
+ 
+@@ -187,6 +194,8 @@ TEST(SurfaceStyleTest, CustomValuesDrive
+   tuning.panel_shadow = false;
+   tuning.control = SurfaceFinish::kRefractive;
+   tuning.control_tint = 0.2;
++  tuning.text_material = PanelMaterial::kGlassmorphic;
++  tuning.text_tint = 0.2;
+   tuning.control_edge = 1.0;
+   tuning.scrim_blur = 12;
+   tuning.scrim_dim = 0.5;
+@@ -218,8 +227,7 @@ TEST(SurfaceStyleTest, GlassmorphicPanel
+ TEST(SurfaceStyleTest, MaterialNamesRoundTrip) {
+   for (PanelMaterial material :
+        {PanelMaterial::kSolid, PanelMaterial::kFast, PanelMaterial::kLiquid,
+-        PanelMaterial::kSystemLiquid, PanelMaterial::kFrosted,
+-        PanelMaterial::kGlassmorphic}) {
++        PanelMaterial::kSystemLiquid, PanelMaterial::kGlassmorphic}) {
+     EXPECT_EQ(ParsePanelMaterial(PanelMaterialString(material)), material);
+   }
+   EXPECT_FALSE(ParsePanelMaterial("ribbon"));
+@@ -245,20 +253,100 @@ TEST(SurfaceStyleTest, PublicLiquidKeeps
+   EXPECT_DOUBLE_EQ(panel.glass_tint_opacity, style.panel_tint);
+ }
+ 
+-TEST(SurfaceStyleTest, FrostedIgnoresTintWithoutErasingTheSavedChoice) {
+-  SurfaceTuning tuning = PresetSurfaceTuning(SurfaceSet::kGlass);
+-  tuning.panel_tint = .8;
+-  tuning.panel_tint_color = SK_ColorRED;
+-  tuning.panel_material = PanelMaterial::kFrosted;
+-  const auto saved = SerializeSurfaceTuning(tuning);
+-  const auto style = ResolveSurfaceStyle({.set = SurfaceSet::kCustom,
+-                                          .tuning = tuning});
+-  EXPECT_FLOAT_EQ(style.panel_tint, 0.f);
+-  EXPECT_EQ(PanelSolidColor(style), kPanelSolidColor);
+-  EXPECT_EQ(ParseSurfaceTuningStrict(saved), tuning);
+-  tuning.panel_material = PanelMaterial::kSystemLiquid;
+-  EXPECT_FLOAT_EQ(ResolveSurfaceStyle({.set = SurfaceSet::kCustom,
+-                                       .tuning = tuning}).panel_tint, .8f);
++TEST(SurfaceStyleTest, RemovedFrostedAndRenamedFlatKeepSavedRecipesReadable) {
++  auto saved = SerializeSurfaceTuning(SurfaceTuning());
++  saved.Set(kSurfaceTuningPanelMaterialKey, "frosted");
++  saved.Set(kSurfaceTuningTextMaterialKey, "frosted");
++  saved.Set(kSurfaceTuningPanelTintKey, .8);
++  const auto parsed = ParseSurfaceTuningStrict(saved);
++  ASSERT_TRUE(parsed);
++  EXPECT_EQ(parsed->panel_material, PanelMaterial::kLiquid);
++  EXPECT_EQ(parsed->text_material, PanelMaterial::kLiquid);
++  EXPECT_DOUBLE_EQ(parsed->panel_tint, .8);
++  EXPECT_EQ(*SerializeSurfaceTuning(*parsed).FindString(
++                kSurfaceTuningPanelMaterialKey),
++            "liquid");
++  EXPECT_EQ(ParsePanelMaterial("flat"), PanelMaterial::kFast);
++  EXPECT_EQ(ParsePanelMaterial("fast"), PanelMaterial::kFast);
++}
++
++TEST(SurfaceStyleTest, TextAndContainerDefaultsAreIndependent) {
++  const SurfaceTuning tuning;
++  const auto text =
++      ResolveSurfaceStyle({.group = SurfaceGroup::kText, .tuning = tuning});
++  const auto containers = ResolveSurfaceStyle(
++      {.group = SurfaceGroup::kContainer, .tuning = tuning});
++  EXPECT_EQ(text.panel_material, PanelMaterial::kSystemLiquid);
++  EXPECT_FLOAT_EQ(text.panel_tint, .4f);
++  EXPECT_FLOAT_EQ(text.panel_opacity, .05f);
++  EXPECT_EQ(containers.panel_material, PanelMaterial::kLiquid);
++  EXPECT_FLOAT_EQ(containers.panel_tint, .6f);
++  EXPECT_FLOAT_EQ(containers.panel_opacity, .2f);
++  auto custom = tuning;
++  custom.text_material = PanelMaterial::kFast;
++  custom.text_opacity = .8;
++  const auto unchanged = ResolveSurfaceStyle(
++      {.group = SurfaceGroup::kContainer, .tuning = custom});
++  EXPECT_EQ(unchanged.panel_material, containers.panel_material);
++  EXPECT_FLOAT_EQ(unchanged.panel_tint, containers.panel_tint);
++  EXPECT_FLOAT_EQ(unchanged.panel_opacity, containers.panel_opacity);
++}
++
++TEST(SurfaceStyleTest, LegacyTextOverrideAlsoAppliesToFloatingControls) {
++  const auto solid = ResolveSurfaceStyle({.panel = PanelChoice::kSolid,
++                                          .group = SurfaceGroup::kText,
++                                          .tuning = SurfaceTuning()});
++  EXPECT_EQ(solid.panel_material, PanelMaterial::kSolid);
++  EXPECT_EQ(solid.control, SurfaceFinish::kSolid);
++  const auto glass =
++      ResolveSurfaceStyle({.panel = PanelChoice::kGlass,
++                           .group = SurfaceGroup::kText,
++                           .tuning = PresetSurfaceTuning(SurfaceSet::kSolid)});
++  EXPECT_EQ(glass.panel_material, PanelMaterial::kSystemLiquid);
++  EXPECT_EQ(glass.control, SurfaceFinish::kGlass);
++}
++
++TEST(SurfaceStyleTest, NeutralOpacityDoesNotIncreaseTintAndFollowsBaseMode) {
++  SurfaceStyle style;
++  style.panel_tint_color = SK_ColorRED;
++  style.panel_tint = .6f;
++  style.panel_opacity = 1;
++  for (SkColor neutral :
++       {SkColorSetRGB(29, 30, 28), SkColorSetRGB(242, 242, 240)}) {
++    style.neutral_base = neutral;
++    EXPECT_EQ(PanelSolidColor(style), neutral);
++    const auto params = EmbeddedGlassParams(
++        SurfaceFinish::kGlass, SK_ColorRED, style.panel_tint,
++        PanelSolidColor(style), gfx::RoundedCornersF(12), 0,
++        style.panel_opacity, neutral);
++    EXPECT_EQ(params.backing_color, neutral);
++    EXPECT_FLOAT_EQ(params.tint_strength, .6f);
++    EXPECT_EQ(params.tint_color, SK_ColorRED);
++  }
++}
++
++TEST(SurfaceStyleTest, OlderClientsGetNewDefaultsAndNewFieldsValidateStrictly) {
++  auto old = SerializeSurfaceTuning(SurfaceTuning());
++  for (const char* key :
++       {kSurfaceTuningPanelOpacityKey, kSurfaceTuningTextMaterialKey,
++        kSurfaceTuningTextTintKey, kSurfaceTuningTextOpacityKey})
++    old.Remove(key);
++  const auto migrated = ParseSurfaceTuningStrict(old);
++  ASSERT_TRUE(migrated);
++  EXPECT_EQ(*migrated, SurfaceTuning());
++  for (const char* key :
++       {kSurfaceTuningPanelOpacityKey, kSurfaceTuningTextTintKey,
++        kSurfaceTuningTextOpacityKey}) {
++    auto invalid = old.Clone();
++    invalid.Set(key, -0.01);
++    EXPECT_FALSE(ParseSurfaceTuningStrict(invalid));
++    invalid.Set(key, 1.01);
++    EXPECT_FALSE(ParseSurfaceTuningStrict(invalid));
++    invalid.Set(key, "opacity");
++    EXPECT_FALSE(ParseSurfaceTuningStrict(invalid));
++  }
++  old.Set(kSurfaceTuningTextMaterialKey, "unknown");
++  EXPECT_FALSE(ParseSurfaceTuningStrict(old));
+ }
+ 
+ TEST(SurfaceStyleTest, TuningParsersClampAndValidate) {
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_bar_material.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_bar_material.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_bar_material.cc
+@@ -26,9 +26,11 @@ CommandBarMaterial::CommandBarMaterial(
+     PrefService* prefs,
+     base::RepeatingCallback<Clip()> clip_provider,
+     base::RepeatingCallback<void(bool)> paint_changed,
+-    std::unique_ptr<CommandBarNativeBackground> native_background)
++    std::unique_ptr<CommandBarNativeBackground> native_background,
++    helium::SurfaceGroup group)
+     : widget_(widget),
+       prefs_(prefs),
++      group_(group),
+       clip_provider_(std::move(clip_provider)),
+       paint_changed_(std::move(paint_changed)),
+       native_background_(std::move(native_background)) {
+@@ -67,10 +69,9 @@ void CommandBarMaterial::Refresh() {
+   if (!widget_) {
+     return;
+   }
+-  // Floating panels share one role: an explicit command bar choice, or the
+-  // profile's surface preset. They never change the window's own setting.
++  // Resolve the owning group without changing window appearance preferences.
+   const helium::SurfaceStyle style =
+-      helium::ResolveSurfaceStyleForWidget(widget_, prefs_);
++      helium::ResolveSurfaceStyleForWidget(widget_, prefs_, group_);
+   const bool requested = prefs_ && style.panel_glass;
+   helium::GlassSurfaceConfiguration configuration =
+       helium::ReadPanelGlassConfiguration(prefs_, style);
+@@ -114,4 +115,12 @@ void CommandBarMaterial::OnWidgetDestroy
+   native_background_.reset();
+ }
+ 
++#if !BUILDFLAG(IS_MAC)
++std::unique_ptr<EmbeddedSurfaceMaterial> CreateEmbeddedSurfaceMaterial(
++    views::Widget*,
++    base::RepeatingClosure) {
++  return nullptr;
++}
++#endif
++
+ }  // namespace arcium
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_bar_material.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_bar_material.h
++++ src/chrome/browser/ui/views/omnibox/arcium_command_bar_material.h
+@@ -17,6 +17,7 @@
+ #include "ui/gfx/geometry/insets.h"
+ #include "ui/gfx/geometry/rect.h"
+ #include "ui/gfx/geometry/rounded_corners_f.h"
++#include "ui/gfx/native_ui_types.h"
+ #include "ui/views/widget/widget_observer.h"
+ 
+ class PrefService;
+@@ -45,6 +46,22 @@ std::unique_ptr<CommandBarNativeBackgrou
+     views::Widget* widget,
+     base::RepeatingClosure appearance_changed);
+ 
++// Host-local glass surrounds live native content. Its material is clipped to
++// a rim so native subview sorting cannot obscure the live page.
++class EmbeddedSurfaceMaterial {
++ public:
++  virtual ~EmbeddedSurfaceMaterial() = default;
++  virtual gfx::NativeView native_view() const = 0;
++  virtual bool Update(const helium::SurfaceStyle& style,
++                      float radius,
++                      float rim_width) = 0;
++  virtual void SetOpacity(float opacity, float duration_seconds) = 0;
++};
++
++std::unique_ptr<EmbeddedSurfaceMaterial> CreateEmbeddedSurfaceMaterial(
++    views::Widget* widget,
++    base::RepeatingClosure appearance_changed);
++
+ // Search and results use the same observer and material implementation, with
+ // their own widget-local clipping. Changes affect paint without rebuilding
+ // the input or results, so focus, query and selection survive live edits.
+@@ -62,7 +79,8 @@ class CommandBarMaterial : public views:
+       PrefService* prefs,
+       base::RepeatingCallback<Clip()> clip_provider,
+       base::RepeatingCallback<void(bool)> paint_changed,
+-      std::unique_ptr<CommandBarNativeBackground> native_background = nullptr);
++      std::unique_ptr<CommandBarNativeBackground> native_background = nullptr,
++      helium::SurfaceGroup group = helium::SurfaceGroup::kText);
+   CommandBarMaterial(const CommandBarMaterial&) = delete;
+   CommandBarMaterial& operator=(const CommandBarMaterial&) = delete;
+   ~CommandBarMaterial() override;
+@@ -83,6 +101,7 @@ class CommandBarMaterial : public views:
+  private:
+   raw_ptr<views::Widget> widget_;
+   raw_ptr<PrefService> prefs_;
++  const helium::SurfaceGroup group_;
+   base::RepeatingCallback<Clip()> clip_provider_;
+   base::RepeatingCallback<void(bool)> paint_changed_;
+   PrefChangeRegistrar pref_registrar_;
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_bar_material_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_bar_material_unittest.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_bar_material_unittest.cc
+@@ -25,6 +25,10 @@ class TestNativeBackground : public Comm
+   explicit TestNativeBackground(bool* destroyed) : destroyed_(destroyed) {}
+   ~TestNativeBackground() override { *destroyed_ = true; }
+ 
++  void SetPanelStyle(const helium::SurfaceStyle& style) override {
++    last_style = style;
++  }
++
+   bool Update(bool requested,
+               const helium::GlassSurfaceConfiguration& configuration,
+               const gfx::Rect& bounds,
+@@ -41,6 +45,7 @@ class TestNativeBackground : public Comm
+   bool last_requested = false;
+   int updates = 0;
+   helium::GlassSurfaceConfiguration last_configuration;
++  helium::SurfaceStyle last_style;
+   gfx::Rect last_bounds;
+   gfx::RoundedCornersF last_corner_radii;
+ 
+@@ -75,6 +80,26 @@ class CommandBarMaterialTest : public vi
+   TestingPrefServiceSimple prefs_;
+ };
+ 
++TEST_F(CommandBarMaterialTest, ContainerGroupDoesNotFollowCommandBarOverride) {
++  auto widget = CreateWidget();
++  bool destroyed = false;
++  auto background = std::make_unique<TestNativeBackground>(&destroyed);
++  auto* native = background.get();
++  CommandBarMaterial material(
++      widget.get(), &prefs_,
++      base::BindRepeating([] { return CommandBarMaterial::Clip{}; }),
++      base::BindRepeating([](bool) {}), std::move(background),
++      helium::SurfaceGroup::kContainer);
++  material.Refresh();
++  EXPECT_TRUE(native->last_requested);
++  EXPECT_EQ(native->last_style.panel_material, helium::PanelMaterial::kLiquid);
++  EXPECT_FLOAT_EQ(native->last_style.panel_tint, .6f);
++  EXPECT_FLOAT_EQ(native->last_style.panel_opacity, .2f);
++  prefs_.SetInteger(kCommandBarAppearancePref, kCommandBarAppearanceGlass);
++  EXPECT_EQ(native->last_style.panel_material, helium::PanelMaterial::kLiquid);
++  EXPECT_FLOAT_EQ(native->last_style.panel_tint, .6f);
++}
++
+ TEST_F(CommandBarMaterialTest, DefaultAndUnknownChoicesKeepAnOpaquePanel) {
+   auto widget = CreateWidget();
+   bool destroyed = false;
+@@ -113,12 +138,14 @@ TEST_F(CommandBarMaterialTest, Automatic
+   EXPECT_TRUE(native->last_requested);
+   EXPECT_TRUE(material.uses_native_material());
+ 
+-  for (const char* set :
+-       {helium::kSurfaceSetQuiet, helium::kSurfaceSetSolid}) {
+-    prefs_.SetString(helium::kArciumSurfaceSetPref, set);
+-    EXPECT_FALSE(native->last_requested);
+-    EXPECT_FALSE(material.uses_native_material());
+-  }
++  prefs_.SetString(helium::kArciumSurfaceSetPref, helium::kSurfaceSetQuiet);
++  EXPECT_FALSE(native->last_requested);
++  EXPECT_FALSE(material.uses_native_material());
++  EXPECT_EQ(native->last_style.panel_material, helium::PanelMaterial::kSolid);
++
++  prefs_.SetString(helium::kArciumSurfaceSetPref, helium::kSurfaceSetSolid);
++  EXPECT_FALSE(native->last_requested);
++  EXPECT_FALSE(material.uses_native_material());
+   prefs_.SetString(helium::kArciumSurfaceSetPref,
+                    helium::kSurfaceSetRefractive);
+   EXPECT_TRUE(material.uses_native_material());
+@@ -194,12 +221,12 @@ TEST_F(CommandBarMaterialTest, GlassUses
+ 
+   helium::SurfaceStyle panel_style;
+   panel_style.panel_glass = true;
+-  panel_style.panel_material = helium::PanelMaterial::kLiquid;
++  panel_style.panel_material = helium::PanelMaterial::kSystemLiquid;
+   EXPECT_EQ(native->last_configuration,
+             helium::PanelGlassConfiguration(saved_configuration, panel_style));
+-  EXPECT_FLOAT_EQ(native->last_configuration.glass_tint_opacity,
+-                  helium::PresetSurfaceTuning(helium::SurfaceSet::kGlass)
+-                      .panel_tint);
++  EXPECT_FLOAT_EQ(
++      native->last_configuration.glass_tint_opacity,
++      helium::PresetSurfaceTuning(helium::SurfaceSet::kGlass).text_tint);
+   EXPECT_DOUBLE_EQ(native->last_configuration.grain, 0.0);
+   EXPECT_TRUE(material.uses_native_material());
+   const auto resolution = helium::ResolveGlassSurfaceConfiguration(
+Index: src/chrome/browser/ui/views/location_bar/location_bar_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/location_bar/location_bar_view.cc
++++ src/chrome/browser/ui/views/location_bar/location_bar_view.cc
+@@ -1675,7 +1675,7 @@ void LocationBarView::RefreshBackground(
+   }
+ 
+   if (IsArciumCommandBarGlass()) {
+-    background_color_ = color_provider->GetColor(kColorArciumPanelBackground);
++    background_color_ = SK_ColorTRANSPARENT;
+   }
+ 
+   if (is_popup_mode_) {
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
+@@ -1480,8 +1480,7 @@ void CommandPanelView::OnPaint(gfx::Canv
+   }
+   cc::PaintFlags fill;
+   fill.setAntiAlias(true);
+-  fill.setColor(native_material_
+-      ? GetColorProvider()->GetColor(kColorArciumPanelBackground) : panel_color_);
++  fill.setColor(native_material_ ? SK_ColorTRANSPARENT : panel_color_);
+   canvas->DrawPath(GetContourPath(), fill);
+   PaintConnectedScopeGlow(canvas);
+ 
+Index: src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
++++ src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
+@@ -406,9 +406,10 @@ void RoundedOmniboxResultsFrame::Layout(
+ 
+ void RoundedOmniboxResultsFrame::SetNativeMaterial(bool native_material) {
+   uses_native_material_ = native_material;
+-  contents_host_->SetBackground(
+-      views::CreateSolidBackground(native_material
+-          ? kColorArciumPanelBackground : kColorOmniboxResultsBackground));
++  contents_host_->SetBackground(views::CreateSolidBackground(
++      native_material
++          ? SK_ColorTRANSPARENT
++          : GetColorProvider()->GetColor(kColorOmniboxResultsBackground)));
+   static_cast<TopBackgroundView*>(top_background_.get())
+       ->SetNativeMaterial(native_material);
+   contents_host_->SchedulePaint();

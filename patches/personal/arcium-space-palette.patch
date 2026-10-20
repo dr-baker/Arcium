@@ -1,0 +1,2880 @@
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn
++++ src/chrome/browser/ui/BUILD.gn
+@@ -473,6 +473,7 @@ static_library("ui") {
+     "helium/helium_sidebar_pin_projection.h",
+     "helium/helium_space.cc",
+     "helium/helium_space.h",
++    "helium/space_palette.h",
+     "helium/helium_space_service.cc",
+     "helium/helium_space_service.h",
+     "helium/helium_space_service_factory.cc",
+@@ -529,6 +530,7 @@ static_library("ui") {
+     ":simple_message_box_headers",
+     "//chrome/browser:browser_public_dependencies",
+     "//chrome/browser:primitives",
++    "//chrome/browser/ui/color:arcium_space_palette",
+     "//chrome/browser/feedback",
+     "//chrome/browser/headless",
+     "//chrome/browser/history",
+Index: src/chrome/browser/ui/color/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/color/BUILD.gn
++++ src/chrome/browser/ui/color/BUILD.gn
+@@ -16,8 +16,16 @@ source_set("color_headers") {
+   ]
+ }
+ 
++source_set("arcium_space_palette") {
++  sources = [ "arcium_space_palette.cc", "arcium_space_color_mixer.h" ]
++  public_deps = [ "//ui/color:arcium_palette" ]
++}
++
+ source_set("mixers") {
+   sources = [
++    "arcium_space_color_mixer.cc",
++    "arcium_space_palette_initializer.h",
++    "arcium_space_color_mixer.h",
+     "chrome_color_mixer.cc",
+     "chrome_color_mixer.h",
+     "chrome_color_mixers.cc",
+@@ -51,6 +59,8 @@ source_set("mixers") {
+ 
+   configs += [ "//build/config/compiler:wexit_time_destructors" ]
+ 
++  public_deps = [ ":arcium_space_palette" ]
++
+   deps = [
+     ":color_headers",
+     "//build:branding_buildflags",
+Index: src/chrome/browser/ui/color/arcium_space_color_mixer.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/color/arcium_space_color_mixer.cc
+@@ -0,0 +1,220 @@
++// Copyright 2026 The Helium Authors
++// SPDX-License-Identifier: GPL-3.0-only
++#include "chrome/browser/ui/color/arcium_space_color_mixer.h"
++#include <cmath>
++#include <numbers>
++#include <map>
++#include <memory>
++#include <set>
++#include "base/no_destructor.h"
++#include "base/synchronization/lock.h"
++#include "chrome/browser/ui/color/arcium_space_palette_initializer.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "ui/color/color_id.h"
++#include "ui/color/color_mixer.h"
++#include "ui/color/color_provider.h"
++#include "ui/color/color_provider_key.h"
++#include "ui/color/color_recipe.h"
++
++namespace {
++
++void AddSpaceColors(ui::ColorProvider* provider,
++                    const ui::ColorProviderKey& key,
++                    const ui::ArciumPalette* palette) {
++  ui::ColorMixer& mixer = provider->AddMixer();
++  mixer[kColorArciumChrome] = {kColorToolbar};
++  mixer[kColorArciumChromeBackground] = {kColorToolbar};
++  mixer[kColorArciumPanel] = {kColorOmniboxResultsBackground};
++  mixer[kColorArciumPanelBackground] = {kColorOmniboxResultsBackground};
++  mixer[kColorArciumText] = {kColorOmniboxText};
++  mixer[kColorArciumMutedText] = {kColorOmniboxTextDimmed};
++  if (!palette ||
++      key.contrast_mode == ui::ColorProviderKey::ContrastMode::kHigh ||
++      key.forced_colors != ui::ColorProviderKey::ForcedColors::kNone) {
++    return;
++  }
++  const auto& input = *palette;
++  const bool dark = key.color_mode == ui::ColorProviderKey::ColorMode::kDark;
++  const auto colors = arcium::GenerateSpacePalette(input, dark);
++  const auto seed = arcium::ColorToOklch(input.seed);
++  const auto companion = arcium::ColorToOklch(input.companion);
++  auto tone = [](arcium::Oklch color, double l, double scale) {
++    return arcium::OklchToColor({l, color.chroma * scale *
++                                      std::sin(std::numbers::pi * l), color.hue});
++  };
++  mixer[ui::kColorRefPrimary0] = {tone(seed, 0.00, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefPrimary10] = {tone(seed, 0.10, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefPrimary20] = {tone(seed, 0.20, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefPrimary25] = {tone(seed, 0.25, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefPrimary30] = {tone(seed, 0.30, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefPrimary40] = {tone(seed, 0.40, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefPrimary50] = {tone(seed, 0.50, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefPrimary60] = {tone(seed, 0.60, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefPrimary70] = {tone(seed, 0.70, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefPrimary80] = {tone(seed, 0.80, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefPrimary90] = {tone(seed, 0.90, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefPrimary95] = {tone(seed, 0.95, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefPrimary99] = {tone(seed, 0.99, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefPrimary100] = {tone(seed, 1.00, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefSecondary0] = {tone(seed, 0.00, input.controls_chroma / 200.0)};
++  mixer[ui::kColorRefSecondary10] = {tone(seed, 0.10, input.controls_chroma / 200.0)};
++  mixer[ui::kColorRefSecondary12] = {tone(seed, 0.12, input.controls_chroma / 200.0)};
++  mixer[ui::kColorRefSecondary15] = {tone(seed, 0.15, input.controls_chroma / 200.0)};
++  mixer[ui::kColorRefSecondary20] = {tone(seed, 0.20, input.controls_chroma / 200.0)};
++  mixer[ui::kColorRefSecondary25] = {tone(seed, 0.25, input.controls_chroma / 200.0)};
++  mixer[ui::kColorRefSecondary30] = {tone(seed, 0.30, input.controls_chroma / 200.0)};
++  mixer[ui::kColorRefSecondary35] = {tone(seed, 0.35, input.controls_chroma / 200.0)};
++  mixer[ui::kColorRefSecondary40] = {tone(seed, 0.40, input.controls_chroma / 200.0)};
++  mixer[ui::kColorRefSecondary50] = {tone(seed, 0.50, input.controls_chroma / 200.0)};
++  mixer[ui::kColorRefSecondary60] = {tone(seed, 0.60, input.controls_chroma / 200.0)};
++  mixer[ui::kColorRefSecondary70] = {tone(seed, 0.70, input.controls_chroma / 200.0)};
++  mixer[ui::kColorRefSecondary80] = {tone(seed, 0.80, input.controls_chroma / 200.0)};
++  mixer[ui::kColorRefSecondary90] = {tone(seed, 0.90, input.controls_chroma / 200.0)};
++  mixer[ui::kColorRefSecondary95] = {tone(seed, 0.95, input.controls_chroma / 200.0)};
++  mixer[ui::kColorRefSecondary99] = {tone(seed, 0.99, input.controls_chroma / 200.0)};
++  mixer[ui::kColorRefSecondary100] = {tone(seed, 1.00, input.controls_chroma / 200.0)};
++  mixer[ui::kColorRefTertiary0] = {tone(companion, 0.00, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefTertiary10] = {tone(companion, 0.10, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefTertiary20] = {tone(companion, 0.20, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefTertiary30] = {tone(companion, 0.30, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefTertiary40] = {tone(companion, 0.40, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefTertiary50] = {tone(companion, 0.50, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefTertiary60] = {tone(companion, 0.60, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefTertiary70] = {tone(companion, 0.70, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefTertiary80] = {tone(companion, 0.80, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefTertiary90] = {tone(companion, 0.90, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefTertiary95] = {tone(companion, 0.95, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefTertiary99] = {tone(companion, 0.99, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefTertiary100] = {tone(companion, 1.00, input.controls_chroma / 100.0)};
++  mixer[ui::kColorRefNeutral0] = {tone(seed, 0.00, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral4] = {tone(seed, 0.04, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral6] = {tone(seed, 0.06, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral8] = {tone(seed, 0.08, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral10] = {tone(seed, 0.10, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral12] = {tone(seed, 0.12, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral15] = {tone(seed, 0.15, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral17] = {tone(seed, 0.17, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral20] = {tone(seed, 0.20, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral22] = {tone(seed, 0.22, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral24] = {tone(seed, 0.24, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral25] = {tone(seed, 0.25, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral30] = {tone(seed, 0.30, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral40] = {tone(seed, 0.40, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral50] = {tone(seed, 0.50, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral60] = {tone(seed, 0.60, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral70] = {tone(seed, 0.70, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral80] = {tone(seed, 0.80, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral87] = {tone(seed, 0.87, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral90] = {tone(seed, 0.90, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral92] = {tone(seed, 0.92, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral94] = {tone(seed, 0.94, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral95] = {tone(seed, 0.95, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral96] = {tone(seed, 0.96, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral98] = {tone(seed, 0.98, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral99] = {tone(seed, 0.99, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutral100] = {tone(seed, 1.00, input.panels_chroma / 300.0)};
++  mixer[ui::kColorRefNeutralVariant0] = {tone(seed, 0.00, input.panels_chroma / 200.0)};
++  mixer[ui::kColorRefNeutralVariant10] = {tone(seed, 0.10, input.panels_chroma / 200.0)};
++  mixer[ui::kColorRefNeutralVariant15] = {tone(seed, 0.15, input.panels_chroma / 200.0)};
++  mixer[ui::kColorRefNeutralVariant20] = {tone(seed, 0.20, input.panels_chroma / 200.0)};
++  mixer[ui::kColorRefNeutralVariant30] = {tone(seed, 0.30, input.panels_chroma / 200.0)};
++  mixer[ui::kColorRefNeutralVariant40] = {tone(seed, 0.40, input.panels_chroma / 200.0)};
++  mixer[ui::kColorRefNeutralVariant50] = {tone(seed, 0.50, input.panels_chroma / 200.0)};
++  mixer[ui::kColorRefNeutralVariant60] = {tone(seed, 0.60, input.panels_chroma / 200.0)};
++  mixer[ui::kColorRefNeutralVariant70] = {tone(seed, 0.70, input.panels_chroma / 200.0)};
++  mixer[ui::kColorRefNeutralVariant80] = {tone(seed, 0.80, input.panels_chroma / 200.0)};
++  mixer[ui::kColorRefNeutralVariant90] = {tone(seed, 0.90, input.panels_chroma / 200.0)};
++  mixer[ui::kColorRefNeutralVariant95] = {tone(seed, 0.95, input.panels_chroma / 200.0)};
++  mixer[ui::kColorRefNeutralVariant99] = {tone(seed, 0.99, input.panels_chroma / 200.0)};
++  mixer[ui::kColorRefNeutralVariant100] = {tone(seed, 1.00, input.panels_chroma / 200.0)};
++
++  mixer[kColorArciumChrome] = {colors.chrome};
++  mixer[kColorArciumChromeBackground] = {colors.chrome_background};
++  mixer[kColorArciumPanel] = {colors.panel};
++  mixer[kColorArciumPanelBackground] = {colors.panel_background};
++  mixer[kColorArciumText] = {colors.text};
++  mixer[kColorArciumMutedText] = {colors.muted_text};
++  mixer[kColorNewTabPageBackground] = {colors.content_canvas};
++  mixer[kColorToolbar] = {colors.chrome};
++  mixer[ui::kColorFrameActive] = {colors.chrome};
++  mixer[ui::kColorFrameInactive] = {colors.chrome};
++  mixer[kColorLocationBarBackground] = {colors.field};
++  mixer[kColorLocationBarBackgroundHovered] = {colors.field_hovered};
++  mixer[kColorOmniboxResultsBackground] = {colors.panel};
++  mixer[kColorOmniboxResultsBackgroundHovered] = {colors.field_hovered};
++  mixer[kColorOmniboxResultsBackgroundSelected] = {colors.accent};
++  mixer[kColorOmniboxText] = {colors.text};
++  mixer[kColorOmniboxTextDimmed] = {colors.muted_text};
++  mixer[kColorOmniboxResultsTextSelected] = {colors.on_accent};
++  mixer[kColorOmniboxResultsUrlSelected] = {colors.on_accent};
++  mixer[kColorOmniboxResultsIconSelected] = {colors.on_accent};
++  mixer[kColorOmniboxResultsButtonIconSelected] = {colors.on_accent};
++  mixer[kColorOmniboxResultsTextDimmedSelected] = {colors.on_accent};
++  mixer[kColorToolbarText] = {colors.text};
++  mixer[kColorToolbarButtonText] = {colors.text};
++  mixer[kColorToolbarButtonIcon] = {colors.muted_text};
++  mixer[kColorToolbarButtonIconHovered] = {colors.text};
++  mixer[ui::kColorSysPrimary] = {colors.accent};
++  mixer[ui::kColorSysOnPrimary] = {colors.on_accent};
++  mixer[ui::kColorSysOnSurface] = {colors.text};
++  mixer[ui::kColorSysOnSurfaceSubtle] = {colors.muted_text};
++  mixer[ui::kColorSysOnSurfaceSecondary] = {colors.muted_text};
++  mixer[ui::kColorSysOutline] = {colors.outline};
++  mixer[ui::kColorSysBase] = {colors.panel};
++  mixer[ui::kColorSysSurface] = {colors.chrome};
++  mixer[ui::kColorSysOmniboxContainer] = {colors.field};
++}
++
++class SpacePaletteInitializer final
++    : public ui::ColorProviderKey::InitializerSupplier {
++ public:
++  explicit SpacePaletteInitializer(const ui::ArciumPalette& palette)
++      : palette_(palette) {}
++  ~SpacePaletteInitializer() override = default;
++  void AddColorMixers(ui::ColorProvider* provider,
++                      const ui::ColorProviderKey& key) const override {
++    AddSpaceColors(provider, key, &palette_);
++  }
++ private:
++  const ui::ArciumPalette palette_;
++};
++
++struct SpaceInitializers {
++  base::Lock lock;
++  std::map<ui::ArciumPalette, std::unique_ptr<SpacePaletteInitializer>> values;
++  std::set<const ui::ColorProviderKey::InitializerSupplier*> pointers;
++};
++
++SpaceInitializers& Initializers() {
++  // ColorProviderManager retains initializer identities in its keys. Interned
++  // values live for the process, so revisiting a palette reuses that identity.
++  static base::NoDestructor<SpaceInitializers> initializers;
++  return *initializers;
++}
++}  // namespace
++
++void AddArciumSpaceColorMixer(ui::ColorProvider* provider,
++                             const ui::ColorProviderKey& key) {
++  AddSpaceColors(provider, key, nullptr);
++}
++
++namespace arcium {
++ui::ColorProviderKey::InitializerSupplier* GetSpacePaletteInitializer(
++    const ui::ArciumPalette& palette) {
++  auto& initializers = Initializers();
++  base::AutoLock lock(initializers.lock);
++  auto [entry, inserted] = initializers.values.try_emplace(palette);
++  if (inserted) {
++    entry->second = std::make_unique<SpacePaletteInitializer>(palette);
++    initializers.pointers.insert(entry->second.get());
++  }
++  return entry->second.get();
++}
++
++bool IsSpacePaletteInitializer(
++    const ui::ColorProviderKey::InitializerSupplier* initializer) {
++  auto& initializers = Initializers();
++  base::AutoLock lock(initializers.lock);
++  return initializers.pointers.contains(initializer);
++}
++}  // namespace arcium
+Index: src/chrome/browser/ui/color/arcium_space_color_mixer.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/color/arcium_space_color_mixer.h
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Helium Authors
++// SPDX-License-Identifier: GPL-3.0-only
++
++#ifndef CHROME_BROWSER_UI_COLOR_ARCIUM_SPACE_COLOR_MIXER_H_
++#define CHROME_BROWSER_UI_COLOR_ARCIUM_SPACE_COLOR_MIXER_H_
++
++#include "third_party/skia/include/core/SkColor.h"
++#include "ui/color/arcium_palette.h"
++
++namespace ui {
++class ColorProvider;
++struct ColorProviderKey;
++}
++
++namespace arcium {
++
++struct Oklch {
++  double lightness;
++  double chroma;
++  double hue;
++};
++
++// sRGB conversion with fixed-lightness, fixed-hue chroma reduction when a
++// sample leaves the display gamut. These are also used by the palette tests.
++Oklch ColorToOklch(SkColor color);
++SkColor OklchToColor(Oklch color);
++double ContrastRatio(SkColor a, SkColor b);
++
++struct SpacePaletteColors {
++  SkColor chrome;
++  SkColor chrome_background;
++  SkColor field;
++  SkColor field_hovered;
++  SkColor panel;
++  SkColor panel_background;
++  SkColor text;
++  SkColor muted_text;
++  SkColor outline;
++  SkColor accent;
++  SkColor on_accent;
++  // Large content surfaces retain only a restrained tint from the Space.
++  SkColor content_canvas;
++  SkColor content_panel;
++  SkColor content_field;
++  SkColor content_hovered;
++};
++
++SpacePaletteColors GenerateSpacePalette(
++    const ui::ArciumPalette& input,
++    bool dark);
++
++}  // namespace arcium
++
++void AddArciumSpaceColorMixer(ui::ColorProvider* provider,
++                             const ui::ColorProviderKey& key);
++
++#endif  // CHROME_BROWSER_UI_COLOR_ARCIUM_SPACE_COLOR_MIXER_H_
+Index: src/chrome/browser/ui/color/arcium_space_palette.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/color/arcium_space_palette.cc
+@@ -0,0 +1,210 @@
++// Copyright 2026 The Helium Authors
++// SPDX-License-Identifier: GPL-3.0-only
++
++#include "chrome/browser/ui/color/arcium_space_color_mixer.h"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <numbers>
++
++
++namespace arcium {
++namespace {
++
++double Linear(double value) {
++  return value <= 0.04045 ? value / 12.92
++                          : std::pow((value + 0.055) / 1.055, 2.4);
++}
++
++double Encoded(double value) {
++  return value <= 0.0031308 ? 12.92 * value
++                            : 1.055 * std::pow(value, 1.0 / 2.4) - 0.055;
++}
++
++// Bjorn Ottosson's D65 Oklab matrices, also used by the native picker.
++// https://bottosson.github.io/posts/oklab/
++std::array<double, 3> LinearRgb(Oklch color) {
++  const double angle = color.hue * std::numbers::pi / 180.0;
++  const double a = color.chroma * std::cos(angle);
++  const double b = color.chroma * std::sin(angle);
++  const double l = std::pow(color.lightness + 0.3963377774 * a +
++                               0.2158037573 * b, 3);
++  const double m = std::pow(color.lightness - 0.1055613458 * a -
++                               0.0638541728 * b, 3);
++  const double s = std::pow(color.lightness - 0.0894841775 * a -
++                               1.2914855480 * b, 3);
++  return {4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
++          -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
++          -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s};
++}
++
++bool InGamut(const std::array<double, 3>& rgb) {
++  return std::ranges::all_of(rgb, [](double channel) {
++    return channel >= -1e-7 && channel <= 1.0000001;
++  });
++}
++
++SkColor Tone(Oklch seed, double lightness, double chroma_scale) {
++  return OklchToColor({lightness,
++                       seed.chroma * chroma_scale *
++                           std::sin(std::numbers::pi * lightness),
++                       seed.hue});
++}
++
++double Luminance(SkColor color) {
++  return 0.2126 * Linear(SkColorGetR(color) / 255.0) +
++         0.7152 * Linear(SkColorGetG(color) / 255.0) +
++         0.0722 * Linear(SkColorGetB(color) / 255.0);
++}
++
++SkColor Foreground(Oklch seed,
++                   double start,
++                   bool lighter,
++                   double ratio,
++                   const std::array<SkColor, 3>& backgrounds) {
++  // Search the perceptual ramp, then verify the quantized display color.
++  // Saturation cannot be used as a substitute for readable lightness.
++  for (int step = 0; step <= 100; ++step) {
++    const double lightness = std::clamp(
++        start + (lighter ? 1 : -1) * step / 100.0, 0.0, 1.0);
++    const SkColor candidate = Tone(seed, lightness, 0.12);
++    if (std::ranges::all_of(backgrounds, [=](SkColor background) {
++          return ContrastRatio(candidate, background) >= ratio;
++        })) {
++      return candidate;
++    }
++  }
++  return lighter ? SK_ColorWHITE : SK_ColorBLACK;
++}
++
++SkColor Composite(SkColor foreground, SkColor background, int alpha) {
++  auto blend = [alpha](int fg, int bg) {
++    return (fg * alpha + bg * (255 - alpha) + 127) / 255;
++  };
++  return SkColorSetRGB(
++      blend(SkColorGetR(foreground), SkColorGetR(background)),
++      blend(SkColorGetG(foreground), SkColorGetG(background)),
++      blend(SkColorGetB(foreground), SkColorGetB(background)));
++}
++
++SkColor ReadablePanelBackground(SkColor panel,
++                               SkColor text,
++                               SkColor muted_text) {
++  // Glass can sit above any page. A compositor-painted contrast floor above
++  // the native material bounds the worst-case black and white backdrops.
++  for (int alpha = 0; alpha <= 255; ++alpha) {
++    bool readable = true;
++    for (SkColor backdrop : {SK_ColorBLACK, SK_ColorWHITE}) {
++      const SkColor composite = Composite(panel, backdrop, alpha);
++      readable &= ContrastRatio(text, composite) >= 4.5 &&
++                  ContrastRatio(muted_text, composite) >= 4.5;
++    }
++    if (readable) {
++      return SkColorSetA(panel, alpha);
++    }
++  }
++  return panel;
++}
++
++}  // namespace
++
++Oklch ColorToOklch(SkColor color) {
++  const double r = Linear(SkColorGetR(color) / 255.0);
++  const double g = Linear(SkColorGetG(color) / 255.0);
++  const double b = Linear(SkColorGetB(color) / 255.0);
++  const double l = std::cbrt(0.4122214708 * r + 0.5363325363 * g +
++                             0.0514459929 * b);
++  const double m = std::cbrt(0.2119034982 * r + 0.6806995451 * g +
++                             0.1073969566 * b);
++  const double s = std::cbrt(0.0883024619 * r + 0.2817188376 * g +
++                             0.6299787005 * b);
++  const double a = 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s;
++  const double lab_b = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s;
++  double hue = std::atan2(lab_b, a) * 180.0 / std::numbers::pi;
++  if (hue < 0) {
++    hue += 360;
++  }
++  const double chroma = std::hypot(a, lab_b);
++  return {0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
++          chroma < 1e-6 ? 0 : chroma, chroma < 1e-6 ? 0 : hue};
++}
++
++SkColor OklchToColor(Oklch color) {
++  if (!std::isfinite(color.lightness) || !std::isfinite(color.chroma) ||
++      !std::isfinite(color.hue)) {
++    return SK_ColorBLACK;
++  }
++  color.lightness = std::clamp(color.lightness, 0.0, 1.0);
++  color.chroma = std::clamp(color.chroma, 0.0, 0.5);
++  auto rgb = LinearRgb(color);
++  if (!InGamut(rgb)) {
++    double low = 0;
++    double high = color.chroma;
++    for (int i = 0; i < 24; ++i) {
++      const double mid = (low + high) / 2;
++      (InGamut(LinearRgb({color.lightness, mid, color.hue})) ? low : high) = mid;
++    }
++    rgb = LinearRgb({color.lightness, low, color.hue});
++  }
++  auto byte = [](double value) {
++    return std::clamp(std::lround(Encoded(std::clamp(value, 0.0, 1.0)) * 255),
++                      0L, 255L);
++  };
++  return SkColorSetRGB(byte(rgb[0]), byte(rgb[1]), byte(rgb[2]));
++}
++
++double ContrastRatio(SkColor a, SkColor b) {
++  const double first = Luminance(a);
++  const double second = Luminance(b);
++  return (std::max(first, second) + 0.05) /
++         (std::min(first, second) + 0.05);
++}
++
++SpacePaletteColors GenerateSpacePalette(
++    const ui::ArciumPalette& input,
++    bool dark) {
++  const Oklch seed = ColorToOklch(input.seed);
++  const double panels = input.panels_chroma / 100.0;
++  SpacePaletteColors colors;
++  // Keep the large page and Settings surfaces near neutral even when the
++  // authored glows and chrome are vivid. Preserve hue and role lightness;
++  // only content chroma is capped, independently of controls and decoration.
++  auto content_tone = [seed, panels](double lightness) {
++    const double chroma = std::min(
++        seed.chroma * panels * 0.15 *
++            std::sin(std::numbers::pi * lightness), 0.012);
++    return OklchToColor({lightness, chroma, seed.hue});
++  };
++  colors.content_canvas = content_tone(dark ? 0.16 : 0.965);
++  colors.content_panel = content_tone(dark ? 0.22 : 0.975);
++  colors.content_field = content_tone(dark ? 0.24 : 0.925);
++  colors.content_hovered = content_tone(dark ? 0.28 : 0.90);
++  colors.chrome = Tone(seed, dark ? 0.16 : 0.965, panels);
++  colors.field = Tone(seed, dark ? 0.24 : 0.925, panels);
++  colors.field_hovered = Tone(seed, dark ? 0.28 : 0.90, panels);
++  colors.panel = Tone(seed, dark ? 0.22 : 0.975, panels);
++  const std::array<SkColor, 3> backgrounds = {
++      colors.chrome, colors.field_hovered, colors.panel};
++  colors.text = Foreground(seed, dark ? 0.94 : 0.19, dark, 7, backgrounds);
++  const SkColor floor_muted_text =
++      Foreground(seed, dark ? 0.73 : 0.40, dark, 4.5, backgrounds);
++  // Add headroom for secondary labels over authored glows without weakening
++  // the existing backdrop floor or changing the decorative colors.
++  colors.muted_text = dark ? Foreground(seed, 0.75, true, 4.5, backgrounds)
++                           : floor_muted_text;
++  colors.outline = Foreground(seed, dark ? 0.61 : 0.50, dark, 3, backgrounds);
++  colors.accent = Tone(seed, dark ? 0.78 : 0.46,
++                        input.controls_chroma / 100.0);
++  colors.on_accent = Foreground(
++      seed, dark ? 0.16 : 0.98, !dark, 4.5,
++      {colors.accent, colors.accent, colors.accent});
++  colors.chrome_background =
++      ReadablePanelBackground(colors.chrome, colors.text, floor_muted_text);
++  colors.panel_background =
++      ReadablePanelBackground(colors.panel, colors.text, floor_muted_text);
++  return colors;
++}
++
++}  // namespace arcium
++
+Index: src/chrome/browser/ui/color/arcium_space_palette_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/color/arcium_space_palette_unittest.cc
+@@ -0,0 +1,145 @@
++// Copyright 2026 The Helium Authors
++// SPDX-License-Identifier: GPL-3.0-only
++#include "chrome/browser/ui/color/arcium_space_color_mixer.h"
++
++#include <cmath>
++#include <limits>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace arcium {
++namespace {
++
++SkColor Composite(SkColor foreground, SkColor background) {
++  const int alpha = SkColorGetA(foreground);
++  auto blend = [alpha](int a, int b) {
++    return (a * alpha + b * (255 - alpha) + 127) / 255;
++  };
++  return SkColorSetRGB(
++      blend(SkColorGetR(foreground), SkColorGetR(background)),
++      blend(SkColorGetG(foreground), SkColorGetG(background)),
++      blend(SkColorGetB(foreground), SkColorGetB(background)));
++}
++
++TEST(ArciumSpacePalette, ContrastAcrossHueChromaModeAndRoleDials) {
++  for (int hue = 0; hue < 360; hue += 15) {
++    for (double chroma : {0., .05, .2, .4}) {
++      for (int controls : {0, 100, 200}) {
++        for (int panels : {0, 35, 200}) {
++          for (bool dark : {false, true}) {
++            SCOPED_TRACE(testing::Message() << hue << ',' << chroma << ','
++                         << controls << ',' << panels << ',' << dark);
++            ui::ArciumPalette input;
++            input.seed = OklchToColor({.65, chroma, double(hue)});
++            input.controls_chroma = controls;
++            input.panels_chroma = panels;
++            const auto colors = GenerateSpacePalette(input, dark);
++            for (SkColor background : {colors.chrome, colors.field,
++                                       colors.field_hovered, colors.panel,
++                                       colors.content_canvas, colors.content_panel,
++                                       colors.content_field, colors.content_hovered}) {
++              EXPECT_GE(ContrastRatio(colors.text, background), 7);
++              EXPECT_GE(ContrastRatio(colors.muted_text, background), 4.5);
++              EXPECT_GE(ContrastRatio(colors.outline, background), 3);
++            }
++            EXPECT_GE(ContrastRatio(colors.on_accent, colors.accent), 4.5);
++            for (SkColor backdrop : {SK_ColorBLACK, SK_ColorWHITE}) {
++              const auto chrome = Composite(colors.chrome_background, backdrop);
++              EXPECT_GE(ContrastRatio(colors.text, chrome), 4.5);
++              EXPECT_GE(ContrastRatio(colors.muted_text, chrome), 4.5);
++              const auto actual = Composite(colors.panel_background, backdrop);
++              EXPECT_GE(ContrastRatio(colors.text, actual), 4.5);
++              EXPECT_GE(ContrastRatio(colors.muted_text, actual), 4.5);
++            }
++          }
++        }
++      }
++    }
++  }
++}
++
++TEST(ArciumSpacePalette, LargeSurfacesKeepOnlyARestainedTint) {
++  for (int hue = 0; hue < 360; hue += 15) {
++    for (bool dark : {false, true}) {
++      ui::ArciumPalette input;
++      input.seed = OklchToColor({.65, .4, double(hue)});
++      input.panels_chroma = 200;
++      const auto colors = GenerateSpacePalette(input, dark);
++      for (SkColor surface : {colors.content_canvas, colors.content_panel,
++                             colors.content_field, colors.content_hovered}) {
++        // Allow for the quantization of the 8-bit display color.
++        EXPECT_LE(ColorToOklch(surface).chroma, .016);
++      }
++      EXPECT_LE(ColorToOklch(colors.content_canvas).chroma,
++                ColorToOklch(colors.chrome).chroma + .004);
++      EXPECT_LE(ColorToOklch(colors.content_panel).chroma,
++                ColorToOklch(colors.panel).chroma + .004);
++      input.panels_chroma = 0;
++      EXPECT_LT(ColorToOklch(GenerateSpacePalette(input, dark).content_canvas)
++                    .chroma, .001);
++    }
++  }
++}
++
++TEST(ArciumSpacePalette, MutedTextOnAuthoredGlowCapture) {
++  ui::ArciumPalette input;
++  input.seed = SkColorSetRGB(255, 48, 224);
++  const auto colors = GenerateSpacePalette(input, true);
++  // Solid adjacent background pixels from the native secondary-glow capture.
++  EXPECT_GE(ContrastRatio(colors.muted_text, SkColorSetRGB(52, 63, 78)), 4.5);
++  EXPECT_LT(ColorToOklch(colors.muted_text).lightness,
++            ColorToOklch(colors.text).lightness);
++}
++
++TEST(ArciumSpacePalette, GamutMappingPreservesLightnessAndRampOrder) {
++  for (int hue = 0; hue < 360; hue += 5) {
++    double previous = -1;
++    for (int step = 0; step <= 100; ++step) {
++      const double lightness = step / 100.;
++      const auto actual = ColorToOklch(OklchToColor({lightness, .4, double(hue)}));
++      EXPECT_GE(actual.lightness, previous - .004);
++      previous = actual.lightness;
++      // At the black end, 8-bit sRGB cannot represent every perceptual stop.
++      if (step >= 10) {
++        EXPECT_NEAR(actual.lightness, lightness, step < 20 ? .015 : .008);
++      }
++    }
++  }
++}
++
++TEST(ArciumSpacePalette, ChromaDialsKeepRoleLightnessAndOtherRolesStable) {
++  ui::ArciumPalette input;
++  input.seed = SkColorSetRGB(178, 97, 225);
++  const auto normal = GenerateSpacePalette(input, true);
++  input.controls_chroma = 0;
++  const auto muted = GenerateSpacePalette(input, true);
++  EXPECT_EQ(normal.panel, muted.panel);
++  EXPECT_NE(normal.accent, muted.accent);
++  EXPECT_NEAR(ColorToOklch(normal.accent).lightness,
++              ColorToOklch(muted.accent).lightness, .005);
++  EXPECT_LT(ColorToOklch(muted.accent).chroma, .001);
++  input.panels_chroma = 200;
++  EXPECT_EQ(muted.accent, GenerateSpacePalette(input, true).accent);
++  EXPECT_NE(muted.panel, GenerateSpacePalette(input, true).panel);
++}
++
++TEST(ArciumSpacePalette, CacheIdentityIncludesBothDialsAndCompanion) {
++  ui::ArciumPalette first;
++  auto second = first;
++  second.controls_chroma++;
++  EXPECT_NE(first, second);
++  second = first;
++  second.panels_chroma++;
++  EXPECT_NE(first, second);
++  second = first;
++  second.companion = SK_ColorRED;
++  EXPECT_NE(first, second);
++}
++
++TEST(ArciumSpacePalette, InvalidSamplesFailClosed) {
++  EXPECT_EQ(SK_ColorBLACK, OklchToColor(
++      {.5, std::numeric_limits<double>::quiet_NaN(), 20}));
++}
++
++}  // namespace
++}  // namespace arcium
+Index: src/chrome/browser/ui/color/chrome_color_id.h
+===================================================================
+--- src.orig/chrome/browser/ui/color/chrome_color_id.h
++++ src/chrome/browser/ui/color/chrome_color_id.h
+@@ -1165,7 +1165,13 @@
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+ #define CHROME_COLOR_IDS \
+-    COMMON_CHROME_COLOR_IDS CHROME_PLATFORM_SPECIFIC_COLOR_IDS
++  COMMON_CHROME_COLOR_IDS CHROME_PLATFORM_SPECIFIC_COLOR_IDS \
++  E_CPONLY(kColorArciumChrome) \
++  E_CPONLY(kColorArciumChromeBackground) \
++  E_CPONLY(kColorArciumPanel) \
++  E_CPONLY(kColorArciumPanelBackground) \
++  E_CPONLY(kColorArciumText) \
++  E_CPONLY(kColorArciumMutedText)
+ 
+ #include "ui/color/color_id_macros.inc"
+ 
+Index: src/chrome/browser/ui/color/chrome_color_mixers.cc
+===================================================================
+--- src.orig/chrome/browser/ui/color/chrome_color_mixers.cc
++++ src/chrome/browser/ui/color/chrome_color_mixers.cc
+@@ -11,6 +11,7 @@
+ #include "base/functional/bind.h"
+ #include "base/no_destructor.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/color/arcium_space_color_mixer.h"
+ #include "chrome/browser/ui/color/chrome_color_mixer.h"
+ #include "chrome/browser/ui/color/material_chrome_color_mixer.h"
+ #include "chrome/browser/ui/color/material_new_tab_page_color_mixer.h"
+@@ -76,6 +77,8 @@ void AddChromeColorMixers(ui::ColorProvi
+   // Must be the last one in order to override other mixer colors.
+   AddNativeChromeColorMixer(provider, key);
+ 
++  AddArciumSpaceColorMixer(provider, key);
++
+   if (key.custom_theme) {
+     key.custom_theme->AddColorMixers(provider, key);
+   }
+Index: src/chrome/browser/ui/helium/arcium_settings_model.cc
+===================================================================
+--- src.orig/chrome/browser/ui/helium/arcium_settings_model.cc
++++ src/chrome/browser/ui/helium/arcium_settings_model.cc
+@@ -15,6 +15,7 @@
+ #include "base/auto_reset.h"
+ #include "base/functional/bind.h"
+ #include "base/strings/stringprintf.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/prefs/session_startup_pref.h"
+@@ -24,6 +25,8 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/color/arcium_space_color_mixer.h"
++#include "chrome/browser/ui/helium/space_palette.h"
+ #include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
+ #include "chrome/browser/ui/helium/arcium_settings_prefs.h"
+ #include "chrome/browser/ui/helium/helium_space.h"
+@@ -38,6 +41,9 @@
+ #include "chrome/common/pref_names.h"
+ #include "components/prefs/pref_service.h"
+ #include "ui/color/color_provider.h"
++#include "ui/color/color_id.h"
++#include "ui/native_theme/native_theme.h"
++#include "ui/views/widget/widget.h"
+ 
+ namespace arcium_settings {
+ namespace {
+@@ -382,6 +388,9 @@ ArciumSettingsModel::ArciumSettingsModel
+   }
+ 
+   space_service_ = helium::HeliumSpaceServiceFactory::GetForProfile(profile_);
++  if (space_service_ && space_service_->GetActiveSpace()) {
++    appearance_space_id_ = space_service_->GetActiveSpace()->id();
++  }
+   shortcut_service_ =
+       browser_shortcuts::BrowserShortcutServiceFactory::GetForProfile(profile_);
+   if (shortcut_service_) {
+@@ -557,15 +566,135 @@ bool ArciumSettingsModel::SetCommandPane
+   return true;
+ }
+ 
++helium::HeliumSpace* ArciumSettingsModel::GetAppearanceSpace() const {
++  return !shutting_down_ && space_service_
++             ? space_service_->GetSpaceById(appearance_space_id_) : nullptr;
++}
++
++bool ArciumSettingsModel::SetAppearanceSpace(std::string_view id) {
++  if (shutting_down_ || !space_service_ || !space_service_->GetSpaceById(id)) {
++    return false;
++  }
++  appearance_space_id_ = id;
++  NotifyChanged();
++  return true;
++}
++
++bool ArciumSettingsModel::IsSpacePaletteRenderingActive() const {
++  if (!GetAppearanceSpace() || !theme_service_ || theme_service_->UsingPolicyTheme()) {
++    return false;
++  }
++  auto* browser = GetAppearanceSpace()->GetPrimaryBrowser();
++  auto* view = browser ? BrowserView::GetBrowserViewForBrowser(browser) : nullptr;
++  auto* widget = view ? view->GetWidget() : nullptr;
++  auto* native_theme = widget ? widget->GetNativeTheme()
++      : ui::NativeTheme::GetInstanceForNativeUi();
++  return native_theme->preferred_contrast() != ui::NativeTheme::PreferredContrast::kMore &&
++      (widget ? widget->GetForcedColors() == ui::ColorProviderKey::ForcedColors::kNone
++              : native_theme->forced_colors() == ui::ColorProviderKey::ForcedColors::kNone);
++}
++
++base::DictValue ArciumSettingsModel::GetSpacePalette() const {
++  const auto* space = GetAppearanceSpace();
++  if (!space || !prefs_) {
++    return base::DictValue().Set("available", false);
++  }
++  const auto input = helium::SpacePaletteKey(
++      &space->theme(), helium::ReadGlassSurfaceConfiguration(prefs_));
++  auto light = arcium::GenerateSpacePalette(input, false);
++  auto dark = arcium::GenerateSpacePalette(input, true);
++  const bool rendering_active = IsSpacePaletteRenderingActive();
++  if (!rendering_active) {
++    auto* browser = space->GetPrimaryBrowser();
++    auto* view = browser ? BrowserView::GetBrowserViewForBrowser(browser) : nullptr;
++    const auto* provider = view && view->GetWidget()
++        ? view->GetWidget()->GetColorProvider() : theme_service_->GetColorProvider();
++    if (provider) {
++      light = {.chrome = provider->GetColor(kColorToolbar),
++               .chrome_background = provider->GetColor(kColorToolbar),
++               .field = provider->GetColor(kColorLocationBarBackground),
++               .field_hovered = provider->GetColor(kColorLocationBarBackgroundHovered),
++               .panel = provider->GetColor(kColorOmniboxResultsBackground),
++               .panel_background = provider->GetColor(kColorOmniboxResultsBackground),
++               .text = provider->GetColor(kColorOmniboxText),
++               .muted_text = provider->GetColor(kColorOmniboxTextDimmed),
++               .outline = provider->GetColor(ui::kColorSysOutline),
++               .accent = provider->GetColor(ui::kColorSysPrimary),
++               .on_accent = provider->GetColor(ui::kColorSysOnPrimary),
++               .content_canvas = provider->GetColor(kColorToolbar),
++               .content_panel = provider->GetColor(kColorOmniboxResultsBackground),
++               .content_field = provider->GetColor(kColorLocationBarBackground),
++               .content_hovered = provider->GetColor(kColorLocationBarBackgroundHovered)};
++      dark = light;
++    }
++  }
++  auto roles = [](const arcium::SpacePaletteColors& colors) {
++    return base::DictValue()
++        .Set("canvas", ColorString(colors.content_canvas))
++        .Set("canvasPanel", ColorString(colors.content_panel))
++        .Set("canvasField", ColorString(colors.content_field))
++        .Set("canvasHover", ColorString(colors.content_hovered))
++        .Set("chrome", ColorString(colors.chrome))
++        .Set("field", ColorString(colors.field))
++        .Set("hover", ColorString(colors.field_hovered))
++        .Set("panel", ColorString(colors.panel))
++        .Set("text", ColorString(colors.text))
++        .Set("mutedText", ColorString(colors.muted_text))
++        .Set("outline", ColorString(colors.outline))
++        .Set("accent", ColorString(colors.accent))
++        .Set("onAccent", ColorString(colors.on_accent));
++  };
++  return base::DictValue()
++      .Set("available", !IsAppearanceManaged())
++      .Set("renderingActive", rendering_active)
++      .Set("id", space->id())
++      .Set("name", base::UTF16ToUTF8(space->name()))
++      .Set("controlsChroma", input.controls_chroma / 100.0)
++      .Set("panelsChroma", input.panels_chroma / 100.0)
++      .Set("lightChromeOpacity", SkColorGetA(
++          light.chrome_background) / 255.0)
++      .Set("darkChromeOpacity", SkColorGetA(
++          dark.chrome_background) / 255.0)
++      .Set("lightPanelOpacity", SkColorGetA(
++          light.panel_background) / 255.0)
++      .Set("darkPanelOpacity", SkColorGetA(
++          dark.panel_background) / 255.0)
++      .Set("light", roles(light))
++      .Set("dark", roles(dark));
++}
++
++bool ArciumSettingsModel::SetSpacePaletteChroma(const base::DictValue& tuning) {
++  auto* space = GetAppearanceSpace();
++  if (!space || IsAppearanceManaged() || !prefs_->IsUserModifiablePreference(
++          helium::kHeliumSpacesPref) || tuning.size() != 2) {
++    return false;
++  }
++  const auto controls = tuning.FindDouble("controlsChroma");
++  const auto panels = tuning.FindDouble("panelsChroma");
++  if (!controls || !panels || !std::isfinite(*controls) ||
++      !std::isfinite(*panels) || *controls < 0 || *controls > 2 ||
++      *panels < 0 || *panels > 2) {
++    return false;
++  }
++  // Freeze the migration input before the first per-Space edit.
++  auto theme = helium::WithSpacePaletteAppearance(
++      space->theme(), helium::SpacePaletteAppearance(&space->theme(),
++          helium::ReadGlassSurfaceConfiguration(prefs_)));
++  theme.controls_chroma = std::lround(*controls * 100);
++  theme.panels_chroma = std::lround(*panels * 100);
++  space_service_->SetSpaceTheme(space->id(), std::move(theme));
++  NotifyChanged();
++  return true;
++}
++
+ base::DictValue ArciumSettingsModel::GetChromeAppearance() const {
+-  if (!prefs_ || !HasPreference(helium::kArciumChromeAppearancePref)) {
++  const auto* space = GetAppearanceSpace();
++  if (!space || !prefs_ || !HasPreference(helium::kArciumChromeAppearancePref)) {
+     return {};
+   }
+-  // Fill missing fields from the shared defaults without changing stored
+-  // values. Malformed values and unknown keys remain visible to the strict
+-  // editor parser, so completing an older dictionary does not sanitize it.
+-  return helium::CompleteGlassSurfaceConfigurationForEditing(
+-      prefs_->GetDict(helium::kArciumChromeAppearancePref));
++  return helium::SerializeGlassSurfaceConfiguration(
++      helium::SpacePaletteAppearance(&space->theme(),
++          helium::ReadGlassSurfaceConfiguration(prefs_)));
+ }
+ 
+ std::string ArciumSettingsModel::GetSurfaceSet() const {
+@@ -619,7 +748,8 @@ void ArciumSettingsModel::RefreshSurface
+     return;
+   }
+   // Showing again keeps a preview that already matches the current style.
+-  BrowserWindowInterface* browser = FindMatchingNormalBrowser(profile_);
++  auto* space = GetAppearanceSpace();
++  BrowserWindowInterface* browser = space ? space->GetPrimaryBrowser() : nullptr;
+   BrowserView* browser_view =
+       browser ? BrowserView::GetBrowserViewForBrowser(browser) : nullptr;
+   // Follow the most recently active window; leave no preview behind.
+@@ -631,43 +761,61 @@ void ArciumSettingsModel::RefreshSurface
+ 
+ bool ArciumSettingsModel::SetChromeAppearance(
+     const base::DictValue& configuration) {
+-  if (shutting_down_ || !prefs_ ||
++  auto* space = GetAppearanceSpace();
++  if (!space || !prefs_ || IsAppearanceManaged() ||
+       !HasPreference(helium::kArciumChromeAppearancePref) ||
+-      !prefs_->IsUserModifiablePreference(
+-          helium::kArciumChromeAppearancePref)) {
++      !prefs_->IsUserModifiablePreference(helium::kArciumChromeAppearancePref) ||
++      !prefs_->IsUserModifiablePreference(helium::kHeliumSpacesPref)) {
+     return false;
+   }
+-
+-  std::optional<helium::GlassSurfaceConfiguration> parsed =
+-      helium::ParseGlassSurfaceConfigurationStrict(configuration);
++  const auto parsed = helium::ParseGlassSurfaceConfigurationStrict(configuration);
+   if (!parsed) {
+     return false;
+   }
+-  // Store the canonical form so future fields and malformed Foundation input
+-  // cannot bypass the one shared runtime schema.
++  space_service_->SetSpaceTheme(space->id(),
++      helium::WithSpacePaletteAppearance(space->theme(), *parsed));
++  // Material policy remains profile-owned. Preserve its legacy color input
++  // for Spaces that have not migrated; it is never written by the picker.
++  auto material = *parsed;
++  const auto legacy = helium::ReadGlassSurfaceConfiguration(prefs_);
++  material.points = legacy.points;
++  material.point_count = legacy.point_count;
++  material.color_harmony = legacy.color_harmony;
++  material.match_color_adjustments = legacy.match_color_adjustments;
++  material.tint_strength = legacy.tint_strength;
++  material.grain = legacy.grain;
+   prefs_->SetDict(helium::kArciumChromeAppearancePref,
+-                  helium::SerializeGlassSurfaceConfiguration(*parsed));
++                  helium::SerializeGlassSurfaceConfiguration(material));
+   return true;
+ }
+ 
+ void ArciumSettingsModel::ResetChromeAppearance() {
+-  ClearPreference(helium::kArciumChromeAppearancePref);
++  auto* space = GetAppearanceSpace();
++  if (!space || IsAppearanceManaged() ||
++      !prefs_->IsUserModifiablePreference(helium::kHeliumSpacesPref)) {
++    return;
++  }
++  auto theme = space->theme();
++  theme.color.reset();
++  theme.background = helium::SpaceBackground();
++  theme.controls_chroma = 100;
++  theme.panels_chroma = 35;
++  space_service_->SetSpaceTheme(space->id(), std::move(theme));
+ }
+ 
+ bool ArciumSettingsModel::IsAppearanceAvailable() const {
+-  return !shutting_down_ && prefs_ && theme_service_ &&
++  return !shutting_down_ && prefs_ && theme_service_ && GetAppearanceSpace() &&
+          prefs_->FindPreference(prefs::kBrowserColorScheme);
+ }
+ 
+ int ArciumSettingsModel::GetAppearanceMode() const {
+-  const int system =
+-      static_cast<int>(ThemeService::BrowserColorScheme::kSystem);
+-  const int dark = static_cast<int>(ThemeService::BrowserColorScheme::kDark);
+-  if (!theme_service_) {
+-    return system;
+-  }
+-  const int mode = static_cast<int>(theme_service_->GetBrowserColorScheme());
+-  return mode >= system && mode <= dark ? mode : system;
++  const auto* space = GetAppearanceSpace();
++  if (!space || space->theme().mode == helium::SpaceTheme::Mode::kAuto) {
++    return static_cast<int>(ThemeService::BrowserColorScheme::kSystem);
++  }
++  return static_cast<int>(space->theme().mode == helium::SpaceTheme::Mode::kDark
++      ? ThemeService::BrowserColorScheme::kDark
++      : ThemeService::BrowserColorScheme::kLight);
+ }
+ 
+ bool ArciumSettingsModel::IsAppearanceManaged() const {
+@@ -686,8 +834,15 @@ bool ArciumSettingsModel::SetAppearanceM
+   if (mode < system || mode > dark) {
+     return false;
+   }
+-  theme_service_->SetBrowserColorScheme(
+-      static_cast<ThemeService::BrowserColorScheme>(mode));
++  auto* space = GetAppearanceSpace();
++  if (!space || !prefs_->IsUserModifiablePreference(helium::kHeliumSpacesPref)) {
++    return false;
++  }
++  auto theme = space->theme();
++  theme.mode = mode == system ? helium::SpaceTheme::Mode::kAuto
++      : mode == dark ? helium::SpaceTheme::Mode::kDark
++                     : helium::SpaceTheme::Mode::kLight;
++  space_service_->SetSpaceTheme(space->id(), std::move(theme));
+   return true;
+ }
+ 
+@@ -746,63 +901,13 @@ base::DictValue ArciumSettingsModel::Get
+   return result;
+ }
+ 
+-bool ArciumSettingsModel::SetSharedPalette(const base::DictValue& payload) {
+-  if (shutting_down_ || !IsAppearanceAvailable() ||
+-      !prefs_->FindPreference(kSharedPalettePref) ||
+-      !prefs_->IsUserModifiablePreference(kSharedPalettePref) ||
+-      theme_service_->UsingPolicyTheme() ||
+-      theme_service_->UsingExtensionTheme()) {
+-    return false;
+-  }
+-
+-  const std::optional<ParsedSharedPalette> palette =
+-      ParseSharedPalette(payload);
+-  if (!palette) {
+-    return false;
+-  }
+-
+-  base::DictValue stored;
+-  stored.Set(kSharedPaletteConfigurationKey, palette->configuration.Clone());
+-  stored.Set(kSharedPaletteAccentKey, palette->accent);
+-  stored.Set(kSharedPaletteLightChromeColorKey, palette->light_chrome_color);
+-  stored.Set(kSharedPaletteDarkChromeColorKey, palette->dark_chrome_color);
+-
+-  {
+-    base::AutoReset<bool> resetter(&suppress_shared_palette_notifications_,
+-                                   true);
+-    prefs_->SetDict(kSharedPalettePref, std::move(stored));
+-    theme_service_->SetUserColor(palette->accent_color);
+-  }
+-  NotifyChanged();
+-  return true;
++bool ArciumSettingsModel::SetSharedPalette(const base::DictValue&) {
++  // Old clients may not write an independent profile-wide color recipe.
++  return false;
+ }
+ 
+ bool ArciumSettingsModel::ResetSharedPalette() {
+-  if (shutting_down_ || !IsAppearanceAvailable() ||
+-      !prefs_->FindPreference(kSharedPalettePref) ||
+-      !prefs_->IsUserModifiablePreference(kSharedPalettePref) ||
+-      theme_service_->UsingPolicyTheme() ||
+-      theme_service_->UsingExtensionTheme()) {
+-    return false;
+-  }
+-
+-  const std::optional<ParsedSharedPalette> palette =
+-      ParseSharedPalette(prefs_->GetDict(kSharedPalettePref));
+-  const bool owns_user_color =
+-      palette && IsCurrentPalette(theme_service_, *palette);
+-  const bool had_saved_palette = !prefs_->GetDict(kSharedPalettePref).empty();
+-  {
+-    base::AutoReset<bool> resetter(&suppress_shared_palette_notifications_,
+-                                   true);
+-    if (owns_user_color) {
+-      theme_service_->SetUserColor(std::nullopt);
+-    }
+-    prefs_->ClearPref(kSharedPalettePref);
+-  }
+-  if (had_saved_palette || owns_user_color) {
+-    NotifyChanged();
+-  }
+-  return true;
++  return false;
+ }
+ 
+ int ArciumSettingsModel::GetStartupType() const {
+Index: src/chrome/browser/ui/helium/arcium_settings_model.h
+===================================================================
+--- src.orig/chrome/browser/ui/helium/arcium_settings_model.h
++++ src/chrome/browser/ui/helium/arcium_settings_model.h
+@@ -25,6 +25,7 @@ class Profile;
+ 
+ namespace helium {
+ class HeliumSpaceService;
++class HeliumSpace;
+ }
+ 
+ namespace arcium_settings {
+@@ -91,6 +92,13 @@ class ArciumSettingsModel final
+   // Holds the Ctrl+Tab switcher open in this profile's browser window so
+   // panel edits can be seen live. Settings turns it off when it closes.
+   void SetSurfacePreview(bool visible);
++  // This target is captured when Settings opens; window activation never
++  // redirects an edit to a different Space. Deleted targets fail closed.
++  bool SetAppearanceSpace(std::string_view id);
++  helium::HeliumSpace* GetAppearanceSpace() const;
++  base::DictValue GetSpacePalette() const;
++  bool IsSpacePaletteRenderingActive() const;
++  bool SetSpacePaletteChroma(const base::DictValue& tuning);
+   base::DictValue GetChromeAppearance() const;
+   // Accepts only a complete, strictly validated configuration. Invalid
+   // values and managed/unavailable preferences are rejected before any write.
+@@ -167,6 +175,7 @@ class ArciumSettingsModel final
+   bool suppress_shared_palette_notifications_ = false;
+   bool shutting_down_ = false;
+   bool surface_preview_ = false;
++  std::string appearance_space_id_;
+ };
+ 
+ }  // namespace arcium_settings
+Index: src/chrome/browser/ui/helium/helium_space.cc
+===================================================================
+--- src.orig/chrome/browser/ui/helium/helium_space.cc
++++ src/chrome/browser/ui/helium/helium_space.cc
+@@ -5,11 +5,14 @@
+ #include "chrome/browser/ui/helium/helium_space.h"
+ 
+ #include <algorithm>
++#include <cmath>
++#include <set>
+ #include <utility>
+ 
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/uuid.h"
+ #include "chrome/browser/ui/helium/arcium_space_icon.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser.h"
+@@ -86,7 +89,8 @@ const char* ModeString(SpaceTheme::Mode
+ double Fraction(const base::DictValue& dict,
+                 std::string_view key,
+                 double fallback) {
+-  return std::clamp(dict.FindDouble(key).value_or(fallback), 0.0, 1.0);
++  const double value = dict.FindDouble(key).value_or(fallback);
++  return std::isfinite(value) ? std::clamp(value, 0.0, 1.0) : fallback;
+ }
+ 
+ std::optional<SpaceBackground> ParseBackground(const base::DictValue* dict) {
+@@ -94,6 +98,15 @@ std::optional<SpaceBackground> ParseBack
+     return std::nullopt;
+   }
+   SpaceBackground background;
++  if (const std::string* harmony = dict->FindString("color_harmony")) {
++    if (*harmony == "custom" || *harmony == "complementary" ||
++        *harmony == "splitComplementary" || *harmony == "triadic" ||
++        *harmony == "tetradic") {
++      background.color_harmony = *harmony;
++    }
++  }
++  background.match_color_adjustments =
++      dict->FindBool("match_color_adjustments").value_or(true);
+   background.tint_strength =
+       Fraction(*dict, kBackgroundTintKey, background.tint_strength);
+   background.grain = Fraction(*dict, kBackgroundGrainKey, background.grain);
+@@ -113,6 +126,9 @@ std::optional<SpaceBackground> ParseBack
+           .radius = std::clamp(glow->FindDouble(kGlowRadiusKey).value_or(0.8),
+                                0.1, 1.5),
+           .opacity = Fraction(*glow, kGlowOpacityKey, 0.5),
++          .id = glow->FindString("id") && glow->FindString("id")->size() <= 128
++                    ? *glow->FindString("id")
++                    : "space-glow-" + base::NumberToString(background.glows.size()),
+       });
+     }
+   }
+@@ -123,6 +139,7 @@ base::DictValue SerializeBackground(cons
+   base::ListValue glows;
+   for (const SpaceGlow& glow : background.glows) {
+     glows.Append(base::DictValue()
++                     .Set("id", glow.id)
+                      .Set(kThemeColorKey, ColorString(glow.color))
+                      .Set(kGlowXKey, glow.x)
+                      .Set(kGlowYKey, glow.y)
+@@ -132,7 +149,9 @@ base::DictValue SerializeBackground(cons
+   return base::DictValue()
+       .Set(kBackgroundGlowsKey, std::move(glows))
+       .Set(kBackgroundTintKey, background.tint_strength)
+-      .Set(kBackgroundGrainKey, background.grain);
++      .Set(kBackgroundGrainKey, background.grain)
++      .Set("color_harmony", background.color_harmony)
++      .Set("match_color_adjustments", background.match_color_adjustments);
+ }
+ 
+ // A Space window opened from another one sits slightly down and to the
+@@ -151,6 +170,8 @@ SpaceTheme SpaceTheme::FromDict(const ba
+   theme.mode = ParseMode(dict->FindString(kThemeModeKey));
+   theme.web_mode = ParseMode(dict->FindString(kThemeWebModeKey));
+   theme.background = ParseBackground(dict->FindDict(kThemeBackgroundKey));
++  theme.controls_chroma = std::clamp(dict->FindInt("controls_chroma").value_or(100), 0, 200);
++  theme.panels_chroma = std::clamp(dict->FindInt("panels_chroma").value_or(35), 0, 200);
+   return theme;
+ }
+ 
+@@ -161,6 +182,9 @@ base::DictValue SpaceTheme::ToDict() con
+   }
+   dict.Set(kThemeModeKey, ModeString(mode));
+   dict.Set(kThemeWebModeKey, ModeString(web_mode));
++  dict.Set("palette_version", 1);
++  dict.Set("controls_chroma", controls_chroma);
++  dict.Set("panels_chroma", panels_chroma);
+   if (background) {
+     dict.Set(kThemeBackgroundKey, SerializeBackground(*background));
+   }
+@@ -194,6 +218,18 @@ void HeliumSpace::SetIcon(std::string ic
+ }
+ 
+ void HeliumSpace::SetTheme(SpaceTheme theme) {
++  if (theme.background) {
++    std::set<std::string> ids;
++    for (auto& glow : theme.background->glows) {
++      if (glow.id.empty() || !ids.insert(glow.id).second) {
++        glow.id = base::Uuid::GenerateRandomV4().AsLowercaseString();
++        ids.insert(glow.id);
++      }
++    }
++    theme.color = theme.background->glows.empty()
++                      ? std::nullopt
++                      : std::optional(theme.background->glows.front().color);
++  }
+   theme_ = std::move(theme);
+   PersistField(kThemeKey, base::Value(theme_.ToDict()));
+ }
+Index: src/chrome/browser/ui/helium/helium_space.h
+===================================================================
+--- src.orig/chrome/browser/ui/helium/helium_space.h
++++ src/chrome/browser/ui/helium/helium_space.h
+@@ -30,6 +30,7 @@ struct SpaceGlow {
+   double y = 0.5;
+   double radius = 0.8;
+   double opacity = 0.5;
++  std::string id;
+ 
+   friend bool operator==(const SpaceGlow&, const SpaceGlow&) = default;
+ };
+@@ -42,6 +43,8 @@ struct SpaceBackground {
+   std::vector<SpaceGlow> glows;
+   double tint_strength = 0.4;
+   double grain = 0.06;
++  std::string color_harmony = "custom";
++  bool match_color_adjustments = true;
+ 
+   friend bool operator==(const SpaceBackground&,
+                          const SpaceBackground&) = default;
+@@ -55,7 +58,7 @@ struct SpaceTheme {
+   base::DictValue ToDict() const;
+   bool IsDefault() const {
+     return !color && mode == Mode::kAuto && web_mode == Mode::kAuto &&
+-           !background;
++           !background && controls_chroma == 100 && panels_chroma == 35;
+   }
+ 
+   friend bool operator==(const SpaceTheme&, const SpaceTheme&) = default;
+@@ -67,6 +70,9 @@ struct SpaceTheme {
+   // Light or dark web pages; kAuto follows the chrome.
+   Mode web_mode = Mode::kAuto;
+   std::optional<SpaceBackground> background;
++  // Multipliers for the shared OKLCH recipe, never independent color seeds.
++  int controls_chroma = 100;
++  int panels_chroma = 35;
+ };
+ 
+ // What a Space window takes from the window the user came from: a new window
+Index: src/chrome/browser/ui/helium/helium_space_service.cc
+===================================================================
+--- src.orig/chrome/browser/ui/helium/helium_space_service.cc
++++ src/chrome/browser/ui/helium/helium_space_service.cc
+@@ -1094,6 +1094,8 @@ void HeliumSpaceService::SetThemePreview
+   } else {
+     theme_previews_.erase(browser->session_id());
+   }
++  NotifyItemsChanged(PersistentItemChange::Space(
++      std::string(GetSpaceIdForBrowser(browser))));
+ }
+ 
+ void HeliumSpaceService::SetSpacePinsCollapsed(std::string_view id,
+Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/helium/helium_space_service_unittest.cc
++++ src/chrome/browser/ui/helium/helium_space_service_unittest.cc
+@@ -26,6 +26,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
+ #include "chrome/browser/ui/helium/helium_space.h"
++#include "chrome/browser/ui/helium/space_palette.h"
+ #include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/pinned_tab_codec.h"
+@@ -1913,4 +1914,107 @@ TEST_F(HeliumSpaceServiceTest,
+ }
+ 
+ }  // namespace
++TEST_F(HeliumSpaceServiceTest, SpacePalettePersistsWithoutChangingOtherSpace) {
++  HeliumSpace* other = service_->GetOrCreateSpace("palette-other", u"Other");
++  const SpaceTheme unchanged = other->theme();
++  SpaceTheme theme;
++  theme.color = SK_ColorMAGENTA;
++  theme.controls_chroma = 175;
++  theme.panels_chroma = 65;
++  SpaceBackground background;
++  background.color_harmony = "triadic";
++  background.match_color_adjustments = false;
++  background.glows.push_back({.color = SK_ColorMAGENTA, .id = "primary"});
++  background.glows.push_back({.color = SK_ColorGREEN, .id = "companion"});
++  theme.background = background;
++  service_->SetSpaceTheme(space_->id(), theme);
++  EXPECT_EQ(other->theme(), unchanged);
++  const auto serialized = space_->theme().ToDict();
++  const auto restored = SpaceTheme::FromDict(&serialized);
++  EXPECT_EQ(restored, theme);
++  EXPECT_EQ(restored.background->glows[0].id, "primary");
++  EXPECT_EQ(restored.background->color_harmony, "triadic");
++}
++
++TEST_F(HeliumSpaceServiceTest, PalettePreviewDoesNotPersistOrChangeOtherWindow) {
++  Browser* other = CreateSecondaryBrowser();
++  HeliumSpace* other_space = service_->GetOrCreateSpace("palette-window", u"Other");
++  service_->SetSpaceForBrowser(other, other_space->id());
++  const auto saved = space_->theme();
++  SpaceTheme preview;
++  preview.color = SK_ColorRED;
++  preview.controls_chroma = 25;
++  service_->SetThemePreviewForBrowser(browser(), preview);
++  ASSERT_TRUE(service_->GetThemeForBrowser(browser()));
++  EXPECT_EQ(service_->GetThemeForBrowser(browser())->controls_chroma, 25);
++  EXPECT_EQ(other_space->theme(), SpaceTheme());
++  EXPECT_EQ(space_->theme(), saved);
++  service_->SetThemePreviewForBrowser(browser(), std::nullopt);
++  EXPECT_EQ(space_->theme(), saved);
++}
++
++TEST_F(HeliumSpaceServiceTest, PaletteRenderingPreservesAuthoredGlows) {
++  auto recipe = DefaultGlassSurfaceConfiguration();
++  recipe.enabled = true;
++  recipe.material_opacity = .63;
++  recipe.glass_tint_opacity = .17;
++  recipe.tint_strength = .83;
++  recipe.grain = .12;
++  recipe.match_color_adjustments = false;
++  recipe.point_count = 3;
++  recipe.points[0] = {.id = "primary",
++                      .color = SkColor4f::FromColor(SkColorSetRGB(250, 142, 255)),
++                      .x = .13, .y = .81, .radius = .67, .opacity = .42};
++  recipe.points[1] = {.id = "companion",
++                      .color = SkColor4f::FromColor(SkColorSetRGB(95, 221, 109)),
++                      .x = .87, .y = .22, .radius = 1.24, .opacity = .79};
++  recipe.points[2] = {.id = "third",
++                      .color = SkColor4f::FromColor(SkColorSetRGB(23, 33, 68)),
++                      .x = .41, .y = .53, .radius = .32, .opacity = .61};
++  for (bool dark : {false, true}) {
++    for (int panels : {0, 200}) {
++      SCOPED_TRACE(testing::Message() << dark << ',' << panels);
++      auto theme = WithSpacePaletteAppearance(SpaceTheme(), recipe);
++      theme.panels_chroma = panels;
++      theme.background->color_harmony = "triadic";
++      const auto saved = theme;
++      auto expected = SpacePaletteAppearance(&theme, recipe);
++      auto rendering = expected;
++      ApplySpacePaletteForRendering(rendering, &theme, dark);
++      ASSERT_TRUE(rendering.chrome_contrast_floor);
++      expected.chrome_contrast_floor = rendering.chrome_contrast_floor;
++      EXPECT_EQ(rendering, expected);
++      EXPECT_EQ(theme, saved);
++      const auto key = SpacePaletteKey(&theme, rendering);
++      EXPECT_EQ(key.seed, recipe.points[0].color.toSkColor());
++      EXPECT_EQ(key.companion, recipe.points[1].color.toSkColor());
++      EXPECT_EQ(key.panels_chroma, panels);
++    }
++  }
++}
++
++TEST_F(HeliumSpaceServiceTest, PaletteRenderingPreservesDisabledEffects) {
++  auto recipe = DefaultGlassSurfaceConfiguration();
++  recipe.enabled = false;
++  auto theme = WithSpacePaletteAppearance(SpaceTheme(), recipe);
++  const auto saved = theme;
++  auto rendering = SpacePaletteAppearance(&theme, recipe);
++  ApplySpacePaletteForRendering(rendering, &theme, false);
++  EXPECT_FALSE(rendering.enabled);
++  EXPECT_EQ(rendering.point_count, 0U);
++  EXPECT_DOUBLE_EQ(rendering.grain, 0);
++  ASSERT_TRUE(rendering.chrome_contrast_floor);
++  EXPECT_GT(SkColorGetA(*rendering.chrome_contrast_floor), 0);
++  EXPECT_EQ(theme, saved);
++  EXPECT_EQ(SpacePaletteKey(&theme, rendering), SpacePaletteKey(&theme, recipe));
++
++  recipe.enabled = true;
++  rendering = SpacePaletteAppearance(&theme, recipe);
++  ApplySpacePaletteForRendering(rendering, &theme, false);
++  EXPECT_TRUE(rendering.enabled);
++  EXPECT_EQ(rendering.point_count, recipe.point_count);
++  EXPECT_DOUBLE_EQ(rendering.grain, recipe.grain);
++  EXPECT_EQ(theme, saved);
++}
++
+ }  // namespace helium
+Index: src/chrome/browser/ui/helium/space_palette.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/helium/space_palette.h
+@@ -0,0 +1,134 @@
++// Copyright 2026 The Helium Authors
++// SPDX-License-Identifier: GPL-3.0-only
++
++#ifndef CHROME_BROWSER_UI_HELIUM_SPACE_PALETTE_H_
++#define CHROME_BROWSER_UI_HELIUM_SPACE_PALETTE_H_
++
++#include <algorithm>
++
++#include "base/strings/string_number_conversions.h"
++#include "chrome/browser/ui/helium/helium_space.h"
++#include "chrome/browser/ui/color/arcium_space_color_mixer.h"
++#include "chrome/browser/ui/views/helium/glass_surface_configuration.h"
++#include "ui/color/arcium_palette.h"
++
++namespace helium {
++
++// The single migration/resolution path for legacy Space colors and profile
++// glows. The old profile Controls accent is deliberately not a color source.
++inline SpaceBackground ResolveSpacePaletteBackground(
++    const SpaceTheme* theme,
++    const GlassSurfaceConfiguration& legacy) {
++  if (theme && theme->background) {
++    return *theme->background;
++  }
++  SpaceBackground background;
++  if (theme && theme->color) {
++    background.glows.push_back({.color = *theme->color, .id = "space-color"});
++  } else {
++    for (size_t i = 0; i < legacy.point_count; ++i) {
++      const auto& point = legacy.points[i];
++      background.glows.push_back({.color = point.color.toSkColor(),
++                                  .x = point.x,
++                                  .y = point.y,
++                                  .radius = point.radius,
++                                  .opacity = point.opacity,
++                                  .id = point.id});
++    }
++    background.tint_strength = legacy.tint_strength;
++    background.grain = legacy.grain;
++    const auto serialized = SerializeGlassSurfaceConfiguration(legacy);
++    background.color_harmony = *serialized.FindString("colorHarmony");
++    background.match_color_adjustments = legacy.match_color_adjustments;
++  }
++  return background;
++}
++
++inline ui::ArciumPalette SpacePaletteKey(
++    const SpaceTheme* theme,
++    const GlassSurfaceConfiguration& legacy) {
++  const auto background = ResolveSpacePaletteBackground(theme, legacy);
++  ui::ArciumPalette key;
++  if (!background.glows.empty()) {
++    key.seed = background.glows.front().color;
++  }
++  key.companion = background.glows.size() > 1 ? background.glows[1].color
++                                             : key.seed;
++  if (theme) {
++    key.controls_chroma = theme->controls_chroma;
++    key.panels_chroma = theme->panels_chroma;
++  }
++  return key;
++}
++
++inline GlassSurfaceConfiguration SpacePaletteAppearance(
++    const SpaceTheme* theme,
++    GlassSurfaceConfiguration configuration) {
++  const auto background = ResolveSpacePaletteBackground(theme, configuration);
++  configuration.point_count = std::min(background.glows.size(),
++                                       kMaxGlassColorPoints);
++  for (size_t i = 0; i < configuration.point_count; ++i) {
++    const auto& glow = background.glows[i];
++    configuration.points[i] = {
++        .id = glow.id.empty() ? "space-glow-" + base::NumberToString(i) : glow.id,
++        .color = SkColor4f::FromColor(glow.color),
++        .x = glow.x,
++        .y = glow.y,
++        .radius = glow.radius,
++        .opacity = glow.opacity};
++  }
++  configuration.tint_strength = background.tint_strength;
++  configuration.grain = background.grain;
++  configuration.match_color_adjustments = background.match_color_adjustments;
++  base::DictValue serialized = SerializeGlassSurfaceConfiguration(configuration);
++  serialized.Set("colorHarmony", background.color_harmony);
++  return ParseGlassSurfaceConfiguration(serialized);
++}
++
++inline SpaceTheme WithSpacePaletteAppearance(
++    SpaceTheme theme,
++    const GlassSurfaceConfiguration& appearance) {
++  SpaceBackground background;
++  for (size_t i = 0; i < appearance.point_count; ++i) {
++    const auto& point = appearance.points[i];
++    background.glows.push_back({.color = point.color.toSkColor(),
++                                .x = point.x,
++                                .y = point.y,
++                                .radius = point.radius,
++                                .opacity = point.opacity,
++                                .id = point.id});
++  }
++  background.tint_strength = appearance.tint_strength;
++  background.grain = appearance.grain;
++  const base::DictValue serialized = SerializeGlassSurfaceConfiguration(appearance);
++  background.color_harmony = *serialized.FindString("colorHarmony");
++  background.match_color_adjustments = appearance.match_color_adjustments;
++  theme.color = background.glows.empty()
++                    ? std::nullopt
++                    : std::optional(background.glows.front().color);
++  theme.background = std::move(background);
++  return theme;
++}
++
++// The palette derives from the authored glows. Add readability support below
++// them without recoloring or changing their placement, size, or intensity.
++inline void ApplySpacePaletteForRendering(
++    GlassSurfaceConfiguration& configuration,
++    const SpaceTheme* theme,
++    bool dark,
++    std::optional<SkColor> floor = std::nullopt) {
++  auto input = SpacePaletteKey(theme, configuration);
++  configuration.chrome_contrast_floor = floor
++      ? *floor : arcium::GenerateSpacePalette(input, dark).chrome_background;
++  if (!configuration.enabled) {
++    // Color selection also works with decorative effects off. This is a
++    // render-only copy; retain all saved points and grain in the recipe.
++    configuration.point_count = 0;
++    configuration.grain = 0;
++    return;
++  }
++}
++
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_UI_HELIUM_SPACE_PALETTE_H_
+Index: src/chrome/browser/ui/views/frame/browser_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_view.cc
++++ src/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1043,7 +1043,7 @@ class MRUTabSwitcherOverlay : public vie
+       return false;
+     }
+     const helium::SurfaceStyle style =
+-        helium::ResolveProfileSurfaceStyle(prefs);
++        helium::ResolveSurfaceStyleForWidget(browser_view_->GetWidget(), prefs);
+     if (style.panel_shadow != built_style_.panel_shadow ||
+         style.panel_tint != built_style_.panel_tint ||
+         style.panel_tint_color != built_style_.panel_tint_color) {
+@@ -1073,7 +1073,6 @@ class MRUTabSwitcherOverlay : public vie
+           finish_(finish),
+           tint_(style.panel_tint),
+           tint_color_(style.panel_tint_color),
+-          solid_color_(helium::PanelSolidColor(style)),
+           shadow_enabled_(style.panel_shadow) {
+       GetViewAccessibility().SetRole(ax::mojom::Role::kGroup);
+       GetViewAccessibility().SetName(
+@@ -1096,6 +1095,11 @@ class MRUTabSwitcherOverlay : public vie
+                 style.panel_material == helium::PanelMaterial::kGlassmorphic
+                     ? style.panel_blur : 0.0f)));
+       }
++      if (glass_surface_) {
++        contrast_floor_ = AddChildView(std::make_unique<views::View>());
++        contrast_floor_->SetPaintToLayer();
++        contrast_floor_->layer()->SetFillsBoundsOpaquely(false);
++      }
+       rail_ = AddChildView(std::make_unique<MRUTabPreviewRail>(browser_view));
+       // Keep card content above the glass layer, in the browser's render pass.
+       rail_->SetPaintToLayer();
+@@ -1124,12 +1128,10 @@ class MRUTabSwitcherOverlay : public vie
+    private:
+     void OnThemeChanged() override {
+       views::View::OnThemeChanged();
+-      // Both Chromium materials follow the theme when no window or custom
+-      // tint color is available.
+-      if (glass_surface_ && !tint_color_) {
+-        glass_surface_->SetTintColor(
+-            GetColorProvider()->GetColor(kColorToolbar));
++      if (glass_surface_) {
++        glass_surface_->SetTintColor(GetColorProvider()->GetColor(kColorArciumPanel));
+       }
++      UpdateFill();
+       if (rail_) {
+         UpdateLabelContrast();
+       }
+@@ -1155,62 +1157,39 @@ class MRUTabSwitcherOverlay : public vie
+             SkColorSetA(SK_ColorBLACK, kMRUShadowAlpha))}));
+         canvas->sk_canvas()->drawRRect(panel, shadow);
+       }
+-      if (!native_material_) {
+-        cc::PaintFlags fill;
+-        fill.setAntiAlias(true);
+-        fill.setColor(solid_color_);
+-        canvas->sk_canvas()->drawRRect(panel, fill);
+-      }
++      cc::PaintFlags fill;
++      fill.setAntiAlias(true);
++      fill.setColor(GetColorProvider()->GetColor(
++          native_material_ ? kColorArciumPanelBackground : kColorArciumPanel));
++      canvas->sk_canvas()->drawRRect(panel, fill);
+     }
+ 
+     void UpdateFill() {
++      if (!GetWidget()) {
++        return;
++      }
+       if (!finish_) {
+-        // The window paints its own fill and shadow.
+         SchedulePaint();
+         return;
+       }
+-      // Glass and native material show through; a solid panel uses the
+-      // command panel's color.
+-      if (UsesBackdrop()) {
+-        SetBackground(nullptr);
+-      } else {
+-        SetBackground(views::CreateRoundedRectBackground(
+-            solid_color_, kMRUCornerRadius));
++      if (contrast_floor_) {
++        contrast_floor_->SetBackground(views::CreateRoundedRectBackground(
++            kColorArciumPanelBackground, kMRUCornerRadius));
+       }
++      SetBackground(UsesBackdrop() ? nullptr
++          : views::CreateRoundedRectBackground(kColorArciumPanel, kMRUCornerRadius));
+     }
+ 
+     void UpdateLabelContrast() {
+-      SkColor background = solid_color_;
+-      const bool uses_backdrop = UsesBackdrop();
+-      if (uses_backdrop && !finish_) {
+-        // Native glass: estimate the panel from its tint over a dark backdrop
+-        // so a bright custom tint still gets readable labels.
+-        background = color_utils::AlphaBlend(
+-            tint_color_.value_or(helium::kPanelSolidColor),
+-            helium::kPanelSolidColor, tint_);
+-      }
+-      if (uses_backdrop && finish_) {
+-        background = browser_view_->GetColorProvider()->GetColor(
+-            kColorTabHoverCardBackground);
+-        auto* page = browser_view_->GetActiveWebContents();
+-        auto* host = page ? page->GetRenderWidgetHostView() : nullptr;
+-        if (host) {
+-          if (auto color = host->GetBackgroundColor()) {
+-            background =
+-                color_utils::GetResultingPaintColor(*color, background);
+-          }
+-        }
+-        background = color_utils::AlphaBlend(
+-            tint_color_.value_or(helium::kPanelSolidColor), background, tint_);
+-      }
+-      rail_->SetLabelContrast(background, uses_backdrop);
++      rail_->SetLabelContrast(
++          GetColorProvider()->GetColor(kColorArciumPanel), UsesBackdrop());
+     }
+ 
++    raw_ptr<views::View> contrast_floor_ = nullptr;
+     const raw_ptr<BrowserView> browser_view_;
+     const std::optional<helium::SurfaceFinish> finish_;
+     const float tint_;
+     const std::optional<SkColor> tint_color_;
+-    const SkColor solid_color_;
+     const bool shadow_enabled_;
+     bool native_material_ = false;
+     raw_ptr<helium::GlassSurfaceView> glass_surface_ = nullptr;
+@@ -1230,13 +1209,6 @@ class MRUTabSwitcherOverlay : public vie
+     }
+   }
+ 
+-  // Separate preview widgets inherit the profile key, but need an explicit
+-  // theme notification when the owning browser changes its Controls accent.
+-  void OnWidgetThemeChanged(views::Widget*) override {
+-    if (widget_) {
+-      widget_->ThemeChanged();
+-    }
+-  }
+ 
+   // A preview can outlive tab cycling, so it closes with its browser window.
+   void OnWidgetClosing(views::Widget* widget) override;
+@@ -1250,7 +1222,7 @@ class MRUTabSwitcherOverlay : public vie
+       CreateWidget(prefs);
+     } else {
+       const helium::SurfaceStyle style =
+-          helium::ResolveProfileSurfaceStyle(prefs);
++          helium::ResolveSurfaceStyleForWidget(browser_view_->GetWidget(), prefs);
+       built_style_ = style;
+       auto bubble = std::make_unique<BubbleView>(browser_view_,
+                                                  style.embedded_panel, style);
+@@ -1287,10 +1259,8 @@ class MRUTabSwitcherOverlay : public vie
+       // it. Clicks still pass through to Settings.
+       widget_->SetZOrderLevel(ui::ZOrderLevel::kFloatingWindow);
+     }
+-    // Match the command panel, which is always dark.
+-    widget_->SetColorModeOverride(ui::ColorProviderKey::ColorMode::kDark);
+     const helium::SurfaceStyle style =
+-        helium::ResolveProfileSurfaceStyle(prefs);
++        helium::ResolveSurfaceStyleForWidget(browser_view_->GetWidget(), prefs);
+     built_style_ = style;
+     bubble_ = widget_->SetContentsView(
+         std::make_unique<BubbleView>(browser_view_, std::nullopt, style));
+@@ -1337,7 +1307,7 @@ class MRUTabSwitcherOverlay : public vie
+   // panel there, so it can float above Settings.
+   bool UsesWidget(PrefService* prefs) const {
+     return helium::CanUseNativePanelGlass(prefs) ||
+-           (preview_ && helium::ResolveProfileSurfaceStyle(prefs)
++           (preview_ && helium::ResolveSurfaceStyleForWidget(browser_view_->GetWidget(), prefs)
+                                 .embedded_panel == helium::SurfaceFinish::kSolid);
+   }
+ 
+@@ -6990,11 +6960,6 @@ void BrowserView::OnThemeChanged() {
+     return;
+   }
+ 
+-  // The floating command panel is a separate widget, so refresh its inherited
+-  // profile theme explicitly without rebuilding its input or results.
+-  if (arcium_command_bar_widget_ && !arcium_command_bar_closing_) {
+-    arcium_command_bar_widget_->ThemeChanged();
+-  }
+   FrameColorsChanged();
+ 
+   // Theme changes may recreate caption buttons, resetting their opacity.
+Index: src/chrome/browser/ui/views/frame/browser_widget.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_widget.cc
++++ src/chrome/browser/ui/views/frame/browser_widget.cc
+@@ -22,8 +22,12 @@
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window_state.h"
++#include "chrome/browser/ui/color/arcium_space_palette_initializer.h"
+ #include "chrome/browser/ui/helium/helium_space.h"
+ #include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/space_palette.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "content/public/browser/web_contents.h"
+ #include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/immersive/immersive_mode_controller.h"
+@@ -117,6 +121,7 @@ BrowserWidget::BrowserWidget(BrowserView
+ }
+ 
+ BrowserWidget::~BrowserWidget() {
++  space_palette_subscription_ = {};
+   set_widget_closed();
+ 
+   // Synchronously destroy owned Widgets, which are typically owned by the
+@@ -214,6 +219,20 @@ void BrowserWidget::InitBrowserWidget()
+   }
+ 
+   Init(std::move(params));
++  if (auto* spaces = helium::HeliumSpaceServiceFactory::GetForProfile(
++          browser->profile())) {
++    space_palette_subscription_ = spaces->RegisterItemsChanged(
++        base::BindRepeating([](BrowserWidget* widget,
++                              const helium::PersistentItemChange&) {
++          widget->RefreshSpacePalette();
++        }, base::Unretained(this)));
++  }
++  if (auto* spaces = helium::HeliumSpaceServiceFactory::GetForProfileIfExists(
++          browser->profile())) {
++    if (const auto* theme = spaces->GetThemeForBrowser(browser)) {
++      applied_space_theme_ = *theme;
++    }
++  }
+ 
+ #if BUILDFLAG(IS_LINUX)
+   SelectNativeTheme();
+@@ -257,6 +276,33 @@ bool BrowserWidget::HandleKeyboardEvent(
+          browser_native_widget_->HandleKeyboardEvent(event);
+ }
+ 
++void BrowserWidget::RefreshSpacePalette() {
++  auto* spaces = helium::HeliumSpaceServiceFactory::GetForProfileIfExists(
++      browser_view_->GetProfile());
++  const auto* theme = spaces ? spaces->GetThemeForBrowser(browser_view_->browser())
++                             : nullptr;
++  std::optional<helium::SpaceTheme> current = theme ? std::optional(*theme)
++                                                  : std::nullopt;
++  if (current == applied_space_theme_) {
++    return;
++  }
++  const auto before = applied_space_theme_.value_or(helium::SpaceTheme());
++  const auto after = current.value_or(helium::SpaceTheme());
++  applied_space_theme_ = std::move(current);
++  ThemeChanged();
++  for (Widget* widget : GetAllOwnedWidgets(GetNativeView())) {
++    if (widget != this) {
++      widget->ThemeChanged();
++    }
++  }
++  if (before.mode != after.mode || before.web_mode != after.web_mode) {
++    auto* tabs = browser_view_->browser()->tab_strip_model();
++    for (int i = 0; i < tabs->count(); ++i) {
++      tabs->GetWebContentsAt(i)->NotifyPreferencesChanged();
++    }
++  }
++}
++
+ void BrowserWidget::UserChangedTheme(BrowserThemeChangeType theme_change_type) {
+   // kWebAppTheme is triggered by web apps and will only change colors, not the
+   // frame type; just refresh the theme on all views in the browser window.
+@@ -280,19 +326,17 @@ void BrowserWidget::UserChangedTheme(Bro
+     // When the browser theme changes, the NativeTheme may also change.
+     SelectNativeTheme();
+ 
+-    // Browser theme changes are directly observed by the BrowserWidget. However
+-    // the other Widgets in the frame's hierarchy may inherit this new theme
+-    // information in their ColorProviderKeys and thus should also be forwarded
+-    // theme change notifications.
+-    Widget::Widgets widgets = GetAllOwnedWidgets(GetNativeView());
+-    for (Widget* widget : widgets) {
+-      widget->ThemeChanged();
+-    }
+   }
+ 
+   if (!theme_changed_observer.theme_changed()) {
+     ThemeChanged();
+   }
++  // Owned surfaces inherit the complete key, including Auto-mode OS changes.
++  for (Widget* widget : GetAllOwnedWidgets(GetNativeView())) {
++    if (widget != this) {
++      widget->ThemeChanged();
++    }
++  }
+ }
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+@@ -456,24 +500,27 @@ ui::ColorProviderKey BrowserWidget::GetC
+   const auto* theme_service = ThemeServiceFactory::GetForProfile(profile);
+   CHECK(theme_service);
+ 
++  const auto system_color_mode = key.color_mode;
+   key = theme_service->GetColorProviderKey(key, profile);
+ 
+-  // An Arcium Space theme replaces its profile's theme in this window. Widget
+-  // overrides below, such as tab group focus, still apply on top.
+-  if (auto* spaces =
+-          helium::HeliumSpaceServiceFactory::GetForProfileIfExists(profile)) {
+-    if (const helium::SpaceTheme* space_theme =
+-            spaces->GetThemeForBrowser(browser_view_->browser())) {
+-      if (space_theme->color) {
+-        key.user_color = *space_theme->color;
+-        key.user_color_source = ui::ColorProviderKey::UserColorSource::kAccent;
+-        key.custom_theme = nullptr;
+-      }
+-      if (space_theme->mode != helium::SpaceTheme::Mode::kAuto) {
+-        key.color_mode = space_theme->mode == helium::SpaceTheme::Mode::kDark
+-                             ? ui::ColorProviderKey::ColorMode::kDark
+-                             : ui::ColorProviderKey::ColorMode::kLight;
+-      }
++  // Carry the complete per-window recipe into child widgets and the cache.
++  // Managed themes and accessibility palettes retain their system policy.
++  if (browser_view_->GetIsNormalType() && !theme_service->UsingPolicyTheme() &&
++      key.contrast_mode != ui::ColorProviderKey::ContrastMode::kHigh &&
++      key.forced_colors == ui::ColorProviderKey::ForcedColors::kNone) {
++    auto* spaces = helium::HeliumSpaceServiceFactory::GetForProfileIfExists(profile);
++    const helium::SpaceTheme* theme = spaces
++        ? spaces->GetThemeForBrowser(browser_view_->browser()) : nullptr;
++    const auto palette = helium::SpacePaletteKey(
++        theme, helium::ReadGlassSurfaceConfiguration(profile->GetPrefs()));
++    key.user_color = palette.seed;
++    key.user_color_source = ui::ColorProviderKey::UserColorSource::kAccent;
++    key.custom_theme = nullptr;
++    key.color_mode = system_color_mode;
++    if (theme && theme->mode != helium::SpaceTheme::Mode::kAuto) {
++      key.color_mode = theme->mode == helium::SpaceTheme::Mode::kDark
++                           ? ui::ColorProviderKey::ColorMode::kDark
++                           : ui::ColorProviderKey::ColorMode::kLight;
+     }
+   }
+ 
+@@ -490,6 +537,18 @@ ui::ColorProviderKey BrowserWidget::GetC
+   // Apply BrowserWidget overrides:
+   key.app_controller =
+       web_app::AppBrowserController::From(browser_view_->browser());
++  if (!key.app_controller && browser_view_->GetIsNormalType() &&
++      !theme_service->UsingPolicyTheme() &&
++      key.contrast_mode != ui::ColorProviderKey::ContrastMode::kHigh &&
++      key.forced_colors == ui::ColorProviderKey::ForcedColors::kNone) {
++    auto* spaces = helium::HeliumSpaceServiceFactory::GetForProfileIfExists(profile);
++    const auto* theme = spaces
++        ? spaces->GetThemeForBrowser(browser_view_->browser()) : nullptr;
++    key.app_controller = arcium::GetSpacePaletteInitializer(
++        helium::SpacePaletteKey(theme,
++            helium::ReadGlassSurfaceConfiguration(profile->GetPrefs())));
++  }
++
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+   // ChromeOS SystemWebApps use the OS theme all the time.
+Index: src/chrome/browser/ui/views/frame/browser_widget.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_widget.h
++++ src/chrome/browser/ui/views/frame/browser_widget.h
+@@ -5,6 +5,9 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_FRAME_BROWSER_WIDGET_H_
+ #define CHROME_BROWSER_UI_VIEWS_FRAME_BROWSER_WIDGET_H_
+ 
++#include "base/callback_list.h"
++#include "chrome/browser/ui/helium/helium_space.h"
++
+ #include "base/memory/raw_ptr.h"
+ #include "build/build_config.h"
+ #include "content/public/browser/keyboard_event_processing_result.h"
+@@ -99,6 +102,7 @@ class BrowserWidget : public views::Widg
+   // ThemeService calls this when a user has changed their theme, indicating
+   // that it's time to redraw everything.
+   void UserChangedTheme(BrowserThemeChangeType theme_change_type);
++  void RefreshSpacePalette();
+ 
+   // views::Widget:
+   views::internal::RootView* CreateRootView() override;
+@@ -186,6 +190,8 @@ class BrowserWidget : public views::Widg
+   // may change, the fast resize strategy will be used to resize its web
+   // contents for smoother dragging.
+   TabDragKind tab_drag_kind_ = TabDragKind::kNone;
++  base::CallbackListSubscription space_palette_subscription_;
++  std::optional<helium::SpaceTheme> applied_space_theme_;
+ 
+ #if BUILDFLAG(IS_LINUX)
+   bool tiled_ = false;
+Index: src/chrome/browser/ui/views/frame/mru_tab_preview_rail.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/mru_tab_preview_rail.cc
++++ src/chrome/browser/ui/views/frame/mru_tab_preview_rail.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/views/frame/mru_tab_preview_rail.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
+ 
+ #include <algorithm>
+ #include <memory>
+@@ -185,8 +186,9 @@ void MRUTabPreviewRail::OnCaptured(tabs:
+ void MRUTabPreviewRail::SetLabelContrast(SkColor background, bool shadow) {
+   background_ = background;
+   shadow_ = shadow;
+-  const SkColor foreground = color_utils::GetColorWithMaxContrast(background);
+-  const SkColor backing = color_utils::GetColorWithMaxContrast(foreground);
++  const auto* colors = browser_view_->GetColorProvider();
++  const SkColor foreground = colors->GetColor(kColorArciumText);
++  const SkColor backing = colors->GetColor(kColorArciumPanel);
+   const SkColor accent = browser_view_->GetColorProvider()->GetColor(
+       ui::kColorSysPrimary);
+   const SkColor selected_outline = color_utils::BlendForMinContrast(
+Index: src/chrome/browser/ui/views/helium/arcium_space_theme_editor.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/arcium_space_theme_editor.cc
++++ src/chrome/browser/ui/views/helium/arcium_space_theme_editor.cc
+@@ -598,6 +598,9 @@ void ArciumSpaceThemeEditor::OnSwatchPre
+     selected_glow_ = 0;
+   }
+   background.glows[*selected_glow_].color = *color;
++  if (theme_.background) {
++    theme_.background->color_harmony = "custom";
++  }
+   Changed();
+ }
+ 
+Index: src/chrome/browser/ui/views/helium/glass_surface.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/glass_surface.cc
++++ src/chrome/browser/ui/views/helium/glass_surface.cc
+@@ -3,6 +3,9 @@
+ // the terms of the GPL-3.0 license found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/views/helium/glass_surface.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "ui/color/color_provider.h"
++#include "ui/views/widget/widget.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -173,6 +176,18 @@ SurfaceStyle ResolveProfileSurfaceStyle(
+   return ResolveSurfaceStyle(inputs);
+ }
+ 
++SurfaceStyle ResolveSurfaceStyleForWidget(const views::Widget* widget,
++                                         const PrefService* prefs) {
++  auto style = ResolveProfileSurfaceStyle(prefs);
++  if (widget) {
++    const auto* colors = widget->GetColorProvider();
++    style.panel_tint_color = colors->GetColor(kColorArciumPanel);
++    style.panel_base = colors->GetColor(kColorArciumPanel);
++    style.panel_background = colors->GetColor(kColorArciumPanelBackground);
++  }
++  return style;
++}
++
+ bool CanUseNativePanelGlass(const PrefService* prefs) {
+   const SurfaceStyle style = ResolveProfileSurfaceStyle(prefs);
+   // Glassmorphic is Chromium's shader, drawn inside the browser window.
+Index: src/chrome/browser/ui/views/helium/native_frame_materials.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/native_frame_materials.cc
++++ src/chrome/browser/ui/views/helium/native_frame_materials.cc
+@@ -11,6 +11,9 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/helium/helium_space.h"
++#include "chrome/browser/ui/helium/space_palette.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "ui/color/color_provider.h"
+ #include "chrome/browser/ui/helium/helium_space_service.h"
+ #include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -53,28 +56,11 @@ GlassSurfaceConfiguration ReadMaterialSe
+   return selection;
+ }
+ 
+-const SpaceBackground* SpaceBackgroundFor(const BrowserView* browser_view) {
+-  if (!ChromeAppearancePrefs(browser_view)) {
+-    return nullptr;
+-  }
+-  auto* spaces = HeliumSpaceServiceFactory::GetForProfileIfExists(
+-      browser_view->GetProfile()->GetOriginalProfile());
+-  const SpaceTheme* theme =
+-      spaces ? spaces->GetThemeForBrowser(
+-                   const_cast<BrowserView*>(browser_view)->browser())
+-             : nullptr;
+-  return theme && theme->background ? &*theme->background : nullptr;
+-}
+-
+ GlassSurfaceResolution ResolveNativeFrameGlass(
+     const BrowserView* browser_view,
+     const GlassBackendAvailability& availability) {
+   GlassSurfaceConfiguration selection =
+       ReadMaterialSelection(ChromeAppearancePrefs(browser_view));
+-  // A Space background is a custom appearance even when the profile has none.
+-  if (SpaceBackgroundFor(browser_view)) {
+-    selection.enabled = true;
+-  }
+   return ResolveGlassSurfaceConfiguration(
+       selection,
+       GetRequestedGlassBackend(), availability.native_liquid_glass,
+@@ -89,29 +75,22 @@ GlassSurfaceConfiguration GetNativeFrame
+   GlassSurfaceConfiguration configuration =
+       prefs ? ReadGlassSurfaceConfiguration(prefs)
+             : DefaultGlassSurfaceConfiguration();
+-  // A Space's background replaces the profile's glows, tint, and grain in its
+-  // window; the material stays the profile's.
+-  if (const SpaceBackground* space_background =
+-          SpaceBackgroundFor(browser_view)) {
+-    const SpaceBackground& background = *space_background;
+-    configuration.enabled = true;
+-    configuration.point_count =
+-        std::min(background.glows.size(), kMaxGlassColorPoints);
+-    for (size_t i = 0; i < configuration.point_count; ++i) {
+-      const SpaceGlow& glow = background.glows[i];
+-      configuration.points[i] = {
+-          .id = "space-glow-" + base::NumberToString(i),
+-          .color = SkColor4f::FromColor(glow.color),
+-          .x = glow.x,
+-          .y = glow.y,
+-          .radius = glow.radius,
+-          .opacity = glow.opacity,
+-      };
++  auto* spaces = browser_view && browser_view->GetProfile()
++      ? HeliumSpaceServiceFactory::GetForProfileIfExists(browser_view->GetProfile())
++      : nullptr;
++  const auto* theme = spaces ? spaces->GetThemeForBrowser(
++      const_cast<BrowserView*>(browser_view)->browser()) : nullptr;
++  configuration = SpacePaletteAppearance(theme, std::move(configuration));
++  if (browser_view && browser_view->GetWidget()) {
++    const auto* widget = browser_view->GetWidget();
++    ApplySpacePaletteForRendering(configuration, theme,
++        widget->GetColorMode() == ui::ColorProviderKey::ColorMode::kDark,
++        widget->GetColorProvider()->GetColor(kColorArciumChromeBackground));
++    if (SkColorGetA(*configuration.chrome_contrast_floor) == SK_AlphaOPAQUE) {
++      configuration.point_count = 0;
+     }
+-    configuration.tint_strength = background.tint_strength;
+-    configuration.grain = background.grain;
+-    configuration.color_harmony = GlassSurfaceColorHarmony::kCustom;
+   }
++
+   return configuration;
+ }
+ 
+Index: src/chrome/browser/ui/views/helium/peek_controller.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/peek_controller.cc
++++ src/chrome/browser/ui/views/helium/peek_controller.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/views/helium/peek_controller.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
+ 
+ #include <algorithm>
+ #include <utility>
+@@ -85,7 +86,7 @@ std::unique_ptr<views::ImageButton> Crea
+   button->SetPreferredSize(gfx::Size(kControlSize, kControlSize));
+   button->SetImageModel(views::Button::STATE_NORMAL,
+                         ui::ImageModel::FromVectorIcon(
+-                            icon, ui::kColorSysOnSurface, kControlIconSize));
++                            icon, kColorArciumText, kControlIconSize));
+   button->SetTooltipText(accessible_name);
+   button->GetViewAccessibility().SetName(accessible_name);
+   button->SetFocusBehavior(views::View::FocusBehavior::ALWAYS);
+@@ -220,7 +221,7 @@ class PeekOverlayView : public views::Vi
+   }
+ 
+   void OnStyleChanged() {
+-    style_ = ResolveProfileSurfaceStyle(prefs_);
++    style_ = ResolveSurfaceStyleForWidget(GetWidget(), prefs_);
+     ApplyStyle();
+   }
+ 
+@@ -253,7 +254,8 @@ class PeekOverlayView : public views::Vi
+       control.button->SetBorder(
+           glass ? views::CreateRoundedRectBorder(
+                       1, kControlSize / 2,
+-                      SkColorSetA(SK_ColorWHITE, style_.control_edge_alpha))
++                      SkColorSetA(GetWidget() ? GetColorProvider()->GetColor(kColorArciumText)
++                                               : SK_ColorWHITE, style_.control_edge_alpha))
+                 : nullptr);
+     }
+     if (GetWidget()) {
+@@ -266,20 +268,20 @@ class PeekOverlayView : public views::Vi
+     const SkColor tint = colors->GetColor(ui::kColorSysSurfaceVariant);
+     scrim_->SetBackground(views::CreateSolidBackground(
+         SkColorSetA(tint, style_.scrim.dim_alpha)));
+-    const SkColor surface = colors->GetColor(ui::kColorSysSurface);
++    const SkColor surface = colors->GetColor(kColorArciumPanel);
+     for (const Control& control : controls_) {
+       control.glass->SetTintColor(surface);
+       control.button->SetBackground(
+-          style_.control == SurfaceFinish::kSolid
+-              ? views::CreateRoundedRectBackground(ui::kColorSysSurface,
+-                                                   kControlSize / 2)
+-              : nullptr);
++          views::CreateRoundedRectBackground(
++              style_.control == SurfaceFinish::kSolid
++                  ? kColorArciumPanel : kColorArciumPanelBackground,
++              kControlSize / 2));
+     }
+   }
+ 
+   void OnThemeChanged() override {
+     views::View::OnThemeChanged();
+-    UpdateColors();
++    OnStyleChanged();
+   }
+ 
+   void Layout(PassKey) override {
+Index: src/chrome/browser/ui/views/helium/surface_style.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/surface_style.cc
++++ src/chrome/browser/ui/views/helium/surface_style.cc
+@@ -331,23 +331,10 @@ SurfaceTuning ReadSurfaceTuning(const Pr
+ 
+ SurfaceInputs ReadSurfaceInputs(const PrefService* prefs) {
+   const SurfaceSet set = ReadSurfaceSet(prefs);
+-  const SurfaceTuning tuning = ReadSurfaceTuning(prefs, set);
+-  std::optional<SkColor> window_tint_color;
+-  if (!tuning.panel_tint_color && prefs &&
+-      prefs->FindPreference(kArciumChromeAppearancePref)) {
+-    // Follow an actual window glass color without copying it into the saved
+-    // panel tuning, so editing or removing that color updates every panel.
+-    const auto window = ReadGlassSurfaceConfiguration(prefs);
+-    if (window.point_count > 0) {
+-      window_tint_color = window.points[0].color.toSkColor();
+-    }
+-  }
+-  return {
+-      .set = set,
+-      .panel = ReadPanelChoice(prefs),
+-      .tuning = tuning,
+-      .window_tint_color = window_tint_color,
+-  };
++  auto tuning = ReadSurfaceTuning(prefs, set);
++  // Old independent tint colors are read only as legacy data, never rendered.
++  tuning.panel_tint_color.reset();
++  return {.set = set, .panel = ReadPanelChoice(prefs), .tuning = tuning};
+ }
+ 
+ SurfaceStyle ResolveSurfaceStyle(const SurfaceInputs& inputs) {
+@@ -397,7 +384,11 @@ SurfaceStyle ResolveSurfaceStyle(const S
+   return style;
+ }
+ 
++
+ SkColor PanelSolidColor(const SurfaceStyle& style) {
++  if (style.panel_base) {
++    return *style.panel_base;
++  }
+   return color_utils::AlphaBlend(
+       style.panel_tint_color.value_or(kPanelSolidColor), kPanelSolidColor,
+       style.panel_tint);
+Index: src/chrome/browser/ui/views/helium/surface_style.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/surface_style.h
++++ src/chrome/browser/ui/views/helium/surface_style.h
+@@ -15,6 +15,7 @@
+ #include "ui/gfx/geometry/rounded_corners_f.h"
+ 
+ class PrefService;
++namespace views { class Widget; }
+ 
+ namespace helium {
+ 
+@@ -156,6 +157,8 @@ struct SurfaceStyle {
+   float panel_tint = 0.3f;
+   float panel_blur = 9.0f;
+   std::optional<SkColor> panel_tint_color;
++  std::optional<SkColor> panel_base;
++  std::optional<SkColor> panel_background;
+   bool panel_shadow = true;
+   SurfaceFinish control = SurfaceFinish::kSolid;
+   float control_tint = 0.55f;
+@@ -198,6 +201,9 @@ SurfaceTuning ReadSurfaceTuning(const Pr
+ SurfaceInputs ReadSurfaceInputs(const PrefService* prefs);
+ 
+ SurfaceStyle ResolveSurfaceStyle(const SurfaceInputs& inputs);
++// Materials come from prefs; every color comes from the owning Space provider.
++SurfaceStyle ResolveSurfaceStyleForWidget(const views::Widget* widget,
++                                         const PrefService* prefs);
+ 
+ // Opaque panel/fallback fill with the same tint color and strength as glass.
+ SkColor PanelSolidColor(const SurfaceStyle& style);
+Index: src/chrome/browser/ui/views/location_bar/location_bar_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/location_bar/location_bar_view.cc
++++ src/chrome/browser/ui/views/location_bar/location_bar_view.cc
+@@ -1675,7 +1675,7 @@ void LocationBarView::RefreshBackground(
+   }
+ 
+   if (IsArciumCommandBarGlass()) {
+-    background_color_ = SK_ColorTRANSPARENT;
++    background_color_ = color_provider->GetColor(kColorArciumPanelBackground);
+   }
+ 
+   if (is_popup_mode_) {
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_bar_material.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_bar_material.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_bar_material.cc
+@@ -70,7 +70,7 @@ void CommandBarMaterial::Refresh() {
+   // Floating panels share one role: an explicit command bar choice, or the
+   // profile's surface preset. They never change the window's own setting.
+   const helium::SurfaceStyle style =
+-      helium::ResolveSurfaceStyle(helium::ReadSurfaceInputs(prefs_));
++      helium::ResolveSurfaceStyleForWidget(widget_, prefs_);
+   const bool requested = prefs_ && style.panel_glass;
+   helium::GlassSurfaceConfiguration configuration =
+       helium::ReadPanelGlassConfiguration(prefs_, style);
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
+@@ -2,6 +2,7 @@
+ // Use of this source code is governed by the GPL-3.0 license.
+ 
+ #include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -494,7 +495,7 @@ class CommandPanelView::Row : public vie
+                            gfx::Rect(0, 0, w, h));
+     if (GetState() == STATE_PRESSED) {
+       FillRoundRect(canvas, gfx::Rect(0, 0, w, h), 6,
+-                    Alpha(SK_ColorWHITE, 16));
++                    Alpha(panel_->text_color_, 16));
+     }
+     panel_->PaintRow(canvas, index_, w, h);
+     canvas->Restore();
+@@ -770,15 +771,6 @@ void CommandPanelView::BindPreferences(
+     const auto style =
+         helium::ResolveSurfaceStyle(helium::ReadSurfaceInputs(owner));
+     view->shadow_ = style.panel_shadow;
+-    view->panel_color_ = helium::PanelSolidColor(style);
+-    view->text_color_ =
+-        color_utils::GetColorWithMaxContrast(view->panel_color_) != SK_ColorWHITE
+-            ? SkColorSetRGB(24, 24, 24) : kText;
+-    view->muted_color_ = color_utils::AlphaBlend(
+-        view->text_color_, view->panel_color_, .7f);
+-    view->input_->SetTextColorId(view->text_color_ == kText
+-                                     ? ui::kColorRefNeutral99
+-                                     : ui::kColorRefNeutral10);
+     view->SchedulePaint();
+   };
+   update_surface(this, prefs);
+@@ -801,13 +793,20 @@ void CommandPanelView::BindPreferences(
+ }
+ void CommandPanelView::OnThemeChanged() {
+   views::View::OnThemeChanged();
+-  // The panel widget inherits the owning browser's profile theme key.
+-  accent_color_ = GetColorProvider()->GetColor(ui::kColorSysPrimary);
++  const auto* colors = GetColorProvider();
++  accent_color_ = colors->GetColor(ui::kColorSysPrimary);
++  panel_color_ = colors->GetColor(kColorArciumPanel);
++  text_color_ = colors->GetColor(kColorArciumText);
++  muted_color_ = colors->GetColor(kColorArciumMutedText);
++  if (input_) {
++    input_->SetTextColorId(kColorArciumText);
++  }
+   SchedulePaint();
+ }
+ SkColor CommandPanelView::SelectionColor() const {
+-  return color_utils::AlphaBlend(accent_color_, panel_color_, .35f);
++  return GetColorProvider()->GetColor(kColorOmniboxResultsBackgroundSelected);
+ }
++
+ SkColor CommandPanelView::AccentColor(SkColor background) const {
+   return color_utils::BlendForMinContrast(accent_color_, background).color;
+ }
+@@ -1481,16 +1480,15 @@ void CommandPanelView::OnPaint(gfx::Canv
+   }
+   cc::PaintFlags fill;
+   fill.setAntiAlias(true);
+-  fill.setColor(panel_color_);
+-  if (!native_material_) {
+-    canvas->DrawPath(GetContourPath(), fill);
+-  }
++  fill.setColor(native_material_
++      ? GetColorProvider()->GetColor(kColorArciumPanelBackground) : panel_color_);
++  canvas->DrawPath(GetContourPath(), fill);
+   PaintConnectedScopeGlow(canvas);
+ 
+   canvas->FillRect(gfx::Rect(body.x() + S(ui_scale_, 10),
+                              body.y() + S(ui_scale_, kSearchHeight - 1),
+                              body.width() - S(ui_scale_, 20), S(ui_scale_, 1)),
+-                   Alpha(SK_ColorWHITE, 21));
++                   Alpha(text_color_, 21));
+   GlyphAt(canvas, Glyph::kSearch,
+           gfx::Rect(body.x() + S(ui_scale_, 20), body.y() + S(ui_scale_, 22),
+                     S(ui_scale_, 18), S(ui_scale_, 18)),
+@@ -1498,7 +1496,7 @@ void CommandPanelView::OnPaint(gfx::Canv
+   canvas->FillRect(
+       gfx::Rect(body.x() + S(ui_scale_, 10), body.bottom() - S(ui_scale_, 42),
+                 body.width() - S(ui_scale_, 20), S(ui_scale_, 1)),
+-      Alpha(SK_ColorWHITE, 11));
++      Alpha(text_color_, 11));
+   {
+     gfx::ScopedCanvas restore(canvas);
+     canvas->Translate(gfx::Vector2d(body.x() + S(ui_scale_, 19),
+@@ -1524,7 +1522,7 @@ void CommandPanelView::OnPaint(gfx::Canv
+     canvas->FillRect(
+         gfx::Rect(scroll_->x(), y + S(ui_scale_, kHeadingHeight - 7),
+                   scroll_->width(), S(ui_scale_, 1)),
+-        Alpha(SK_ColorWHITE, 11));
++        Alpha(text_color_, 11));
+   }
+   if (rows_.empty()) {
+     auto empty_bounds = scroll_->bounds();
+@@ -1545,11 +1543,8 @@ void CommandPanelView::PaintRow(gfx::Can
+       static_cast<int>(index) == selected_ && !scope_browsing_;
+   const SkColor row_background = selected ? SelectionColor() : panel_color_;
+   const SkColor row_text = selected
+-      ? (color_utils::GetColorWithMaxContrast(row_background) == SK_ColorWHITE
+-             ? kText : SkColorSetRGB(24, 24, 24))
+-      : text_color_;
+-  const SkColor row_muted = selected
+-      ? color_utils::AlphaBlend(row_text, row_background, .7f) : muted_color_;
++      ? GetColorProvider()->GetColor(kColorOmniboxResultsTextSelected) : text_color_;
++  const SkColor row_muted = selected ? row_text : muted_color_;
+   // Selection semantics update immediately. The cue arrives with the moving
+   // highlight, so it cannot announce the destination ahead of that highlight.
+   const float cue_progress = selected ? selection_animation_.GetCurrentValue() : 0;
+@@ -1635,13 +1630,13 @@ void CommandPanelView::PaintRow(gfx::Can
+     if (appearance_.labels == CommandPanelAppearance::Labels::kPill) {
+       FillRoundRect(
+           canvas, gfx::Rect(label_x, (height - 18) / 2, category_width, 18), 4,
+-          Alpha(appearance_.scope_tints ? tint : SK_ColorWHITE,
++          Alpha(appearance_.scope_tints ? tint : row_text,
+                 appearance_.scope_tints ? (selected ? 31 : 20)
+                                         : (selected ? 10 : 4)));
+     }
+     if (joined) {
+       canvas->FillRect(gfx::Rect(label_x - 10, (height - 13) / 2, 1, 13),
+-                       Alpha(SK_ColorWHITE, 46));
++                       Alpha(row_text, 46));
+     }
+     canvas->DrawStringRect(
+         data.category, category_font,
+@@ -1715,7 +1710,7 @@ void CommandPanelView::PaintScope(gfx::C
+   if (!appearance_.connected) {
+     cc::PaintFlags edge;
+     edge.setAntiAlias(true);
+-    edge.setColor(Alpha(SK_ColorWHITE, base::ClampRound(36 + 20 * weight)));
++    edge.setColor(Alpha(text_color_, base::ClampRound(36 + 20 * weight)));
+     edge.setStyle(cc::PaintFlags::kStroke_Style);
+     edge.setStrokeWidth(1);
+     canvas->DrawPath(TopRoundedRectPath(
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
+@@ -98,7 +98,6 @@ bool BrowserView::ShowArciumNativeComman
+   params.bounds = bounds;
+   params.delegate = arcium_native_command_delegate_.get();
+   widget->Init(std::move(params));
+-  widget->SetColorModeOverride(ui::ColorProviderKey::ColorMode::kDark);
+   arcium_command_bar_widget_ = std::move(widget);
+   arcium_command_bar_widget_->AddObserver(this);
+   arcium_command_bar_widget_->GetRootView()->DeprecatedLayoutImmediately();
+Index: src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
++++ src/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
+@@ -407,9 +407,8 @@ void RoundedOmniboxResultsFrame::Layout(
+ void RoundedOmniboxResultsFrame::SetNativeMaterial(bool native_material) {
+   uses_native_material_ = native_material;
+   contents_host_->SetBackground(
+-      native_material
+-          ? nullptr
+-          : views::CreateSolidBackground(kColorOmniboxResultsBackground));
++      views::CreateSolidBackground(native_material
++          ? kColorArciumPanelBackground : kColorOmniboxResultsBackground));
+   static_cast<TopBackgroundView*>(top_background_.get())
+       ->SetNativeMaterial(native_material);
+   contents_host_->SchedulePaint();
+Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
++++ src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
+@@ -23,6 +23,7 @@
+ #include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/views/frame/browser_widget.h"
+ #include "chrome/browser/ui/views/helium/arcium_space_controls.h"
+ #include "components/prefs/pref_service.h"
+ #include "content/public/browser/web_contents.h"
+@@ -457,41 +458,8 @@ VerticalTabStripBottomContainer::Current
+ }
+ 
+ void VerticalTabStripBottomContainer::ApplyTheme() {
+-  // BrowserWidget reads the theme from the Space service when it builds its
+-  // color provider key; repaint only when that theme changes.
+-  std::optional<helium::SpaceTheme> current = CurrentTheme();
+-  if (!GetWidget() || current == applied_theme_) {
+-    return;
+-  }
+-  const helium::SpaceTheme before = applied_theme_.value_or(helium::SpaceTheme());
+-  const helium::SpaceTheme after = current.value_or(helium::SpaceTheme());
+-  const bool web_mode_changed = before.web_mode != after.web_mode;
+-  const bool chrome_changed =
+-      before.color != after.color || before.mode != after.mode;
+-  applied_theme_ = std::move(current);
+-  if (chrome_changed) {
+-    GetWidget()->ThemeChanged();
+-  } else if (before.background != after.background) {
+-#if BUILDFLAG(IS_MAC)
+-    // Glows, tint, and grain are native window state. Update only that, not
+-    // the whole Views tree, so dragging a glow or a slider stays cheap.
+-    if (auto* native = static_cast<views::NativeWidgetMac*>(
+-            GetWidget()->native_widget())) {
+-      static_cast<views::WidgetObserver*>(native)->OnWidgetThemeChanged(
+-          GetWidget());
+-    }
+-#else
+-    GetWidget()->ThemeChanged();
+-#endif
+-  }
+-  // Pages take their light or dark mode from web preferences, which a chrome
+-  // repaint alone does not recompute when only the pages' mode changed.
+-  if (web_mode_changed) {
+-    if (TabStripModel* tabs = browser_->GetTabStripModel()) {
+-      for (int i = 0; i < tabs->count(); ++i) {
+-        tabs->GetWebContentsAt(i)->NotifyPreferencesChanged();
+-      }
+-    }
++  if (GetWidget()) {
++    static_cast<BrowserWidget*>(GetWidget())->RefreshSpacePalette();
+   }
+ }
+ 
+Index: src/chrome/test/BUILD.gn
+===================================================================
+--- src.orig/chrome/test/BUILD.gn
++++ src/chrome/test/BUILD.gn
+@@ -11420,6 +11420,25 @@ test("captcha_provider_fuzztests") {
+ }
+ 
+ if (toolkit_views) {
++  test("arcium_space_color_mixer_unittests") {
++    sources = [ "../browser/ui/color/arcium_space_color_mixer_unittest.cc" ]
++    deps = [
++      "//base/test:run_all_unittests",
++      "//chrome/browser/ui/color:mixers",
++      "//testing/gtest",
++      "//ui/color",
++    ]
++  }
++
++  test("arcium_space_palette_unittests") {
++    sources = [ "../browser/ui/color/arcium_space_palette_unittest.cc" ]
++    deps = [
++      "//base/test:run_all_unittests",
++      "//chrome/browser/ui/color:arcium_space_palette",
++      "//testing/gtest",
++    ]
++  }
++
+   test("arcium_glass_surface_configuration_unittests") {
+     sources = [
+       "../browser/ui/views/helium/glass_surface_configuration_unittest.cc",
+Index: src/ui/color/BUILD.gn
+===================================================================
+--- src.orig/ui/color/BUILD.gn
++++ src/ui/color/BUILD.gn
+@@ -7,6 +7,11 @@ import("//mojo/public/tools/bindings/moj
+ import("//testing/test.gni")
+ import("//ui/base/ui_features.gni")
+ 
++source_set("arcium_palette") {
++  sources = [ "arcium_palette.h" ]
++  public_deps = [ "//skia" ]
++}
++
+ source_set("color_headers") {
+   sources = [
+     "color_id.h",
+Index: src/ui/color/arcium_palette.h
+===================================================================
+--- /dev/null
++++ src/ui/color/arcium_palette.h
+@@ -0,0 +1,16 @@
++// Copyright 2026 The Helium Authors
++// SPDX-License-Identifier: GPL-3.0-only
++#ifndef UI_COLOR_ARCIUM_PALETTE_H_
++#define UI_COLOR_ARCIUM_PALETTE_H_
++#include <compare>
++#include "third_party/skia/include/core/SkColor.h"
++namespace ui {
++struct ArciumPalette {
++    SkColor seed = SkColorSetRGB(119, 101, 181);
++    SkColor companion = seed;
++    int controls_chroma = 100;
++    int panels_chroma = 35;
++    auto operator<=>(const ArciumPalette&) const = default;
++  };
++}  // namespace ui
++#endif  // UI_COLOR_ARCIUM_PALETTE_H_
+Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/glass_surface_configuration.h
++++ src/chrome/browser/ui/views/helium/glass_surface_configuration.h
+@@ -113,6 +113,8 @@ struct GlassColorPoint {
+ };
+ 
+ struct GlassSurfaceConfiguration {
++  // Resolved per-window paint policy. Never serialized into the picker recipe.
++  std::optional<SkColor> chrome_contrast_floor;
+   // false means that the existing command-line glass policy remains in
+   // control. The editable default enables the Liquid Glass surface.
+   bool enabled = true;
+@@ -132,7 +134,8 @@ struct GlassSurfaceConfiguration {
+   size_t point_count = 0;
+ 
+   bool operator==(const GlassSurfaceConfiguration& other) const {
+-    if (enabled != other.enabled || material != other.material ||
++    if (chrome_contrast_floor != other.chrome_contrast_floor ||
++        enabled != other.enabled || material != other.material ||
+         material_opacity != other.material_opacity ||
+         glass_tint_opacity != other.glass_tint_opacity ||
+         glass_style != other.glass_style ||
+Index: src/chrome/browser/ui/views/helium/surface_style_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/surface_style_unittest.cc
++++ src/chrome/browser/ui/views/helium/surface_style_unittest.cc
+@@ -60,49 +60,35 @@ TEST(SurfaceStyleTest, MissingAndMalform
+   EXPECT_EQ(ReadPanelChoice(&prefs), PanelChoice::kGlass);
+ }
+ 
+-TEST(SurfaceStyleTest, PanelTintFollowsEditableWindowColorAndKeepsCustomOverride) {
++TEST(SurfaceStyleTest, RuntimeIgnoresIndependentLegacyPanelAndWindowColors) {
+   TestingPrefServiceSimple prefs;
+-  prefs.registry()->RegisterStringPref(kArciumSurfaceSetPref, kSurfaceSetGlass);
++  prefs.registry()->RegisterStringPref(kArciumSurfaceSetPref, kSurfaceSetCustom);
+   prefs.registry()->RegisterDictionaryPref(kArciumSurfaceTuningPref);
+   prefs.registry()->RegisterDictionaryPref(kArciumChromeAppearancePref);
+-
+   auto window = DefaultGlassSurfaceConfiguration();
+-  window.point_count = 2;
+-  window.points[0].color = SkColor4f::FromColor(SK_ColorRED);
+-  window.points[1].color = SkColor4f::FromColor(SK_ColorGREEN);
+-  prefs.SetDict(kArciumChromeAppearancePref,
+-                SerializeGlassSurfaceConfiguration(window));
+-  EXPECT_EQ(ResolveSurfaceStyle(ReadSurfaceInputs(&prefs)).panel_tint_color,
+-            SK_ColorRED);
+-  EXPECT_FALSE(ReadSurfaceTuning(&prefs, SurfaceSet::kGlass).panel_tint_color);
+-  // Settings serializes the input tuning; a resolved window color must not
+-  // turn the Window tint choice into a custom color in its snapshot.
+-  EXPECT_FALSE(ReadSurfaceInputs(&prefs).tuning.panel_tint_color);
+-
+-  // Editing the window color changes the tint without saving a panel color.
+-  window.points[0].color = SkColor4f::FromColor(SK_ColorBLUE);
+-  prefs.SetDict(kArciumChromeAppearancePref,
+-                SerializeGlassSurfaceConfiguration(window));
+-  EXPECT_EQ(ResolveSurfaceStyle(ReadSurfaceInputs(&prefs)).panel_tint_color,
+-            SK_ColorBLUE);
+-
+-  prefs.SetString(kArciumSurfaceSetPref, kSurfaceSetCustom);
++  window.point_count = 1;
+   SurfaceTuning tuning;
+   tuning.panel_tint_color = SK_ColorYELLOW;
+-  prefs.SetDict(kArciumSurfaceTuningPref, SerializeSurfaceTuning(tuning));
+-  EXPECT_EQ(ResolveSurfaceStyle(ReadSurfaceInputs(&prefs)).panel_tint_color,
+-            SK_ColorYELLOW);
+-
+-  // Re-enabling Window tint follows the palette again; removing all colors
+-  // leaves the color unset for the renderer's browser-theme fallback.
+-  tuning.panel_tint_color.reset();
+-  prefs.SetDict(kArciumSurfaceTuningPref, SerializeSurfaceTuning(tuning));
+-  EXPECT_EQ(ResolveSurfaceStyle(ReadSurfaceInputs(&prefs)).panel_tint_color,
+-            SK_ColorBLUE);
+-  window.point_count = 0;
+-  prefs.SetDict(kArciumChromeAppearancePref,
+-                SerializeGlassSurfaceConfiguration(window));
+-  EXPECT_FALSE(ResolveSurfaceStyle(ReadSurfaceInputs(&prefs)).panel_tint_color);
++  tuning.panel_blur = 17;
++  tuning.panel_tint = .65;
++  const auto saved = SerializeSurfaceTuning(tuning);
++  prefs.SetDict(kArciumSurfaceTuningPref, saved.Clone());
++  for (SkColor color : {SK_ColorRED, SK_ColorBLUE}) {
++    window.points[0].color = SkColor4f::FromColor(color);
++    prefs.SetDict(kArciumChromeAppearancePref,
++                  SerializeGlassSurfaceConfiguration(window));
++    const auto inputs = ReadSurfaceInputs(&prefs);
++    EXPECT_FALSE(inputs.tuning.panel_tint_color);
++    EXPECT_FALSE(ResolveSurfaceStyle(inputs).panel_tint_color);
++    EXPECT_EQ(inputs.tuning.panel_blur, 17);
++    EXPECT_EQ(inputs.tuning.panel_tint, .65);
++    EXPECT_EQ(prefs.GetDict(kArciumSurfaceTuningPref), saved);
++  }
++  SurfaceStyle resolved;
++  resolved.panel_base = SK_ColorMAGENTA;
++  resolved.panel_tint_color = SK_ColorYELLOW;
++  resolved.panel_tint = 0;
++  EXPECT_EQ(PanelSolidColor(resolved), SK_ColorMAGENTA);
+ }
+ 
+ TEST(SurfaceStyleTest, SolidFillUsesTintAndChromiumBlurStaysIndependent) {
+Index: src/chrome/browser/ui/color/arcium_space_palette_initializer.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/color/arcium_space_palette_initializer.h
+@@ -0,0 +1,17 @@
++// Copyright 2026 The Helium Authors
++// SPDX-License-Identifier: GPL-3.0-only
++#ifndef CHROME_BROWSER_UI_COLOR_ARCIUM_SPACE_PALETTE_INITIALIZER_H_
++#define CHROME_BROWSER_UI_COLOR_ARCIUM_SPACE_PALETTE_INITIALIZER_H_
++
++#include "ui/color/arcium_palette.h"
++#include "ui/color/color_provider_key.h"
++
++namespace arcium {
++// Immutable, interned values keep the existing per-window initializer identity
++// stable across widgets, Space switches, and visits to a previous palette.
++ui::ColorProviderKey::InitializerSupplier* GetSpacePaletteInitializer(
++    const ui::ArciumPalette& palette);
++bool IsSpacePaletteInitializer(
++    const ui::ColorProviderKey::InitializerSupplier* initializer);
++}  // namespace arcium
++#endif
+Index: src/chrome/browser/ui/color/win/native_chrome_color_mixer_win.cc
+===================================================================
+--- src.orig/chrome/browser/ui/color/win/native_chrome_color_mixer_win.cc
++++ src/chrome/browser/ui/color/win/native_chrome_color_mixer_win.cc
+@@ -13,6 +13,7 @@
+ #include "base/win/windows_version.h"
+ #include "chrome/browser/themes/theme_properties.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/color/arcium_space_palette_initializer.h"
+ #include "chrome/browser/win/mica_titlebar.h"
+ #include "chrome/grit/theme_resources.h"
+ #include "ui/color/color_id.h"
+@@ -247,7 +248,9 @@ void AddNativeNonHighContrastColors(ui::
+     mixer[ui::kColorSysHeaderContainerInactive] = {ui::kColorSysBase};
+   }
+ 
+-  if (ShouldDefaultThemeUseMicaTitlebar() && !key.app_controller) {
++  if (ShouldDefaultThemeUseMicaTitlebar() &&
++      (!key.app_controller ||
++       arcium::IsSpacePaletteInitializer(key.app_controller.get()))) {
+     mixer[kColorNewTabButtonBackgroundFrameActive] = {SK_ColorTRANSPARENT};
+     mixer[kColorNewTabButtonBackgroundFrameInactive] = {SK_ColorTRANSPARENT};
+     mixer[kColorNewTabButtonInkDropFrameActive] =
+Index: src/chrome/browser/ui/color/arcium_space_color_mixer_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/color/arcium_space_color_mixer_unittest.cc
+@@ -0,0 +1,72 @@
++// Copyright 2026 The Helium Authors
++// SPDX-License-Identifier: GPL-3.0-only
++#include "chrome/browser/ui/color/arcium_space_color_mixer.h"
++#include "chrome/browser/ui/color/arcium_space_palette_initializer.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/color/color_mixer.h"
++#include "ui/color/color_provider.h"
++#include "ui/color/color_recipe.h"
++
++TEST(ArciumSpaceColorMixer, InitializerIdentityIncludesWholeRecipe) {
++  ui::ArciumPalette input;
++  auto* first = arcium::GetSpacePaletteInitializer(input);
++  EXPECT_EQ(first, arcium::GetSpacePaletteInitializer(input));
++  auto other = input;
++  other.controls_chroma += 1;
++  EXPECT_NE(first, arcium::GetSpacePaletteInitializer(other));
++  other = input;
++  other.panels_chroma += 1;
++  EXPECT_NE(first, arcium::GetSpacePaletteInitializer(other));
++  other = input;
++  other.companion ^= 1;
++  EXPECT_NE(first, arcium::GetSpacePaletteInitializer(other));
++  EXPECT_TRUE(arcium::IsSpacePaletteInitializer(first));
++  EXPECT_FALSE(arcium::IsSpacePaletteInitializer(nullptr));
++  EXPECT_EQ(first, arcium::GetSpacePaletteInitializer(input));
++}
++
++TEST(ArciumSpaceColorMixer, PerWindowCallbackAppliesResolvedRoles) {
++  ui::ArciumPalette input;
++  for (bool dark : {false, true}) {
++    ui::ColorProvider provider;
++    ui::ColorProviderKey key;
++    key.color_mode = dark ? ui::ColorProviderKey::ColorMode::kDark
++                          : ui::ColorProviderKey::ColorMode::kLight;
++    key.app_controller = arcium::GetSpacePaletteInitializer(input);
++    AddArciumSpaceColorMixer(&provider, key);
++    key.app_controller->AddColorMixers(&provider, key);
++    provider.GenerateColorMapForTesting();
++    const auto expected = arcium::GenerateSpacePalette(input, dark);
++    EXPECT_EQ(provider.GetColor(kColorNewTabPageBackground), expected.content_canvas);
++    EXPECT_EQ(provider.GetColor(kColorArciumChrome), expected.chrome);
++    EXPECT_EQ(provider.GetColor(kColorToolbar), expected.chrome);
++    EXPECT_EQ(provider.GetColor(kColorArciumPanelBackground), expected.panel_background);
++    EXPECT_EQ(provider.GetColor(kColorOmniboxResultsBackgroundSelected), expected.accent);
++    EXPECT_EQ(provider.GetColor(kColorOmniboxResultsTextSelected), expected.on_accent);
++  }
++}
++
++TEST(ArciumSpaceColorMixer, AccessibilityRetainsStockRoles) {
++  for (bool forced : {false, true}) {
++    ui::ColorProvider provider;
++    auto& stock = provider.AddMixer();
++    stock[kColorToolbar] = {SK_ColorWHITE};
++    stock[kColorOmniboxResultsBackground] = {SK_ColorBLACK};
++    stock[kColorOmniboxText] = {SK_ColorWHITE};
++    stock[kColorOmniboxTextDimmed] = {SK_ColorGRAY};
++    ui::ColorProviderKey key;
++    if (forced) {
++      key.forced_colors = ui::ColorProviderKey::ForcedColors::kWhite;
++    } else {
++      key.contrast_mode = ui::ColorProviderKey::ContrastMode::kHigh;
++    }
++    AddArciumSpaceColorMixer(&provider, key);
++    arcium::GetSpacePaletteInitializer(ui::ArciumPalette())->AddColorMixers(
++        &provider, key);
++    provider.GenerateColorMapForTesting();
++    EXPECT_EQ(provider.GetColor(kColorArciumChrome), SK_ColorWHITE);
++    EXPECT_EQ(provider.GetColor(kColorArciumPanel), SK_ColorBLACK);
++    EXPECT_EQ(provider.GetColor(kColorArciumMutedText), SK_ColorGRAY);
++  }
++}
+Index: src/chrome/browser/ui/webui/new_tab_page/new_tab_page_handler.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/new_tab_page/new_tab_page_handler.cc
++++ src/chrome/browser/ui/webui/new_tab_page/new_tab_page_handler.cc
+@@ -512,7 +512,8 @@ NewTabPageHandler::NewTabPageHandler(
+     content::WebContents* web_contents,
+     const base::Time& ntp_navigation_start_time,
+     const std::vector<ntp::ModuleIdDetail>* module_id_details)
+-    : SettingsEnabledObserver(
++    : content::WebContentsObserver(web_contents),
++      SettingsEnabledObserver(
+           optimization_guide::UserVisibleFeatureKey::kWallpaperSearch),
+       logger_(profile,
+               chrome::ChromeUINewTabPageURLAsGURL(),
+@@ -1244,6 +1245,10 @@ void NewTabPageHandler::OnContextualSear
+ #endif  // !BUILDFLAG(IS_ANDROID)
+ }
+ 
++void NewTabPageHandler::OnColorProviderChanged() {
++  OnThemeChanged();
++}
++
+ void NewTabPageHandler::OnNativeThemeUpdated(ui::NativeTheme* observed_theme) {
+   OnThemeChanged();
+ }
+Index: src/chrome/browser/ui/webui/new_tab_page/new_tab_page_handler.h
+===================================================================
+--- src.orig/chrome/browser/ui/webui/new_tab_page/new_tab_page_handler.h
++++ src/chrome/browser/ui/webui/new_tab_page/new_tab_page_handler.h
+@@ -77,7 +77,8 @@ class ThemeProvider;
+ }  // namespace ui
+ 
+ class NewTabPageHandler
+-    : public new_tab_page::mojom::PageHandler,
++    : public content::WebContentsObserver,
++      public new_tab_page::mojom::PageHandler,
+       public ui::NativeThemeObserver,
+       public ThemeServiceObserver,
+       public NtpCustomBackgroundServiceObserver,
+@@ -175,6 +176,9 @@ class NewTabPageHandler
+   void OnContextualSearchIPHEngaged() override;
+ 
+  private:
++  // content::WebContentsObserver:
++  void OnColorProviderChanged() override;
++
+   // ui::NativeThemeObserver:
+   void OnNativeThemeUpdated(ui::NativeTheme* observed_theme) override;
+ 
+Index: src/chrome/browser/ui/webui/new_tab_page_third_party/new_tab_page_third_party_handler.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/new_tab_page_third_party/new_tab_page_third_party_handler.cc
++++ src/chrome/browser/ui/webui/new_tab_page_third_party/new_tab_page_third_party_handler.cc
+@@ -26,7 +26,8 @@ NewTabPageThirdPartyHandler::NewTabPageT
+     mojo::PendingRemote<new_tab_page_third_party::mojom::Page> pending_page,
+     Profile* profile,
+     content::WebContents* web_contents)
+-    : profile_(profile),
++    : content::WebContentsObserver(web_contents),
++      profile_(profile),
+       web_contents_(web_contents),
+       page_{std::move(pending_page)},
+       receiver_{this, std::move(pending_page_handler)} {
+@@ -46,6 +47,10 @@ void NewTabPageThirdPartyHandler::OnThem
+   NotifyAboutTheme();
+ }
+ 
++void NewTabPageThirdPartyHandler::OnColorProviderChanged() {
++  NotifyAboutTheme();
++}
++
+ void NewTabPageThirdPartyHandler::OnNativeThemeUpdated(
+     ui::NativeTheme* observed_theme) {
+   NotifyAboutTheme();
+Index: src/chrome/browser/ui/webui/new_tab_page_third_party/new_tab_page_third_party_handler.h
+===================================================================
+--- src.orig/chrome/browser/ui/webui/new_tab_page_third_party/new_tab_page_third_party_handler.h
++++ src/chrome/browser/ui/webui/new_tab_page_third_party/new_tab_page_third_party_handler.h
+@@ -24,7 +24,8 @@ class WebContents;
+ }  // namespace content
+ 
+ class NewTabPageThirdPartyHandler
+-    : public new_tab_page_third_party::mojom::PageHandler,
++    : public content::WebContentsObserver,
++      public new_tab_page_third_party::mojom::PageHandler,
+       public ThemeServiceObserver,
+       public ui::NativeThemeObserver {
+  public:
+@@ -48,6 +49,9 @@ class NewTabPageThirdPartyHandler
+   // ThemeServiceObserver:
+   void OnThemeChanged() override;
+ 
++  // content::WebContentsObserver:
++  void OnColorProviderChanged() override;
++
+   // ui::NativeThemeObserver:
+   void OnNativeThemeUpdated(ui::NativeTheme* observed_theme) override;
+ 
