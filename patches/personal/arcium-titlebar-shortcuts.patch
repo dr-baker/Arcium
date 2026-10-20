@@ -1,0 +1,212 @@
+Index: src/chrome/browser/ui/browser_shortcuts/arcium_shortcut_presets_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_shortcuts/arcium_shortcut_presets_unittest.cc
++++ src/chrome/browser/ui/browser_shortcuts/arcium_shortcut_presets_unittest.cc
+@@ -236,7 +236,15 @@ TEST(ArciumShortcutPresetsTest,
+ 
+   const char kArcToolbarShortcut[] = "Meta+Shift+KeyD";
+   EXPECT_EQ(service.FindCommandForAccelerator(kArcToolbarShortcut),
+-            IDC_BOOKMARK_ALL_TABS);
++            IDC_ARCIUM_TOGGLE_TOOLBAR);
++  ASSERT_EQ(service.AssignAcceleratorToCommand(IDC_BOOKMARK_ALL_TABS,
++                                               kArcToolbarShortcut),
++            AssignmentResult::kSuccess);
++  {
++    BrowserShortcutService restored_user_binding(&pref_service);
++    EXPECT_EQ(restored_user_binding.FindCommandForAccelerator(
++                  kArcToolbarShortcut), IDC_BOOKMARK_ALL_TABS);
++  }
+   EXPECT_EQ(ApplyArcShortcutPreset(&service), PresetResult::kApplied);
+   EXPECT_EQ(service.FindCommandForAccelerator(kArcToolbarShortcut),
+             IDC_ARCIUM_TOGGLE_TOOLBAR);
+Index: src/chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.cc
++++ src/chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.cc
+@@ -323,6 +323,8 @@ std::vector<int> GetBrowserShortcutComma
+   // Ctrl+S dispatcher.
+   commands.push_back(IDC_SAVE_PAGE);
+   commands.push_back(IDC_ARCIUM_TOGGLE_TOOLBAR);
++  // Keep the former toolbar-shortcut owner assignable without a default.
++  commands.push_back(IDC_BOOKMARK_ALL_TABS);
+   commands.push_back(IDC_TOGGLE_VERTICAL_TABS_COLLAPSE);
+ 
+   commands.push_back(IDC_COPY_URL);
+Index: src/chrome/browser/ui/browser_shortcuts/browser_shortcut_platform_mac.mm
+===================================================================
+--- src.orig/chrome/browser/ui/browser_shortcuts/browser_shortcut_platform_mac.mm
++++ src/chrome/browser/ui/browser_shortcuts/browser_shortcut_platform_mac.mm
+@@ -117,22 +117,24 @@ bool IsDynamicCloseCommand(int command_i
+ }
+ 
+ int CanonicalMenuCommandId(int command_id) {
+-  // The macOS menu exposes Save Page and Copy URL as separate items, while
+-  // Chromium's static Cocoa accelerators own their shared keys through legacy
+-  // dispatchers. Treat those dispatchers as the canonical menu defaults when
+-  // deciding whether the menu item is still at its default.
++  // Some menu commands share their canonical key with another command,
++  // including Bookmark All Tabs after the toolbar takes Command-Shift-D.
++  // Use that owner when checking whether a menu item is still at its default.
+   switch (command_id) {
+     case IDC_SAVE_PAGE:
+       return IDC_CTRL_S_SHORTCUT;
+     case IDC_COPY_URL:
+       return IDC_COPY_OR_INSPECT_SHORTCUT;
++    case IDC_BOOKMARK_ALL_TABS:
++      return IDC_ARCIUM_TOGGLE_TOOLBAR;
+     default:
+       return command_id;
+   }
+ }
+ 
+ bool IsUnassignedCanonicalMenuCommand(int command_id) {
+-  return command_id == IDC_SAVE_PAGE || command_id == IDC_COPY_URL;
++  return command_id == IDC_SAVE_PAGE || command_id == IDC_COPY_URL ||
++         command_id == IDC_BOOKMARK_ALL_TABS;
+ }
+ 
+ bool IsManagedMenuCommand(
+@@ -186,8 +188,8 @@ bool IsMenuCommandHeliumModifiable(
+ 
+   const bool is_unassigned_canonical_menu_command =
+       IsUnassignedCanonicalMenuCommand(command_id) && !accelerator.has_value();
+-  // Chromium's native Save Page and Copy URL items may intentionally have no
+-  // key equivalent; treat that absence as their canonical baseline. A present
++  // These native menu items may intentionally have no key equivalent;
++  // treat that absence as their canonical baseline. A present
+   // noncanonical key is an AppKit remap and remains reserved.
+   if (!IsManagedMenuCommand(item, command_id,
+                             AcceleratorFromMenuItem(item)) &&
+@@ -222,9 +224,8 @@ void AppendMenuItems(
+       const ui::Accelerator* default_accelerator =
+           user_modifiable ? CanonicalMenuAcceleratorForCommand(command_id)
+                           : nullptr;
+-      // An unassigned Save Page or Copy URL menu item inherits its legacy
+-      // default for modifiability checks, but must not steal that accelerator
+-      // from the legacy dispatcher in the service's default map.
++      // An unassigned alias inherits its canonical key for modifiability
++      // checks, without taking that key from its owner in the default map.
+       const bool is_unassigned_canonical_menu_command =
+           IsUnassignedCanonicalMenuCommand(command_id) &&
+           !menu_accelerator_for_defaults.has_value();
+@@ -272,6 +273,7 @@ bool IsPlatformDefaultUserModifiable(int
+     case IDC_BOOKMARK_THIS_TAB:
+       return accelerator ==
+              ui::Accelerator(ui::VKEY_D, ui::EF_COMMAND_DOWN);
++    case IDC_ARCIUM_TOGGLE_TOOLBAR:
+     case IDC_BOOKMARK_ALL_TABS:
+       return accelerator == ui::Accelerator(
+                                 ui::VKEY_D,
+Index: src/chrome/browser/ui/browser_shortcuts/browser_shortcut_platform_mac_unittest.mm
+===================================================================
+--- src.orig/chrome/browser/ui/browser_shortcuts/browser_shortcut_platform_mac_unittest.mm
++++ src/chrome/browser/ui/browser_shortcuts/browser_shortcut_platform_mac_unittest.mm
+@@ -263,6 +263,49 @@ TEST(BrowserShortcutPlatformMacTest,
+ }
+ 
+ TEST(BrowserShortcutPlatformMacTest,
++     ToolbarDefaultPreservesCustomBookmarkMenuShortcut) {
++  ASSERT_NE(NSApp, nil);
++  NSMenu* bookmark_menu = MainMenuWithCommandShortcut(
++      IDC_BOOKMARK_ALL_TABS, @"Bookmark All Tabs", @"", 0,
++      @selector(commandDispatch:));
++  NSMenuItem* bookmark_all = [bookmark_menu itemWithTag:IDC_BOOKMARK_ALL_TABS];
++  ScopedMainMenu menu(bookmark_menu);
++  const ui::Accelerator toolbar(ui::VKEY_D,
++                               ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN);
++  const ui::Accelerator custom_bookmark(ui::VKEY_B,
++                                       ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN);
++
++  for (int refresh = 0; refresh < 3; ++refresh) {
++    EXPECT_EQ(CountDefaultsForCommand(GetPlatformDefaultAccelerators(),
++                                     IDC_BOOKMARK_ALL_TABS), 0);
++    UpdatePlatformMenuAccelerators({
++        {toolbar, IDC_ARCIUM_TOGGLE_TOOLBAR},
++        {custom_bookmark, IDC_BOOKMARK_ALL_TABS},
++    });
++    EXPECT_TRUE([bookmark_all.keyEquivalent isEqualToString:@"b"]);
++    EXPECT_EQ(bookmark_all.keyEquivalentModifierMask,
++              NSEventModifierFlagCommand | NSEventModifierFlagOption);
++  }
++  UpdatePlatformMenuAccelerators({{toolbar, IDC_ARCIUM_TOGGLE_TOOLBAR}});
++  EXPECT_EQ(bookmark_all.keyEquivalent.length, 0u);
++
++  // A later AppKit override remains reserved instead of being rewritten.
++  bookmark_all.keyEquivalent = @"x";
++  bookmark_all.keyEquivalentModifierMask =
++      NSEventModifierFlagCommand | NSEventModifierFlagOption;
++  bool found_override = false;
++  for (const auto& entry : GetPlatformDefaultAccelerators()) {
++    if (entry.command_id == IDC_BOOKMARK_ALL_TABS) {
++      found_override = true;
++      EXPECT_FALSE(entry.user_modifiable);
++    }
++  }
++  EXPECT_TRUE(found_override);
++  UpdatePlatformMenuAccelerators({{custom_bookmark, IDC_BOOKMARK_ALL_TABS}});
++  EXPECT_TRUE([bookmark_all.keyEquivalent isEqualToString:@"x"]);
++}
++
++TEST(BrowserShortcutPlatformMacTest,
+      ManagedEmptyAliasItemsRetainTheirOriginalUnassignedBaseline) {
+   ASSERT_NE(NSApp, nil);
+   const ui::Accelerator save_page_accelerator(
+@@ -421,7 +464,7 @@ TEST(BrowserShortcutPlatformMacTest,
+   const ExpectedAccelerator expected[] = {
+       {IDC_BOOKMARK_THIS_TAB,
+        ui::Accelerator(ui::VKEY_D, ui::EF_COMMAND_DOWN)},
+-      {IDC_BOOKMARK_ALL_TABS,
++      {IDC_ARCIUM_TOGGLE_TOOLBAR,
+        ui::Accelerator(ui::VKEY_D,
+                        ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN)},
+       {IDC_COPY_OR_INSPECT_SHORTCUT,
+Index: src/chrome/browser/ui/cocoa/accelerators_cocoa.mm
+===================================================================
+--- src.orig/chrome/browser/ui/cocoa/accelerators_cocoa.mm
++++ src/chrome/browser/ui/cocoa/accelerators_cocoa.mm
+@@ -100,7 +100,7 @@ const struct AcceleratorMapping {
+     {IDC_HOME, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN, ui::VKEY_H},
+     {IDC_BACK, ui::EF_COMMAND_DOWN, ui::VKEY_OEM_4},
+     {IDC_FORWARD, ui::EF_COMMAND_DOWN, ui::VKEY_OEM_6},
+-    {IDC_BOOKMARK_ALL_TABS, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN,
++    {IDC_ARCIUM_TOGGLE_TOOLBAR, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN,
+      ui::VKEY_D},
+     {IDC_MINIMIZE_WINDOW, ui::EF_COMMAND_DOWN, ui::VKEY_M},
+     {IDC_SELECT_NEXT_TAB, ui::EF_CONTROL_DOWN, ui::VKEY_TAB},
+Index: src/chrome/browser/ui/helium/arcium_settings_model.cc
+===================================================================
+--- src.orig/chrome/browser/ui/helium/arcium_settings_model.cc
++++ src/chrome/browser/ui/helium/arcium_settings_model.cc
+@@ -55,7 +55,7 @@ constexpr char kSharedPaletteDarkChromeC
+ constexpr char kSharedPaletteControlColorIDKey[] = "controlColorID";
+ constexpr size_t kSharedPaletteConfigurationKeyCount = 13;
+ 
+-constexpr std::array<std::string_view, 41> kProfilePreferences = {
++constexpr std::array<std::string_view, 42> kProfilePreferences = {
+     prefs::kRestoreOnStartup,
+     prefs::kPromptForDownload,
+     prefs::kHeliumLittleArcExternalLinks,
+@@ -68,6 +68,7 @@ constexpr std::array<std::string_view, 4
+     prefs::kHeliumLayout,
+     prefs::kVerticalTabsUncollapsedWidth,
+     arcium::kCollapsedSidebarStylePref,
++    arcium::kShowToolbarPref,
+     arcium::kCommandBarAppearancePref,
+     arcium::kCommandPanelLayoutPref,
+     helium::kArciumSurfaceSetPref,
+Index: src/chrome/test/BUILD.gn
+===================================================================
+--- src.orig/chrome/test/BUILD.gn
++++ src/chrome/test/BUILD.gn
+@@ -11513,6 +11513,11 @@ if (!is_android && toolkit_views) {
+     }
+ 
+     if (is_mac) {
++      sources += [
++        "../browser/ui/browser_shortcuts/arcium_shortcut_presets_unittest.cc",
++        "../browser/ui/browser_shortcuts/browser_shortcut_platform_mac_unittest.mm",
++      ]
++      deps += [ "//components/prefs:test_support" ]
+       data_deps = [ "//chrome:chrome_framework" ]
+     } else if (is_linux || is_chromeos || is_win) {
+       data_deps = [ "//chrome:packed_resources" ]
