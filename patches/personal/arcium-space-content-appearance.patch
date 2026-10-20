@@ -1,0 +1,640 @@
+Index: src/chrome/browser/chrome_content_browser_client.cc
+===================================================================
+--- src.orig/chrome/browser/chrome_content_browser_client.cc
++++ src/chrome/browser/chrome_content_browser_client.cc
+@@ -187,7 +187,7 @@
+ #include "chrome/browser/ui/helium/helium_space.h"
+ #include "chrome/browser/ui/helium/helium_space_service.h"
+ #include "chrome/browser/ui/helium/helium_space_service_factory.h"
+-#include "components/tabs/public/tab_interface.h"
++#include "chrome/browser/ui/helium/space_content_appearance.h"
+ #include "chrome/browser/ui/login/http_auth_coordinator.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+@@ -329,6 +329,7 @@
+ #include "components/site_isolation/site_isolation_policy.h"
+ #include "components/subresource_filter/content/browser/content_subresource_filter_throttle_manager.h"
+ #include "components/supervised_user/core/common/features.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "components/translate/core/common/translate_switches.h"
+ #include "components/user_prefs/user_prefs.h"
+ #include "components/variations/variations_associated_data.h"
+@@ -4201,10 +4202,10 @@ GetPreferredColorScheme(const WebPrefere
+   } else {
+     // WebUI and regular pages follow the browser theme color mode, provided by
+     // the color provider.
+-    preferred_color_scheme =
+-        web_contents->GetColorMode() == ui::ColorProviderKey::ColorMode::kLight
+-            ? blink::mojom::PreferredColorScheme::kLight
+-            : blink::mojom::PreferredColorScheme::kDark;
++    preferred_color_scheme = helium::GetSpaceContentColorMode(web_contents) ==
++                                     ui::ColorProviderKey::ColorMode::kLight
++                                 ? blink::mojom::PreferredColorScheme::kLight
++                                 : blink::mojom::PreferredColorScheme::kDark;
+     // An Arcium Space can give its pages a different light or dark mode from
+     // its browser chrome.
+     if (const helium::SpaceTheme* space_theme =
+@@ -4221,8 +4222,8 @@ GetPreferredColorScheme(const WebPrefere
+   // Update the preferred root scrollbar color based on the lightness level of
+   // the toolbar's color.
+   preferred_root_scrollbar_color_scheme =
+-      color_utils::IsDark(
+-          web_contents->GetColorProvider().GetColor(kColorToolbar))
++      color_utils::IsDark(helium::GetSpaceContentColorProvider(web_contents)
++                              .GetColor(kColorToolbar))
+           ? blink::mojom::PreferredColorScheme::kDark
+           : blink::mojom::PreferredColorScheme::kLight;
+ #endif
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn
++++ src/chrome/browser/ui/BUILD.gn
+@@ -475,6 +475,8 @@ static_library("ui") {
+     "helium/helium_space.cc",
+     "helium/helium_space.h",
+     "helium/space_palette.h",
++    "helium/space_content_appearance.cc",
++    "helium/space_content_appearance.h",
+     "helium/helium_space_service.cc",
+     "helium/helium_space_service.h",
+     "helium/helium_space_service_factory.cc",
+@@ -1423,6 +1425,8 @@ static_library("ui") {
+       "//chrome/browser/ui/webui/new_tab_page/action_chips",
+     ]
+     public_deps += [ "//components/themes" ]
++    # ThemeSource resolves New Tab colors through the owning Space.
++    allow_circular_includes_from += [ "//chrome/browser/ui/webui:theme_source" ]
+   }
+ 
+   if (!is_android) {
+@@ -2346,6 +2350,9 @@ static_library("ui") {
+       "//chrome/browser/ui/webui/ntp",
+       "//chrome/browser/ui/webui/ntp:ntp_resource_cache",
+ 
++      # Third-party New Tab uses the same per-Space content appearance.
++      "//chrome/browser/ui/webui/new_tab_page_third_party:impl",
++
+       # omnibox_popup includes browser_window.h and other headers from
+       # //chrome/browser/ui.
+       "//chrome/browser/ui/webui/omnibox_everywhere",
+Index: src/chrome/browser/ui/helium/arcium_settings_model.cc
+===================================================================
+--- src.orig/chrome/browser/ui/helium/arcium_settings_model.cc
++++ src/chrome/browser/ui/helium/arcium_settings_model.cc
+@@ -872,6 +872,47 @@ bool ArciumSettingsModel::SetAppearanceM
+   return true;
+ }
+ 
++bool ArciumSettingsModel::IsContentAppearanceAvailable() const {
++  return !shutting_down_ && prefs_ && GetAppearanceSpace() &&
++         prefs_->FindPreference(helium::kHeliumSpacesPref);
++}
++
++int ArciumSettingsModel::GetContentAppearanceMode() const {
++  const auto* space = GetAppearanceSpace();
++  if (!space ||
++      space->theme().content_mode == helium::SpaceTheme::Mode::kAuto) {
++    return static_cast<int>(ThemeService::BrowserColorScheme::kSystem);
++  }
++  return static_cast<int>(space->theme().content_mode ==
++                                  helium::SpaceTheme::Mode::kDark
++                              ? ThemeService::BrowserColorScheme::kDark
++                              : ThemeService::BrowserColorScheme::kLight);
++}
++
++bool ArciumSettingsModel::IsContentAppearanceManaged() const {
++  return !IsContentAppearanceAvailable() ||
++         !prefs_->IsUserModifiablePreference(helium::kHeliumSpacesPref);
++}
++
++bool ArciumSettingsModel::SetContentAppearanceMode(int mode) {
++  if (IsContentAppearanceManaged()) {
++    return false;
++  }
++  const int system =
++      static_cast<int>(ThemeService::BrowserColorScheme::kSystem);
++  const int dark = static_cast<int>(ThemeService::BrowserColorScheme::kDark);
++  if (mode < system || mode > dark) {
++    return false;
++  }
++  auto* space = GetAppearanceSpace();
++  auto theme = space->theme();
++  theme.content_mode = mode == system ? helium::SpaceTheme::Mode::kAuto
++                       : mode == dark ? helium::SpaceTheme::Mode::kDark
++                                      : helium::SpaceTheme::Mode::kLight;
++  space_service_->SetSpaceTheme(space->id(), std::move(theme));
++  return true;
++}
++
+ base::DictValue ArciumSettingsModel::GetSharedPalette() const {
+   base::DictValue result;
+   result.Set(kSharedPaletteConfigurationKey, base::DictValue());
+Index: src/chrome/browser/ui/helium/arcium_settings_model.h
+===================================================================
+--- src.orig/chrome/browser/ui/helium/arcium_settings_model.h
++++ src/chrome/browser/ui/helium/arcium_settings_model.h
+@@ -106,13 +106,17 @@ class ArciumSettingsModel final
+   bool SetChromeAppearance(const base::DictValue& configuration);
+   void ResetChromeAppearance();
+ 
+-  // Browser appearance mode is owned by ThemeService. The integer values
+-  // match ThemeService::BrowserColorScheme and are exposed only to the
+-  // SettingsUI bridge.
++  // Window chrome and browser-page appearance belong to the captured Space.
++  // Values match ThemeService::BrowserColorScheme for the SettingsUI bridge;
++  // system means follow window chrome for browser-page appearance.
+   bool IsAppearanceAvailable() const;
+   int GetAppearanceMode() const;
+   bool IsAppearanceManaged() const;
+   bool SetAppearanceMode(int mode);
++  bool IsContentAppearanceAvailable() const;
++  int GetContentAppearanceMode() const;
++  bool IsContentAppearanceManaged() const;
++  bool SetContentAppearanceMode(int mode);
+ 
+   // The palette dictionary stores SettingsPaletteConfiguration JSON together
+   // with its resolved browser colors. Effective state is returned only when
+Index: src/chrome/browser/ui/helium/helium_space.cc
+===================================================================
+--- src.orig/chrome/browser/ui/helium/helium_space.cc
++++ src/chrome/browser/ui/helium/helium_space.cc
+@@ -47,6 +47,7 @@ constexpr char kPinsCollapsedKey[] = "pi
+ constexpr char kThemeColorKey[] = "color";
+ constexpr char kThemeModeKey[] = "mode";
+ constexpr char kThemeWebModeKey[] = "web_mode";
++constexpr char kThemeContentModeKey[] = "content_mode";
+ constexpr char kThemeBackgroundKey[] = "background";
+ constexpr char kBackgroundGlowsKey[] = "glows";
+ constexpr char kBackgroundTintKey[] = "tint_strength";
+@@ -170,6 +171,7 @@ SpaceTheme SpaceTheme::FromDict(const ba
+   theme.color = ParseColor(dict->FindString(kThemeColorKey));
+   theme.mode = ParseMode(dict->FindString(kThemeModeKey));
+   theme.web_mode = ParseMode(dict->FindString(kThemeWebModeKey));
++  theme.content_mode = ParseMode(dict->FindString(kThemeContentModeKey));
+   theme.background = ParseBackground(dict->FindDict(kThemeBackgroundKey));
+   if (const auto* id = dict->FindString("accent_glow_id"); id && id->size() <= 128) {
+     theme.accent_glow_id = *id;
+@@ -187,6 +189,7 @@ base::DictValue SpaceTheme::ToDict() con
+   }
+   dict.Set(kThemeModeKey, ModeString(mode));
+   dict.Set(kThemeWebModeKey, ModeString(web_mode));
++  dict.Set(kThemeContentModeKey, ModeString(content_mode));
+   dict.Set("palette_version", 1);
+   dict.Set("accent_glow_id", accent_glow_id);
+   dict.Set("controls_chroma", controls_chroma);
+Index: src/chrome/browser/ui/helium/helium_space.h
+===================================================================
+--- src.orig/chrome/browser/ui/helium/helium_space.h
++++ src/chrome/browser/ui/helium/helium_space.h
+@@ -58,7 +58,8 @@ struct SpaceTheme {
+   base::DictValue ToDict() const;
+   bool IsDefault() const {
+     return !color && mode == Mode::kAuto && web_mode == Mode::kAuto &&
+-           !background && accent_glow_id.empty() && controls_chroma == 100 &&
++           content_mode == Mode::kAuto && !background &&
++           accent_glow_id.empty() && controls_chroma == 100 &&
+            panels_chroma == 35;
+   }
+ 
+@@ -73,6 +74,8 @@ struct SpaceTheme {
+   Mode mode = Mode::kAuto;
+   // Light or dark web pages; kAuto follows the chrome.
+   Mode web_mode = Mode::kAuto;
++  // New Tab and native Settings content; kAuto follows window chrome.
++  Mode content_mode = Mode::kAuto;
+   std::optional<SpaceBackground> background;
+   // Stable palette source; absent or deleted selections use the first glow.
+   std::string accent_glow_id;
+Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/helium/helium_space_service_unittest.cc
++++ src/chrome/browser/ui/helium/helium_space_service_unittest.cc
+@@ -22,13 +22,14 @@
+ #include "chrome/browser/browser_features.h"
+ #include "chrome/browser/lifetime/browser_shutdown.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/themes/theme_service.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/helium/arcium_settings_model.h"
+ #include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
+ #include "chrome/browser/ui/helium/helium_space.h"
+-#include "chrome/browser/ui/helium/space_palette.h"
+ #include "chrome/browser/ui/helium/helium_space_service_factory.h"
++#include "chrome/browser/ui/helium/space_palette.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/pinned_tab_codec.h"
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+@@ -2087,5 +2088,85 @@ TEST_F(HeliumSpaceServiceTest, AccentMod
+   EXPECT_FALSE(model.SetSpaceAccent(recipe.points[0].id));
+   EXPECT_EQ(service_->GetSpaceById(space_id)->theme(), selected);
+ }
++TEST_F(HeliumSpaceServiceTest,
++       ContentModeKeepsTargetRecipeAndIndependentPolicy) {
++  const int follow =
++      static_cast<int>(ThemeService::BrowserColorScheme::kSystem);
++  const int light = static_cast<int>(ThemeService::BrowserColorScheme::kLight);
++  const int dark = static_cast<int>(ThemeService::BrowserColorScheme::kDark);
++  auto theme = WithSpacePaletteAppearance(SpaceTheme(),
++                                          DefaultGlassSurfaceConfiguration());
++  theme.mode = SpaceTheme::Mode::kDark;
++  theme.web_mode = SpaceTheme::Mode::kLight;
++  const auto target_id = space_->id();
++  const auto other_id =
++      service_->GetOrCreateSpace("content-other", u"Other")->id();
++  service_->SetSpaceTheme(target_id, theme);
++  const auto original = service_->GetSpaceById(target_id)->theme();
++  const auto other_original = service_->GetSpaceById(other_id)->theme();
++  arcium_settings::ArciumSettingsModel model(profile(), base::DoNothing(),
++                                             base::DoNothing());
++  ASSERT_TRUE(model.SetAppearanceSpace(target_id));
++  service_->SetActiveSpace(other_id);
++  ASSERT_TRUE(model.IsContentAppearanceAvailable());
++  EXPECT_FALSE(model.IsContentAppearanceManaged());
++  EXPECT_EQ(model.GetContentAppearanceMode(), follow);
++  auto expected = original;
++  for (int mode : {light, dark, follow}) {
++    ASSERT_TRUE(model.SetContentAppearanceMode(mode));
++    expected.content_mode = mode == follow ? SpaceTheme::Mode::kAuto
++                            : mode == dark ? SpaceTheme::Mode::kDark
++                                           : SpaceTheme::Mode::kLight;
++    EXPECT_EQ(service_->GetSpaceById(target_id)->theme(), expected);
++    EXPECT_EQ(service_->GetSpaceById(other_id)->theme(), other_original);
++    EXPECT_EQ(model.GetContentAppearanceMode(), mode);
++    EXPECT_EQ(model.GetAppearanceMode(), dark);
++  }
++  EXPECT_FALSE(model.SetContentAppearanceMode(-1));
++  EXPECT_FALSE(model.SetContentAppearanceMode(dark + 1));
++  EXPECT_EQ(service_->GetSpaceById(target_id)->theme(), expected);
++  auto* test_prefs = profile()->GetTestingPrefService();
++  test_prefs->SetManagedPref(prefs::kBrowserColorScheme, base::Value(follow));
++  EXPECT_FALSE(model.IsContentAppearanceManaged());
++  ASSERT_TRUE(model.SetContentAppearanceMode(light));
++  expected.content_mode = SpaceTheme::Mode::kLight;
++  EXPECT_EQ(service_->GetSpaceById(target_id)->theme(), expected);
++  test_prefs->RemoveManagedPref(prefs::kBrowserColorScheme);
++  test_prefs->SetManagedPref(
++      kHeliumSpacesPref,
++      base::Value(test_prefs->GetList(kHeliumSpacesPref).Clone()));
++  EXPECT_TRUE(model.IsContentAppearanceManaged());
++  EXPECT_FALSE(model.SetContentAppearanceMode(dark));
++  test_prefs->RemoveManagedPref(kHeliumSpacesPref);
++  EXPECT_EQ(service_->GetSpaceById(target_id)->theme(), expected);
++  ASSERT_TRUE(model.SetAppearanceSpace(other_id));
++  ASSERT_TRUE(service_->DeleteSpace(other_id));
++  EXPECT_FALSE(model.IsContentAppearanceAvailable());
++  EXPECT_FALSE(model.SetContentAppearanceMode(dark));
++  EXPECT_EQ(service_->GetSpaceById(target_id)->theme(), expected);
++}
++
++TEST_F(HeliumSpaceServiceTest, ContentModeDefaultsAndRoundTripsIndependently) {
++  base::DictValue legacy;
++  legacy.Set("mode", "dark");
++  legacy.Set("web_mode", "light");
++  auto theme = SpaceTheme::FromDict(&legacy);
++  EXPECT_EQ(theme.content_mode, SpaceTheme::Mode::kAuto);
++  EXPECT_EQ(theme.mode, SpaceTheme::Mode::kDark);
++  EXPECT_EQ(theme.web_mode, SpaceTheme::Mode::kLight);
++  theme.content_mode = SpaceTheme::Mode::kLight;
++  const auto saved = theme.ToDict();
++  EXPECT_EQ(SpaceTheme::FromDict(&saved), theme);
++  auto invalid = saved.Clone();
++  invalid.Set("content_mode", "unknown");
++  const auto restored = SpaceTheme::FromDict(&invalid);
++  EXPECT_EQ(restored.content_mode, SpaceTheme::Mode::kAuto);
++  EXPECT_EQ(restored.mode, theme.mode);
++  EXPECT_EQ(restored.web_mode, theme.web_mode);
++  SpaceTheme only_content;
++  EXPECT_TRUE(only_content.IsDefault());
++  only_content.content_mode = SpaceTheme::Mode::kDark;
++  EXPECT_FALSE(only_content.IsDefault());
++}
+ 
+ }  // namespace helium
+Index: src/chrome/browser/ui/helium/space_content_appearance.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/helium/space_content_appearance.cc
+@@ -0,0 +1,95 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium/space_content_appearance.h"
++
++#include <optional>
++
++#include "build/build_config.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/common/url_constants.h"
++#include "ui/color/color_provider_manager.h"
++#include "ui/native_theme/native_theme.h"
++#include "url/gurl.h"
++
++#if !BUILDFLAG(IS_ANDROID)
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium/helium_space.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/common/webui_url_constants.h"
++#include "components/tabs/public/tab_interface.h"
++#include "ui/views/widget/widget.h"
++#endif
++
++namespace helium {
++namespace {
++std::optional<ui::ColorProviderKey> ContentColorProviderKey(
++    content::WebContents* contents) {
++#if !BUILDFLAG(IS_ANDROID)
++  if (!contents || Profile::FromBrowserContext(contents->GetBrowserContext())
++                       ->IsOffTheRecord()) {
++    return std::nullopt;
++  }
++  const auto& url = contents->GetVisibleURL();
++  if (!url.SchemeIs(content::kChromeUIScheme) ||
++      !(url.host() == chrome::kChromeUINewTabHost ||
++        url.host() == chrome::kChromeUINewTabPageHost ||
++        url.host() == chrome::kChromeUINewTabPageThirdPartyHost)) {
++    return std::nullopt;
++  }
++  if (ui::NativeTheme::GetInstanceForWeb()->forced_colors() !=
++      ui::ColorProviderKey::ForcedColors::kNone) {
++    return std::nullopt;
++  }
++  auto* tab = tabs::TabInterface::MaybeGetFromContents(contents);
++  auto* window = tab ? tab->GetBrowserWindowInterface() : nullptr;
++  auto* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
++  auto* spaces =
++      browser
++          ? HeliumSpaceServiceFactory::GetForProfileIfExists(browser->profile())
++          : nullptr;
++  const auto* theme = spaces ? spaces->GetThemeForBrowser(browser) : nullptr;
++  auto* view =
++      browser ? BrowserView::GetBrowserViewForBrowser(browser) : nullptr;
++  auto* widget = view ? view->GetWidget() : nullptr;
++  if (!theme || !widget) {
++    return std::nullopt;
++  }
++  auto key = widget->GetColorProviderKey();
++  if (key.forced_colors != ui::ColorProviderKey::ForcedColors::kNone ||
++      key.contrast_mode == ui::ColorProviderKey::ContrastMode::kHigh) {
++    return std::nullopt;
++  }
++  if (theme->content_mode != SpaceTheme::Mode::kAuto) {
++    key.color_mode = theme->content_mode == SpaceTheme::Mode::kDark
++                         ? ui::ColorProviderKey::ColorMode::kDark
++                         : ui::ColorProviderKey::ColorMode::kLight;
++  }
++  return key;
++#else
++  return std::nullopt;
++#endif
++}
++}  // namespace
++
++const ui::ColorProvider& GetSpaceContentColorProvider(
++    content::WebContents* contents) {
++  if (auto key = ContentColorProviderKey(contents)) {
++    return *ui::ColorProviderManager::Get().GetColorProviderFor(*key);
++  }
++  return contents->GetColorProvider();
++}
++
++ui::ColorProviderKey::ColorMode GetSpaceContentColorMode(
++    content::WebContents* contents) {
++  if (auto key = ContentColorProviderKey(contents)) {
++    return key->color_mode;
++  }
++  return contents->GetColorMode();
++}
++}  // namespace helium
+Index: src/chrome/browser/ui/helium/space_content_appearance.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/helium/space_content_appearance.h
+@@ -0,0 +1,26 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_SPACE_CONTENT_APPEARANCE_H_
++#define CHROME_BROWSER_UI_HELIUM_SPACE_CONTENT_APPEARANCE_H_
++
++#include "ui/color/color_provider_key.h"
++
++namespace content {
++class WebContents;
++}
++namespace ui {
++class ColorProvider;
++}
++
++namespace helium {
++// Built-in New Tab pages may choose a scheme independently of their window.
++// Other contents and accessibility color overrides retain their usual provider.
++const ui::ColorProvider& GetSpaceContentColorProvider(
++    content::WebContents* contents);
++ui::ColorProviderKey::ColorMode GetSpaceContentColorMode(
++    content::WebContents* contents);
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_UI_HELIUM_SPACE_CONTENT_APPEARANCE_H_
+Index: src/chrome/browser/ui/views/frame/browser_widget.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_widget.cc
++++ src/chrome/browser/ui/views/frame/browser_widget.cc
+@@ -295,7 +295,8 @@ void BrowserWidget::RefreshSpacePalette(
+       widget->ThemeChanged();
+     }
+   }
+-  if (before.mode != after.mode || before.web_mode != after.web_mode) {
++  if (before.mode != after.mode || before.web_mode != after.web_mode ||
++      before.content_mode != after.content_mode) {
+     auto* tabs = browser_view_->browser()->tab_strip_model();
+     for (int i = 0; i < tabs->count(); ++i) {
+       tabs->GetWebContentsAt(i)->NotifyPreferencesChanged();
+Index: src/chrome/browser/ui/webui/new_tab_page/new_tab_page_handler.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/new_tab_page/new_tab_page_handler.cc
++++ src/chrome/browser/ui/webui/new_tab_page/new_tab_page_handler.cc
+@@ -60,6 +60,7 @@
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/hats/hats_service.h"
+ #include "chrome/browser/ui/hats/hats_service_factory.h"
++#include "chrome/browser/ui/helium/space_content_appearance.h"
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+ #include "chrome/browser/ui/views/new_tab_footer/footer_controller.h"
+ #include "chrome/browser/ui/views/side_panel/customize_chrome/customize_chrome_utils.h"
+@@ -1254,9 +1255,9 @@ void NewTabPageHandler::OnNativeThemeUpd
+ }
+ 
+ void NewTabPageHandler::OnThemeChanged() {
+-  page_->SetTheme(MakeTheme(web_contents_->GetColorProvider(), theme_provider_,
+-                            theme_service_, ntp_custom_background_service_,
+-                            web_contents_));
++  page_->SetTheme(MakeTheme(helium::GetSpaceContentColorProvider(web_contents_),
++                            theme_provider_, theme_service_,
++                            ntp_custom_background_service_, web_contents_));
+ }
+ 
+ void NewTabPageHandler::OnCustomBackgroundImageUpdated() {
+Index: src/chrome/browser/ui/webui/new_tab_page/new_tab_page_ui.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/new_tab_page/new_tab_page_ui.cc
++++ src/chrome/browser/ui/webui/new_tab_page/new_tab_page_ui.cc
+@@ -54,6 +54,7 @@
+ #include "chrome/browser/sync/sync_service_factory.h"
+ #include "chrome/browser/themes/theme_service_factory.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/helium/space_content_appearance.h"
+ #include "chrome/browser/ui/user_education/browser_user_education_interface.h"
+ #include "chrome/browser/ui/views/side_panel/customize_chrome/customize_chrome_utils.h"
+ #include "chrome/browser/ui/views/side_panel/customize_chrome/side_panel_controller_views.h"
+@@ -1416,7 +1417,8 @@ void NewTabPageUI::OnColorProviderChange
+   if (!web_contents() || !web_ui()) {
+     return;
+   }
+-  const ui::ColorProvider& color_provider = web_contents()->GetColorProvider();
++  const ui::ColorProvider& color_provider =
++      helium::GetSpaceContentColorProvider(web_contents());
+   auto background_color = color_provider.GetColor(kColorNewTabPageBackground);
+   update.Set("backgroundColor", skia::SkColorToHexString(background_color));
+   content::WebUIDataSource::Update(Profile::FromWebUI(web_ui()),
+Index: src/chrome/browser/ui/webui/new_tab_page/untrusted_source.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/new_tab_page/untrusted_source.cc
++++ src/chrome/browser/ui/webui/new_tab_page/untrusted_source.cc
+@@ -30,6 +30,7 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/search/background/ntp_custom_background_service.h"
+ #include "chrome/browser/search/background/ntp_custom_background_service_factory.h"
++#include "chrome/browser/ui/helium/space_content_appearance.h"
+ #include "chrome/browser/ui/search/ntp_user_data_logger.h"
+ #include "chrome/common/url_constants.h"
+ #include "chrome/grit/new_tab_page_untrusted_resources.h"
+@@ -198,7 +199,7 @@ void UntrustedSource::StartDataRequest(
+           async_param_data["dark"] = "1";
+         } else {
+           content::WebContents* web_contents = wc_getter.Run();
+-          if (web_contents && web_contents->GetColorMode() ==
++          if (web_contents && helium::GetSpaceContentColorMode(web_contents) ==
+                                   ui::ColorProviderKey::ColorMode::kDark) {
+             async_param_data["dark"] = "1";
+           }
+Index: src/chrome/browser/ui/webui/new_tab_page_third_party/new_tab_page_third_party_handler.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/new_tab_page_third_party/new_tab_page_third_party_handler.cc
++++ src/chrome/browser/ui/webui/new_tab_page_third_party/new_tab_page_third_party_handler.cc
+@@ -10,6 +10,7 @@
+ #include "chrome/browser/themes/theme_service.h"
+ #include "chrome/browser/themes/theme_service_factory.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/helium/space_content_appearance.h"
+ #include "chrome/browser/ui/webui/ntp/ntp_resource_cache.h"
+ #include "chrome/browser/ui/webui/util/webui_util_desktop.h"
+ #include "chrome/common/pref_names.h"
+@@ -62,16 +63,18 @@ void NewTabPageThirdPartyHandler::Notify
+   const ui::ThemeProvider* theme_provider =
+       webui::GetThemeProviderDeprecated(web_contents_);
+   DCHECK(theme_provider);
+-  const ui::ColorProvider& color_provider = web_contents_->GetColorProvider();
++  const ui::ColorProvider& color_provider =
++      helium::GetSpaceContentColorProvider(web_contents_);
+   most_visited->background_color =
+       color_provider.GetColor(kColorNewTabPageMostVisitedTileBackground);
+   most_visited->use_white_tile_icon =
+       color_utils::IsDark(most_visited->background_color);
+   theme->text_color = color_provider.GetColor(kColorNewTabPageText);
+   most_visited->is_dark = !color_utils::IsDark(theme->text_color);
+-  theme->color_background = color_utils::SkColorToRgbaString(GetThemeColor(
+-      webui::GetNativeThemeDeprecated(web_contents_),
+-      web_contents_->GetColorProvider(), kColorNewTabPageBackground));
++  theme->color_background = color_utils::SkColorToRgbaString(
++      GetThemeColor(webui::GetNativeThemeDeprecated(web_contents_),
++                    helium::GetSpaceContentColorProvider(web_contents_),
++                    kColorNewTabPageBackground));
+   if (theme_provider->HasCustomImage(IDR_THEME_NTP_BACKGROUND)) {
+     theme->background_tiling = GetNewTabBackgroundTilingCSS(*theme_provider);
+     theme->background_position =
+Index: src/chrome/browser/ui/webui/new_tab_page_third_party/new_tab_page_third_party_ui.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/new_tab_page_third_party/new_tab_page_third_party_ui.cc
++++ src/chrome/browser/ui/webui/new_tab_page_third_party/new_tab_page_third_party_ui.cc
+@@ -12,6 +12,7 @@
+ #include "chrome/browser/themes/theme_properties.h"
+ #include "chrome/browser/themes/theme_service.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/helium/space_content_appearance.h"
+ #include "chrome/browser/ui/webui/cr_components/most_visited/most_visited_handler.h"
+ #include "chrome/browser/ui/webui/favicon_source.h"
+ #include "chrome/browser/ui/webui/new_tab_page_third_party/new_tab_page_third_party_handler.h"
+@@ -90,7 +91,8 @@ void CreateAndAddNewTabPageThirdPartyUiH
+   // TODO(crbug.com/40823895): Always mock theme provider in tests so that
+   // `theme_provider` is never nullptr.
+   if (theme_provider) {
+-    const ui::ColorProvider& color_provider = web_contents->GetColorProvider();
++    const ui::ColorProvider& color_provider =
++        helium::GetSpaceContentColorProvider(web_contents);
+     source->AddString("backgroundPosition",
+                       GetNewTabBackgroundPositionCSS(*theme_provider));
+     source->AddString("backgroundTiling",
+Index: src/chrome/browser/ui/webui/ntp/ntp_resource_cache.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/ntp/ntp_resource_cache.cc
++++ src/chrome/browser/ui/webui/ntp/ntp_resource_cache.cc
+@@ -26,6 +26,7 @@
+ #include "chrome/browser/themes/theme_service_factory.h"
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/helium/space_content_appearance.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/webui/util/webui_util_desktop.h"
+ #include "chrome/common/buildflags.h"
+@@ -201,9 +202,9 @@ base::RefCountedMemory* NTPResourceCache
+     return new_tab_incognito_css_.get();
+   }
+ 
+-  if (!new_tab_css_) {
+-    CreateNewTabCSS(wc_getter);
+-  }
++  // A normal request belongs to a Space, whose content mode and palette can
++  // change independently of the profile's ThemeService notifications.
++  CreateNewTabCSS(wc_getter);
+   return new_tab_css_.get();
+ }
+ 
+@@ -398,7 +399,8 @@ void NTPResourceCache::CreateNewTabCSS(
+ 
+   const ui::ThemeProvider& tp =
+       ThemeService::GetThemeProviderForProfile(profile_);
+-  const ui::ColorProvider& cp = web_contents->GetColorProvider();
++  const ui::ColorProvider& cp =
++      helium::GetSpaceContentColorProvider(web_contents);
+ 
+   // Get our theme colors.
+   SkColor color_background =
+Index: src/chrome/browser/ui/webui/theme_source.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/theme_source.cc
++++ src/chrome/browser/ui/webui/theme_source.cc
+@@ -24,6 +24,7 @@
+ #include "chrome/browser/themes/theme_service_factory.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/color/chrome_color_provider_utils.h"
++#include "chrome/browser/ui/helium/space_content_appearance.h"
+ #include "chrome/browser/ui/webui/current_channel_logo.h"
+ #include "chrome/browser/ui/webui/ntp/ntp_resource_cache.h"
+ #include "chrome/browser/ui/webui/ntp/ntp_resource_cache_factory.h"
+@@ -370,7 +371,8 @@ void ThemeSource::SendColorsCss(
+     const content::WebContents::Getter& wc_getter,
+     content::URLDataSource::GotDataCallback callback) {
+   base::ElapsedTimer timer;
+-  const ui::ColorProvider& color_provider = wc_getter.Run()->GetColorProvider();
++  const ui::ColorProvider& color_provider =
++      helium::GetSpaceContentColorProvider(wc_getter.Run());
+ 
+ #if BUILDFLAG(IS_ANDROID)
+   bool is_grayscale = false;
