@@ -1,0 +1,552 @@
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -146,6 +146,8 @@ void RegisterBrowserUserPrefs(user_prefs
+                                 arcium::kChromeFrameBorderWidthDefault);
+   registry->RegisterIntegerPref(arcium::kCollapsedSidebarStylePref,
+                                 arcium::kCollapsedSidebarStyleFullyHidden);
++  registry->RegisterIntegerPref(arcium::kSidebarFooterActionPref,
++                                arcium::kSidebarFooterActionExtensions);
+   registry->RegisterBooleanPref(arcium::kShowToolbarPref, true);
+   registry->RegisterBooleanPref(arcium::kArcSidebarNavigationEnabledPref,
+                                 true);
+--- a/chrome/browser/ui/helium/arcium_appearance_prefs.h
++++ b/chrome/browser/ui/helium/arcium_appearance_prefs.h
+@@ -19,6 +19,17 @@ inline constexpr char kArcSidebarNavigat
+     "arcium.appearance.sidebar_navigation";
+ inline constexpr char kSidebarExtensionsDrawerEnabledPref[] =
+     "arcium.appearance.sidebar_extensions_drawer";
++// Stable profile values shared with native Settings and the footer menu.
++inline constexpr char kSidebarFooterActionPref[] =
++    "arcium.appearance.sidebar_footer_action";
++inline constexpr int kSidebarFooterActionNone = 0;
++inline constexpr int kSidebarFooterActionExtensions = 1;
++inline constexpr int kSidebarFooterActionHome = 2;
++inline constexpr int kSidebarFooterActionDownloads = 3;
++inline constexpr int kSidebarFooterActionHistory = 4;
++inline constexpr int kSidebarFooterActionBookmarks = 5;
++inline constexpr int kSidebarFooterActionMin = kSidebarFooterActionNone;
++inline constexpr int kSidebarFooterActionMax = kSidebarFooterActionBookmarks;
+ inline constexpr char kCollapsedSidebarStylePref[] =
+     "arcium.appearance.collapsed_sidebar_style";
+ inline constexpr int kCollapsedSidebarStyleIconRail = 0;
+--- a/chrome/browser/ui/helium/arcium_settings_model.cc
++++ b/chrome/browser/ui/helium/arcium_settings_model.cc
+@@ -55,7 +55,7 @@ constexpr char kSharedPaletteDarkChromeC
+ constexpr char kSharedPaletteControlColorIDKey[] = "controlColorID";
+ constexpr size_t kSharedPaletteConfigurationKeyCount = 13;
+ 
+-constexpr std::array<std::string_view, 42> kProfilePreferences = {
++constexpr std::array<std::string_view, 43> kProfilePreferences = {
+     prefs::kRestoreOnStartup,
+     prefs::kPromptForDownload,
+     prefs::kHeliumLittleArcExternalLinks,
+@@ -68,6 +68,7 @@ constexpr std::array<std::string_view, 4
+     prefs::kHeliumLayout,
+     prefs::kVerticalTabsUncollapsedWidth,
+     arcium::kCollapsedSidebarStylePref,
++    arcium::kSidebarFooterActionPref,
+     arcium::kShowToolbarPref,
+     arcium::kCommandBarAppearancePref,
+     arcium::kCommandPanelLayoutPref,
+--- a/chrome/browser/ui/views/extensions/extensions_toolbar_button.cc
++++ b/chrome/browser/ui/views/extensions/extensions_toolbar_button.cc
+@@ -152,6 +152,10 @@ bool ExtensionsToolbarButton::ShouldShow
+ }
+ 
+ void ExtensionsToolbarButton::ToggleExtensionsMenu() {
++  ToggleExtensionsMenuFromAnchor(this);
++}
++
++void ExtensionsToolbarButton::ToggleExtensionsMenuFromAnchor(views::View* anchor) {
+   if (extensions_menu_coordinator_ &&
+       extensions_menu_coordinator_->IsShowing()) {
+     extensions_menu_coordinator_->Hide();
+@@ -162,7 +166,7 @@ void ExtensionsToolbarButton::ToggleExte
+   }
+ 
+   pressed_lock_ = menu_button_controller_->TakeLock();
+-  extensions_toolbar_->OnMenuOpening();
++  extensions_toolbar_->OnMenuOpening(/*use_toolbar_anchor=*/anchor == this);
+   base::RecordAction(base::UserMetricsAction("Extensions.Toolbar.MenuOpened"));
+   views::Widget* menu;
+   if (base::FeatureList::IsEnabled(
+@@ -171,7 +175,7 @@ void ExtensionsToolbarButton::ToggleExte
+       base::RecordAction(base::UserMetricsAction(
+           "Extensions.Toolbar.MenuOpenedWhenExtensionsAreRequestingAccess"));
+     }
+-    extensions_menu_coordinator_->Show(views::BubbleAnchor(this),
++    extensions_menu_coordinator_->Show(views::BubbleAnchor(anchor),
+                                        extensions_toolbar_);
+     menu = extensions_menu_coordinator_->GetExtensionsMenuWidget();
+   } else {
+@@ -179,7 +183,7 @@ void ExtensionsToolbarButton::ToggleExte
+     // extensions_features::kExtensionsMenuAccessControl menu, therefore we can
+     // use Browser for the other menu until the feature is rolled out.
+     menu = ExtensionsMenuView::ShowBubble(
+-        this, browser_, extensions_toolbar_->GetToolbarViewModel(),
++        anchor, browser_, extensions_toolbar_->GetToolbarViewModel(),
+         extensions_toolbar_);
+   }
+   extensions_menu_widget_ = menu->GetWeakPtr();
+--- a/chrome/browser/ui/views/extensions/extensions_toolbar_button.h
++++ b/chrome/browser/ui/views/extensions/extensions_toolbar_button.h
+@@ -38,6 +38,8 @@ class ExtensionsToolbarButton : public T
+   // Toggle the Extensions menu. If the ExtensionsToolbarDesktop is in
+   // kAutoHide mode and hidden this will cause it to show.
+   void ToggleExtensionsMenu();
++  // Keeps one menu owner while allowing a persistent sidebar control to anchor it.
++  void ToggleExtensionsMenuFromAnchor(views::View* anchor);
+ 
+   bool GetExtensionsMenuShowing() const;
+ 
+--- a/chrome/browser/ui/views/extensions/extensions_toolbar_desktop.cc
++++ b/chrome/browser/ui/views/extensions/extensions_toolbar_desktop.cc
+@@ -873,6 +873,10 @@ void ExtensionsToolbarDesktop::ToggleExt
+   GetExtensionsButton()->ToggleExtensionsMenu();
+ }
+ 
++void ExtensionsToolbarDesktop::ToggleExtensionsMenuFromAnchor(views::View* anchor) {
++  GetExtensionsButton()->ToggleExtensionsMenuFromAnchor(anchor);
++}
++
+ bool ExtensionsToolbarDesktop::GetDropFormats(
+     int* formats,
+     std::set<ui::ClipboardFormatType>* format_types) {
+@@ -1077,8 +1081,14 @@ void ExtensionsToolbarDesktop::UpdateCon
+                      weak_ptr_factory_.GetWeakPtr()));
+ }
+ 
+-void ExtensionsToolbarDesktop::OnMenuOpening() {
+-  EnsureSidebarExtensionControlVisible();
++void ExtensionsToolbarDesktop::OnMenuOpening(bool use_toolbar_anchor) {
++  if (use_toolbar_anchor) {
++    EnsureSidebarExtensionControlVisible();
++  } else if (!external_menu_reveal_lock_) {
++    external_menu_reveal_lock_ =
++        BrowserView::GetBrowserViewForBrowser(browser_)->tab_strip_view()
++            ->GetExpandOnHoverLock(ExpandOnHoverLockType::kKeepExpanded);
++  }
+   content::WebContents* web_contents = GetCurrentWebContents();
+   if (!web_contents) {
+     return;
+@@ -1169,8 +1179,12 @@ void ExtensionsToolbarDesktop::EnsureSid
+ }
+ 
+ void ExtensionsToolbarDesktop::MaybeRestoreSidebarExtensionControl() {
+-  if (!sidebar_menu_only_ || IsExtensionsMenuShowing() || popup_owner_ ||
+-      popped_out_action_ || !anchored_widgets_.empty()) {
++  if (IsExtensionsMenuShowing() || popup_owner_ || popped_out_action_ ||
++      !anchored_widgets_.empty()) {
++    return;
++  }
++  external_menu_reveal_lock_.reset();
++  if (!sidebar_menu_only_) {
+     return;
+   }
+   sidebar_extension_ui_requested_ = false;
+--- a/chrome/browser/ui/views/extensions/extensions_toolbar_desktop.h
++++ b/chrome/browser/ui/views/extensions/extensions_toolbar_desktop.h
+@@ -155,7 +155,7 @@ class ExtensionsToolbarDesktop : public
+   bool IsExtensionsMenuShowing() const;
+ 
+   // Event handler for when the extensions menu is opened.
+-  void OnMenuOpening();
++  void OnMenuOpening(bool use_toolbar_anchor = true);
+ 
+   // Event handler for when the extensions menu is closed.
+   void OnMenuClosed();
+@@ -238,6 +238,7 @@ class ExtensionsToolbarDesktop : public
+   bool CanShowToolbarActionPopupForAPICall(
+       const ToolbarActionsModel::ActionId&) override;
+   void ToggleExtensionsMenu() override;
++  void ToggleExtensionsMenuFromAnchor(views::View* anchor);
+ 
+   // ExtensionsToolbarViewModel::Observer:
+   void OnActionsInitialized() override;
+@@ -357,6 +358,7 @@ class ExtensionsToolbarDesktop : public
+   bool side_panel_active_ = false;
+   bool sidebar_extension_ui_requested_ = false;
+   std::unique_ptr<ExpandOnHoverLock> sidebar_extension_reveal_lock_;
++  std::unique_ptr<ExpandOnHoverLock> external_menu_reveal_lock_;
+   void EnsureSidebarExtensionControlVisible();
+   void MaybeRestoreSidebarExtensionControl();
+ 
+--- a/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
++++ b/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
+@@ -7,6 +7,10 @@
+ #include <memory>
+ #include <cstdlib>
+ #include "base/run_loop.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
++#include "chrome/browser/ui/views/helium/arcium_space_controls.h"
++#include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h"
+ #include "base/test/run_until.h"
+ #include "ui/gfx/scoped_animation_duration_scale_mode.h"
+ 
+@@ -43,6 +47,13 @@ class ArciumBrowserChromeTest : public T
+           return std::make_unique<PinnedToolbarActionsModel>(
+               Profile::FromBrowserContext(context));
+         }));
++    factories.emplace_back(
++        helium::HeliumSpaceServiceFactory::GetInstance(),
++        base::BindOnce([](content::BrowserContext* context)
++                           -> std::unique_ptr<KeyedService> {
++          return std::make_unique<helium::HeliumSpaceService>(
++              Profile::FromBrowserContext(context));
++        }));
+     return factories;
+   }
+ 
+@@ -211,3 +222,80 @@ TEST_F(ArciumBrowserChromeTest, HoverLoc
+   EXPECT_EQ(prefs()->GetInteger(prefs::kVerticalTabsUncollapsedWidth),
+             saved_width);
+ }
++
++TEST_F(ArciumBrowserChromeTest, FooterSpacesCenterBetweenFixedEndButtons) {
++  auto* footer = browser_view()->vertical_tab_strip_region_view_for_testing()
++                     ->GetBottomContainer();
++  for (int width : {220, 320}) {
++    prefs()->SetInteger(prefs::kVerticalTabsUncollapsedWidth, width);
++    Layout();
++    const auto bounds = footer->GetContentsBounds();
++    const auto spaces = footer->spaces_scroll_for_testing()->bounds();
++    EXPECT_LE(std::abs(spaces.CenterPoint().x() - bounds.CenterPoint().x()), 1);
++    EXPECT_EQ(footer->footer_action_for_testing()->GetBoundsInScreen().x(),
++              footer->GetBoundsInScreen().x() + bounds.x());
++    EXPECT_EQ(footer->add_button_for_testing()->bounds().right(), bounds.right());
++    EXPECT_LT(footer->footer_action_for_testing()->GetBoundsInScreen().right(),
++              footer->spaces_scroll_for_testing()->GetBoundsInScreen().x());
++  }
++}
++
++TEST_F(ArciumBrowserChromeTest, FooterOverflowKeepsEndButtonsAndScrollableSpaces) {
++  auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(
++      browser()->profile());
++  ASSERT_TRUE(service);
++  for (int i = 0; i < 12; ++i) {
++    service->GetOrCreateSpace("footer-" + std::to_string(i), u"Footer Space");
++  }
++  auto* footer = browser_view()->vertical_tab_strip_region_view_for_testing()
++                     ->GetBottomContainer();
++  prefs()->SetInteger(prefs::kVerticalTabsUncollapsedWidth, 220);
++  Layout();
++  EXPECT_GT(footer->spaces_row_for_testing()->width(),
++            footer->spaces_scroll_for_testing()->width());
++  EXPECT_LE(footer->spaces_scroll_for_testing()->bounds().right(),
++            footer->add_button_for_testing()->bounds().x());
++  EXPECT_EQ(footer->add_button_for_testing()->bounds().right(),
++            footer->GetContentsBounds().right());
++}
++
++TEST_F(ArciumBrowserChromeTest, FooterActionChangesLiveAndRetainsCenterWhenHidden) {
++  auto* footer = browser_view()->vertical_tab_strip_region_view_for_testing()
++                     ->GetBottomContainer();
++  auto* button = static_cast<ArciumSpaceIconButton*>(
++      footer->footer_action_for_testing());
++  EXPECT_EQ(prefs()->GetInteger(arcium::kSidebarFooterActionPref),
++            arcium::kSidebarFooterActionExtensions);
++  EXPECT_EQ(button->icon(), "ph:puzzle-piece");
++  const int original_center =
++      footer->spaces_scroll_for_testing()->bounds().CenterPoint().x();
++  prefs()->SetInteger(arcium::kSidebarFooterActionPref,
++                      arcium::kSidebarFooterActionHome);
++  EXPECT_EQ(button->icon(), "ph:house");
++  prefs()->SetInteger(arcium::kSidebarFooterActionPref,
++                      arcium::kSidebarFooterActionNone);
++  Layout();
++  EXPECT_FALSE(button->GetVisible());
++  EXPECT_EQ(footer->spaces_scroll_for_testing()->bounds().CenterPoint().x(),
++            original_center);
++  prefs()->SetInteger(arcium::kSidebarFooterActionPref, 999);
++  Layout();
++  EXPECT_TRUE(button->GetVisible());
++  EXPECT_EQ(button->icon(), "ph:puzzle-piece");
++  EXPECT_EQ(prefs()->GetInteger(arcium::kSidebarFooterActionPref), 999);
++}
++
++TEST_F(ArciumBrowserChromeTest, FooterRailAndExpandedPresentationRemainDistinct) {
++  auto* footer = browser_view()->vertical_tab_strip_region_view_for_testing()
++                     ->GetBottomContainer();
++  footer->OnCollapseStateChanged(tabs::VerticalTabStripCollapseState::kCollapsed);
++  Layout();
++  EXPECT_LT(footer->footer_action_for_testing()->GetBoundsInScreen().y(),
++            footer->add_button_for_testing()->GetBoundsInScreen().y());
++  footer->OnCollapseStateChanged(tabs::VerticalTabStripCollapseState::kExpanded);
++  Layout();
++  EXPECT_EQ(footer->footer_action_for_testing()->GetBoundsInScreen().y(),
++            footer->add_button_for_testing()->GetBoundsInScreen().y());
++  EXPECT_LE(std::abs(footer->spaces_scroll_for_testing()->bounds().CenterPoint().x() -
++                     footer->GetContentsBounds().CenterPoint().x()), 1);
++}
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
+@@ -5,12 +5,22 @@
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <set>
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_view.h"
++#include "chrome/browser/ui/views/extensions/extensions_toolbar_desktop.h"
++#include "ui/base/window_open_disposition_utils.h"
++#include "ui/events/event.h"
++#include "ui/views/layout/fill_layout.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/profiles/profile_manager.h"
+ #include "chrome/browser/ui/browser.h"
+@@ -51,6 +61,22 @@ constexpr int kSpaceButtonSpacing = 2;
+ // Spaces visible at once in the compact rail; more scroll.
+ constexpr int kCompactRailSpaces = 6;
+ 
++struct FooterActionDescriptor {
++  const char* icon;
++  const char16_t* label;
++  int command;
++};
++constexpr std::array<FooterActionDescriptor, 6> kFooterActions = {{
++    {"", u"None", 0},
++    {"puzzle-piece", u"Extensions", 0},
++    {"house", u"Home", IDC_HOME},
++    {"download-simple", u"Downloads", IDC_SHOW_DOWNLOADS},
++    {"clock-counter-clockwise", u"History", IDC_SHOW_HISTORY},
++    {"bookmarks", u"Bookmarks", IDC_SHOW_BOOKMARK_MANAGER},
++}};
++constexpr int kFooterMenuFirst = 100;
++constexpr int kFooterMenuLast = kFooterMenuFirst + kFooterActions.size() - 1;
++
+ enum SpaceMenuCommand {
+   kEditSpace = 1,
+   kNewSpace,
+@@ -68,6 +94,28 @@ VerticalTabStripBottomContainer::Vertica
+   SetOrientation(views::LayoutOrientation::kHorizontal);
+   SetCrossAxisAlignment(views::LayoutAlignment::kCenter);
+ 
++  // Equal end slots keep the Space group centered in the whole sidebar.
++  footer_action_slot_ = AddChildView(std::make_unique<views::View>());
++  footer_action_slot_->SetPreferredSize(
++      gfx::Size(kSpaceButtonSize, kSpaceButtonSize));
++  footer_action_slot_->SetLayoutManager(std::make_unique<views::FillLayout>());
++  footer_action_slot_->set_context_menu_controller(this);
++  footer_action_button_ = footer_action_slot_->AddChildView(
++      std::make_unique<ArciumSpaceIconButton>(
++          base::BindRepeating(&VerticalTabStripBottomContainer::RunFooterAction,
++                              base::Unretained(this)),
++          helium::MakePhosphorIcon("puzzle-piece"), kSpaceGlyphSize,
++          kSpaceButtonSize));
++  footer_action_button_->SetForegroundColorId(
++      kColorTabForegroundInactiveFrameActive);
++  footer_action_button_->set_context_menu_controller(this);
++  footer_registrar_.Init(browser_->GetProfile()->GetPrefs());
++  footer_registrar_.Add(
++      arcium::kSidebarFooterActionPref,
++      base::BindRepeating(&VerticalTabStripBottomContainer::UpdateFooterAction,
++                          base::Unretained(this)));
++  UpdateFooterAction();
++
+   // Spaces beyond the sidebar's width scroll sideways. A layer-less scroll
+   // view cannot take trackpad scroll events, so keep the default layers.
+   spaces_scroll_ = AddChildView(std::make_unique<views::ScrollView>());
+@@ -271,7 +319,23 @@ void VerticalTabStripBottomContainer::Re
+ }
+ 
+ void VerticalTabStripBottomContainer::Layout(PassKey) {
++  UpdateFooterAction();
+   LayoutSuperclass<views::FlexLayoutView>(this);
++  if (!tab_strip_collapsed_) {
++    const gfx::Rect bounds = GetContentsBounds();
++    const int y = bounds.CenterPoint().y() - kSpaceButtonSize / 2;
++    footer_action_slot_->SetBounds(bounds.x(), y, kSpaceButtonSize,
++                                    kSpaceButtonSize);
++    add_button_->SetBounds(bounds.right() - kSpaceButtonSize, y,
++                            kSpaceButtonSize, kSpaceButtonSize);
++    const int available = std::max(
++        0, bounds.width() - 2 * (kSpaceButtonSize + kSpaceButtonSpacing));
++    const int row_width =
++        std::min(available, spaces_row_->GetPreferredSize().width());
++    spaces_scroll_->SetBounds(bounds.CenterPoint().x() - row_width / 2, y,
++                               row_width, kSpaceButtonSize);
++    spaces_scroll_->DeprecatedLayoutImmediately();
++  }
+   // An unclipped scroll view leaves its contents' size to them: keep the
+   // horizontal row at its full width so it can scroll sideways.
+   if (!tab_strip_collapsed_ &&
+@@ -373,10 +437,102 @@ void VerticalTabStripBottomContainer::Cr
+   }
+ }
+ 
++int VerticalTabStripBottomContainer::FooterAction() const {
++  const int value = browser_->GetProfile()->GetPrefs()->GetInteger(
++      arcium::kSidebarFooterActionPref);
++  return value >= arcium::kSidebarFooterActionMin &&
++                 value <= arcium::kSidebarFooterActionMax
++             ? value
++             : arcium::kSidebarFooterActionExtensions;
++}
++
++void VerticalTabStripBottomContainer::UpdateFooterAction() {
++  const int action = FooterAction();
++  if (action != current_footer_action_ && GetWidget() &&
++      current_footer_action_ == arcium::kSidebarFooterActionExtensions) {
++    if (auto* view = BrowserView::GetBrowserViewForBrowser(browser_)) {
++      if (view->toolbar() && view->toolbar()->extensions_container()) {
++        view->toolbar()->extensions_container()->CloseExtensionsMenuIfOpen();
++      }
++    }
++  }
++  const auto& descriptor = kFooterActions[action];
++  if (action != current_footer_action_) {
++    current_footer_action_ = action;
++  footer_action_button_->SetVisible(action != arcium::kSidebarFooterActionNone);
++  footer_action_button_->SetIcon(helium::MakePhosphorIcon(descriptor.icon));
++  footer_action_button_->SetTooltipText(descriptor.label);
++  footer_action_button_->GetViewAccessibility().SetName(descriptor.label);
++  footer_action_button_->GetViewAccessibility().SetHasPopup(
++      action == arcium::kSidebarFooterActionExtensions
++          ? ax::mojom::HasPopup::kMenu : ax::mojom::HasPopup::kFalse);
++  }
++  footer_action_button_->SetEnabled(
++      !descriptor.command || chrome::IsCommandEnabled(browser_, descriptor.command));
++}
++
++void VerticalTabStripBottomContainer::RunFooterAction(const ui::Event& event) {
++  const int action = FooterAction();
++  if (action == arcium::kSidebarFooterActionExtensions) {
++    if (auto* view = BrowserView::GetBrowserViewForBrowser(browser_)) {
++      if (view->toolbar() && view->toolbar()->extensions_container()) {
++        view->toolbar()->extensions_container()->ToggleExtensionsMenuFromAnchor(
++            footer_action_button_);
++      }
++    }
++    return;
++  }
++  const int command = kFooterActions[action].command;
++  if (command && chrome::IsCommandEnabled(browser_, command)) {
++    chrome::ExecuteCommandWithDisposition(
++        browser_, command, ui::DispositionFromEventFlags(event.flags()));
++  }
++}
++
++void VerticalTabStripBottomContainer::ShowFooterActionMenu(
++    const gfx::Point& point, ui::mojom::MenuSourceType source_type) {
++  menu_space_.reset();
++  menu_runner_.reset();
++  menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++  menu_model_->AddTitle(u"Sidebar button");
++  const bool managed = browser_->GetProfile()->GetPrefs()->IsManagedPreference(
++      arcium::kSidebarFooterActionPref);
++  for (size_t i = 0; i < kFooterActions.size(); ++i) {
++    menu_model_->AddRadioItem(kFooterMenuFirst + i, kFooterActions[i].label, 1);
++    menu_model_->SetEnabledAt(menu_model_->GetItemCount() - 1, !managed);
++  }
++  menu_runner_ = std::make_unique<views::MenuRunner>(
++      menu_model_.get(), views::MenuRunner::CONTEXT_MENU);
++  menu_runner_->RunMenuAt(GetWidget(), nullptr, gfx::Rect(point, gfx::Size()),
++                          views::MenuAnchorPosition::kTopLeft, source_type);
++}
++
++bool VerticalTabStripBottomContainer::IsCommandIdChecked(int command_id) const {
++  return command_id >= kFooterMenuFirst && command_id <= kFooterMenuLast &&
++         FooterAction() == command_id - kFooterMenuFirst;
++}
++
++views::View* VerticalTabStripBottomContainer::footer_action_for_testing() const {
++  return footer_action_button_;
++}
++views::View* VerticalTabStripBottomContainer::spaces_row_for_testing() const {
++  return spaces_row_;
++}
++views::View* VerticalTabStripBottomContainer::spaces_scroll_for_testing() const {
++  return spaces_scroll_;
++}
++views::View* VerticalTabStripBottomContainer::add_button_for_testing() const {
++  return add_button_;
++}
++
+ void VerticalTabStripBottomContainer::ShowContextMenuForViewImpl(
+     views::View* source,
+     const gfx::Point& point,
+     ui::mojom::MenuSourceType source_type) {
++  if (source == footer_action_button_ || source == footer_action_slot_) {
++    ShowFooterActionMenu(point, source_type);
++    return;
++  }
+   const auto found = std::ranges::find_if(
+       space_buttons_, [source](const auto& button) { return button == source; });
+   if (found == space_buttons_.end()) {
+@@ -402,6 +558,14 @@ void VerticalTabStripBottomContainer::Sh
+ 
+ void VerticalTabStripBottomContainer::ExecuteCommand(int command_id,
+                                                      int event_flags) {
++  if (command_id >= kFooterMenuFirst && command_id <= kFooterMenuLast) {
++    auto* prefs = browser_->GetProfile()->GetPrefs();
++    if (!prefs->IsManagedPreference(arcium::kSidebarFooterActionPref)) {
++      prefs->SetInteger(arcium::kSidebarFooterActionPref,
++                        command_id - kFooterMenuFirst);
++    }
++    return;
++  }
+   if (command_id == kNewSpace) {
+     CreateSpace();
+     return;
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h
+@@ -27,6 +27,7 @@
+ class ArciumSpaceIconButton;
+ class BrowserWindowInterface;
+ class Profile;
++namespace ui { class Event; }
+ 
+ namespace helium {
+ class PersistentItemChange;
+@@ -81,6 +82,11 @@ class VerticalTabStripBottomContainer :
+   void Layout(PassKey) override;
+   void RevealSelected();
+ 
++  views::View* footer_action_for_testing() const;
++  views::View* spaces_row_for_testing() const;
++  views::View* spaces_scroll_for_testing() const;
++  views::View* add_button_for_testing() const;
++
+   // views::ContextMenuController:
+   void ShowContextMenuForViewImpl(views::View* source,
+                                   const gfx::Point& point,
+@@ -88,6 +94,7 @@ class VerticalTabStripBottomContainer :
+ 
+   // ui::SimpleMenuModel::Delegate:
+   void ExecuteCommand(int command_id, int event_flags) override;
++  bool IsCommandIdChecked(int command_id) const override;
+ 
+   // ProfileAttributesStorageObserver:
+   void OnProfileWasRemoved(const base::FilePath& profile_path,
+@@ -102,12 +109,21 @@ class VerticalTabStripBottomContainer :
+   void UpdateCollapsedPresentation();
+   void ActivateSpace(size_t index);
+   void CreateSpace();
++  int FooterAction() const;
++  void UpdateFooterAction();
++  void RunFooterAction(const ui::Event& event);
++  void ShowFooterActionMenu(const gfx::Point& point,
++                            ui::mojom::MenuSourceType source_type);
+   bool IsWindowSpace(const helium::SpaceDirectoryEntry& entry) const;
+   std::optional<helium::SpaceTheme> CurrentTheme() const;
+   void ApplyTheme();
+ 
+   raw_ptr<tabs::VerticalTabStripStateController> state_controller_ = nullptr;
+   raw_ptr<BrowserWindowInterface> browser_ = nullptr;
++  raw_ptr<views::View> footer_action_slot_ = nullptr;
++  raw_ptr<ArciumSpaceIconButton> footer_action_button_ = nullptr;
++  int current_footer_action_ = -1;
++  PrefChangeRegistrar footer_registrar_;
+   raw_ptr<views::ScrollView> spaces_scroll_ = nullptr;
+   bool reveal_selected_ = false;
+   gfx::Size last_layout_size_;
