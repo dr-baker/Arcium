@@ -1,0 +1,135 @@
+Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
++++ src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/views/frame/test_with_browser_view.h"
+ 
+ #include <memory>
++#include <cstdlib>
+ 
+ #include "base/functional/bind.h"
+ #include "chrome/app/chrome_command_ids.h"
+@@ -22,6 +23,7 @@
+ #include "chrome/browser/ui/views/frame/multi_contents_view.h"
+ #include "chrome/common/pref_names.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_button.h"
+ #include "chrome/browser/ui/views/location_bar/location_bar_view.h"
+ #include "components/prefs/pref_service.h"
+ #include "ui/views/widget/widget.h"
+@@ -133,3 +135,28 @@ TEST_F(ArciumBrowserChromeTest, SidebarA
+   EXPECT_FALSE(prefs()->GetBoolean(arcium::kShowToolbarPref));
+   EXPECT_TRUE(chrome::IsCommandEnabled(browser(), IDC_ARCIUM_TOGGLE_TOOLBAR));
+ }
++
++TEST_F(ArciumBrowserChromeTest, SidebarCaptionMatchesNavigationRowAtEachScale) {
++  prefs()->SetBoolean(arcium::kArcSidebarNavigationEnabledPref, true);
++  auto* toolbar = browser_view()->toolbar();
++  for (int scale : {100, 110}) {
++    prefs()->SetInteger(arcium::kChromeUIScalePref, scale);
++    Layout();
++    const int caption_height = toolbar->GetSidebarNavigationCaptionHeight();
++    EXPECT_EQ(browser_view()->GetFrameElementInfo().toolbar_minimum_height,
++              caption_height);
++    EXPECT_LT(caption_height, toolbar->GetMinimumSize().height());
++    EXPECT_LE(std::abs(toolbar->forward_button()->bounds().CenterPoint().y() * 2 -
++                       caption_height), 1);
++  }
++}
++
++TEST_F(ArciumBrowserChromeTest, HiddenTopBarRetainsIntrinsicCaptionHeight) {
++  const int visible_height =
++      browser_view()->GetFrameElementInfo().toolbar_minimum_height;
++  ASSERT_GT(visible_height, 0);
++  prefs()->SetBoolean(arcium::kShowToolbarPref, false);
++  Layout();
++  EXPECT_EQ(browser_view()->GetFrameElementInfo().toolbar_minimum_height,
++            visible_height);
++}
+Index: src/chrome/browser/ui/views/frame/browser_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_view.cc
++++ src/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1980,9 +1980,12 @@ ClientFrameElementInfo BrowserView::GetF
+                 ->GetPreferredSize()
+                 .height()
+           : 0;
+-  if (toolbar_ && ShouldDrawVerticalTabStrip() &&
+-      (IsFullscreen() || IsToolbarVisible())) {
+-    info.toolbar_minimum_height = toolbar_->GetMinimumSize().height();
++  // Native caption geometry is intrinsic. Visibility and reveal are handled
++  // separately, including when the ordinary top bar is hidden.
++  if (toolbar_ && ShouldDrawVerticalTabStrip()) {
++    info.toolbar_minimum_height = toolbar_->IsSidebarNavigationMode()
++                                      ? toolbar_->GetSidebarNavigationCaptionHeight()
++                                      : toolbar_->GetMinimumSize().height();
+   } else if (web_app_frame_toolbar_ && ShouldDrawWebAppFrameToolbar()) {
+     info.toolbar_minimum_height =
+         web_app_frame_toolbar_->GetMinimumSize().height();
+@@ -2355,6 +2358,20 @@ void BrowserView::UpdateSidebarNavigatio
+     sidebar_navigation_reveal_lock_.reset();
+   }
+   if (parent_changed) {
++    // Native caption sizing can change when the toolbar moves. Defer the
++    // native frame refresh because placement also runs from Layout().
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(
++                       [](base::WeakPtr<BrowserView> view) {
++                         if (!view || !view->GetWidget() ||
++                             !view->GetIsNormalType() || view->IsFullscreen()) {
++                           return;
++                         }
++                         if (auto* frame = view->GetFrameView()) {
++                           frame->OnTabStripStateChanged();
++                         }
++                       },
++                       weak_ptr_factory_.GetWeakPtr()));
+     browser_->command_controller()->UpdateCommandEnabled(
+         IDC_ARCIUM_TOGGLE_TOOLBAR,
+         browser_->is_type_normal() && !IsFullscreen() && !sidebar &&
+Index: src/chrome/browser/ui/views/toolbar/toolbar_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ src/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -2041,11 +2041,15 @@ void ToolbarView::SetSidebarNavigationEx
+   PreferredSizeChanged();
+ }
+ 
++int ToolbarView::GetSidebarNavigationCaptionHeight() const {
++  return arcium::ScaleChromeDip(this, 6) * 2 +
++         GetBackForwardButtonSize().height();
++}
++
+ gfx::Size ToolbarView::GetSidebarNavigationSize() const {
+   const int padding = arcium::ScaleChromeDip(this, 6);
+   const int gap = arcium::ScaleChromeDip(this, 4);
+-  const int navigation_height = std::max(GetBackForwardButtonSize().height(),
+-                                         sidebar_navigation_exclusion_height_);
++  const int navigation_height = GetBackForwardButtonSize().height();
+   return {arcium::ScaleChromeDip(this, 160),
+           padding * 2 + navigation_height + gap +
+               location_bar_->PreferredSize().height()};
+@@ -2054,8 +2058,7 @@ gfx::Size ToolbarView::GetSidebarNavigat
+ void ToolbarView::LayoutSidebarNavigation() {
+   const int padding = arcium::ScaleChromeDip(this, 6);
+   const int gap = arcium::ScaleChromeDip(this, 4);
+-  const int row_height = std::max(GetBackForwardButtonSize().height(),
+-                                  sidebar_navigation_exclusion_height_);
++  const int row_height = GetBackForwardButtonSize().height();
+   for (views::View* child : children()) {
+     if (child != back_ && child != forward_ && child != reload_ &&
+         child != home_ && child != vertical_tabs_collapse_button_ &&
+Index: src/chrome/browser/ui/views/toolbar/toolbar_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/toolbar/toolbar_view.h
++++ src/chrome/browser/ui/views/toolbar/toolbar_view.h
+@@ -189,6 +189,8 @@ class ToolbarView : public views::Access
+     return sidebar_navigation_overflow_;
+   }
+   void SetSidebarNavigationExclusion(int width, int height);
++  // Intrinsic first-row height, independent of cached native exclusions.
++  int GetSidebarNavigationCaptionHeight() const;
+ 
+   // Updates the vertical tabs collapse button visibility and icon.
+   void UpdateVerticalTabsCollapseButton();
