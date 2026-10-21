@@ -1,0 +1,108 @@
+Index: src/chrome/browser/ui/browser_command_controller.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_command_controller.cc
++++ src/chrome/browser/ui/browser_command_controller.cc
+@@ -2600,9 +2600,12 @@ void BrowserCommandController::UpdateCom
+   command_updater_->UpdateCommandEnabled(IDC_FULLSCREEN, fullscreen_enabled);
+   command_updater_->UpdateCommandEnabled(IDC_TOGGLE_FULLSCREEN_TOOLBAR,
+                                          fullscreen_enabled);
++  const BrowserView* browser_view =
++      BrowserView::GetBrowserViewForBrowser(browser_);
+   command_updater_->UpdateCommandEnabled(
+       IDC_ARCIUM_TOGGLE_TOOLBAR,
+       browser_->is_type_normal() && !is_fullscreen &&
++          !(browser_view && browser_view->IsSidebarNavigationActive()) &&
+           !profile()->GetPrefs()->FindPreference(arcium::kShowToolbarPref)
+                ->IsManaged());
+ 
+Index: src/chrome/browser/ui/browser_ui_prefs.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_ui_prefs.cc
++++ src/chrome/browser/ui/browser_ui_prefs.cc
+@@ -148,7 +148,7 @@ void RegisterBrowserUserPrefs(user_prefs
+                                 arcium::kCollapsedSidebarStyleFullyHidden);
+   registry->RegisterBooleanPref(arcium::kShowToolbarPref, true);
+   registry->RegisterBooleanPref(arcium::kArcSidebarNavigationEnabledPref,
+-                                false);
++                                true);
+   registry->RegisterBooleanPref(arcium::kSidebarExtensionsDrawerEnabledPref,
+                                 false);
+ 
+Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
++++ src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
+@@ -20,6 +20,8 @@
+ #include "chrome/browser/ui/views/frame/contents_container_view.h"
+ #include "chrome/browser/ui/views/frame/multi_contents_view.h"
+ #include "chrome/common/pref_names.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_view.h"
++#include "chrome/browser/ui/views/location_bar/location_bar_view.h"
+ #include "components/prefs/pref_service.h"
+ #include "ui/views/widget/widget.h"
+ 
+@@ -101,3 +103,32 @@ TEST_F(ArciumBrowserChromeTest, Horizont
+   EXPECT_EQ(browser_view()->multi_contents_view()
+                 ->GetActiveContentsContainerView()->bounds().y(), 0);
+ }
++
++TEST_F(ArciumBrowserChromeTest, SidebarDefaultPreservesExplicitTopBarChoice) {
++  prefs()->ClearPref(arcium::kArcSidebarNavigationEnabledPref);
++  EXPECT_TRUE(prefs()->GetBoolean(arcium::kArcSidebarNavigationEnabledPref));
++  EXPECT_TRUE(browser_view()->IsSidebarNavigationActive());
++  prefs()->SetBoolean(arcium::kArcSidebarNavigationEnabledPref, false);
++  EXPECT_FALSE(browser_view()->IsSidebarNavigationActive());
++}
++
++TEST_F(ArciumBrowserChromeTest, SidebarAddressSurvivesSavedHiddenTopBar) {
++  prefs()->SetBoolean(arcium::kShowToolbarPref, false);
++  prefs()->SetBoolean(arcium::kArcSidebarNavigationEnabledPref, true);
++  Layout();
++  ASSERT_TRUE(browser_view()->IsSidebarNavigationActive());
++  EXPECT_TRUE(browser_view()->IsToolbarVisible());
++  EXPECT_TRUE(browser_view()->toolbar()->GetVisible());
++  EXPECT_TRUE(browser_view()->toolbar()->location_bar_view()->GetVisible());
++  EXPECT_FALSE(prefs()->GetBoolean(arcium::kShowToolbarPref));
++  EXPECT_FALSE(chrome::IsCommandEnabled(browser(), IDC_ARCIUM_TOGGLE_TOOLBAR));
++  EXPECT_EQ(browser_view()->multi_contents_view()
++                ->GetActiveContentsContainerView()->bounds().y(), 12);
++
++  prefs()->SetBoolean(arcium::kArcSidebarNavigationEnabledPref, false);
++  Layout();
++  EXPECT_FALSE(browser_view()->IsSidebarNavigationActive());
++  EXPECT_FALSE(browser_view()->IsToolbarVisible());
++  EXPECT_FALSE(prefs()->GetBoolean(arcium::kShowToolbarPref));
++  EXPECT_TRUE(chrome::IsCommandEnabled(browser(), IDC_ARCIUM_TOGGLE_TOOLBAR));
++}
+Index: src/chrome/browser/ui/views/frame/browser_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_view.cc
++++ src/chrome/browser/ui/views/frame/browser_view.cc
+@@ -2355,6 +2355,11 @@ void BrowserView::UpdateSidebarNavigatio
+     sidebar_navigation_reveal_lock_.reset();
+   }
+   if (parent_changed) {
++    browser_->command_controller()->UpdateCommandEnabled(
++        IDC_ARCIUM_TOGGLE_TOOLBAR,
++        browser_->is_type_normal() && !IsFullscreen() && !sidebar &&
++            !GetProfile()->GetPrefs()->FindPreference(arcium::kShowToolbarPref)
++                 ->IsManaged());
+     if (auto* frame_view = GetFrameView()) {
+       frame_view->SetCaptionButtonsOpacity(GetCaptionChromeRevealRatio());
+     }
+@@ -4789,12 +4794,11 @@ bool BrowserView::IsToolbarVisible() con
+   }
+ #endif
+ 
++  // Show top bar owns only the ordinary toolbar. Sidebar placement keeps its
++  // address field with the tabs, including when the saved top bar is hidden.
+   if (browser_->is_type_normal() && !IsFullscreen() &&
++      !IsSidebarNavigationActive() &&
+       !toolbar_temporarily_revealed_for_location_focus_ &&
+-      !(IsSidebarNavigationActive() &&
+-        (sidebar_navigation_external_reveal_count_ > 0 ||
+-         toolbar_->IsSidebarNavigationMenuShowing() ||
+-         HasOpenBubbleFromTopContainer())) &&
+       !GetProfile()->GetPrefs()->GetBoolean(arcium::kShowToolbarPref)) {
+     return false;
+   }
