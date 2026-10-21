@@ -1,0 +1,175 @@
+Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
+@@ -0,0 +1,104 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/frame/test_with_browser_view.h"
++
++#include <memory>
++
++#include "base/functional/bind.h"
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
++#include "chrome/browser/ui/views/helium/arcium_chrome_ui_scale.h"
++#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/split_tab_metrics.h"
++#include "components/split_tabs/split_tab_visual_data.h"
++#include "chrome/browser/ui/toolbar/pinned_toolbar/pinned_toolbar_actions_model.h"
++#include "chrome/browser/ui/toolbar/pinned_toolbar/pinned_toolbar_actions_model_factory.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/contents_container_view.h"
++#include "chrome/browser/ui/views/frame/multi_contents_view.h"
++#include "chrome/common/pref_names.h"
++#include "components/prefs/pref_service.h"
++#include "ui/views/widget/widget.h"
++
++class ArciumBrowserChromeTest : public TestWithBrowserView {
++ protected:
++  TestingProfile::TestingFactories GetTestingFactories() override {
++    auto factories = TestWithBrowserView::GetTestingFactories();
++    factories.emplace_back(
++        PinnedToolbarActionsModelFactory::GetInstance(),
++        base::BindRepeating([](content::BrowserContext* context)
++                               -> std::unique_ptr<KeyedService> {
++          return std::make_unique<PinnedToolbarActionsModel>(
++              Profile::FromBrowserContext(context));
++        }));
++    return factories;
++  }
++
++  void SetUp() override {
++    TestWithBrowserView::SetUp();
++    AddTab(browser(), GURL("https://example.com/"));
++    prefs()->SetInteger(arcium::kChromeUIScalePref, 100);
++    prefs()->SetBoolean(prefs::kHeliumRoundedFrame, true);
++    prefs()->SetInteger(arcium::kChromeFrameBorderWidthPref, 12);
++    prefs()->SetBoolean(arcium::kArcSidebarNavigationEnabledPref, false);
++    auto* controller = tabs::VerticalTabStripStateController::From(browser());
++    controller->SetVerticalTabsEnabled(true);
++    controller->SetTabStripRightAligned(false);
++    browser_view()->GetWidget()->Show();
++    browser_view()->SetSize(gfx::Size(1000, 800));
++    Layout();
++  }
++
++  PrefService* prefs() { return browser()->profile()->GetPrefs(); }
++  void Layout() { browser_view()->GetWidget()->LayoutRootViewIfNecessary(); }
++};
++
++TEST_F(ArciumBrowserChromeTest, HiddenToolbarHasEvenUnattachedFrameEdges) {
++  ASSERT_TRUE(browser_view()->ShouldDrawVerticalTabStrip());
++  ASSERT_TRUE(chrome::IsCommandEnabled(browser(), IDC_ARCIUM_TOGGLE_TOOLBAR));
++  chrome::ExecuteCommand(browser(), IDC_ARCIUM_TOGGLE_TOOLBAR);
++  ASSERT_FALSE(browser_view()->IsToolbarVisible());
++  Layout();
++  auto* view = browser_view()->multi_contents_view();
++  const auto bounds = view->GetActiveContentsContainerView()->bounds();
++  EXPECT_EQ(bounds.y(), 12);
++  EXPECT_EQ(view->width() - bounds.right(), 12);
++  EXPECT_EQ(view->height() - bounds.bottom(), 12);
++
++  chrome::ExecuteCommand(browser(), IDC_ARCIUM_TOGGLE_TOOLBAR);
++  Layout();
++  EXPECT_EQ(view->GetActiveContentsContainerView()->bounds().y(), 0);
++}
++
++TEST_F(ArciumBrowserChromeTest, HiddenToolbarHasEvenSplitFrameEdges) {
++  AddTab(browser(), GURL("https://example.org/"));
++  auto* model = browser()->tab_strip_model();
++  ASSERT_EQ(model->count(), 2);
++  model->AddToNewSplit(
++      {1 - model->active_index()}, split_tabs::SplitTabVisualData(),
++      split_tabs::SplitTabCreatedSource::kToolbarButton);
++  prefs()->SetBoolean(arcium::kShowToolbarPref, false);
++  Layout();
++  auto* view = browser_view()->multi_contents_view();
++  const auto insets = view->split_view_insets_for_testing();
++  EXPECT_EQ(insets.top(), 12);
++  EXPECT_EQ(insets.right(), 12);
++  EXPECT_EQ(insets.bottom(), 12);
++  prefs()->SetBoolean(arcium::kShowToolbarPref, true);
++  Layout();
++  EXPECT_EQ(view->split_view_insets_for_testing().top(), 0);
++}
++
++TEST_F(ArciumBrowserChromeTest, HorizontalTabsRetainTopAttachment) {
++  tabs::VerticalTabStripStateController::From(browser())
++      ->SetVerticalTabsEnabled(false);
++  prefs()->SetBoolean(arcium::kShowToolbarPref, false);
++  Layout();
++  ASSERT_FALSE(browser_view()->ShouldDrawVerticalTabStrip());
++  EXPECT_EQ(browser_view()->multi_contents_view()
++                ->GetActiveContentsContainerView()->bounds().y(), 0);
++}
+Index: src/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ src/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -257,6 +257,8 @@ struct BrowserViewTabbedLayoutImpl::Vert
+ 
+ // Stores information about visual separators throughout the browser.
+ struct BrowserViewTabbedLayoutImpl::SeparatorInfo {
++  // Whether visible controls above the page can own its top edge.
++  bool has_top_chrome = false;
+   // True if the separator should be rendered in the top container.
+   bool top_container_separator = false;
+   // True if the separator should be rendered in the multi-contents view.
+@@ -308,6 +310,12 @@ BrowserViewTabbedLayoutImpl::CalculateSe
+   const bool infobar_attached_to_rounded_frame =
+       has_infobar && views().multi_contents_view->ShouldUseRoundedFrame();
+ 
++  info.has_top_chrome =
++      has_infobar || delegate().IsBookmarkBarVisible() ||
++      (!IsSidebarNavigationMode(views()) && delegate().IsToolbarVisible()) ||
++      (layout_data_->tab_strip_type == TabStripType::kHorizontal &&
++       ShowDynamicTabStrip(layout_data_->tab_strip_type));
++
+   const bool would_have_separator = has_infobar || !is_split_view;
+   switch (layout_data_->window_state) {
+     case WindowState::kNormal:
+@@ -316,7 +324,8 @@ BrowserViewTabbedLayoutImpl::CalculateSe
+       info.shadow_box = false;
+       const bool suppress_separator = infobar_attached_to_rounded_frame;
+       // Keep the regular contents separator below the infobar.
+-      info.multi_contents_separator = !suppress_separator;
++      info.multi_contents_separator =
++          !suppress_separator && info.has_top_chrome;
+       info.top_container_separator = !suppress_separator && has_infobar;
+       info.side_panel_top_padding = !is_force_to_top;
+       info.adjust_for_missing_separator =
+@@ -1389,7 +1398,8 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+     const int border_inset =
+         arcium::GetChromeFrameBorderWidth(views().browser_view);
+     const int top_inset =
+-        layout_data_->window_state == WindowState::kFullscreen ||
++        !separator_info.has_top_chrome ||
++                layout_data_->window_state == WindowState::kFullscreen ||
+                 infobar_visible
+             ? border_inset
+             : zen.enabled
+Index: src/chrome/test/BUILD.gn
+===================================================================
+--- src.orig/chrome/test/BUILD.gn
++++ src/chrome/test/BUILD.gn
+@@ -11468,6 +11468,7 @@ if (!is_android && toolkit_views) {
+       "../browser/extensions/api/settings_private/prefs_util_unittest.cc",
+       "../browser/renderer_context_menu/render_view_context_menu_unittest.cc",
+       "../browser/ui/helium/helium_space_service_unittest.cc",
++      "../browser/ui/views/frame/arcium_browser_chrome_unittest.cc",
+     ]
+ 
+     data = [
+@@ -11505,6 +11506,7 @@ if (!is_android && toolkit_views) {
+       "//content/test:test_support",
+       "//testing/gmock",
+       "//testing/gtest",
++      "//ui/views",
+       "//url",
+     ]
+ 
