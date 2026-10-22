@@ -2452,7 +2452,18 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
  
  #include <algorithm>
  #include <array>
-@@ -494,7 +495,7 @@ class CommandPanelView::Row : public vie
+@@ -398,6 +399,10 @@ CommandPanelAppearance ReadCommandPanelA
+     result.glow_strength = strength;
+   }
+   result.activity_dots = value.FindBool("activity_dots").value_or(true);
++  const auto chrome = helium::ReadGlassSurfaceConfiguration(prefs);
++  if (chrome.color_effect != helium::GlassSurfaceColorEffect::kGlows) {
++    result.glow_strength = 0.0;
++  }
+   return result;
+ }
+ 
+@@ -494,7 +499,7 @@ class CommandPanelView::Row : public vie
                             gfx::Rect(0, 0, w, h));
      if (GetState() == STATE_PRESSED) {
        FillRoundRect(canvas, gfx::Rect(0, 0, w, h), 6,
@@ -2461,7 +2472,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
      }
      panel_->PaintRow(canvas, index_, w, h);
      canvas->Restore();
-@@ -770,15 +771,6 @@ void CommandPanelView::BindPreferences(
+@@ -770,15 +775,7 @@ void CommandPanelView::BindPreferences(
      const auto style =
          helium::ResolveSurfaceStyle(helium::ReadSurfaceInputs(owner));
      view->shadow_ = style.panel_shadow;
@@ -2474,10 +2485,11 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 -    view->input_->SetTextColorId(view->text_color_ == kText
 -                                     ? ui::kColorRefNeutral99
 -                                     : ui::kColorRefNeutral10);
++    view->SetAppearance(ReadCommandPanelAppearance(owner));
      view->SchedulePaint();
    };
    update_surface(this, prefs);
-@@ -801,13 +793,20 @@ void CommandPanelView::BindPreferences(
+@@ -801,13 +798,20 @@ void CommandPanelView::BindPreferences(
  }
  void CommandPanelView::OnThemeChanged() {
    views::View::OnThemeChanged();
@@ -2501,7 +2513,17 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
  SkColor CommandPanelView::AccentColor(SkColor background) const {
    return color_utils::BlendForMinContrast(accent_color_, background).color;
  }
-@@ -1481,16 +1480,15 @@ void CommandPanelView::OnPaint(gfx::Canv
+@@ -1421,7 +1425,8 @@ SkPath CommandPanelView::GetContourPath(
+   return path.detach();
+ }
+ void CommandPanelView::PaintConnectedScopeGlow(gfx::Canvas* canvas) {
+-  if (!appearance_.connected || !appearance_.scope_tints || actions_visible_) {
++  if (!appearance_.connected || !appearance_.scope_tints ||
++      appearance_.glow_strength <= 0.0 || actions_visible_) {
+     return;
+   }
+   gfx::ScopedCanvas restore(canvas);
+@@ -1481,16 +1486,15 @@ void CommandPanelView::OnPaint(gfx::Canv
    }
    cc::PaintFlags fill;
    fill.setAntiAlias(true);
@@ -2522,7 +2544,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    GlyphAt(canvas, Glyph::kSearch,
            gfx::Rect(body.x() + S(ui_scale_, 20), body.y() + S(ui_scale_, 22),
                      S(ui_scale_, 18), S(ui_scale_, 18)),
-@@ -1498,7 +1496,7 @@ void CommandPanelView::OnPaint(gfx::Canv
+@@ -1498,7 +1502,7 @@ void CommandPanelView::OnPaint(gfx::Canv
    canvas->FillRect(
        gfx::Rect(body.x() + S(ui_scale_, 10), body.bottom() - S(ui_scale_, 42),
                  body.width() - S(ui_scale_, 20), S(ui_scale_, 1)),
@@ -2531,7 +2553,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    {
      gfx::ScopedCanvas restore(canvas);
      canvas->Translate(gfx::Vector2d(body.x() + S(ui_scale_, 19),
-@@ -1524,7 +1522,7 @@ void CommandPanelView::OnPaint(gfx::Canv
+@@ -1524,7 +1528,7 @@ void CommandPanelView::OnPaint(gfx::Canv
      canvas->FillRect(
          gfx::Rect(scroll_->x(), y + S(ui_scale_, kHeadingHeight - 7),
                    scroll_->width(), S(ui_scale_, 1)),
@@ -2540,7 +2562,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    }
    if (rows_.empty()) {
      auto empty_bounds = scroll_->bounds();
-@@ -1545,11 +1543,8 @@ void CommandPanelView::PaintRow(gfx::Can
+@@ -1545,11 +1549,8 @@ void CommandPanelView::PaintRow(gfx::Can
        static_cast<int>(index) == selected_ && !scope_browsing_;
    const SkColor row_background = selected ? SelectionColor() : panel_color_;
    const SkColor row_text = selected
@@ -2554,7 +2576,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    // Selection semantics update immediately. The cue arrives with the moving
    // highlight, so it cannot announce the destination ahead of that highlight.
    const float cue_progress = selected ? selection_animation_.GetCurrentValue() : 0;
-@@ -1635,13 +1630,13 @@ void CommandPanelView::PaintRow(gfx::Can
+@@ -1635,13 +1636,13 @@ void CommandPanelView::PaintRow(gfx::Can
      if (appearance_.labels == CommandPanelAppearance::Labels::kPill) {
        FillRoundRect(
            canvas, gfx::Rect(label_x, (height - 18) / 2, category_width, 18), 4,
@@ -2570,7 +2592,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
      }
      canvas->DrawStringRect(
          data.category, category_font,
-@@ -1715,7 +1710,7 @@ void CommandPanelView::PaintScope(gfx::C
+@@ -1715,13 +1716,14 @@ void CommandPanelView::PaintScope(gfx::C
    if (!appearance_.connected) {
      cc::PaintFlags edge;
      edge.setAntiAlias(true);
@@ -2579,6 +2601,14 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
      edge.setStyle(cc::PaintFlags::kStroke_Style);
      edge.setStrokeWidth(1);
      canvas->DrawPath(TopRoundedRectPath(
+         gfx::RectF(.5f, .5f, width - 1, height - 1), 13), edge);
+   }
+-  if (appearance_.scope_tints && !appearance_.connected) {
++  if (appearance_.scope_tints && !appearance_.connected &&
++      appearance_.glow_strength > 0.0) {
+     cc::PaintFlags glow;
+     if (scope.id == kOmniScope) {
+       constexpr std::array<float, 3> centers = {.5f, .88f, .12f};
 Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
@@ -2734,7 +2764,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/helium/glass_surface_configuration.h
 +++ src/chrome/browser/ui/views/helium/glass_surface_configuration.h
-@@ -54,6 +54,8 @@ inline constexpr char kGlassAppearanceFr
+@@ -55,6 +55,8 @@ inline constexpr char kGlassAppearanceFr
  inline constexpr char kGlassAppearanceFrostedStylePopover[] = "popover";
  inline constexpr char kGlassAppearanceFrostedStyleHud[] = "hud";
  inline constexpr char kGlassAppearanceColorHarmonyCustom[] = "custom";
@@ -2743,7 +2773,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.h
  inline constexpr char kGlassAppearanceColorHarmonyComplementary[] =
      "complementary";
  inline constexpr char kGlassAppearanceColorHarmonySplitComplementary[] =
-@@ -92,6 +94,8 @@ enum class GlassSurfaceFrostedStyle {
+@@ -100,6 +102,8 @@ enum class GlassSurfaceFrostedStyle {
  
  enum class GlassSurfaceColorHarmony {
    kCustom,
@@ -2752,7 +2782,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.h
    kComplementary,
    kSplitComplementary,
    kTriadic,
-@@ -113,6 +117,8 @@ struct GlassColorPoint {
+@@ -121,6 +125,8 @@ struct GlassColorPoint {
  };
  
  struct GlassSurfaceConfiguration {
@@ -2761,16 +2791,16 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.h
    // false means that the existing command-line glass policy remains in
    // control. The editable default enables the Liquid Glass surface.
    bool enabled = true;
-@@ -132,7 +138,8 @@ struct GlassSurfaceConfiguration {
+@@ -141,7 +147,8 @@ struct GlassSurfaceConfiguration {
    size_t point_count = 0;
  
    bool operator==(const GlassSurfaceConfiguration& other) const {
 -    if (enabled != other.enabled || material != other.material ||
 +    if (chrome_contrast_floor != other.chrome_contrast_floor ||
 +        enabled != other.enabled || material != other.material ||
+         color_effect != other.color_effect ||
          material_opacity != other.material_opacity ||
          glass_tint_opacity != other.glass_tint_opacity ||
-         glass_style != other.glass_style ||
 Index: src/chrome/browser/ui/views/helium/surface_style_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/helium/surface_style_unittest.cc
@@ -3113,7 +3143,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration_unittest.c
 ===================================================================
 --- src.orig/chrome/browser/ui/views/helium/glass_surface_configuration_unittest.cc
 +++ src/chrome/browser/ui/views/helium/glass_surface_configuration_unittest.cc
-@@ -290,6 +290,8 @@ TEST(GlassSurfaceConfigurationTest, Stri
+@@ -338,6 +338,8 @@ TEST(GlassSurfaceConfigurationTest, Stri
    const HarmonyCase cases[] = {
        {kGlassAppearanceColorHarmonyCustom,
         GlassSurfaceColorHarmony::kCustom},
@@ -3193,7 +3223,33 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
    base::test::ScopedFeatureList feature_list_;
    std::shared_ptr<FakeState> state_;
    std::unique_ptr<views::Widget> widget_;
-@@ -527,7 +561,7 @@ TEST_F(ArciumNativePanelTest, ThemeAccen
+@@ -465,6 +499,25 @@ TEST(CommandPanelAppearanceTest, Preserv
+             ReadCommandPanelAppearance(&prefs).reveal);
+ }
+ 
++TEST(CommandPanelAppearanceTest, WindowColorPolicySuppressesGlowsWithoutChangingSavedDial) {
++  TestingPrefServiceSimple prefs;
++  prefs.registry()->RegisterDictionaryPref(kCommandPanelLayoutPref);
++  prefs.registry()->RegisterDictionaryPref(helium::kArciumChromeAppearancePref);
++  prefs.SetDict(kCommandPanelLayoutPref,
++                base::DictValue().Set("glow_strength", 1.25));
++  for (const auto effect : {helium::GlassSurfaceColorEffect::kNone,
++                           helium::GlassSurfaceColorEffect::kTint,
++                           helium::GlassSurfaceColorEffect::kGlows}) {
++    auto chrome = helium::DefaultGlassSurfaceConfiguration();
++    chrome.color_effect = effect;
++    prefs.SetDict(helium::kArciumChromeAppearancePref,
++                  helium::SerializeGlassSurfaceConfiguration(chrome));
++    EXPECT_DOUBLE_EQ(ReadCommandPanelAppearance(&prefs).glow_strength,
++        effect == helium::GlassSurfaceColorEffect::kGlows ? 1.25 : 0.0);
++    EXPECT_EQ(prefs.GetDict(kCommandPanelLayoutPref).FindDouble("glow_strength"), 1.25);
++  }
++}
++
+ TEST(CommandPanelAppearanceTest, ReadsGlowStrengthAndRejectsInvalidValues) {
+   TestingPrefServiceSimple prefs;
+   prefs.registry()->RegisterDictionaryPref(kCommandPanelLayoutPref);
+@@ -527,7 +580,7 @@ TEST_F(ArciumNativePanelTest, ThemeAccen
                       panel()->selected_for_testing()].get());
  }
  
@@ -3202,7 +3258,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
    TestingPrefServiceSimple prefs;
    prefs.registry()->RegisterDictionaryPref(kCommandPanelLayoutPref);
    prefs.registry()->RegisterIntegerPref(kChromeUIScalePref, kChromeUIScaleDefault);
-@@ -543,10 +577,10 @@ TEST_F(ArciumNativePanelTest, SolidTintU
+@@ -543,10 +596,10 @@ TEST_F(ArciumNativePanelTest, SolidTintU
    input->SetSelectedRange(gfx::Range(2, 5));
    helium::SurfaceTuning tuning;
    tuning.panel_material = helium::PanelMaterial::kSolid;
@@ -3214,7 +3270,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
    EXPECT_EQ(SK_ColorWHITE, PaintPanel().getColor(50, 100));
    EXPECT_GT(color_utils::GetContrastRatio(input->GetTextColor(), SK_ColorWHITE),
              4.5f);
-@@ -554,14 +588,12 @@ TEST_F(ArciumNativePanelTest, SolidTintU
+@@ -554,14 +607,12 @@ TEST_F(ArciumNativePanelTest, SolidTintU
    EXPECT_EQ(u"retained query", input->GetText());
    EXPECT_EQ(gfx::Range(2, 5), input->GetSelectedRange());
  
