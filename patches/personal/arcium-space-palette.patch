@@ -1982,15 +1982,16 @@ Index: src/chrome/browser/ui/views/frame/browser_widget.cc
  #include "chrome/browser/ui/helium/helium_space_service_factory.h"
  #include "chrome/browser/ui/ui_features.h"
  #include "chrome/browser/ui/immersive/immersive_mode_controller.h"
-@@ -117,6 +121,7 @@ BrowserWidget::BrowserWidget(BrowserView
+@@ -117,6 +121,8 @@ BrowserWidget::BrowserWidget(BrowserView
  }
  
  BrowserWidget::~BrowserWidget() {
++  space_palette_pref_registrar_.Reset();
 +  space_palette_subscription_ = {};
    set_widget_closed();
  
    // Synchronously destroy owned Widgets, which are typically owned by the
-@@ -214,6 +219,20 @@ void BrowserWidget::InitBrowserWidget()
+@@ -214,6 +220,29 @@ void BrowserWidget::InitBrowserWidget()
    }
  
    Init(std::move(params));
@@ -2002,16 +2003,25 @@ Index: src/chrome/browser/ui/views/frame/browser_widget.cc
 +          widget->RefreshSpacePalette();
 +        }, base::Unretained(this)));
 +  }
-+  if (auto* spaces = helium::HeliumSpaceServiceFactory::GetForProfileIfExists(
-+          browser->profile())) {
-+    if (const auto* theme = spaces->GetThemeForBrowser(browser)) {
-+      applied_space_theme_ = *theme;
-+    }
++  auto* spaces = helium::HeliumSpaceServiceFactory::GetForProfileIfExists(
++      browser->profile());
++  const auto* theme = spaces ? spaces->GetThemeForBrowser(browser) : nullptr;
++  if (theme) {
++    applied_space_theme_ = *theme;
 +  }
++  applied_space_palette_ = helium::SpacePaletteKey(
++      theme, helium::ReadGlassSurfaceConfiguration(browser->profile()->GetPrefs()));
++  Profile* appearance_profile = browser->profile()->GetOriginalProfile();
++  space_palette_pref_registrar_.Init(
++      (appearance_profile ? appearance_profile : browser->profile())->GetPrefs());
++  space_palette_pref_registrar_.Add(
++      helium::kArciumChromeAppearancePref,
++      base::BindRepeating(&BrowserWidget::RefreshSpacePalette,
++                          base::Unretained(this)));
  
  #if BUILDFLAG(IS_LINUX)
    SelectNativeTheme();
-@@ -257,6 +276,33 @@ bool BrowserWidget::HandleKeyboardEvent(
+@@ -257,6 +286,38 @@ bool BrowserWidget::HandleKeyboardEvent(
           browser_native_widget_->HandleKeyboardEvent(event);
  }
  
@@ -2022,12 +2032,17 @@ Index: src/chrome/browser/ui/views/frame/browser_widget.cc
 +                             : nullptr;
 +  std::optional<helium::SpaceTheme> current = theme ? std::optional(*theme)
 +                                                  : std::nullopt;
-+  if (current == applied_space_theme_) {
++  const auto palette = helium::SpacePaletteKey(
++      theme, helium::ReadGlassSurfaceConfiguration(browser_view_->GetProfile()->GetPrefs()));
++  // Grain and opacity do not change this key. Keep their native-only updates
++  // cheap while mode changes with a saved tint refresh every Views consumer.
++  if (current == applied_space_theme_ && palette == applied_space_palette_) {
 +    return;
 +  }
 +  const auto before = applied_space_theme_.value_or(helium::SpaceTheme());
 +  const auto after = current.value_or(helium::SpaceTheme());
 +  applied_space_theme_ = std::move(current);
++  applied_space_palette_ = palette;
 +  ThemeChanged();
 +  for (Widget* widget : GetAllOwnedWidgets(GetNativeView())) {
 +    if (widget != this) {
@@ -2045,7 +2060,7 @@ Index: src/chrome/browser/ui/views/frame/browser_widget.cc
  void BrowserWidget::UserChangedTheme(BrowserThemeChangeType theme_change_type) {
    // kWebAppTheme is triggered by web apps and will only change colors, not the
    // frame type; just refresh the theme on all views in the browser window.
-@@ -280,19 +326,17 @@ void BrowserWidget::UserChangedTheme(Bro
+@@ -280,19 +341,17 @@ void BrowserWidget::UserChangedTheme(Bro
      // When the browser theme changes, the NativeTheme may also change.
      SelectNativeTheme();
  
@@ -2071,7 +2086,7 @@ Index: src/chrome/browser/ui/views/frame/browser_widget.cc
  }
  
  ///////////////////////////////////////////////////////////////////////////////
-@@ -456,24 +500,27 @@ ui::ColorProviderKey BrowserWidget::GetC
+@@ -456,24 +515,27 @@ ui::ColorProviderKey BrowserWidget::GetC
    const auto* theme_service = ThemeServiceFactory::GetForProfile(profile);
    CHECK(theme_service);
  
@@ -2115,7 +2130,7 @@ Index: src/chrome/browser/ui/views/frame/browser_widget.cc
      }
    }
  
-@@ -490,6 +537,18 @@ ui::ColorProviderKey BrowserWidget::GetC
+@@ -490,6 +552,18 @@ ui::ColorProviderKey BrowserWidget::GetC
    // Apply BrowserWidget overrides:
    key.app_controller =
        web_app::AppBrowserController::From(browser_view_->browser());
@@ -2138,7 +2153,7 @@ Index: src/chrome/browser/ui/views/frame/browser_widget.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/browser_widget.h
 +++ src/chrome/browser/ui/views/frame/browser_widget.h
-@@ -5,6 +5,9 @@
+@@ -5,9 +5,14 @@
  #ifndef CHROME_BROWSER_UI_VIEWS_FRAME_BROWSER_WIDGET_H_
  #define CHROME_BROWSER_UI_VIEWS_FRAME_BROWSER_WIDGET_H_
  
@@ -2148,7 +2163,12 @@ Index: src/chrome/browser/ui/views/frame/browser_widget.h
  #include "base/memory/raw_ptr.h"
  #include "build/build_config.h"
  #include "content/public/browser/keyboard_event_processing_result.h"
-@@ -99,6 +102,7 @@ class BrowserWidget : public views::Widg
++#include "components/prefs/pref_change_registrar.h"
++#include "ui/color/arcium_palette.h"
+ #include "ui/base/mojom/menu_source_type.mojom-forward.h"
+ #include "ui/base/mojom/window_show_state.mojom-forward.h"
+ #include "ui/base/pointer/touch_ui_controller.h"
+@@ -99,6 +104,7 @@ class BrowserWidget : public views::Widg
    // ThemeService calls this when a user has changed their theme, indicating
    // that it's time to redraw everything.
    void UserChangedTheme(BrowserThemeChangeType theme_change_type);
@@ -2156,12 +2176,14 @@ Index: src/chrome/browser/ui/views/frame/browser_widget.h
  
    // views::Widget:
    views::internal::RootView* CreateRootView() override;
-@@ -186,6 +190,8 @@ class BrowserWidget : public views::Widg
+@@ -186,6 +192,10 @@ class BrowserWidget : public views::Widg
    // may change, the fast resize strategy will be used to resize its web
    // contents for smoother dragging.
    TabDragKind tab_drag_kind_ = TabDragKind::kNone;
 +  base::CallbackListSubscription space_palette_subscription_;
 +  std::optional<helium::SpaceTheme> applied_space_theme_;
++  std::optional<ui::ArciumPalette> applied_space_palette_;
++  PrefChangeRegistrar space_palette_pref_registrar_;
  
  #if BUILDFLAG(IS_LINUX)
    bool tiled_ = false;
