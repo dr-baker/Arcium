@@ -6649,7 +6649,7 @@ Index: src/chrome/browser/ui/tabs/tab_menu_model.cc
  #include "chrome/browser/ui/color/chrome_color_id.h"
  #include "chrome/browser/ui/immersive/immersive_mode_controller.h"
  #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_context_menu_delegate.h"
-@@ -423,17 +424,48 @@ void TabMenuModel::Build(int index) {
+@@ -423,17 +424,49 @@ void TabMenuModel::Build(int index) {
                        IDS_TAB_CXMENU_DUPLICATE);
    SetElementIdentifierAt(GetItemCount() - 1, kDuplicateMenuItem);
  
@@ -6686,7 +6686,8 @@ Index: src/chrome/browser/ui/tabs/tab_menu_model.cc
 +    } else if (helium::CanMakePin(tab_interface_.get())) {
 +      AddSeparator(ui::NORMAL_SEPARATOR);
 +      AddItemWithStringId(TabStripModel::CommandMakePin,
-+                          IDS_TAB_CXMENU_MAKE_PIN);
++                          tab_interface_->IsSplit() ? IDS_SPLIT_VIEW_PIN_ACTION_2_IPH
++                                                    : IDS_TAB_CXMENU_MAKE_PIN);
 +    }
 +  }
  
@@ -8026,7 +8027,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
-@@ -0,0 +1,2364 @@
+@@ -0,0 +1,2385 @@
 +// Copyright 2025 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -8941,7 +8942,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +          helium::PersistentRecordKind kind, int depth,
 +          std::string_view parent_id, bool folder, bool collapsed,
 +          bool selected, tabs::TabInterface* live_tab,
-+          const std::u16string& title, const GURL& url) {
++          const std::u16string& title, const GURL& url, bool split) {
 +    const std::string item_id(id);
 +    desired_keys.insert(key);
 +    views::View* row = nullptr;
@@ -8997,6 +8998,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +        PersistentTabView::PresentationState presentation{
 +            .live = live_tab != nullptr,
 +            .selected = selected,
++            .split = split,
 +            .network_state = live_tab
 +                                 ? tabs::TabNetworkStateForWebContents(
 +                                       live_tab->GetContents())
@@ -9011,6 +9013,26 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +                                        kind, id, source_space_id);
 +              },
 +              weak_ptr_factory_.GetWeakPtr(), kind, item_id, space_id);
++          presentation.return_home_callback = base::BindRepeating(
++              [](base::WeakPtr<PinTabContainerView> container,
++                 helium::PersistentRecordKind kind, const std::string& id,
++                 const std::string& source_space_id) {
++                if (!container || !container->space_service_ ||
++                    !container->collection_node_ ||
++                    !container->collection_node_->GetController()) {
++                  return false;
++                }
++                BrowserView* owner = container->collection_node_
++                    ->GetController()->GetBrowserView();
++                Browser* browser = owner ? owner->browser() : nullptr;
++                if (!browser || (kind == helium::PersistentRecordKind::kPin &&
++                    container->space_service_->GetSpaceIdForBrowser(browser) !=
++                        source_space_id)) {
++                  return false;
++                }
++                return container->space_service_->ReturnPersistentItemHome(
++                    browser, kind, id, source_space_id);
++              }, weak_ptr_factory_.GetWeakPtr(), kind, item_id, space_id);
 +        }
 +        link_row->UpdatePresentation(title, url, std::move(presentation));
 +      } else {
@@ -9064,7 +9086,7 @@ Index: src/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
 +                  row.key.item_id, helium::PersistentRecordKind::kPin,
 +                  static_cast<int>(row.depth),
 +                  row.parent ? row.parent->item_id : std::string(), folder,
-+                  row.collapsed, row.selected, live_tab, row.title, row.url);
++                  row.collapsed, row.selected, live_tab, row.title, row.url, row.split);
 +  }
 +
 +  for (auto it = persistent_rows_.begin(); it != persistent_rows_.end();) {
@@ -15713,7 +15735,7 @@ Index: src/chrome/browser/ui/helium/helium_sidebar_pin_projection.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_sidebar_pin_projection.cc
-@@ -0,0 +1,512 @@
+@@ -0,0 +1,515 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -15889,6 +15911,7 @@ Index: src/chrome/browser/ui/helium/helium_sidebar_pin_projection.cc
 +        .sibling_index = index,
 +        .collapsed = folder && folder->collapsed,
 +        .selected = selected,
++        .split = link && link->split.has_value(),
 +        .live_tab_handle = !folder && binding != live_bindings.end()
 +                               ? std::optional<int32_t>(binding->second)
 +                               : std::nullopt,
@@ -15913,6 +15936,7 @@ Index: src/chrome/browser/ui/helium/helium_sidebar_pin_projection.cc
 +                              : std::nullopt,
 +          .collapsed = folder && folder->collapsed,
 +          .selected = selected,
++          .split = link && link->split.has_value(),
 +          .title = folder ? folder->title : LinkTitle(*link),
 +          .url = link ? link->url : GURL(),
 +      };
@@ -16206,6 +16230,7 @@ Index: src/chrome/browser/ui/helium/helium_sidebar_pin_projection.cc
 +                                  MakeKey(projection.space_id_, parent_id)),
 +              .collapsed = node->second.collapsed,
 +              .selected = node->second.selected,
++              .split = node->second.split,
 +              .live_tab_handle = node->second.live_tab_handle,
 +              .title = node->second.title,
 +              .url = node->second.url,
@@ -16230,7 +16255,7 @@ Index: src/chrome/browser/ui/helium/helium_sidebar_pin_projection.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_sidebar_pin_projection.h
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,163 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -16270,6 +16295,7 @@ Index: src/chrome/browser/ui/helium/helium_sidebar_pin_projection.h
 +  std::optional<SidebarPinKey> parent;
 +  bool collapsed = false;
 +  bool selected = false;
++  bool split = false;
 +  std::optional<int32_t> live_tab_handle;
 +  std::u16string title;
 +  GURL url;
@@ -16342,6 +16368,7 @@ Index: src/chrome/browser/ui/helium/helium_sidebar_pin_projection.h
 +    size_t sibling_index = 0;
 +    bool collapsed = false;
 +    bool selected = false;
++    bool split = false;
 +    std::optional<int32_t> live_tab_handle;
 +    std::u16string title;
 +    GURL url;
@@ -16396,7 +16423,7 @@ Index: src/chrome/browser/ui/helium/helium_sidebar_pin_projection_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_sidebar_pin_projection_unittest.cc
-@@ -0,0 +1,398 @@
+@@ -0,0 +1,419 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -16793,13 +16820,34 @@ Index: src/chrome/browser/ui/helium/helium_sidebar_pin_projection_unittest.cc
 +  EXPECT_TRUE(missing_active.rows().empty());
 +}
 +
++TEST(HeliumSidebarPinProjectionTest, SplitIdentitySurvivesDragPreview) {
++  auto split = Pin("split");
++  std::get<PersistentLink>(split.data).split = PersistentSplit{
++      .second_url = GURL("https://second.test/"), .second_title = u"Second"};
++  PersistentNodes pins{std::move(split), Pin("plain")};
++  HeliumSidebarPinProjection projection("space-a", pins);
++  ASSERT_TRUE(projection.valid());
++  ASSERT_EQ(2u, projection.rows().size());
++  EXPECT_TRUE(projection.rows()[0].split);
++  EXPECT_EQ(u"Pin / Second", projection.rows()[0].title);
++  EXPECT_FALSE(projection.rows()[1].split);
++  const auto intent = ResolveSidebarPinDrop(
++      projection, Key("split"), Drop("plain", SidebarPinDropPosition::kAfter));
++  const auto preview = PreviewSidebarPinMove(projection, intent);
++  ASSERT_TRUE(preview);
++  ASSERT_EQ(2u, preview->size());
++  EXPECT_FALSE(preview->front().split);
++  EXPECT_TRUE(preview->back().split);
++  EXPECT_EQ(Key("split"), preview->back().key);
++}
++
 +}  // namespace
 +}  // namespace helium
 Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
-@@ -0,0 +1,608 @@
+@@ -0,0 +1,657 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -16813,6 +16861,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
 +#include "base/functional/bind.h"
 +#include "base/task/sequenced_task_runner.h"
 +#include "base/time/time.h"
++#include "chrome/app/vector_icons/vector_icons.h"
 +#include "chrome/browser/favicon/favicon_service_factory.h"
 +#include "chrome/browser/favicon/favicon_utils.h"
 +#include "chrome/browser/history/history_service_factory.h"
@@ -16873,12 +16922,19 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
 +  return state != PersistentFaviconState::kResolved;
 +}
 +
-+void AppendDormantPersistentItemMenuItems(ui::SimpleMenuModel* model,
-+                                          bool is_pin) {
++void AppendPersistentItemMenuItems(ui::SimpleMenuModel* model,
++                                   bool is_pin,
++                                   bool is_split,
++                                   bool can_return_home) {
 +  CHECK(model);
 +  model->AddItem(static_cast<int>(PersistentItemMenuCommand::kOpen),
 +                 l10n_util::GetStringUTF16(IDS_HISTORY_OPEN));
 +  if (is_pin) {
++    model->AddItem(static_cast<int>(PersistentItemMenuCommand::kReturnHome),
++                   l10n_util::GetStringUTF16(IDS_TAB_CXMENU_RESET_PIN_HOME));
++    model->SetEnabledAt(model->GetItemCount() - 1, can_return_home);
++  }
++  if (is_pin && !is_split) {
 +    model->AddItem(static_cast<int>(PersistentItemMenuCommand::kFavorite),
 +                   l10n_util::GetStringUTF16(IDS_TAB_CXMENU_PIN_TAB));
 +  }
@@ -16977,10 +17033,9 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
 +void PersistentTabView::UpdateContent(std::u16string title, const GURL& url) {
 +  if (title_->GetText() != title) {
 +    title_->SetText(title);
-+    SetTooltipText(title);
-+    GetViewAccessibility().SetName(title);
 +  }
 +  title_->SetVisible(presentation_mode_ != PresentationMode::kCompactGrid);
++  UpdateAccessibleName();
 +
 +  if (url_ != url) {
 +    url_ = url;
@@ -16991,10 +17046,22 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
 +  }
 +}
 +
++void PersistentTabView::UpdateAccessibleName() {
++  const std::u16string description = presentation_state_.split
++      ? l10n_util::GetStringUTF16(IDS_OVERFLOW_MENU_ITEM_TEXT_SPLIT_VIEW)
++      : std::u16string();
++  const std::u16string title = title_->GetText();
++  SetTooltipText(description.empty() ? title
++                                     : title + u" (" + description + u")");
++  GetViewAccessibility().SetName(title);
++  GetViewAccessibility().SetDescription(description);
++}
++
 +void PersistentTabView::ApplyPresentationState(PresentationState state) {
 +  const bool was_live = presentation_state_.live;
 +  const bool was_selected = selected_;
 +  presentation_state_ = std::move(state);
++  UpdateAccessibleName();
 +  SetSelected(presentation_state_.selected);
 +  RefreshIconData();
 +  UpdateCloseButtonVisibility();
@@ -17303,10 +17370,13 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
 +
 +void PersistentTabView::RefreshIconData() {
 +  tabs::TabData data;
-+  data.favicon = favicon_model_;
++  data.favicon = presentation_state_.split
++      ? ui::ImageModel::FromVectorIcon(kSplitSceneIcon, ui::kColorIcon)
++      : favicon_model_;
 +  data.visible_url = url_;
 +  data.network_state = presentation_state_.network_state;
 +  data.should_themify_favicon =
++      !presentation_state_.split &&
 +      favicon_state_ == PersistentFaviconState::kResolved &&
 +      favicon::ShouldThemifyFavicon(url_);
 +  icon_->SetData(data);
@@ -17360,8 +17430,10 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
 +    const gfx::Point& point,
 +    ui::mojom::MenuSourceType source_type) {
 +  context_menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
-+  AppendDormantPersistentItemMenuItems(context_menu_model_.get(),
-+                                       !favorite_callback_.is_null());
++  AppendPersistentItemMenuItems(
++      context_menu_model_.get(), !favorite_callback_.is_null(),
++      presentation_state_.split,
++      IsCommandIdEnabled(static_cast<int>(PersistentItemMenuCommand::kReturnHome)));
 +  context_menu_runner_ = std::make_unique<views::MenuRunner>(
 +      context_menu_model_.get(),
 +      views::MenuRunner::HAS_MNEMONICS | views::MenuRunner::CONTEXT_MENU);
@@ -17370,7 +17442,22 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
 +      views::MenuAnchorPosition::kTopLeft, source_type);
 +}
 +
++bool PersistentTabView::IsCommandIdEnabled(int command_id) const {
++  switch (static_cast<PersistentItemMenuCommand>(command_id)) {
++    case PersistentItemMenuCommand::kReturnHome:
++      return presentation_state_.live &&
++             !presentation_state_.return_home_callback.is_null();
++    case PersistentItemMenuCommand::kFavorite:
++      return !presentation_state_.split && !favorite_callback_.is_null();
++    default:
++      return true;
++  }
++}
++
 +void PersistentTabView::ExecuteCommand(int command_id, int event_flags) {
++  if (!IsCommandIdEnabled(command_id)) {
++    return;
++  }
 +  switch (static_cast<PersistentItemMenuCommand>(command_id)) {
 +    case PersistentItemMenuCommand::kOpen:
 +      ActivateFromMenu();
@@ -17387,6 +17474,16 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
 +            FROM_HERE, remove_callback_);
 +      }
 +      break;
++    case PersistentItemMenuCommand::kReturnHome: {
++      // Native navigation may synchronously destroy this row. Cancel its menu
++      // and copy the callback before dispatching to the current owner.
++      if (context_menu_runner_) {
++        context_menu_runner_->Cancel();
++      }
++      auto callback = presentation_state_.return_home_callback;
++      callback.Run();
++      break;
++    }
 +    case PersistentItemMenuCommand::kFavorite:
 +      if (context_menu_runner_) {
 +        context_menu_runner_->Cancel();
@@ -17412,7 +17509,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,230 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -17462,6 +17559,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
 +  kOpen = 1,
 +  kRemove = 2,
 +  kFavorite = 3,
++  kReturnHome = 4,
 +};
 +
 +enum class PersistentFaviconState {
@@ -17472,8 +17570,10 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
 +
 +bool ShouldApplyGeneratedFavicon(PersistentFaviconState state);
 +
-+void AppendDormantPersistentItemMenuItems(ui::SimpleMenuModel* model,
-+                                          bool is_pin);
++void AppendPersistentItemMenuItems(ui::SimpleMenuModel* model,
++                                   bool is_pin,
++                                   bool is_split = false,
++                                   bool can_return_home = false);
 +
 +class PersistentTabView;
 +
@@ -17511,8 +17611,10 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
 +  struct PresentationState {
 +    bool live = false;
 +    bool selected = false;
++    bool split = false;
 +    tabs::TabNetworkState network_state = tabs::TabNetworkState::kNone;
 +    base::RepeatingCallback<bool()> dematerialize_callback;
++    base::RepeatingCallback<bool()> return_home_callback;
 +  };
 +
 +  PersistentTabView(Profile* profile,
@@ -17532,6 +17634,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
 +  const GURL& url() const { return url_; }
 +  bool selected() const { return selected_; }
 +  bool live() const { return presentation_state_.live; }
++  bool split() const { return presentation_state_.split; }
 +  bool loading() const {
 +    return presentation_state_.network_state ==
 +               tabs::TabNetworkState::kWaiting ||
@@ -17566,6 +17669,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
 +      ui::mojom::MenuSourceType source_type) override;
 +
 +  // ui::SimpleMenuModel::Delegate:
++  bool IsCommandIdEnabled(int command_id) const override;
 +  void ExecuteCommand(int command_id, int event_flags) override;
 +
 + private:
@@ -17588,6 +17692,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
 +  void SetSelected(bool selected);
 +  void UpdateContent(std::u16string title, const GURL& url);
 +  void ApplyPresentationState(PresentationState state);
++  void UpdateAccessibleName();
 +  void UpdateCloseButtonVisibility();
 +  void CloseButtonPressed(const ui::Event& event);
 +  void UpdateColors();
@@ -17639,7 +17744,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
-@@ -0,0 +1,352 @@
+@@ -0,0 +1,418 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -17940,7 +18045,7 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
 +
 +TEST_F(PersistentTabViewTest, DormantFavoriteMenuExposesOpenAndUnfavorite) {
 +  ui::SimpleMenuModel model(nullptr);
-+  AppendDormantPersistentItemMenuItems(&model, false);
++  AppendPersistentItemMenuItems(&model, false);
 +  ASSERT_EQ(2u, model.GetItemCount());
 +  EXPECT_EQ(static_cast<int>(PersistentItemMenuCommand::kOpen),
 +            model.GetCommandIdAt(0));
@@ -17952,18 +18057,21 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
 +
 +TEST_F(PersistentTabViewTest, DormantPinMenuAlsoExposesFavorite) {
 +  ui::SimpleMenuModel model(nullptr);
-+  AppendDormantPersistentItemMenuItems(&model, true);
-+  ASSERT_EQ(3u, model.GetItemCount());
++  AppendPersistentItemMenuItems(&model, true);
++  ASSERT_EQ(4u, model.GetItemCount());
 +  EXPECT_EQ(static_cast<int>(PersistentItemMenuCommand::kOpen),
 +            model.GetCommandIdAt(0));
-+  EXPECT_EQ(static_cast<int>(PersistentItemMenuCommand::kFavorite),
++  EXPECT_EQ(static_cast<int>(PersistentItemMenuCommand::kReturnHome),
 +            model.GetCommandIdAt(1));
-+  EXPECT_EQ(l10n_util::GetStringUTF16(IDS_TAB_CXMENU_PIN_TAB),
-+            model.GetLabelAt(1));
-+  EXPECT_EQ(static_cast<int>(PersistentItemMenuCommand::kRemove),
++  EXPECT_FALSE(model.IsEnabledAt(1));
++  EXPECT_EQ(static_cast<int>(PersistentItemMenuCommand::kFavorite),
 +            model.GetCommandIdAt(2));
-+  EXPECT_EQ(l10n_util::GetStringUTF16(IDS_TAB_CXMENU_REMOVE_PIN),
++  EXPECT_EQ(l10n_util::GetStringUTF16(IDS_TAB_CXMENU_PIN_TAB),
 +            model.GetLabelAt(2));
++  EXPECT_EQ(static_cast<int>(PersistentItemMenuCommand::kRemove),
++            model.GetCommandIdAt(3));
++  EXPECT_EQ(l10n_util::GetStringUTF16(IDS_TAB_CXMENU_REMOVE_PIN),
++            model.GetLabelAt(3));
 +}
 +
 +TEST_F(PersistentTabViewTest, PressEmitsExactlyOneActivation) {
@@ -17991,6 +18099,69 @@ Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
 +  EXPECT_EQ(0, remove_count);
 +  task_environment()->RunUntilIdle();
 +  EXPECT_EQ(1, remove_count);
++}
++
++TEST_F(PersistentTabViewTest, SplitMenuReturnsHomeWithoutOfferingFavorite) {
++  ui::SimpleMenuModel model(nullptr);
++  AppendPersistentItemMenuItems(&model, true, true, true);
++  ASSERT_EQ(3u, model.GetItemCount());
++  EXPECT_EQ(static_cast<int>(PersistentItemMenuCommand::kOpen),
++            model.GetCommandIdAt(0));
++  EXPECT_EQ(static_cast<int>(PersistentItemMenuCommand::kReturnHome),
++            model.GetCommandIdAt(1));
++  EXPECT_EQ(l10n_util::GetStringUTF16(IDS_TAB_CXMENU_RESET_PIN_HOME),
++            model.GetLabelAt(1));
++  EXPECT_TRUE(model.IsEnabledAt(1));
++  EXPECT_EQ(static_cast<int>(PersistentItemMenuCommand::kRemove),
++            model.GetCommandIdAt(2));
++}
++
++TEST_F(PersistentTabViewTest, ReturnHomeFollowsLiveBindingAndSplitIdentity) {
++  int count = 0;
++  auto row = MakeView(PersistentTabView::PresentationMode::kFullRow);
++  const int command = static_cast<int>(PersistentItemMenuCommand::kReturnHome);
++  EXPECT_FALSE(row->IsCommandIdEnabled(command));
++  PersistentTabView::PresentationState state;
++  state.split = true;
++  state.return_home_callback = base::BindRepeating([](int* count) {
++    ++*count;
++    return true;
++  }, &count);
++  row->UpdatePresentation(u"First / Second", GURL("https://example.test/"), state);
++  EXPECT_TRUE(row->split());
++  EXPECT_FALSE(row->IsCommandIdEnabled(command));
++  row->ExecuteCommand(command, 0);
++  EXPECT_EQ(0, count);
++  ui::AXNodeData node;
++  row->GetViewAccessibility().GetAccessibleNodeData(&node);
++  EXPECT_EQ(u"First / Second",
++            node.GetString16Attribute(ax::mojom::StringAttribute::kName));
++  EXPECT_EQ(l10n_util::GetStringUTF16(IDS_OVERFLOW_MENU_ITEM_TEXT_SPLIT_VIEW),
++            node.GetString16Attribute(ax::mojom::StringAttribute::kDescription));
++  state.live = true;
++  row->UpdatePresentation(u"First / Second", GURL("https://example.test/"), state);
++  EXPECT_TRUE(row->IsCommandIdEnabled(command));
++  row->ExecuteCommand(command, 0);
++  EXPECT_EQ(1, count);
++  row->UpdatePresentation(u"First / Second", GURL("https://example.test/"), {});
++  EXPECT_FALSE(row->split());
++  EXPECT_FALSE(row->IsCommandIdEnabled(command));
++  row->ExecuteCommand(command, 0);
++  EXPECT_EQ(1, count);
++}
++
++TEST_F(PersistentTabViewTest, ReturnHomeCallbackMayDestroyItsRow) {
++  auto row = MakeView(PersistentTabView::PresentationMode::kFullRow);
++  PersistentTabView::PresentationState state;
++  state.live = true;
++  state.return_home_callback = base::BindRepeating(
++      [](std::unique_ptr<PersistentTabView>* row) {
++        row->reset();
++        return true;
++      }, &row);
++  row->UpdatePresentation(u"Split", GURL("https://example.test/"), std::move(state));
++  row->ExecuteCommand(static_cast<int>(PersistentItemMenuCommand::kReturnHome), 0);
++  EXPECT_EQ(nullptr, row);
 +}
 Index: src/chrome/browser/ui/helium/helium_sidebar_native_tab_drag_session.cc
 ===================================================================
