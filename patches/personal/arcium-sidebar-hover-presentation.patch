@@ -86,7 +86,7 @@ Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
 +++ src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
-@@ -6,8 +6,17 @@
+@@ -6,8 +6,21 @@
  
  #include <memory>
  #include <cstdlib>
@@ -97,6 +97,10 @@ Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
  #include "base/functional/bind.h"
 +#include "base/scoped_observation.h"
 +#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/color/chrome_color_mixers.h"
++#include "components/color/color_mixers.h"
++#include "ui/color/color_provider_manager.h"
++#include "ui/gfx/color_palette.h"
 +#include "chrome/browser/ui/helium/space_palette.h"
 +#include "chrome/browser/ui/views/frame/browser_widget.h"
 +#include "ui/color/color_provider.h"
@@ -104,7 +108,7 @@ Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
  #include "chrome/app/chrome_command_ids.h"
  #include "chrome/browser/ui/browser_commands.h"
  #include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
-@@ -19,6 +28,7 @@
+@@ -19,6 +32,7 @@
  #include "chrome/browser/ui/toolbar/pinned_toolbar/pinned_toolbar_actions_model.h"
  #include "chrome/browser/ui/toolbar/pinned_toolbar/pinned_toolbar_actions_model_factory.h"
  #include "chrome/browser/ui/views/frame/browser_view.h"
@@ -112,7 +116,33 @@ Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
  #include "chrome/browser/ui/views/frame/contents_container_view.h"
  #include "chrome/browser/ui/views/frame/multi_contents_view.h"
  #include "chrome/common/pref_names.h"
-@@ -160,3 +170,130 @@ TEST_F(ArciumBrowserChromeTest, HiddenTo
+@@ -44,6 +58,13 @@ class ArciumBrowserChromeTest : public T
+ 
+   void SetUp() override {
+     TestWithBrowserView::SetUp();
++    // TestWithBrowserView omits ChromeViewsTestBase's mixer registration.
++    // Use the production color pipeline before asserting cached view colors.
++    ui::ColorProviderManager::Get().AppendColorProviderInitializer(
++        base::BindRepeating(color::AddComponentsColorMixers));
++    ui::ColorProviderManager::Get().AppendColorProviderInitializer(
++        base::BindRepeating(AddChromeColorMixers));
++    browser_view()->GetWidget()->ThemeChanged();
+     AddTab(browser(), GURL("https://example.com/"));
+     prefs()->SetInteger(arcium::kChromeUIScalePref, 100);
+     prefs()->SetBoolean(prefs::kHeliumRoundedFrame, true);
+@@ -57,6 +78,11 @@ class ArciumBrowserChromeTest : public T
+     Layout();
+   }
+ 
++  void TearDown() override {
++    TestWithBrowserView::TearDown();
++    ui::ColorProviderManager::ResetForTesting();
++  }
++
+   PrefService* prefs() { return browser()->profile()->GetPrefs(); }
+   void Layout() { browser_view()->GetWidget()->LayoutRootViewIfNecessary(); }
+ };
+@@ -160,3 +186,131 @@ TEST_F(ArciumBrowserChromeTest, HiddenTo
    EXPECT_EQ(browser_view()->GetFrameElementInfo().toolbar_minimum_height,
              visible_height);
  }
@@ -217,6 +247,7 @@ Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
 +  PaletteThemeChangeObserver browser_changes(widget, true);
 +  PaletteThemeChangeObserver owned_changes(owned.get());
 +  const SkColor glow_panel = browser_changes.panel_color;
++  ASSERT_NE(glow_panel, gfx::kPlaceholderColor);
 +
 +  recipe.color_effect = helium::GlassSurfaceColorEffect::kTint;
 +  prefs()->SetDict(helium::kArciumChromeAppearancePref,
@@ -370,3 +401,15 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
    std::optional<base::TimeTicks> expand_on_hover_start_time_;
    base::RetainingOneShotTimer expand_on_hover_heuristic_timer_;
    std::optional<gfx::Point> point_at_expand_on_hover_timer_start_;
+Index: src/chrome/test/BUILD.gn
+===================================================================
+--- src.orig/chrome/test/BUILD.gn
++++ src/chrome/test/BUILD.gn
+@@ -11498,6 +11498,7 @@ if (!is_android && toolkit_views) {
+       "//chrome/browser/ui/side_panel:test_support",
+       "//chrome/browser/user_education:user_education",
+       "//components/autofill/content/browser:test_support",
++      "//components/color",
+       "//components/prefs",
+       "//components/proxy_config",
+       "//components/variations",
