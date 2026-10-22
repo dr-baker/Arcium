@@ -2,15 +2,16 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/helium/glass_surface_configuration.h
 +++ src/chrome/browser/ui/views/helium/glass_surface_configuration.h
-@@ -26,6 +26,7 @@ inline constexpr char kArciumChromeAppea
+@@ -26,6 +26,8 @@ inline constexpr char kArciumChromeAppea
      "arcium.chrome.appearance";
  
  inline constexpr char kGlassAppearanceEnabledKey[] = "enabled";
 +inline constexpr char kGlassAppearanceColorEffectKey[] = "colorEffect";
++inline constexpr char kGlassAppearanceTintColorKey[] = "tintColor";
  inline constexpr char kGlassAppearanceMaterialKey[] = "material";
  inline constexpr char kGlassAppearanceMaterialOpacityKey[] = "materialOpacity";
  inline constexpr char kGlassAppearanceGlassTintOpacityKey[] =
-@@ -40,6 +41,7 @@ inline constexpr char kGlassAppearanceGr
+@@ -40,6 +42,7 @@ inline constexpr char kGlassAppearanceGr
  inline constexpr char kGlassAppearancePointsKey[] = "points";
  inline constexpr char kGlassAppearanceMatchColorAdjustmentsKey[] =
      "matchColorAdjustments";
@@ -18,7 +19,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.h
  
  inline constexpr char kGlassAppearanceAuto[] = "auto";
  inline constexpr char kGlassAppearanceLiquidGlass[] = "liquidGlass";
-@@ -52,6 +54,13 @@ inline constexpr char kGlassAppearanceFr
+@@ -52,6 +55,13 @@ inline constexpr char kGlassAppearanceFr
  inline constexpr char kGlassAppearanceFrostedStyleMenu[] = "menu";
  inline constexpr char kGlassAppearanceFrostedStylePopover[] = "popover";
  inline constexpr char kGlassAppearanceFrostedStyleHud[] = "hud";
@@ -32,7 +33,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.h
  
  inline constexpr char kGlassPointIdKey[] = "id";
  inline constexpr char kGlassPointColorKey[] = "color";
-@@ -62,6 +71,13 @@ inline constexpr char kGlassPointOpacity
+@@ -62,6 +72,13 @@ inline constexpr char kGlassPointOpacity
  
  inline constexpr size_t kMaxGlassColorPoints = 4;
  
@@ -46,7 +47,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.h
  enum class GlassSurfaceMaterial {
    kAuto,
    kLiquidGlass,
-@@ -82,6 +98,14 @@ enum class GlassSurfaceFrostedStyle {
+@@ -82,6 +99,14 @@ enum class GlassSurfaceFrostedStyle {
    kHud,
  };
  
@@ -61,7 +62,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.h
  struct GlassColorPoint {
    std::string id;
    SkColor4f color = {1.0f, 1.0f, 1.0f, 1.0f};
-@@ -101,6 +125,7 @@ struct GlassSurfaceConfiguration {
+@@ -101,6 +126,7 @@ struct GlassSurfaceConfiguration {
    // control. The editable default enables the Liquid Glass surface.
    bool enabled = true;
    GlassSurfaceMaterial material = GlassSurfaceMaterial::kLiquidGlass;
@@ -69,9 +70,12 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.h
    double material_opacity = 0.95;
    double glass_tint_opacity = 0.7;
    GlassSurfaceGlassStyle glass_style = GlassSurfaceGlassStyle::kRegular;
-@@ -111,11 +136,13 @@ struct GlassSurfaceConfiguration {
+@@ -110,20 +136,25 @@ struct GlassSurfaceConfiguration {
+   double tint_strength = 0.0;
    double grain = 0.0;
    double grain_scale = 0.5;
++  // Optional Space-owned flat-tint seed; absent follows the existing palette.
++  std::optional<SkColor> tint_color;
    bool match_color_adjustments = false;
 +  GlassSurfaceColorHarmony color_harmony = GlassSurfaceColorHarmony::kCustom;
    std::array<GlassColorPoint, kMaxGlassColorPoints> points;
@@ -83,15 +87,17 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.h
          material_opacity != other.material_opacity ||
          glass_tint_opacity != other.glass_tint_opacity ||
          glass_style != other.glass_style ||
-@@ -124,6 +151,7 @@ struct GlassSurfaceConfiguration {
+         frosted_style != other.frosted_style ||
+         frosted_tint_strength != other.frosted_tint_strength ||
          tint_strength != other.tint_strength || grain != other.grain ||
-         grain_scale != other.grain_scale ||
+-        grain_scale != other.grain_scale ||
++        grain_scale != other.grain_scale || tint_color != other.tint_color ||
          match_color_adjustments != other.match_color_adjustments ||
 +        color_harmony != other.color_harmony ||
          point_count != other.point_count) {
        return false;
      }
-@@ -150,6 +178,11 @@ struct GlassSurfaceResolution {
+@@ -150,6 +181,11 @@ struct GlassSurfaceResolution {
  
  GlassSurfaceConfiguration DefaultGlassSurfaceConfiguration();
  
@@ -112,7 +118,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.cc
  constexpr double kMinimumGrainScale = 0.5;
  constexpr double kMaximumGrainScale = 2.0;
 +constexpr size_t kLegacyGlassSurfaceFieldCount = 12;
-+constexpr size_t kGlassSurfaceFieldCount = kLegacyGlassSurfaceFieldCount + 2;
++constexpr size_t kGlassSurfaceFieldCount = kLegacyGlassSurfaceFieldCount + 3;
  
  std::optional<double> FindNumber(const base::DictValue& dict,
                                   std::string_view key) {
@@ -187,7 +193,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.cc
  const char* MaterialString(GlassSurfaceMaterial material) {
    switch (material) {
      case GlassSurfaceMaterial::kAuto:
-@@ -203,8 +262,34 @@ const char* MaterialString(GlassSurfaceM
+@@ -203,8 +262,35 @@ const char* MaterialString(GlassSurfaceM
    return kGlassAppearanceAuto;
  }
  
@@ -218,12 +224,13 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.cc
 +
  bool IsKnownTopLevelKey(std::string_view key) {
 -  return key == kGlassAppearanceEnabledKey ||
-+  return key == kGlassAppearanceColorEffectKey ||
++  return key == kGlassAppearanceTintColorKey ||
++         key == kGlassAppearanceColorEffectKey ||
 +         key == kGlassAppearanceEnabledKey ||
           key == kGlassAppearanceMaterialKey ||
           key == kGlassAppearanceMaterialOpacityKey ||
           key == kGlassAppearanceGlassTintOpacityKey ||
-@@ -215,7 +300,8 @@ bool IsKnownTopLevelKey(std::string_view
+@@ -215,7 +301,8 @@ bool IsKnownTopLevelKey(std::string_view
           key == kGlassAppearanceGrainKey ||
           key == kGlassAppearanceGrainScaleKey ||
           key == kGlassAppearancePointsKey ||
@@ -233,13 +240,19 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.cc
  }
  
  bool IsKnownPointKey(std::string_view key) {
-@@ -294,10 +380,19 @@ GlassSurfaceConfiguration ParseGlassSurf
+@@ -294,10 +381,25 @@ GlassSurfaceConfiguration ParseGlassSurf
      const base::DictValue& dict) {
    GlassSurfaceConfiguration configuration = DefaultGlassSurfaceConfiguration();
  
 +  if (const std::string* effect = dict.FindString(kGlassAppearanceColorEffectKey)) {
 +    configuration.color_effect = ParseColorEffect(*effect).value_or(
 +        GlassSurfaceColorEffect::kGlows);
++  }
++  if (const auto* value = dict.FindString(kGlassAppearanceTintColorKey)) {
++    SkColor4f color;
++    if (ParseRgbColor(*value, &color)) {
++      configuration.tint_color = color.toSkColor();
++    }
 +  }
    configuration.enabled =
        dict.FindBool(kGlassAppearanceEnabledKey).value_or(configuration.enabled);
@@ -253,7 +266,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.cc
    if (const std::string* material =
            dict.FindString(kGlassAppearanceMaterialKey)) {
      configuration.material = ParseMaterial(*material, configuration.material);
-@@ -368,7 +463,8 @@ GlassSurfaceConfiguration ParseGlassSurf
+@@ -368,7 +470,8 @@ GlassSurfaceConfiguration ParseGlassSurf
  
  std::optional<GlassSurfaceConfiguration> ParseGlassSurfaceConfigurationStrict(
      const base::DictValue& dict) {
@@ -263,7 +276,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.cc
      return std::nullopt;
    }
    for (const auto item : dict) {
-@@ -380,6 +476,20 @@ std::optional<GlassSurfaceConfiguration>
+@@ -380,6 +483,20 @@ std::optional<GlassSurfaceConfiguration>
    const std::optional<bool> enabled = dict.FindBool(kGlassAppearanceEnabledKey);
    const std::optional<bool> match_color_adjustments =
        dict.FindBool(kGlassAppearanceMatchColorAdjustmentsKey);
@@ -284,7 +297,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.cc
    const std::string* material_string =
        dict.FindString(kGlassAppearanceMaterialKey);
    const std::optional<GlassSurfaceMaterial> material =
-@@ -395,16 +505,18 @@ std::optional<GlassSurfaceConfiguration>
+@@ -395,16 +512,25 @@ std::optional<GlassSurfaceConfiguration>
        frosted_style_string ? ParseFrostedStyleStrict(*frosted_style_string)
                             : std::nullopt;
    if (!enabled || !match_color_adjustments || !material || !glass_style ||
@@ -294,6 +307,13 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.cc
    }
  
    GlassSurfaceConfiguration configuration;
++  if (const auto* value = dict.Find(kGlassAppearanceTintColorKey)) {
++    SkColor4f color;
++    if (!value->is_string() || !ParseRgbColor(value->GetString(), &color)) {
++      return std::nullopt;
++    }
++    configuration.tint_color = color.toSkColor();
++  }
    configuration.enabled = *enabled;
 +  configuration.color_effect = *effect;
    configuration.match_color_adjustments = *match_color_adjustments;
@@ -304,16 +324,21 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.cc
    if (!HasFiniteNumberInRange(dict, kGlassAppearanceMaterialOpacityKey, 0.0,
                                1.0, &configuration.material_opacity) ||
        !HasFiniteNumberInRange(dict, kGlassAppearanceGlassTintOpacityKey, 0.0,
-@@ -491,6 +603,8 @@ base::DictValue SerializeGlassSurfaceCon
+@@ -490,7 +616,13 @@ base::DictValue SerializeGlassSurfaceCon
+   }
  
    base::DictValue result;
++  if (configuration.tint_color) {
++    result.Set(kGlassAppearanceTintColorKey,
++               ColorString(SkColor4f::FromColor(*configuration.tint_color)));
++  }
    result.Set(kGlassAppearanceEnabledKey, configuration.enabled);
 +  result.Set(kGlassAppearanceColorEffectKey,
 +             ColorEffectString(configuration.color_effect));
    result.Set(kGlassAppearanceMatchColorAdjustmentsKey,
               configuration.match_color_adjustments);
    result.Set(kGlassAppearanceMaterialKey,
-@@ -513,6 +627,8 @@ base::DictValue SerializeGlassSurfaceCon
+@@ -513,6 +645,8 @@ base::DictValue SerializeGlassSurfaceCon
               CanonicalNumber(configuration.grain_scale, kMinimumGrainScale,
                               kMaximumGrainScale));
    result.Set(kGlassAppearancePointsKey, std::move(points));
@@ -322,7 +347,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration.cc
    return result;
  }
  
-@@ -524,6 +640,22 @@ base::DictValue CompleteGlassSurfaceConf
+@@ -524,6 +658,22 @@ base::DictValue CompleteGlassSurfaceConf
    return complete;
  }
  
@@ -357,7 +382,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration_unittest.c
    ASSERT_EQ(configuration.point_count, 2u);
    EXPECT_EQ(configuration.points[0].id, "yellow");
    EXPECT_EQ(configuration.points[1].id, "blue");
-@@ -43,6 +44,57 @@ TEST(GlassSurfaceConfigurationTest, Defa
+@@ -43,6 +44,97 @@ TEST(GlassSurfaceConfigurationTest, Defa
    EXPECT_DOUBLE_EQ(*serialized.FindDouble(kGlassAppearanceGlassTintOpacityKey),
                     0.7);
    EXPECT_DOUBLE_EQ(*serialized.FindDouble(kGlassAppearanceGrainScaleKey), 0.5);
@@ -412,10 +437,50 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration_unittest.c
 +  const auto disabled = GlassSurfaceConfigurationForPainting(recipe);
 +  EXPECT_EQ(disabled.point_count, 0u);
 +  EXPECT_DOUBLE_EQ(disabled.grain, 0.0);
++}
++
++TEST(GlassSurfaceConfigurationTest, OptionalTintColorMigratesAndRoundTripsWithoutGlows) {
++  auto recipe = DefaultGlassSurfaceConfiguration();
++  EXPECT_FALSE(ParseGlassSurfaceConfiguration(
++      SerializeGlassSurfaceConfiguration(recipe)).tint_color);
++  recipe.point_count = 0;
++  recipe.tint_color = SkColorSetRGB(18, 160, 220);
++  for (const auto mode : {GlassSurfaceColorEffect::kTint,
++                          GlassSurfaceColorEffect::kNone,
++                          GlassSurfaceColorEffect::kGlows}) {
++    recipe.color_effect = mode;
++    const auto parsed = ParseGlassSurfaceConfigurationStrict(
++        SerializeGlassSurfaceConfiguration(recipe));
++    ASSERT_TRUE(parsed);
++    EXPECT_EQ(*parsed, recipe);
++    EXPECT_EQ(parsed->point_count, 0u);
++    EXPECT_EQ(parsed->tint_color, recipe.tint_color);
++    const auto paint = GlassSurfaceConfigurationForPainting(*parsed);
++    EXPECT_EQ(paint.point_count, 0u);
++    if (mode == GlassSurfaceColorEffect::kTint) {
++      EXPECT_DOUBLE_EQ(paint.grain, 0.0);
++    }
++  }
++  auto changed = recipe;
++  changed.tint_color = SK_ColorRED;
++  EXPECT_NE(changed, recipe);
++}
++
++TEST(GlassSurfaceConfigurationTest, RejectsMalformedOptionalTintColor) {
++  auto saved = SerializeGlassSurfaceConfiguration(DefaultGlassSurfaceConfiguration());
++  for (const auto* invalid : {"red", "#12345", "#12345678", "#GG0000"}) {
++    saved.Set(kGlassAppearanceTintColorKey, invalid);
++    EXPECT_FALSE(ParseGlassSurfaceConfigurationStrict(saved));
++    EXPECT_FALSE(ParseGlassSurfaceConfiguration(saved).tint_color);
++  }
++  saved.Set(kGlassAppearanceTintColorKey, false);
++  EXPECT_FALSE(ParseGlassSurfaceConfigurationStrict(saved));
++  saved.Remove(kGlassAppearanceTintColorKey);
++  EXPECT_TRUE(ParseGlassSurfaceConfigurationStrict(saved));
  }
  
  TEST(GlassSurfaceConfigurationTest, EmptyDictionaryUsesCanonicalDefaults) {
-@@ -73,6 +125,7 @@ TEST(GlassSurfaceConfigurationTest,
+@@ -73,6 +165,7 @@ TEST(GlassSurfaceConfigurationTest,
    EXPECT_DOUBLE_EQ(configuration.frosted_tint_strength, 1.0);
    EXPECT_DOUBLE_EQ(configuration.grain_scale, 0.5);
    EXPECT_EQ(configuration.point_count, 0u);
@@ -423,7 +488,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration_unittest.c
  }
  
  TEST(GlassSurfaceConfigurationTest, EqualityIncludesNewFields) {
-@@ -96,6 +149,9 @@ TEST(GlassSurfaceConfigurationTest, Equa
+@@ -96,6 +189,9 @@ TEST(GlassSurfaceConfigurationTest, Equa
    changed = baseline;
    changed.grain_scale = 2.0;
    EXPECT_NE(changed, baseline);
@@ -433,7 +498,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration_unittest.c
  }
  
  TEST(GlassSurfaceConfigurationTest,
-@@ -111,7 +167,7 @@ TEST(GlassSurfaceConfigurationTest,
+@@ -111,7 +207,7 @@ TEST(GlassSurfaceConfigurationTest,
    base::DictValue complete =
        CompleteGlassSurfaceConfigurationForEditing(legacy);
    EXPECT_EQ(legacy, original);
@@ -442,7 +507,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration_unittest.c
    EXPECT_TRUE(ParseGlassSurfaceConfigurationStrict(complete));
    EXPECT_TRUE(*complete.FindBool(kGlassAppearanceEnabledKey));
    EXPECT_STREQ(complete.FindString(kGlassAppearanceMaterialKey)->c_str(),
-@@ -129,6 +185,8 @@ TEST(GlassSurfaceConfigurationTest,
+@@ -129,6 +225,8 @@ TEST(GlassSurfaceConfigurationTest,
    EXPECT_DOUBLE_EQ(*complete.FindDouble(kGlassAppearanceFrostedTintStrengthKey),
                     1.0);
    EXPECT_DOUBLE_EQ(*complete.FindDouble(kGlassAppearanceGrainScaleKey), 0.5);
@@ -451,7 +516,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration_unittest.c
  }
  
  TEST(GlassSurfaceConfigurationTest,
-@@ -253,6 +311,94 @@ TEST(GlassSurfaceConfigurationTest, Soli
+@@ -253,6 +351,94 @@ TEST(GlassSurfaceConfigurationTest, Soli
    EXPECT_TRUE(resolution.paints_chrome_transparent);
  }
  
@@ -546,7 +611,7 @@ Index: src/chrome/browser/ui/views/helium/glass_surface_configuration_unittest.c
  TEST(GlassSurfaceConfigurationTest, StrictSerializerRoundTripsCanonicalValue) {
    GlassSurfaceConfiguration configuration = DefaultGlassSurfaceConfiguration();
    configuration.enabled = true;
-@@ -272,7 +418,7 @@ TEST(GlassSurfaceConfigurationTest, Stri
+@@ -272,7 +458,7 @@ TEST(GlassSurfaceConfigurationTest, Stri
  
    base::DictValue canonical_again = SerializeGlassSurfaceConfiguration(*parsed);
    EXPECT_EQ(serialized, canonical_again);
