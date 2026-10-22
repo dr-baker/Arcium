@@ -86,7 +86,7 @@ Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
 +++ src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
-@@ -6,6 +6,9 @@
+@@ -6,8 +6,21 @@
  
  #include <memory>
  #include <cstdlib>
@@ -95,8 +95,20 @@ Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
 +#include "ui/gfx/scoped_animation_duration_scale_mode.h"
  
  #include "base/functional/bind.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/color/chrome_color_mixers.h"
++#include "components/color/color_mixers.h"
++#include "ui/color/color_provider_manager.h"
++#include "ui/gfx/color_palette.h"
++#include "chrome/browser/ui/helium/space_palette.h"
++#include "chrome/browser/ui/views/frame/browser_widget.h"
++#include "ui/color/color_provider.h"
++#include "ui/views/widget/widget_observer.h"
  #include "chrome/app/chrome_command_ids.h"
-@@ -19,6 +22,7 @@
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
+@@ -19,6 +32,7 @@
  #include "chrome/browser/ui/toolbar/pinned_toolbar/pinned_toolbar_actions_model.h"
  #include "chrome/browser/ui/toolbar/pinned_toolbar/pinned_toolbar_actions_model_factory.h"
  #include "chrome/browser/ui/views/frame/browser_view.h"
@@ -104,7 +116,33 @@ Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
  #include "chrome/browser/ui/views/frame/contents_container_view.h"
  #include "chrome/browser/ui/views/frame/multi_contents_view.h"
  #include "chrome/common/pref_names.h"
-@@ -160,3 +164,50 @@ TEST_F(ArciumBrowserChromeTest, HiddenTo
+@@ -44,6 +58,13 @@ class ArciumBrowserChromeTest : public T
+ 
+   void SetUp() override {
+     TestWithBrowserView::SetUp();
++    // TestWithBrowserView omits ChromeViewsTestBase's mixer registration.
++    // Use the production color pipeline before asserting cached view colors.
++    ui::ColorProviderManager::Get().AppendColorProviderInitializer(
++        base::BindRepeating(color::AddComponentsColorMixers));
++    ui::ColorProviderManager::Get().AppendColorProviderInitializer(
++        base::BindRepeating(AddChromeColorMixers));
++    browser_view()->GetWidget()->ThemeChanged();
+     AddTab(browser(), GURL("https://example.com/"));
+     prefs()->SetInteger(arcium::kChromeUIScalePref, 100);
+     prefs()->SetBoolean(prefs::kHeliumRoundedFrame, true);
+@@ -57,6 +78,11 @@ class ArciumBrowserChromeTest : public T
+     Layout();
+   }
+ 
++  void TearDown() override {
++    TestWithBrowserView::TearDown();
++    ui::ColorProviderManager::ResetForTesting();
++  }
++
+   PrefService* prefs() { return browser()->profile()->GetPrefs(); }
+   void Layout() { browser_view()->GetWidget()->LayoutRootViewIfNecessary(); }
+ };
+@@ -160,3 +186,131 @@ TEST_F(ArciumBrowserChromeTest, HiddenTo
    EXPECT_EQ(browser_view()->GetFrameElementInfo().toolbar_minimum_height,
              visible_height);
  }
@@ -154,6 +192,87 @@ Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
 +  EXPECT_EQ(last_presentation, tabs::VerticalTabStripCollapseState::kCollapsed);
 +  EXPECT_EQ(prefs()->GetInteger(prefs::kVerticalTabsUncollapsedWidth),
 +            saved_width);
++}
++
++namespace {
++class PaletteThemeChangeObserver : public views::WidgetObserver {
++ public:
++  explicit PaletteThemeChangeObserver(views::Widget* widget,
++                                      bool capture_panel = false)
++      : capture_panel_(capture_panel) {
++    observation_.Observe(widget);
++    if (capture_panel_) {
++      panel_color = widget->GetColorProvider()->GetColor(kColorArciumPanel);
++    }
++  }
++  void OnWidgetThemeChanged(views::Widget* widget) override {
++    ++changes;
++    if (capture_panel_) {
++      panel_color = widget->GetColorProvider()->GetColor(kColorArciumPanel);
++    }
++  }
++  void OnWidgetDestroying(views::Widget*) override { observation_.Reset(); }
++
++  int changes = 0;
++  SkColor panel_color = SK_ColorTRANSPARENT;
++
++ private:
++  const bool capture_panel_;
++  base::ScopedObservation<views::Widget, views::WidgetObserver> observation_{this};
++};
++}  // namespace
++
++TEST_F(ArciumBrowserChromeTest, ColorModeRefreshesCachedPaletteAndOwnedWidgets) {
++  auto* spaces = helium::HeliumSpaceServiceFactory::GetForProfile(browser()->profile());
++  ASSERT_TRUE(spaces);
++  auto* space = spaces->GetOrCreateSpace("mode-palette", u"Mode palette");
++  auto recipe = helium::DefaultGlassSurfaceConfiguration();
++  recipe.point_count = 1;
++  recipe.points[0].color = SkColor4f::FromColor(SK_ColorGREEN);
++  recipe.tint_color = SK_ColorRED;
++  recipe.color_effect = helium::GlassSurfaceColorEffect::kGlows;
++  spaces->SetSpaceTheme(space->id(),
++      helium::WithSpacePaletteAppearance(helium::SpaceTheme(), recipe));
++  spaces->SetSpaceForBrowser(browser(), space->id());
++  prefs()->SetDict(helium::kArciumChromeAppearancePref,
++                   helium::SerializeGlassSurfaceConfiguration(recipe));
++  const auto saved_theme = space->theme();
++  auto* widget = browser_view()->browser_widget();
++  auto owned = std::make_unique<views::Widget>();
++  views::Widget::InitParams params(views::Widget::InitParams::CLIENT_OWNS_WIDGET,
++                                  views::Widget::InitParams::TYPE_POPUP);
++  params.parent = widget->GetNativeView();
++  owned->Init(std::move(params));
++  ASSERT_TRUE(views::Widget::GetAllOwnedWidgets(widget->GetNativeView()).contains(owned.get()));
++  PaletteThemeChangeObserver browser_changes(widget, true);
++  PaletteThemeChangeObserver owned_changes(owned.get());
++  const SkColor glow_panel = browser_changes.panel_color;
++  ASSERT_NE(glow_panel, gfx::kPlaceholderColor);
++
++  recipe.color_effect = helium::GlassSurfaceColorEffect::kTint;
++  prefs()->SetDict(helium::kArciumChromeAppearancePref,
++                   helium::SerializeGlassSurfaceConfiguration(recipe));
++  EXPECT_EQ(space->theme(), saved_theme);
++  EXPECT_GT(browser_changes.changes, 0);
++  EXPECT_GT(owned_changes.changes, 0);
++  EXPECT_NE(browser_changes.panel_color, glow_panel);
++  const int browser_notifications = browser_changes.changes;
++  const int owned_notifications = owned_changes.changes;
++
++  recipe.grain = 0.12;
++  recipe.material_opacity = 0.6;
++  prefs()->SetDict(helium::kArciumChromeAppearancePref,
++                   helium::SerializeGlassSurfaceConfiguration(recipe));
++  EXPECT_EQ(browser_changes.changes, browser_notifications);
++  EXPECT_EQ(owned_changes.changes, owned_notifications);
++
++  recipe.color_effect = helium::GlassSurfaceColorEffect::kGlows;
++  prefs()->SetDict(helium::kArciumChromeAppearancePref,
++                   helium::SerializeGlassSurfaceConfiguration(recipe));
++  EXPECT_GT(browser_changes.changes, browser_notifications);
++  EXPECT_GT(owned_changes.changes, owned_notifications);
++  EXPECT_EQ(browser_changes.panel_color, glow_panel);
++  EXPECT_EQ(space->theme(), saved_theme);
 +}
 Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 ===================================================================
@@ -282,3 +401,15 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
    std::optional<base::TimeTicks> expand_on_hover_start_time_;
    base::RetainingOneShotTimer expand_on_hover_heuristic_timer_;
    std::optional<gfx::Point> point_at_expand_on_hover_timer_start_;
+Index: src/chrome/test/BUILD.gn
+===================================================================
+--- src.orig/chrome/test/BUILD.gn
++++ src/chrome/test/BUILD.gn
+@@ -11509,6 +11509,7 @@ if (!is_android && toolkit_views) {
+       "//components/keyed_service/core",
+       "//components/tabs:test_support",
+       "//components/autofill/content/browser:test_support",
++      "//components/color",
+       "//components/prefs",
+       "//components/proxy_config",
+       "//components/variations",

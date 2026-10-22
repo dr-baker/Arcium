@@ -1,0 +1,99 @@
+Index: src/chrome/browser/ui/profiles/profile_picker.cc
+===================================================================
+--- src.orig/chrome/browser/ui/profiles/profile_picker.cc
++++ src/chrome/browser/ui/profiles/profile_picker.cc
+@@ -11,7 +11,6 @@
+ #include "base/containers/flat_set.h"
+ #include "base/feature_list.h"
+ #include "base/logging.h"
+-#include "base/metrics/histogram_functions.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/profiles/profile_manager.h"
+ #include "chrome/browser/profiles/profiles_state.h"
+@@ -181,18 +180,9 @@ StartupProfileMode ProfilePicker::GetSta
+     }
+   }
+ 
+-  size_t number_of_profiles = profile_manager->GetNumberOfProfiles();
+-  // Need to consider 0 profiles as this is what happens in some browser-tests.
+-  if (number_of_profiles <= 1) {
+-    return StartupProfileMode::kBrowserWindow;
+-  }
+-
+-  bool pref_enabled = g_browser_process->local_state()->GetBoolean(
+-      prefs::kBrowserShowProfilePickerOnStartup);
+-  base::UmaHistogramBoolean("ProfilePicker.AskOnStartup", pref_enabled);
+-  if (pref_enabled) {
+-    return StartupProfileMode::kProfilePicker;
+-  }
++  // Spaces select the browsing profile. Open the last browser session directly,
++  // even when Chromium's legacy ask-on-startup preference is enabled. Explicit
++  // profile creation and administrator policy are handled above.
+   return StartupProfileMode::kBrowserWindow;
+ }
+ 
+Index: src/chrome/browser/ui/profiles/profile_picker_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/profiles/profile_picker_unittest.cc
++++ src/chrome/browser/ui/profiles/profile_picker_unittest.cc
+@@ -51,14 +51,15 @@ class ProfilePickerTest : public testing
+   TestingProfileManager testing_profile_manager_;
+ };
+ 
+-TEST_F(ProfilePickerTest, ShouldShowAtLaunch_MultipleProfiles_Default) {
++TEST_F(ProfilePickerTest,
++       OpensBrowserAtLaunch_MultipleProfiles_LegacyPickerEnabled) {
+   testing_profile_manager()->CreateTestingProfile("profile1");
+   testing_profile_manager()->CreateTestingProfile("profile2");
+   ASSERT_TRUE(
+       local_state()->GetBoolean(prefs::kBrowserShowProfilePickerOnStartup));
+ 
+   EXPECT_EQ(ProfilePicker::GetStartupMode(),
+-            StartupProfileMode::kProfilePicker);
++            StartupProfileMode::kBrowserWindow);
+ }
+ 
+ TEST_F(ProfilePickerTest, ShouldShowAtLaunch_MultipleProfiles_DisabledStartup) {
+@@ -68,6 +69,30 @@ TEST_F(ProfilePickerTest, ShouldShowAtLa
+ 
+   EXPECT_EQ(ProfilePicker::GetStartupMode(),
+             StartupProfileMode::kBrowserWindow);
++}
++
++TEST_F(ProfilePickerTest, OpensBrowserAtLaunch_NoProfiles) {
++  EXPECT_EQ(ProfilePicker::GetStartupMode(),
++            StartupProfileMode::kBrowserWindow);
++}
++
++TEST_F(ProfilePickerTest, ForcedPickerPolicyIsRespected) {
++  testing_profile_manager()->CreateTestingProfile("profile1");
++  testing_profile_manager()->CreateTestingProfile("profile2");
++  local_state()->SetInteger(prefs::kBrowserProfilePickerAvailabilityOnStartup, 2);
++  local_state()->SetBoolean(prefs::kBrowserShowProfilePickerOnStartup, false);
++
++  EXPECT_EQ(ProfilePicker::GetStartupMode(),
++            StartupProfileMode::kProfilePicker);
++}
++
++TEST_F(ProfilePickerTest, DisabledPickerPolicyIsRespected) {
++  testing_profile_manager()->CreateTestingProfile("profile1");
++  testing_profile_manager()->CreateTestingProfile("profile2");
++  local_state()->SetInteger(prefs::kBrowserProfilePickerAvailabilityOnStartup, 1);
++
++  EXPECT_EQ(ProfilePicker::GetStartupMode(),
++            StartupProfileMode::kBrowserWindow);
+ }
+ 
+ TEST_F(ProfilePickerTest, ShouldShowAtLaunch_SingleProfile) {
+Index: src/chrome/test/BUILD.gn
+===================================================================
+--- src.orig/chrome/test/BUILD.gn
++++ src/chrome/test/BUILD.gn
+@@ -11468,6 +11468,7 @@ if (!is_android && toolkit_views) {
+       "../browser/extensions/api/settings_private/prefs_util_unittest.cc",
+       "../browser/renderer_context_menu/render_view_context_menu_unittest.cc",
+       "../browser/ui/helium/helium_space_service_unittest.cc",
++      "../browser/ui/profiles/profile_picker_unittest.cc",
+       "../browser/ui/views/frame/arcium_browser_chrome_unittest.cc",
+     "../browser/ui/helium/arcium_space_icon_unittest.cc",
+     ]
