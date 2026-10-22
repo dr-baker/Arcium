@@ -19472,7 +19472,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_space_service_unittest.cc
-@@ -0,0 +1,1293 @@
+@@ -0,0 +1,1304 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -19685,6 +19685,40 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +    return {id.value_or(std::string()), tab};
 +  }
 +
++  void RestoreOrderedSplit(tabs::TabInterface* first,
++                           tabs::TabInterface* second,
++                           split_tabs::SplitTabVisualData visuals) {
++    auto* model = browser()->tab_strip_model();
++    ASSERT_NE(first, second);
++    int first_index = model->GetIndexOfTab(first);
++    int second_index = model->GetIndexOfTab(second);
++    ASSERT_NE(TabStripModel::kNoTab, first_index);
++    ASSERT_NE(TabStripModel::kNoTab, second_index);
++    // AddTab inserts relative to selection. Arrange the named panes explicitly
++    // so sorting native indices cannot exchange their saved home identities.
++    if (first_index > second_index) {
++      model->MoveWebContentsAt(first_index, second_index,
++                               /*select_after_move=*/false, std::nullopt);
++    }
++    first_index = model->GetIndexOfTab(first);
++    second_index = model->GetIndexOfTab(second);
++    if (second_index != first_index + 1) {
++      model->MoveWebContentsAt(second_index, first_index + 1,
++                               /*select_after_move=*/false, std::nullopt);
++    }
++    first_index = model->GetIndexOfTab(first);
++    second_index = model->GetIndexOfTab(second);
++    ASSERT_EQ(first_index + 1, second_index);
++    model->RestoreSplit(split_tabs::SplitTabId::GenerateNew(),
++                        {first_index, second_index}, std::move(visuals));
++    ASSERT_TRUE(first->IsSplit());
++    ASSERT_EQ(first->GetSplit(), second->GetSplit());
++    const auto panes = model->GetSplitData(*first->GetSplit())->ListTabs();
++    ASSERT_EQ(2u, panes.size());
++    EXPECT_EQ(first, panes[0]);
++    EXPECT_EQ(second, panes[1]);
++  }
++
 +  struct SplitPin {
 +    std::string id;
 +    tabs::TabInterface* first;
@@ -19694,14 +19728,11 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +  SplitPin AddSplitPin(bool stacked = false) {
 +    auto* first = AddOrdinaryTab("https://left.test/");
 +    auto* second = AddOrdinaryTab("https://right.test/");
-+    auto* model = browser()->tab_strip_model();
-+    model->RestoreSplit(
-+        split_tabs::SplitTabId::GenerateNew(),
-+        {model->GetIndexOfTab(first), model->GetIndexOfTab(second)},
-+        split_tabs::SplitTabVisualData(
-+            stacked ? split_tabs::SplitTabLayout::kStacked
-+                    : split_tabs::SplitTabLayout::kSideBySide,
-+            0.4));
++    RestoreOrderedSplit(first, second,
++                        split_tabs::SplitTabVisualData(
++                            stacked ? split_tabs::SplitTabLayout::kStacked
++                                    : split_tabs::SplitTabLayout::kSideBySide,
++                            0.4));
 +    auto id = service_->ConvertTabToPinInSpace(browser(), space_->id(), first,
 +                                               {}, {});
 +    EXPECT_TRUE(id);
@@ -19966,10 +19997,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +  const auto first_handle = first->GetHandle();
 +  const auto second_handle = second->GetHandle();
 +  auto* model = browser()->tab_strip_model();
-+  model->RestoreSplit(
-+      split_tabs::SplitTabId::GenerateNew(),
-+      {model->GetIndexOfTab(first), model->GetIndexOfTab(second)},
-+      split_tabs::SplitTabVisualData());
++  RestoreOrderedSplit(first, second, split_tabs::SplitTabVisualData());
 +  auto callback = TabUIHelper::From(first)->AddTabUIChangeCallback(
 +      base::BindLambdaForTesting([&]() {
 +        if (auto* pane = second_handle.Get()) {
@@ -20027,10 +20055,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +  auto* second = AddOrdinaryTab("https://right.test/");
 +  const auto handle = second->GetHandle();
 +  auto* model = browser()->tab_strip_model();
-+  model->RestoreSplit(
-+      split_tabs::SplitTabId::GenerateNew(),
-+      {model->GetIndexOfTab(first), model->GetIndexOfTab(second)},
-+      split_tabs::SplitTabVisualData());
++  RestoreOrderedSplit(first, second, split_tabs::SplitTabVisualData());
 +  auto callback = TabUIHelper::From(second)->AddTabUIChangeCallback(
 +      base::BindLambdaForTesting([&]() {
 +        if (auto* pane = handle.Get()) {
@@ -20054,10 +20079,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +  const auto first_handle = first->GetHandle();
 +  const auto second_handle = second->GetHandle();
 +  auto* model = browser()->tab_strip_model();
-+  model->RestoreSplit(
-+      split_tabs::SplitTabId::GenerateNew(),
-+      {model->GetIndexOfTab(first), model->GetIndexOfTab(second)},
-+      split_tabs::SplitTabVisualData());
++  RestoreOrderedSplit(first, second, split_tabs::SplitTabVisualData());
 +  auto callback = TabUIHelper::From(second)->AddTabUIChangeCallback(
 +      base::BindLambdaForTesting([&]() { service_->Shutdown(); }));
 +  auto id =
@@ -20144,10 +20166,9 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +TEST_F(HeliumSpaceServiceTest, SplittingExistingPinSavesItsWholePair) {
 +  auto [id, first] = AddLivePin();
 +  auto* second = AddOrdinaryTab("https://companion.test/");
-+  auto* model = browser()->tab_strip_model();
-+  model->RestoreSplit(split_tabs::SplitTabId::GenerateNew(),
-+      {model->GetIndexOfTab(first), model->GetIndexOfTab(second)},
-+      split_tabs::SplitTabVisualData(split_tabs::SplitTabLayout::kStacked, 0.42));
++  RestoreOrderedSplit(first, second,
++                      split_tabs::SplitTabVisualData(
++                          split_tabs::SplitTabLayout::kStacked, 0.42));
 +  base::RunLoop().RunUntilIdle();
 +  EXPECT_EQ(std::optional<std::string>(id), service_->GetPersistentItemId(second));
 +  const auto* item = PersistentItemCodec::FindLink(space_->pins(), id);
@@ -20162,9 +20183,9 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +  auto* first = AddOrdinaryTab("https://same.test/");
 +  auto* second = AddOrdinaryTab("https://same.test/");
 +  auto* model = browser()->tab_strip_model();
-+  model->RestoreSplit(split_tabs::SplitTabId::GenerateNew(),
-+      {model->GetIndexOfTab(first), model->GetIndexOfTab(second)},
-+      split_tabs::SplitTabVisualData(split_tabs::SplitTabLayout::kStacked, 0.31));
++  RestoreOrderedSplit(first, second,
++                      split_tabs::SplitTabVisualData(
++                          split_tabs::SplitTabLayout::kStacked, 0.31));
 +  model->ActivateTabAt(model->GetIndexOfTab(second));
 +  auto id = service_->ConvertTabToPinInSpace(browser(), space_->id(), first, {}, {});
 +  ASSERT_TRUE(id);
@@ -20202,9 +20223,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +  auto* first = AddOrdinaryTab("https://left.test/");
 +  auto* second = AddOrdinaryTab("https://right.test/");
 +  auto* model = browser()->tab_strip_model();
-+  model->RestoreSplit(split_tabs::SplitTabId::GenerateNew(),
-+      {model->GetIndexOfTab(first), model->GetIndexOfTab(second)},
-+      split_tabs::SplitTabVisualData());
++  RestoreOrderedSplit(first, second, split_tabs::SplitTabVisualData());
 +  auto id = service_->ConvertTabToPinInSpace(browser(), space_->id(), first, {}, {});
 +  ASSERT_TRUE(id);
 +  GURL home;
@@ -20225,11 +20244,9 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +  auto* first = AddOrdinaryTab("https://same.test/");
 +  auto* second = AddOrdinaryTab("https://same.test/");
 +  auto* model = browser()->tab_strip_model();
-+  model->RestoreSplit(
-+      split_tabs::SplitTabId::GenerateNew(),
-+      {model->GetIndexOfTab(first), model->GetIndexOfTab(second)},
-+      split_tabs::SplitTabVisualData(split_tabs::SplitTabLayout::kStacked,
-+                                     0.37));
++  RestoreOrderedSplit(first, second,
++                      split_tabs::SplitTabVisualData(
++                          split_tabs::SplitTabLayout::kStacked, 0.37));
 +  model->ActivateTabAt(model->GetIndexOfTab(second));
 +  const int count = model->count();
 +  auto id =
@@ -20272,10 +20289,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +  auto* first = AddOrdinaryTab("https://left.test/");
 +  auto* second = AddOrdinaryTab("https://right.test/");
 +  auto* model = browser()->tab_strip_model();
-+  model->RestoreSplit(
-+      split_tabs::SplitTabId::GenerateNew(),
-+      {model->GetIndexOfTab(first), model->GetIndexOfTab(second)},
-+      split_tabs::SplitTabVisualData());
++  RestoreOrderedSplit(first, second, split_tabs::SplitTabVisualData());
 +  auto id =
 +      service_->ConvertTabToPinInSpace(browser(), space_->id(), first, {}, {});
 +  ASSERT_TRUE(id);
@@ -20315,10 +20329,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +  auto* first = AddOrdinaryTab("https://left.test/");
 +  auto* second = AddOrdinaryTab("https://right.test/");
 +  auto* model = browser()->tab_strip_model();
-+  model->RestoreSplit(
-+      split_tabs::SplitTabId::GenerateNew(),
-+      {model->GetIndexOfTab(first), model->GetIndexOfTab(second)},
-+      split_tabs::SplitTabVisualData());
++  RestoreOrderedSplit(first, second, split_tabs::SplitTabVisualData());
 +  auto id =
 +      service_->ConvertTabToPinInSpace(browser(), space_->id(), first, {}, {});
 +  ASSERT_TRUE(id);
