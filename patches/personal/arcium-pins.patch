@@ -1137,7 +1137,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/helium_space_service.cc
 +++ src/chrome/browser/ui/helium/helium_space_service.cc
-@@ -4,48 +4,522 @@
+@@ -4,48 +4,524 @@
  
  #include "chrome/browser/ui/helium/helium_space_service.h"
  
@@ -1540,7 +1540,9 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  std::optional<SessionID> owner_browser_id;
 +  raw_ptr<tabs::TabInterface> companion = nullptr;
 +  bool primary_is_second = false;
-+  bool restoring_split = false;
++  // A validated conversion or session restore may briefly own panes in
++  // different native collections while it places the complete saved split.
++  bool placing_split = false;
 +  base::CallbackListSubscription companion_will_detach;
 +  base::CallbackListSubscription companion_did_insert;
 +  base::CallbackListSubscription companion_did_activate;
@@ -1674,7 +1676,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
    }
  }
  
-@@ -56,16 +530,8 @@ void HeliumSpaceService::EnsureDefaultSp
+@@ -56,16 +532,8 @@ void HeliumSpaceService::EnsureDefaultSp
      }
      return;
    }
@@ -1693,7 +1695,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
  }
  
  HeliumSpace* HeliumSpaceService::GetDefaultSpace() {
-@@ -79,9 +545,8 @@ const HeliumSpace* HeliumSpaceService::G
+@@ -79,9 +547,8 @@ const HeliumSpace* HeliumSpaceService::G
  
  HeliumSpace* HeliumSpaceService::GetActiveSpace() {
    EnsureDefaultSpace();
@@ -1705,7 +1707,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      return active;
    }
    return spaces_.front().get();
-@@ -100,52 +565,3729 @@ HeliumSpace* HeliumSpaceService::GetOrCr
+@@ -100,52 +567,3748 @@ HeliumSpace* HeliumSpaceService::GetOrCr
                                                    std::u16string name) {
    if (HeliumSpace* existing = GetSpaceById(id)) {
      existing->SetName(std::move(name));
@@ -2862,7 +2864,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  const auto browser_handle = browser->AsWeakPtr();
 +  auto* model = browser->tab_strip_model();
 +  if (!IsLiveAssociationPlacementValid(*association) &&
-+      !association->restoring_split) {
++      !association->placing_split) {
 +    return false;
 +  }
 +  if (association->companion &&
@@ -2893,7 +2895,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +        static_cast<const tabs::TabStripCollection*>(model->Root());
 +    if (strip->IsPinTab(original_primary.Get()) &&
 +        strip->IsPinTab(other_handle.Get())) {
-+      association->restoring_split = false;
++      association->placing_split = false;
 +      return true;
 +    }
 +    if (!original_primary.Get()->IsSplit()) {
@@ -2994,7 +2996,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  if (!valid()) {
 +    return false;
 +  }
-+  resolve()->restoring_split = false;
++  resolve()->placing_split = false;
 +  return first.Get()->IsSplit() &&
 +         first.Get()->GetSplit() == second.Get()->GetSplit();
 +}
@@ -3255,7 +3257,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +        FROM_HERE,
 +        base::BindOnce(&HeliumSpaceService::SaveLiveSplitVisuals,
 +                       weak_factory_.GetWeakPtr(), association->token));
-   }
++  }
 +  if (association && live_pin_space_transfers_.contains(association->token)) {
 +    return;
 +  }
@@ -4242,8 +4244,27 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +      return id;
 +    }
 +    const uint64_t token = association->token;
-+    if (!AttachSplitPane(token, second_pane, true) || !service ||
-+        !service->EnsureLiveSplit(token) || !service) {
++    if (!AttachSplitPane(token, second_pane, true) || !service) {
++      return id;
++    }
++    auto current = service->live_associations_.find(token);
++    if (current == service->live_associations_.end() ||
++        current->second->tab != first_handle.Get() ||
++        current->second->companion != second_handle->Get()) {
++      return id;
++    }
++    current->second->placing_split = true;
++    base::ScopedClosureRunner finish_placement(base::BindOnce(
++        [](base::WeakPtr<HeliumSpaceService> service, uint64_t token) {
++          if (service) {
++            const auto current = service->live_associations_.find(token);
++            if (current != service->live_associations_.end()) {
++              current->second->placing_split = false;
++            }
++          }
++        },
++        service, token));
++    if (!service->EnsureLiveSplit(token) || !service) {
 +      return id;
 +    }
 +    auto* focus =
@@ -4559,7 +4580,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +      }
 +      return false;
 +    }
-+  }
+   }
 +
 +  space->SetPins(std::move(staged_pins));
 +  RegisterDormantItems();
@@ -5332,7 +5353,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +    if (current == live_associations_.end()) {
 +      return false;
 +    }
-+    current->second->restoring_split = true;
++    current->second->placing_split = true;
 +    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
 +        FROM_HERE,
 +        base::BindOnce(base::IgnoreResult(&HeliumSpaceService::EnsureLiveSplit),
@@ -5353,7 +5374,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
 +  const auto item = ResolveItem(browser, kind, id);
 +  if (association && item && item->split) {
 +    association->primary_is_second = second;
-+    association->restoring_split = true;
++    association->placing_split = true;
 +    const auto service = weak_factory_.GetWeakPtr();
 +    const auto handle = tab->GetHandle();
 +    const uint64_t token = association->token;
@@ -5442,7 +5463,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
      return false;
    }
    SetSpaceForBrowser(browser, found->second);
-@@ -158,22 +4300,48 @@ void HeliumSpaceService::AddSpaceToSessi
+@@ -158,22 +4321,48 @@ void HeliumSpaceService::AddSpaceToSessi
    if (!extra_data) {
      return;
    }
@@ -5499,7 +5520,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service.cc
  std::vector<HeliumSpace*> HeliumSpaceService::GetSpaces() {
    EnsureDefaultSpace();
    std::vector<HeliumSpace*> result;
-@@ -186,33 +4354,125 @@ std::vector<HeliumSpace*> HeliumSpaceSer
+@@ -186,33 +4375,125 @@ std::vector<HeliumSpace*> HeliumSpaceSer
  
  void HeliumSpaceService::OnBrowserCreated(BrowserWindowInterface* window) {
    Browser* browser = window ? window->GetBrowserForMigrationOnly() : nullptr;
@@ -19472,7 +19493,7 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/helium_space_service_unittest.cc
-@@ -0,0 +1,1304 @@
+@@ -0,0 +1,1340 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -20238,6 +20259,42 @@ Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
 +  EXPECT_EQ(GURL("https://left.test/"), home);
 +  ASSERT_TRUE(service_->GetPersistentItemHome(second, &home, &title));
 +  EXPECT_EQ(GURL("https://right.test/"), home);
++}
++
++TEST_F(HeliumSpaceServiceTest, PinningReversedNativeSplitRetainsBothLivePages) {
++  AddOrdinaryTab("https://keep.test/");
++  auto* page_a = AddOrdinaryTab("https://page-a.test/");
++  auto* page_b = AddOrdinaryTab("https://page-b.test/");
++  auto* contents_a = page_a->GetContents();
++  auto* contents_b = page_b->GetContents();
++  auto* model = browser()->tab_strip_model();
++  RestoreOrderedSplit(page_b, page_a, split_tabs::SplitTabVisualData());
++  model->ActivateTabAt(model->GetIndexOfTab(page_b));
++  const int original_count = model->count();
++
++  auto id =
++      service_->ConvertTabToPinInSpace(browser(), space_->id(), page_b, {}, {});
++  ASSERT_TRUE(id);
++  EXPECT_EQ(original_count, model->count());
++  EXPECT_EQ(contents_a, page_a->GetContents());
++  EXPECT_EQ(contents_b, page_b->GetContents());
++  ASSERT_TRUE(page_b->IsSplit());
++  EXPECT_EQ(page_b->GetSplit(), page_a->GetSplit());
++  EXPECT_EQ(page_b, model->GetActiveTab());
++  auto panes = model->GetSplitData(*page_b->GetSplit())->ListTabs();
++  ASSERT_EQ(2u, panes.size());
++  EXPECT_EQ(page_b, panes[0]);
++  EXPECT_EQ(page_a, panes[1]);
++  EXPECT_EQ(id, service_->GetPersistentItemId(page_b));
++  EXPECT_EQ(id, service_->GetPersistentItemId(page_a));
++
++  base::RunLoop().RunUntilIdle();
++  ASSERT_TRUE(service_->ActivatePersistentItem(
++      browser(), PersistentRecordKind::kPin, *id));
++  EXPECT_EQ(original_count, model->count());
++  panes = model->GetSplitData(*page_b->GetSplit())->ListTabs();
++  EXPECT_EQ(contents_b, panes[0]->GetContents());
++  EXPECT_EQ(contents_a, panes[1]->GetContents());
 +}
 +
 +TEST_F(HeliumSpaceServiceTest, SplitPinOwnsBothPanesAndRestoresMissingPane) {
