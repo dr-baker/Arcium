@@ -92,3 +92,19 @@ def test_empty_response_is_rejected(tmp_path):
         with pytest.raises(ValueError, match='empty test fixture'):
             fixtures.restore_missing_fixtures(tmp_path, VERSION)
     assert not any((tmp_path / relative).exists() for relative in fixtures.FIXTURES)
+
+
+def test_gateway_retries_are_bounded_and_missing_files_are_not_retried(tmp_path):
+    """Retry transient upstream failures without hiding an invalid release path."""
+    # pylint: disable=protected-access
+    session = fixtures.validate_patches._get_requests_session()
+    with mock.patch.object(fixtures.validate_patches, '_get_requests_session',
+                           return_value=session), \
+         mock.patch.object(fixtures.validate_patches, '_download_googlesource_file',
+                           return_value='fixture\n'):
+        fixtures.restore_missing_fixtures(tmp_path, VERSION)
+    retries = session.get_adapter(fixtures.CHROMIUM_REPOSITORY).max_retries
+    assert retries.total == 3
+    assert retries.is_retry('GET', 502)
+    assert retries.is_retry('GET', 504)
+    assert not retries.is_retry('GET', 404)
