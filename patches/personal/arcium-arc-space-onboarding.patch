@@ -130,9 +130,21 @@ Index: src/chrome/browser/importer/arcium_arc_import_browsertest.cc
 ===================================================================
 --- src.orig/chrome/browser/importer/arcium_arc_import_browsertest.cc
 +++ src/chrome/browser/importer/arcium_arc_import_browsertest.cc
-@@ -4,14 +4,21 @@
+@@ -3,15 +3,34 @@
+ // found in the LICENSE file.
  
  #include "chrome/browser/importer/arcium_arc_import.h"
++#include "chrome/browser/importer/arcium_arc_import_prefs.h"
++#include "chrome/browser/importer/arcium_arc_spaces_import.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/profiles/keep_alive/scoped_profile_keep_alive.h"
++#include "chrome/browser/profiles/keep_alive/profile_keep_alive_types.h"
++#include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
++#include "chrome/browser/ui/views/helium/glass_surface_configuration.h"
++#include "chrome/common/pref_names.h"
++#include "components/helium_services/pref_names.h"
++#include "components/prefs/scoped_user_pref_update.h"
  
 +#include <cstdint>
  #include <map>
@@ -143,6 +155,7 @@ Index: src/chrome/browser/importer/arcium_arc_import_browsertest.cc
  #include <utility>
 +#include <vector>
  
++#include "base/functional/bind.h"
 +#include "base/task/cancelable_task_tracker.h"
  #include "base/test/bind.h"
 +#include "base/test/test_future.h"
@@ -152,7 +165,7 @@ Index: src/chrome/browser/importer/arcium_arc_import_browsertest.cc
  #include "chrome/browser/importer/profile_writer.h"
  #include "chrome/browser/profiles/profile.h"
  #include "chrome/browser/ui/arcium/tab_provenance.h"
-@@ -28,7 +35,12 @@
+@@ -28,7 +47,12 @@
  #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
  #include "chrome/test/base/in_process_browser_test.h"
  #include "chrome/test/base/ui_test_utils.h"
@@ -165,7 +178,7 @@ Index: src/chrome/browser/importer/arcium_arc_import_browsertest.cc
  #include "components/tabs/public/tab_group.h"
  #include "components/tab_groups/tab_group_visual_data.h"
  #include "content/public/browser/render_frame_host.h"
-@@ -38,6 +50,8 @@
+@@ -38,9 +62,22 @@
  #include "net/test/embedded_test_server/embedded_test_server.h"
  #include "testing/gtest/include/gtest/gtest.h"
  #include "third_party/blink/public/mojom/frame/sudden_termination_disabler_type.mojom.h"
@@ -174,7 +187,123 @@ Index: src/chrome/browser/importer/arcium_arc_import_browsertest.cc
  #include "url/gurl.h"
  
  namespace arcium {
-@@ -661,5 +675,291 @@ IN_PROC_BROWSER_TEST_F(ArciumArcImportBr
++class ArcSpacesImportBrowserTestPeer {
++ public:
++  static base::OnceCallback<void(Profile*)> DestinationReply(
++      ArcSpacesImport& importer, std::string source_key, bool newly_created) {
++    return base::BindOnce(&ArcSpacesImport::DestinationInitialized,
++                          importer.weak_factory_.GetWeakPtr(),
++                          std::shared_ptr<ArcSpacesImport::SourceLease>(),
++                          std::move(source_key), newly_created,
++                          importer.new_profile_appearance_.Clone());
++  }
++};
+ namespace {
+ 
+ constexpr char kSnapshot[] = R"json({
+@@ -157,6 +194,101 @@ std::map<std::u16string, bool> GroupColl
+ class ArciumArcImportBrowserTest : public InProcessBrowserTest {};
+ 
+ IN_PROC_BROWSER_TEST_F(ArciumArcImportBrowserTest,
++                       NewDestinationKeepsAppearanceAfterWelcomeCloses) {
++  int notifications = 0;
++  auto importer = std::make_unique<ArcSpacesImport>(
++      base::BindLambdaForTesting([&] { ++notifications; }),
++      base::DictValue()
++          .Set(prefs::kHeliumLayout, 2)
++          .Set(arcium::kShowToolbarPref, false)
++          .Set(prefs::kTabCyclingMRU, true)
++          .Set(helium::kArciumChromeAppearancePref,
++               base::DictValue().Set("material", "liquidGlass")));
++  auto reply = ArcSpacesImportBrowserTestPeer::DestinationReply(
++      *importer, "appearance-source", true);
++  base::test::TestFuture<Profile*> created;
++  std::unique_ptr<ScopedProfileKeepAlive> keep_alive;
++  ProfileManager::CreateMultiProfileAsync(
++      u"Arc appearance test", 0, false,
++      base::BindLambdaForTesting([&](Profile* profile) {
++        if (profile) {
++          keep_alive = ScopedProfileKeepAlive::TryAcquire(
++              profile, ProfileKeepAliveOrigin::kArciumSettingsWindow);
++        }
++        created.SetValue(profile);
++      }));
++  importer.reset();
++  ASSERT_FALSE(reply.IsCancelled());
++  Profile* target = created.Get();
++  ASSERT_TRUE(target);
++  ASSERT_TRUE(keep_alive);
++  auto* target_prefs = target->GetPrefs();
++  ASSERT_EQ(PrefService::INITIALIZATION_STATUS_CREATED_NEW_PREF_STORE,
++            target_prefs->GetInitializationStatus());
++  std::move(reply).Run(target);
++  EXPECT_EQ(2, target_prefs->GetInteger(prefs::kHeliumLayout));
++  EXPECT_FALSE(target_prefs->GetBoolean(arcium::kShowToolbarPref));
++  EXPECT_TRUE(target_prefs->GetBoolean(prefs::kTabCyclingMRU));
++  const auto& material = target_prefs->GetDict(helium::kArciumChromeAppearancePref);
++  ASSERT_TRUE(material.FindString("material"));
++  EXPECT_EQ("liquidGlass", *material.FindString("material"));
++  EXPECT_FALSE(target_prefs->GetBoolean(prefs::kHeliumServicesEnabled));
++  EXPECT_FALSE(target_prefs->GetBoolean(prefs::kHeliumServicesConsented));
++  EXPECT_TRUE(target_prefs->GetBoolean(prefs::kHeliumDidOnboarding));
++  EXPECT_EQ("appearance-source",
++            target_prefs->GetString(prefs::kArciumArcImportSourceMarker));
++  const auto& mapping = g_browser_process->local_state()->GetDict(
++      prefs::kArciumArcImportDestinations);
++  ASSERT_TRUE(mapping.FindString("appearance-source"));
++  EXPECT_EQ(target->GetPath().BaseName().AsUTF8Unsafe(),
++            *mapping.FindString("appearance-source"));
++  EXPECT_EQ(0, notifications);
++}
++
++IN_PROC_BROWSER_TEST_F(ArciumArcImportBrowserTest,
++                       MappedDestinationRetainsItsAppearanceAndConsent) {
++  Profile* target = browser()->profile();
++  auto* target_prefs = target->GetPrefs();
++  target_prefs->SetString(prefs::kArciumArcImportSourceMarker, "existing-source");
++  target_prefs->SetInteger(prefs::kHeliumLayout, 0);
++  target_prefs->SetBoolean(arcium::kShowToolbarPref, true);
++  target_prefs->SetBoolean(prefs::kTabCyclingMRU, false);
++  target_prefs->SetBoolean(prefs::kHeliumServicesConsented, true);
++  {
++    ScopedDictPrefUpdate mapping(g_browser_process->local_state(),
++                                prefs::kArciumArcImportDestinations);
++    mapping->Set("existing-source", target->GetPath().BaseName().AsUTF8Unsafe());
++  }
++  auto importer = std::make_unique<ArcSpacesImport>(
++      base::BindRepeating([] {}),
++      base::DictValue().Set(prefs::kHeliumLayout, 2)
++          .Set(arcium::kShowToolbarPref, false)
++          .Set(prefs::kTabCyclingMRU, true));
++  auto reply = ArcSpacesImportBrowserTestPeer::DestinationReply(
++      *importer, "existing-source", false);
++  importer.reset();
++  std::move(reply).Run(target);
++  EXPECT_EQ(0, target_prefs->GetInteger(prefs::kHeliumLayout));
++  EXPECT_TRUE(target_prefs->GetBoolean(arcium::kShowToolbarPref));
++  EXPECT_FALSE(target_prefs->GetBoolean(prefs::kTabCyclingMRU));
++  EXPECT_TRUE(target_prefs->GetBoolean(prefs::kHeliumServicesConsented));
++  // A premarked profile also cannot be adopted through the new-profile path.
++  auto rejected = std::make_unique<ArcSpacesImport>(
++      base::BindRepeating([] {}),
++      base::DictValue().Set(prefs::kHeliumLayout, 2));
++  auto rejected_reply = ArcSpacesImportBrowserTestPeer::DestinationReply(
++      *rejected, "other-source", true);
++  rejected.reset();
++  std::move(rejected_reply).Run(target);
++  EXPECT_EQ(0, target_prefs->GetInteger(prefs::kHeliumLayout));
++  EXPECT_EQ("existing-source",
++            target_prefs->GetString(prefs::kArciumArcImportSourceMarker));
++  EXPECT_FALSE(g_browser_process->local_state()
++                   ->GetDict(prefs::kArciumArcImportDestinations)
++                   .contains("other-source"));
++}
++
++IN_PROC_BROWSER_TEST_F(ArciumArcImportBrowserTest,
+                        ProfileWriterReportsArcSnapshotResult) {
+   scoped_refptr<ProfileWriter> failed_writer =
+       base::MakeRefCounted<ProfileWriter>(browser()->profile());
+@@ -661,5 +793,291 @@ IN_PROC_BROWSER_TEST_F(ArciumArcImportBr
    }
  }
  
@@ -846,11 +975,17 @@ Index: src/chrome/browser/ui/webui/onboarding/onboarding_handler_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/webui/onboarding/onboarding_handler_unittest.cc
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,219 @@
 +// Copyright 2026 The Arcium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
 +#include "chrome/browser/ui/webui/onboarding/onboarding_handler.h"
++
++#include "chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.h"
++#include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
++#include "chrome/browser/ui/helium/arcium_settings_prefs.h"
++#include "chrome/browser/ui/views/helium/glass_surface_configuration.h"
++#include "chrome/common/pref_names.h"
 +
 +#include <memory>
 +#include <utility>
@@ -896,6 +1031,57 @@ Index: src/chrome/browser/ui/webui/onboarding/onboarding_handler_unittest.cc
 +  content::TestWebUI web_ui_;
 +  raw_ptr<OnboardingMessageHandler> handler_ = nullptr;
 +};
++
++TEST_F(OnboardingMessageHandlerTest, ImportAppearanceUsesVisibleArciumDefaults) {
++  const auto appearance =
++      ArcSpacesImportHandler::CaptureNewProfileAppearance(*profile_.GetPrefs());
++  EXPECT_EQ(2, appearance.FindInt(prefs::kHeliumLayout));
++  EXPECT_EQ(false, appearance.FindBool(arcium::kShowToolbarPref));
++  EXPECT_EQ(false,
++            appearance.FindBool(arcium::kArcSidebarNavigationEnabledPref));
++  EXPECT_EQ(true, appearance.FindBool(prefs::kTabCyclingMRU));
++  EXPECT_EQ(true,
++            appearance.FindBool(prefs::kArciumOmniboxPersistentItemsEnabled));
++}
++
++TEST_F(OnboardingMessageHandlerTest, ImportAppearanceOwnsExplicitChoices) {
++  auto* prefs = profile_.GetPrefs();
++  prefs->SetInteger(prefs::kHeliumLayout, 0);
++  prefs->SetBoolean(prefs::kTabCyclingMRU, false);
++  prefs->SetBoolean(arcium::kShowToolbarPref, true);
++  prefs->SetDict(arcium_settings::kSharedPalettePref,
++                 base::DictValue().Set("accent", "#1565C0"));
++  prefs->SetDict(helium::kArciumChromeAppearancePref,
++                 base::DictValue().Set("material", "liquidGlass"));
++  const auto appearance =
++      ArcSpacesImportHandler::CaptureNewProfileAppearance(*prefs);
++  prefs->SetDict(arcium_settings::kSharedPalettePref, base::DictValue());
++  prefs->SetDict(helium::kArciumChromeAppearancePref, base::DictValue());
++  EXPECT_EQ(0, appearance.FindInt(prefs::kHeliumLayout));
++  EXPECT_EQ(false, appearance.FindBool(prefs::kTabCyclingMRU));
++  EXPECT_EQ(true, appearance.FindBool(arcium::kShowToolbarPref));
++  const auto* palette = appearance.FindDict(arcium_settings::kSharedPalettePref);
++  ASSERT_TRUE(palette);
++  ASSERT_TRUE(palette->FindString("accent"));
++  EXPECT_EQ("#1565C0", *palette->FindString("accent"));
++  const auto* chrome = appearance.FindDict(helium::kArciumChromeAppearancePref);
++  ASSERT_TRUE(chrome);
++  ASSERT_TRUE(chrome->FindString("material"));
++  EXPECT_EQ("liquidGlass", *chrome->FindString("material"));
++}
++
++TEST_F(OnboardingMessageHandlerTest, ImportAppearanceExcludesPrivateState) {
++  ChangePrivateTree();
++  profile_.GetPrefs()->SetBoolean(prefs::kHeliumServicesConsented, true);
++  const auto appearance =
++      ArcSpacesImportHandler::CaptureNewProfileAppearance(*profile_.GetPrefs());
++  EXPECT_FALSE(appearance.contains(kPrivatePref));
++  EXPECT_FALSE(appearance.contains(prefs::kHeliumServicesEnabled));
++  EXPECT_FALSE(appearance.contains(prefs::kHeliumServicesConsented));
++  EXPECT_FALSE(appearance.contains(prefs::kHeliumDidOnboarding));
++  EXPECT_FALSE(appearance.contains("helium.spaces"));
++  EXPECT_FALSE(appearance.contains("arcium.arc_import.source_marker"));
++}
 +
 +TEST_F(OnboardingMessageHandlerTest, SnapshotContainsOnlyFrontendContract) {
 +  ChangePrivateTree();
@@ -2089,7 +2275,7 @@ Index: src/chrome/browser/importer/arcium_arc_spaces_import.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/importer/arcium_arc_spaces_import.cc
-@@ -0,0 +1,712 @@
+@@ -0,0 +1,724 @@
 +// Copyright 2026 The Helium Authors
 +// SPDX-License-Identifier: GPL-3.0-only
 +#include "chrome/browser/importer/arcium_arc_spaces_import.h"
@@ -2255,8 +2441,10 @@ Index: src/chrome/browser/importer/arcium_arc_spaces_import.cc
 +  return true;
 +}
 +
-+ArcSpacesImport::ArcSpacesImport(base::RepeatingClosure changed)
-+    : changed_(std::move(changed)) {}
++ArcSpacesImport::ArcSpacesImport(base::RepeatingClosure changed,
++                                 base::DictValue new_profile_appearance)
++    : changed_(std::move(changed)),
++      new_profile_appearance_(std::move(new_profile_appearance)) {}
 +ArcSpacesImport::~ArcSpacesImport() {
 +  weak_factory_.InvalidateWeakPtrs();
 +  // Detach the observer before cancelling the self-deleting host.
@@ -2523,7 +2711,7 @@ Index: src/chrome/browser/importer/arcium_arc_spaces_import.cc
 +    manager->CreateProfileAsync(
 +        path, base::BindOnce(&ArcSpacesImport::DestinationInitialized,
 +                             weak_factory_.GetWeakPtr(), source_lease_,
-+                             group.source_key, false));
++                             group.source_key, false, base::DictValue()));
 +  } else {
 +    if (!local_state->GetBoolean(prefs::kBrowserAddPersonEnabled)) {
 +      CompleteCurrent("failed", "policy_blocked");
@@ -2533,7 +2721,7 @@ Index: src/chrome/browser/importer/arcium_arc_spaces_import.cc
 +        u"Arc · " + base::UTF8ToUTF16(group.profile_label), 0, false,
 +        base::BindOnce(&ArcSpacesImport::DestinationInitialized,
 +                       weak_factory_.GetWeakPtr(), source_lease_,
-+                       group.source_key, true));
++                       group.source_key, true, new_profile_appearance_.Clone()));
 +  }
 +}
 +void ArcSpacesImport::DestinationInitialized(
@@ -2541,6 +2729,7 @@ Index: src/chrome/browser/importer/arcium_arc_spaces_import.cc
 +    std::shared_ptr<SourceLease> lease,
 +    std::string source_key,
 +    bool newly_created,
++    base::DictValue appearance,
 +    Profile* profile) {
 +  auto* manager =
 +      g_browser_process ? g_browser_process->profile_manager() : nullptr;
@@ -2575,6 +2764,15 @@ Index: src/chrome/browser/importer/arcium_arc_spaces_import.cc
 +        failure = "invalid_destination_mapping";
 +      } else {
 +        auto* profile_prefs = profile->GetPrefs();
++        // Only an accepted, newly created destination inherits appearance.
++        // The callback owns the snapshot even if its welcome page has closed.
++        for (const auto [name, value] : appearance) {
++          const auto* preference = profile_prefs->FindPreference(name);
++          if (preference && preference->GetType() == value.type() &&
++              profile_prefs->IsUserModifiablePreference(name)) {
++            profile_prefs->Set(name, value);
++          }
++        }
 +        profile_prefs->SetString(prefs::kArciumArcImportSourceMarker,
 +                                 source_key);
 +        profile_prefs->SetBoolean(prefs::kHeliumServicesEnabled, false);
@@ -2806,7 +3004,7 @@ Index: src/chrome/browser/importer/arcium_arc_spaces_import.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/importer/arcium_arc_spaces_import.h
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,136 @@
 +// Copyright 2026 The Helium Authors
 +// SPDX-License-Identifier: GPL-3.0-only
 +#ifndef CHROME_BROWSER_IMPORTER_ARCIUM_ARC_SPACES_IMPORT_H_
@@ -2863,7 +3061,10 @@ Index: src/chrome/browser/importer/arcium_arc_spaces_import.h
 +                           std::string_view source_key,
 +                           std::string_view directory);
 +
-+  explicit ArcSpacesImport(base::RepeatingClosure changed);
++  // Appearance is captured by the UI before asynchronous profile creation.
++  // This internal dictionary never comes from Javascript.
++  explicit ArcSpacesImport(base::RepeatingClosure changed,
++                           base::DictValue new_profile_appearance = {});
 +  ~ArcSpacesImport();
 +  ArcSpacesImport(const ArcSpacesImport&) = delete;
 +  ArcSpacesImport& operator=(const ArcSpacesImport&) = delete;
@@ -2884,6 +3085,7 @@ Index: src/chrome/browser/importer/arcium_arc_spaces_import.h
 +
 + private:
 +  friend class ArcSpacesImportTestPeer;
++  friend class ArcSpacesImportBrowserTestPeer;
 +
 +  struct Inventory {
 +    std::vector<Entry> entries;
@@ -2906,6 +3108,7 @@ Index: src/chrome/browser/importer/arcium_arc_spaces_import.h
 +                                     std::shared_ptr<SourceLease> lease,
 +                                     std::string source_key,
 +                                     bool newly_created,
++                                     base::DictValue appearance,
 +                                     Profile* profile);
 +  void SourcesDetected(int generation);
 +  void InventoryReady(int generation, Inventory inventory);
@@ -2918,6 +3121,7 @@ Index: src/chrome/browser/importer/arcium_arc_spaces_import.h
 +  void Changed();
 +
 +  base::RepeatingClosure changed_;
++  const base::DictValue new_profile_appearance_;
 +  std::unique_ptr<ImporterList> importer_list_;
 +  int generation_ = 0, batch_id_ = 0, next_job_id_ = 0;
 +  std::string phase_ = "ready", failure_;
@@ -3308,14 +3512,61 @@ Index: src/chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.cc
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,198 @@
 +// Copyright 2026 The Helium Authors
 +// SPDX-License-Identifier: GPL-3.0-only
 +#include "chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.h"
 +#include "base/functional/bind.h"
 +#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
++#include "chrome/browser/ui/helium/arcium_settings_prefs.h"
++#include "chrome/browser/ui/helium/helium_layout_state_controller.h"
++#include "chrome/browser/ui/views/helium/arcium_chrome_ui_scale.h"
++#include "chrome/browser/ui/views/helium/glass_surface_configuration.h"
++#include "chrome/browser/ui/views/helium/surface_style.h"
++#include "chrome/common/pref_names.h"
++#include "components/prefs/pref_service.h"
 +#include "content/public/browser/web_contents.h"
 +#include "content/public/browser/web_ui.h"
++
++base::DictValue ArcSpacesImportHandler::CaptureNewProfileAppearance(
++    const PrefService& source) {
++  // Secondary Chromium profiles do not receive installer initial preferences.
++  // Preserve explicit choices; otherwise start with Arcium's visible sidebar.
++  base::DictValue appearance;
++  appearance.Set(prefs::kHeliumLayout,
++                 static_cast<int>(HeliumLayoutType::kVertical));
++  appearance.Set(prefs::kHeliumCenteredLocationBar, true);
++  appearance.Set(prefs::kHeliumMinimalLocationBar, true);
++  appearance.Set(prefs::kHeliumPeekEnabled, true);
++  appearance.Set(prefs::kTabCyclingMRU, true);
++  appearance.Set(prefs::kHeliumVerticalRightAligned, false);
++  appearance.Set(prefs::kHeliumLittleArcExternalLinks, true);
++  appearance.Set(prefs::kArciumOmniboxPersistentItemsEnabled, true);
++  appearance.Set(prefs::kBrowserColorScheme, 1);
++  appearance.Set(arcium::kArcSidebarNavigationEnabledPref, false);
++  appearance.Set(arcium::kChromeUIScalePref, arcium::kChromeUIScaleDefault);
++  appearance.Set(arcium::kChromeFrameBorderWidthPref, 4);
++  appearance.Set(arcium::kCollapsedSidebarStylePref, 1);
++  appearance.Set(arcium::kShowToolbarPref, false);
++  appearance.Set(arcium_settings::kSharedPalettePref, base::DictValue());
++  appearance.Set(helium::kArciumChromeAppearancePref, base::DictValue());
++  appearance.Set(helium::kArciumSurfaceSetPref, helium::kSurfaceSetGlass);
++  appearance.Set(helium::kArciumSurfaceTuningPref, base::DictValue());
++  for (auto [name, value] : appearance) {
++    const auto* preference = source.FindPreference(name);
++    if (!preference || preference->GetType() != value.type()) {
++      continue;
++    }
++    // Dictionaries include the seeded palette and material configuration.
++    // An older unseeded profile keeps supported registered material defaults.
++    if (source.GetUserPrefValue(name) || preference->IsManaged() ||
++        value.is_dict()) {
++      value = preference->GetValue()->Clone();
++    }
++  }
++  return appearance;
++}
 +
 +ArcSpacesImportHandler::ArcSpacesImportHandler() = default;
 +ArcSpacesImportHandler::~ArcSpacesImportHandler() = default;
@@ -3376,8 +3627,10 @@ Index: src/chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.cc
 +    return;
 +  }
 +  if (!controller_)
-+    controller_ = std::make_unique<arcium::ArcSpacesImport>(base::BindRepeating(
-+        &ArcSpacesImportHandler::Changed, base::Unretained(this)));
++    controller_ = std::make_unique<arcium::ArcSpacesImport>(
++        base::BindRepeating(&ArcSpacesImportHandler::Changed,
++                            base::Unretained(this)),
++        CaptureNewProfileAppearance(*profile->GetPrefs()));
 +  controller_->Discover();
 +  Reply(args, "");
 +}
@@ -3462,7 +3715,7 @@ Index: src/chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.h
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,31 @@
 +// Copyright 2026 The Helium Authors
 +// SPDX-License-Identifier: GPL-3.0-only
 +#ifndef CHROME_BROWSER_UI_WEBUI_ONBOARDING_ARC_SPACES_IMPORT_HANDLER_H_
@@ -3471,11 +3724,15 @@ Index: src/chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.h
 +#include "chrome/browser/importer/arcium_arc_spaces_import.h"
 +#include "content/public/browser/web_ui_message_handler.h"
 +
++class PrefService;
++
 +class ArcSpacesImportHandler : public content::WebUIMessageHandler {
 + public:
 +  ArcSpacesImportHandler();
 +  ~ArcSpacesImportHandler() override;
 +  void RegisterMessages() override;
++  // Copy appearance leaves only, never browsing data or service consent.
++  static base::DictValue CaptureNewProfileAppearance(const PrefService& prefs);
 +
 + private:
 +  void OnJavascriptDisallowed() override;
