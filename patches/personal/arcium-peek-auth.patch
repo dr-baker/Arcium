@@ -1006,7 +1006,64 @@ Index: src/chrome/browser/ui/views/helium/peek_controller_browsertest.cc
  #include "ui/views/view_utils.h"
  
  namespace helium {
-@@ -713,4 +718,544 @@ IN_PROC_BROWSER_TEST_F(PeekControllerBro
+@@ -458,22 +463,33 @@ IN_PROC_BROWSER_TEST_F(PeekControllerBro
+   ASSERT_TRUE(embedded_test_server()->Start());
+   const GURL url = embedded_test_server()->GetURL("/empty.html");
+   ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), url));
++  TabStripModel* const model = browser()->tab_strip_model();
++  ASSERT_EQ(1, model->count());
+   ASSERT_TRUE(ui_test_utils::NavigateToURLWithDisposition(
+       browser(), url, WindowOpenDisposition::NEW_BACKGROUND_TAB,
+       ui_test_utils::BROWSER_TEST_WAIT_FOR_LOAD_STOP));
+-  TabStripModel* const model = browser()->tab_strip_model();
++  ASSERT_EQ(2, model->count());
++  ASSERT_EQ(0, model->active_index());
++  auto* const left = model->GetWebContentsAt(0);
++  auto* const right = model->GetWebContentsAt(1);
+   BrowserView* const view = BrowserView::GetBrowserViewForBrowser(browser());
+   PeekController* const controller = view->peek_controller();
+   const auto split =
+       model->AddToNewSplit({1}, split_tabs::SplitTabVisualData(),
+                            split_tabs::SplitTabCreatedSource::kToolbarButton);
++  ASSERT_EQ(2, model->count());
+   for (int source_index : {0, 1}) {
++    SCOPED_TRACE(testing::Message() << "source_index=" << source_index);
++    ASSERT_EQ(2, model->count());
+     model->ActivateTabAt(source_index);
+     content::WebContents* const source = model->GetWebContentsAt(source_index);
+     ASSERT_TRUE(controller->Show(PeekNavigationParams(url), source));
+     content::WebContents* const preview =
+         controller->web_contents_for_testing();
++    auto weak_preview = preview->GetWeakPtr();
+     ASSERT_TRUE(content::WaitForLoadStop(preview));
++    ASSERT_EQ(3, model->count());
++    ASSERT_EQ(preview, model->GetActiveWebContents());
+     EXPECT_EQ(split, model->GetSplitForTab(0));
+     EXPECT_EQ(split, model->GetSplitForTab(1));
+     EXPECT_FALSE(model->GetSplitForTab(model->GetIndexOfWebContents(preview)));
+@@ -487,6 +503,21 @@ IN_PROC_BROWSER_TEST_F(PeekControllerBro
+       return !controller->is_showing() &&
+              model->GetActiveWebContents() == source;
+     }));
++    testing::Message ownership;
++    for (int index = 0; index < model->count(); ++index) {
++      auto* contents = model->GetWebContentsAt(index);
++      ownership << " tab=" << index << " left=" << (contents == left)
++                << " right=" << (contents == right)
++                << " preview=" << (contents == weak_preview.get())
++                << " active=" << (contents == model->GetActiveWebContents())
++                << " temporary=" << tabs::TemporaryTab::IsTemporary(contents)
++                << " split=" << model->GetSplitForTab(index).has_value();
++    }
++    SCOPED_TRACE(ownership);
++    if (weak_preview) {
++      EXPECT_EQ(TabStripModel::kNoTab,
++                model->GetIndexOfWebContents(weak_preview.get()));
++    }
+     EXPECT_EQ(2, model->count());
+     EXPECT_EQ(source, model->GetActiveWebContents());
+     EXPECT_EQ(split, model->GetSplitForTab(0));
+@@ -713,4 +744,544 @@ IN_PROC_BROWSER_TEST_F(PeekControllerBro
    ASSERT_TRUE(content::ExecJs(bulk_preview, "window.onbeforeunload = null"));
  }
  
