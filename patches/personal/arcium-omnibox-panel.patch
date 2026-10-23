@@ -568,7 +568,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
-@@ -0,0 +1,2280 @@
+@@ -0,0 +1,2350 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -1418,14 +1418,19 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  return row ? row->data.selection_key : std::string();
 +}
 +const CommandPanelView::DisplayRow* CommandPanelView::SelectedRow() const {
-+  if (selected_ < 0 || selected_ >= static_cast<int>(rows_.size())) {
++  if ((!actions_visible_ && !publication_) || selected_ < 0 ||
++      selected_ >= static_cast<int>(rows_.size())) {
 +    return nullptr;
 +  }
 +  const auto& row = rows_[selected_];
 +  return row.menu_entry.has_value() == actions_visible_ ? &row : nullptr;
 +}
 +CommandPanelView::Row* CommandPanelView::SelectedRowView() const {
-+  return SelectedRow() && selected_ < static_cast<int>(row_views_.size())
++  // A pending query retains its visual selection while action and AX
++  // authority are blocked separately by SelectedRow(), Select() and Activate().
++  return selected_ >= 0 && selected_ < static_cast<int>(row_views_.size()) &&
++                 selected_ < static_cast<int>(rows_.size()) &&
++                 rows_[selected_].menu_entry.has_value() == actions_visible_
 +             ? row_views_[selected_].get()
 +             : nullptr;
 +}
@@ -1505,8 +1510,13 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  requested_query_ = current_context_ ? std::u16string() : query;
 +  if (publication_ && (publication_->scope_id != scope_ ||
 +                       publication_->query != requested_query_)) {
++    const bool same_scope = publication_->scope_id == scope_;
 +    publication_.reset();
-+    rows_.clear();
++    // Keep the last presentation while this scope searches again. It has no
++    // executable authority until the current request supplies replacement rows.
++    if (!same_scope) {
++      rows_.clear();
++    }
 +    RebuildViews();
 +  }
 +  const uint64_t request = ++request_generation_;
@@ -1544,9 +1554,8 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    return;
 +  }
 +  const bool preserve_selection = publication_ != nullptr;
-+  publication_ = std::move(publication);
-+  SyncScopes(publication_->scopes);
-+  if (scopes_.empty() || publication_->scope_id != scope_) {
++  SyncScopes(publication->scopes);
++  if (scopes_.empty() || publication->scope_id != scope_) {
 +    publication_.reset();
 +    rows_.clear();
 +    selection_explicit_ = false;
@@ -1558,6 +1567,18 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    }
 +    return;
 +  }
++  const bool has_current_row = current_context_ && scope_ == kOmniScope &&
++                               publication->current_tab.has_value();
++  if (!actions_visible_ && !rows_.empty() && publication->rows.empty() &&
++      !has_current_row && !publication->done) {
++    if (selection_explicit_ && pending_selection_key_.empty()) {
++      pending_selection_key_ = SelectedKey();
++    }
++    publication_.reset();
++    RebuildViews(true);
++    return;
++  }
++  publication_ = std::move(publication);
 +  if (current_context_ && invocation_prefill_pending_) {
 +    const base::AutoReset<bool> update_guard(&updating_, true);
 +    input_->SetText(publication_->invocation_text);
@@ -1674,27 +1695,43 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  RebuildViews(preserve_selection);
 +}
 +void CommandPanelView::RebuildViews(bool preserve_selection) {
-+  input_->GetViewAccessibility().ClearActiveDescendant();
-+  row_views_.clear();
-+  hovered_ = -1;
-+  if (back_button_) {
++  if (!preserve_selection || hovered_ >= static_cast<int>(rows_.size())) {
++    hovered_ = -1;
++  }
++  if (!actions_visible_ && back_button_) {
 +    RemoveChildViewT(back_button_.get());
 +    back_button_ = nullptr;
 +  }
-+  results_view_->RemoveAllChildViews();
-+  if (actions_visible_) {
++  if (actions_visible_ && !back_button_) {
 +    back_button_ = AddChildView(std::make_unique<BackButton>(this));
++  }
++  if (back_button_) {
 +    back_button_->GetViewAccessibility().SetName(
 +        menu_stack_.size() > 1 ? u"Back to actions" : u"Back to results");
 +  }
++  // Reuse row slots as Chromium's popup does. Async text/icon updates must not
++  // tear down every button and its accessibility node between painted frames.
++  if (row_views_.size() > rows_.size()) {
++    input_->GetViewAccessibility().ClearActiveDescendant();
++  }
++  while (row_views_.size() > rows_.size()) {
++    auto* row = row_views_.back().get();
++    row_views_.pop_back();
++    results_view_->RemoveChildViewT(row);
++  }
++  while (row_views_.size() < rows_.size()) {
++    row_views_.push_back(results_view_->AddChildView(
++        std::make_unique<Row>(this, row_views_.size())));
++  }
 +  for (size_t i = 0; i < rows_.size(); ++i) {
-+    auto* row = results_view_->AddChildView(std::make_unique<Row>(this, i));
++    auto* row = row_views_[i].get();
 +    const auto& data = rows_[i].data;
 +    row->GetViewAccessibility().SetName(data.title + u", " + data.category +
 +                                        u", " + data.detail + u", " +
 +                                        Verb(rows_[i]));
-+    row->SetEnabled(!rows_[i].menu_entry || rows_[i].menu_entry->enabled);
-+    row_views_.push_back(row);
++    row->SetEnabled(actions_visible_ ? rows_[i].menu_entry &&
++                                          rows_[i].menu_entry->enabled
++                                    : publication_ != nullptr);
 +  }
 +  if (!preserve_selection) {
 +    selection_initialized_ = false;
@@ -2389,6 +2426,28 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +void CommandPanelView::Select(int index,
 +                              bool animate,
 +                              bool preserve_animation) {
++  if (!actions_visible_ && !publication_) {
++    // Retained rows are presentation only. Keep paint aligned with the new
++    // default slot, without granting selection or action authority to old data.
++    if (auto* row = SelectedRowView(); row && row->y() != selection_y_) {
++      previous_selection_y_ = selection_y_ = row->y();
++      selection_animation_.Reset(1);
++    }
++    for (const auto& row : row_views_) {
++      row->GetViewAccessibility().SetIsSelected(false);
++      row->SchedulePaint();
++    }
++    if (scope_browsing_ && !scope_buttons_.empty()) {
++      input_->GetViewAccessibility().SetActiveDescendant(
++          *scope_buttons_[ScopeIndex(scope_)]);
++    } else {
++      input_->GetViewAccessibility().ClearActiveDescendant();
++    }
++    results_view_->SchedulePaint();
++    footer_button_->SchedulePaint();
++    SchedulePaint();
++    return;
++  }
 +  if (animate && !rows_.empty()) {
 +    selection_explicit_ = true;
 +  }
@@ -2419,7 +2478,8 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  }
 +  for (size_t i = 0; i < row_views_.size(); ++i) {
 +    row_views_[i]->GetViewAccessibility().SetIsSelected(
-+        static_cast<int>(i) == selected_ && !scope_browsing_);
++        static_cast<int>(i) == selected_ && !scope_browsing_ &&
++        (actions_visible_ || publication_));
 +    row_views_[i]->SchedulePaint();
 +  }
 +  if (scope_browsing_ && !scope_buttons_.empty()) {
@@ -2498,7 +2558,13 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  for (size_t i = 0; i < scopes_.size(); ++i) {
 +    previous_scope_weights_[i] = ScopeWeight(i);
 +  }
++  const bool changed_scope = scope_ != scope;
 +  scope_ = scope;
++  if (changed_scope) {
++    publication_.reset();
++    rows_.clear();
++    RebuildViews();
++  }
 +  scope_selection_animation_.Reset(
 +      gfx::Animation::ShouldRenderRichAnimation() ? 0 : 1);
 +  if (gfx::Animation::ShouldRenderRichAnimation()) {
@@ -2662,7 +2728,8 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  FocusInput();
 +}
 +void CommandPanelView::Activate(int index, int event_flags) {
-+  if (index < 0 || index >= static_cast<int>(rows_.size())) {
++  if ((!actions_visible_ && !publication_) || index < 0 ||
++      index >= static_cast<int>(rows_.size())) {
 +    return;
 +  }
 +  if (scope_browsing_) {
@@ -2769,6 +2836,9 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    if (code == ui::VKEY_UP) {
 +      return true;
 +    }
++  }
++  if (!actions_visible_ && !publication_ && code == ui::VKEY_DOWN) {
++    return true;
 +  }
 +  if (code == ui::VKEY_UP && selected_ <= 0 && !actions_visible_) {
 +    BrowseScopes(true);
@@ -3286,7 +3356,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
-@@ -0,0 +1,2069 @@
+@@ -0,0 +1,2221 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +#include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
@@ -3316,6 +3386,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +#include "ui/events/event.h"
 +#include "ui/gfx/animation/animation_test_api.h"
 +#include "ui/gfx/font_list.h"
++#include "ui/gfx/image/image_skia_rep.h"
 +#include "ui/gfx/scoped_animation_duration_scale_mode.h"
 +#include "ui/gfx/text_utils.h"
 +#include "ui/views/accessibility/view_accessibility.h"
@@ -4396,6 +4467,157 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  EXPECT_EQ(u"reference", panel()->input_for_testing()->GetText());
 +  EXPECT_EQ(u"reference", panel()->row_for_testing(0).title);
 +}
++TEST_F(ArciumNativePanelTest, DeferredQueryKeepsRowsWithoutStaleActions) {
++  Open();
++  Query(u"interface");
++  Key(ui::VKEY_DOWN);
++  ASSERT_TRUE(panel()->row_for_testing(1).has_actions);
++  const auto count = panel()->row_count_for_testing();
++  auto* list = panel()->scroll_for_testing()->contents();
++  views::ViewTracker first(list->children()[0]);
++  state_->defer_search = true;
++  Query(u"interfacex");
++  auto old_callback = state_->publish;
++  auto old_publication = state_->last_publication;
++  Query(u"interfacey");
++  old_callback.Run(old_publication);
++  EXPECT_EQ(count, panel()->row_count_for_testing());
++  ASSERT_TRUE(first.view());
++  EXPECT_EQ(first.view(), list->children()[0]);
++  for (views::View* row : list->children()) {
++    EXPECT_FALSE(row->GetEnabled());
++  }
++  EXPECT_FALSE(PaintPanel().empty());
++  Key(ui::VKEY_DOWN);
++  EXPECT_EQ(0, panel()->selected_for_testing());
++  Key(ui::VKEY_K, kActionModifier);
++  EXPECT_FALSE(panel()->actions_visible_for_testing());
++  Key(ui::VKEY_RETURN);
++  EXPECT_TRUE(state_->executed.empty());
++  ui::AXNodeData pending_input;
++  panel()->input_for_testing()->GetViewAccessibility().GetAccessibleNodeData(
++      &pending_input);
++  EXPECT_FALSE(pending_input.HasIntAttribute(
++      ax::mojom::IntAttribute::kActivedescendantId));
++  Publish(state_->last_publication);
++  ASSERT_TRUE(first.view());
++  EXPECT_TRUE(first.view()->GetEnabled());
++  EXPECT_EQ(u"interfacey", panel()->row_for_testing(0).title);
++  Key(ui::VKEY_RETURN);
++  ASSERT_EQ(1u, state_->executed.size());
++  EXPECT_EQ(u"interfacey", state_->executed.back().query);
++}
++
++TEST_F(ArciumNativePanelTest, PendingQueryKeepsThePaintedSelectionBackground) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
++  Open();
++  Query(u"reference");
++  auto* list = panel()->scroll_for_testing()->contents();
++  ASSERT_GT(list->children().size(), 1u);
++  const int row_height = list->children()[0]->height();
++  gfx::Point probe(list->width() / 2, row_height - 5);
++  views::View::ConvertPointToTarget(list, widget_->GetRootView(), &probe);
++  const auto before = PaintPanel();
++  const auto selected = before.getColor(probe.x(), probe.y());
++  ASSERT_NE(selected, before.getColor(probe.x(), probe.y() + row_height));
++  state_->defer_search = true;
++  Query(u"reference pending");
++  const auto pending = PaintPanel();
++  EXPECT_EQ(selected, pending.getColor(probe.x(), probe.y()));
++  EXPECT_FALSE(list->children()[0]->GetEnabled());
++  Key(ui::VKEY_RETURN);
++  EXPECT_TRUE(state_->executed.empty());
++}
++
++TEST_F(ArciumNativePanelTest, EmptyPartialResultsDoNotBlankThePreviousList) {
++  Open();
++  Query(u"reference");
++  const auto count = panel()->row_count_for_testing();
++  ASSERT_GT(count, 1u);
++  views::ViewTracker first(
++      panel()->scroll_for_testing()->contents()->children()[0]);
++  state_->defer_search = true;
++  Query(u"no matches yet");
++  auto empty = Update();
++  empty->rows.clear();
++  empty->done = false;
++  Publish(empty);
++  EXPECT_EQ(count, panel()->row_count_for_testing());
++  ASSERT_TRUE(first.view());
++  EXPECT_FALSE(first.view()->GetEnabled());
++  Key(ui::VKEY_RETURN);
++  EXPECT_TRUE(state_->executed.empty());
++  auto completed = Update();
++  completed->done = true;
++  Publish(completed);
++  EXPECT_EQ(0u, panel()->row_count_for_testing());
++  EXPECT_FALSE(first.view());
++}
++
++TEST_F(ArciumNativePanelTest, PublicationsReuseRowViewsAndUpdateTheirContents) {
++  Open();
++  auto* list = panel()->scroll_for_testing()->contents();
++  views::ViewTracker first(list->children()[0]);
++  views::ViewTracker last(list->children().back());
++  auto update = Update();
++  update->rows[0].title = u"Updated browser search";
++  update->rows[0].icon = TestIcon(SK_ColorBLUE);
++  Publish(update);
++  ASSERT_TRUE(first.view());
++  EXPECT_EQ(first.view(), list->children()[0]);
++  EXPECT_TRUE(last.view());
++  ui::AXNodeData data;
++  first.view()->GetViewAccessibility().GetAccessibleNodeData(&data);
++  EXPECT_EQ(0u, data.GetString16Attribute(ax::mojom::StringAttribute::kName)
++                    .find(u"Updated browser search"));
++  EXPECT_EQ(SK_ColorBLUE,
++            panel()->row_for_testing(0).icon.GetRepresentation(1.f)
++                .GetBitmap().getColor(0, 0));
++  auto shorter = Update();
++  shorter->rows.resize(2);
++  Publish(shorter);
++  EXPECT_TRUE(first.view());
++  EXPECT_FALSE(last.view());
++  EXPECT_EQ(2u, list->children().size());
++}
++
++TEST_F(ArciumNativePanelTest, PendingScopeChangeClearsThePreviousScopeRows) {
++  Open();
++  state_->defer_search = true;
++  Query(u"pending");
++  ASSERT_GT(panel()->row_count_for_testing(), 0u);
++  views::ViewTracker first(
++      panel()->scroll_for_testing()->contents()->children()[0]);
++  auto old_callback = state_->publish;
++  auto old_publication = state_->last_publication;
++  Key(ui::VKEY_RIGHT);
++  EXPECT_EQ(kWebScope, panel()->scope_for_testing());
++  EXPECT_EQ(0u, panel()->row_count_for_testing());
++  EXPECT_FALSE(first.view());
++  old_callback.Run(old_publication);
++  EXPECT_EQ(0u, panel()->row_count_for_testing());
++}
++
++TEST_F(ArciumNativePanelTest, EmptyPartialKeepsAnExplicitSelectionForItsReturn) {
++  Open();
++  Query(u"interface");
++  Key(ui::VKEY_DOWN);
++  ASSERT_EQ("interface", panel()->row_for_testing(1).selection_key);
++  auto returning = Update();
++  auto empty = Update();
++  empty->rows.clear();
++  empty->done = false;
++  Publish(empty);
++  EXPECT_EQ("interface", panel()->pending_selection_key_for_testing());
++  Key(ui::VKEY_RETURN);
++  EXPECT_TRUE(state_->executed.empty());
++  Publish(returning);
++  EXPECT_EQ("interface",
++            panel()->row_for_testing(panel()->selected_for_testing())
++                .selection_key);
++}
++
 +TEST_F(ArciumNativePanelTest, AsyncInvocationClearsPreviousResultViews) {
 +  Open();
 +  ASSERT_EQ(7u, panel()->row_count_for_testing());
@@ -6338,7 +6560,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
                    auto* browser = context->browser();
                    return browser ? browser->tab_strip_model()
                                         ->GetActiveWebContents()
-@@ -271,14 +309,14 @@ class CachedAutocompleteClient final : p
+@@ -271,15 +309,18 @@ class CachedAutocompleteClient final : p
    }
  
   private:
@@ -6351,20 +6573,58 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
                                    public TemplateURLServiceObserver {
   public:
 -  explicit NativeQueryProvider(std::shared_ptr<ProductionContext> context)
-+  explicit NativeQueryProvider(std::shared_ptr<CommandSessionContext> context)
++  NativeQueryProvider(
++      std::shared_ptr<CommandSessionContext> context,
++      CommandNativeControllerFactoryForTesting controller_factory)
        : context_(std::move(context)),
++        controller_factory_(std::move(controller_factory)),
          engines_(TemplateURLServiceFactory::GetForProfile(
              context_->browser()->profile())) {
-@@ -713,7 +751,7 @@ class NativeQueryProvider final : public
+     if (engines_) {
+@@ -336,12 +377,15 @@ class NativeQueryProvider final : public
+     const AutocompleteInput input = CreateInput();
+     controller_->Start(input);
+   }
+-  void Cancel() override {
++  void Cancel(std::optional<std::string_view> next_scope = std::nullopt) override {
++    const bool continuation = next_scope && !publish_.is_null() &&
++                              *next_scope == query_.scope_id;
+     ++query_generation_;
+     publish_.Reset();
+     context_->icons.Cancel();
+     if (controller_) {
+-      controller_->Stop(AutocompleteStopReason::kClobbered);
++      controller_->Stop(continuation ? AutocompleteStopReason::kInteraction
++                                     : AutocompleteStopReason::kClobbered);
+     }
+     lease_.InvalidateCurrent();
+   }
+@@ -411,8 +455,12 @@ class NativeQueryProvider final : public
+     }
+     AutocompleteControllerConfig config{.provider_types = types};
+     config.unscoped_open_tab_suggestions = !web;
+-    controller_ = std::make_shared<AutocompleteController>(
+-        std::make_unique<CachedAutocompleteClient>(context_), config);
++    controller_ = controller_factory_.is_null()
++                      ? std::make_shared<AutocompleteController>(
++                            std::make_unique<CachedAutocompleteClient>(context_),
++                            config)
++                      : controller_factory_.Run(web);
++    CHECK(controller_);
+     controller_is_web_ = web;
+     controller_->AddObserver(this);
+   }
+@@ -713,7 +761,8 @@ class NativeQueryProvider final : public
              lease_.revision(), std::move(callback), std::move(results)));
    }
  
 -  std::shared_ptr<ProductionContext> context_;
 +  std::shared_ptr<CommandSessionContext> context_;
++  CommandNativeControllerFactoryForTesting controller_factory_;
    raw_ptr<TemplateURLService> engines_;
    base::ScopedObservation<TemplateURLService, TemplateURLServiceObserver>
        engine_observation_{this};
-@@ -733,11 +771,12 @@ class NativeQueryProvider final : public
+@@ -733,11 +782,12 @@ class NativeQueryProvider final : public
  
  class LocalQueryProvider final : public CommandQueryProvider {
   public:
@@ -6378,15 +6638,19 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
    std::string_view id() const override { return kBuiltinCommandProvider; }
    bool SupportsScope(std::string_view scope_id) const override {
      return scope_id == kOmniScope ||
-@@ -761,6 +800,7 @@ class LocalQueryProvider final : public
+@@ -761,9 +811,10 @@ class LocalQueryProvider final : public
               CommandProviderPublishCallback publish) override {
      query_ = std::move(query);
      publish_ = std::move(publish);
 +    context_->corpus.SetActive(true);
      Publish();
    }
-   void Cancel() override {
-@@ -779,6 +819,12 @@ class LocalQueryProvider final : public
+-  void Cancel() override {
++  void Cancel(std::optional<std::string_view> = std::nullopt) override {
+     ++generation_;
+     publish_.Reset();
+     context_->icons.Cancel();
+@@ -779,6 +830,12 @@ class LocalQueryProvider final : public
        return;
      }
      const auto& index = context_->corpus.index();
@@ -6399,7 +6663,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
      if (query_.scope_id == kOmniScope && !query_.text.empty()) {
        // Native autocomplete owns nonempty Omni order and default selection.
        PostResults({}, index.revision());
-@@ -864,6 +910,7 @@ class LocalQueryProvider final : public
+@@ -864,6 +921,7 @@ class LocalQueryProvider final : public
                 CommandProviderResults results) {
                if (!owner || generation != owner->generation_ ||
                    epoch != owner->query_.epoch || owner->publish_.is_null() ||
@@ -6407,7 +6671,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
                    corpus_revision !=
                        owner->context_->corpus.index().revision()) {
                  return;
-@@ -873,7 +920,7 @@ class LocalQueryProvider final : public
+@@ -873,7 +931,7 @@ class LocalQueryProvider final : public
              weak_factory_.GetWeakPtr(), generation_, query_.epoch,
              corpus_revision, std::move(callback), std::move(results)));
    }
@@ -6416,7 +6680,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
    base::CallbackListSubscription corpus_subscription_;
    CommandQuery query_;
    CommandProviderPublishCallback publish_;
-@@ -904,8 +951,18 @@ class RouterActionDelegate final : publi
+@@ -904,10 +962,23 @@ class RouterActionDelegate final : publi
  }  // namespace
  
  std::unique_ptr<CommandSession> CreateCommandSession(Browser* browser) {
@@ -6425,7 +6689,9 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
 +}
 +
 +std::unique_ptr<CommandSession> CreateCommandSession(
-+    Browser* browser, std::shared_ptr<CommandSessionContext>& context) {
++    Browser* browser,
++    std::shared_ptr<CommandSessionContext>& context,
++    CommandNativeControllerFactoryForTesting controller_factory) {
 +  base::ElapsedTimer timer;
    CHECK(browser);
 -  auto context = std::make_shared<ProductionContext>(browser);
@@ -6434,9 +6700,13 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
 +  }
 +  CHECK_EQ(context->browser(), browser);
    auto registry = std::make_unique<CommandProviderRegistry>();
-   auto native = std::make_unique<NativeQueryProvider>(context);
+-  auto native = std::make_unique<NativeQueryProvider>(context);
++  auto native = std::make_unique<NativeQueryProvider>(
++      context, std::move(controller_factory));
    const auto weak_native = native->GetWeakPtr();
-@@ -936,15 +993,17 @@ std::unique_ptr<CommandSession> CreateCo
+   CommandNativeActionCallbacks callbacks{
+       base::BindRepeating(
+@@ -936,15 +1007,17 @@ std::unique_ptr<CommandSession> CreateCo
    // rows, cancellation, and any lazy actions they add to their opaque targets.
    CHECK(registry->Register(std::move(native)));
    CHECK(registry->Register(std::make_unique<LocalQueryProvider>(context)));
@@ -6460,7 +6730,42 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.h
 ===================================================================
 --- src.orig/chrome/browser/ui/omnibox/arcium_command_providers.h
 +++ src/chrome/browser/ui/omnibox/arcium_command_providers.h
-@@ -94,7 +94,12 @@ std::unique_ptr<CommandSession> CreateCo
+@@ -5,11 +5,13 @@
+ #define CHROME_BROWSER_UI_OMNIBOX_ARCIUM_COMMAND_PROVIDERS_H_
+ 
+ #include <memory>
++#include <optional>
+ #include <string_view>
+ #include <vector>
+ 
+ #include "chrome/browser/ui/omnibox/arcium_command_session.h"
+ 
++class AutocompleteController;
+ class Browser;
+ 
+ namespace arcium {
+@@ -39,7 +41,10 @@ class CommandQueryProvider {
+   virtual bool SupportsScope(std::string_view scope_id) const;
+   virtual void Start(CommandQuery query,
+                      CommandProviderPublishCallback publish) = 0;
+-  virtual void Cancel() = 0;
++  // An immediate query restart may retain suggestions for this same scope.
++  // This hint never carries execution authority across query generations.
++  virtual void Cancel(
++      std::optional<std::string_view> next_scope = std::nullopt) = 0;
+   // Cancel preserves a selected menu target; a new invocation/query clears it.
+   virtual void ResetRetainedTarget();
+   virtual CommandMenu ResolveActions(const CommandProviderTarget& target,
+@@ -61,7 +66,7 @@ class CommandProviderRegistry {
+   std::vector<CommandQueryProvider*> ProvidersForScope(
+       std::string_view scope_id) const;
+   std::vector<CommandScopeDescriptor> GetScopes() const;
+-  void Cancel();
++  void Cancel(std::optional<std::string_view> next_scope = std::nullopt);
+   void ResetRetainedTargets();
+ 
+  private:
+@@ -94,7 +99,16 @@ std::unique_ptr<CommandSession> CreateCo
  
  // This browser-owned factory contains the Profile/controller/URL integration.
  // Presenters receive only CommandSession and its immutable value publications.
@@ -6468,8 +6773,12 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.h
  std::unique_ptr<CommandSession> CreateCommandSession(Browser* browser);
 +// Retain only browser data/cache between presentations. Each session still owns
 +// fresh query generations, action authority, selection, and subscriptions.
++using CommandNativeControllerFactoryForTesting = base::RepeatingCallback<
++    std::shared_ptr<AutocompleteController>(bool web)>;
 +std::unique_ptr<CommandSession> CreateCommandSession(
-+    Browser* browser, std::shared_ptr<CommandSessionContext>& context);
++    Browser* browser,
++    std::shared_ptr<CommandSessionContext>& context,
++    CommandNativeControllerFactoryForTesting controller_factory = {});
  
  }  // namespace arcium
  
@@ -6517,12 +6826,21 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
  #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
  #include "chrome/browser/profiles/profile.h"
  #include "chrome/browser/ui/browser.h"
-@@ -29,8 +43,12 @@
+@@ -29,8 +43,21 @@
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
  #include "chrome/common/pref_names.h"
  #include "chrome/test/base/browser_with_test_window_test.h"
 +#include "chrome/test/base/testing_profile.h"
  #include "components/content_settings/core/browser/host_content_settings_map.h"
++#include "components/omnibox/browser/autocomplete_controller.h"
++#include "components/omnibox/browser/autocomplete_controller_config.h"
++#include "components/omnibox/browser/autocomplete_input.h"
++#include "components/omnibox/browser/autocomplete_match.h"
++#include "components/omnibox/browser/autocomplete_match_type.h"
++#include "components/omnibox/browser/autocomplete_result.h"
++#include "components/omnibox/browser/fake_autocomplete_provider_client.h"
++#include "components/omnibox/browser/omnibox_prefs.h"
++#include "components/prefs/pref_registry_simple.h"
  #include "components/prefs/pref_service.h"
 +#include "components/history/core/browser/history_service.h"
 +#include "components/favicon_base/favicon_types.h"
@@ -6530,7 +6848,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
  #include "components/sessions/content/session_tab_helper.h"
  #include "components/split_tabs/split_tab_visual_data.h"
  #include "components/tabs/public/split_tab_data.h"
-@@ -39,8 +57,10 @@
+@@ -39,8 +66,10 @@
  #include "content/public/browser/navigation_entry.h"
  #include "content/public/browser/web_contents.h"
  #include "testing/gtest/include/gtest/gtest.h"
@@ -6541,10 +6859,44 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
  
  namespace arcium {
  namespace {
-@@ -110,8 +130,76 @@ CommandIntent Intent(CommandTarget targe
+@@ -110,8 +139,110 @@ CommandIntent Intent(CommandTarget targe
            .target = std::move(target)};
  }
  
++class NativeContinuityObserver : public AutocompleteController::Observer {
++ public:
++  ~NativeContinuityObserver() override {
++    for (const auto& controller : controllers) {
++      controller->RemoveObserver(this);
++    }
++  }
++  std::shared_ptr<AutocompleteController> Create(bool /*web*/) {
++    auto client = std::make_unique<FakeAutocompleteProviderClient>();
++    omnibox::RegisterProfilePrefs(static_cast<PrefRegistrySimple*>(
++        client->GetPrefs()->DeprecatedGetPrefRegistry()));
++    auto controller = std::make_shared<AutocompleteController>(
++        std::move(client), AutocompleteControllerConfig{.provider_types = 0});
++    controller->AddObserver(this);
++    controllers.push_back(controller);
++    return controller;
++  }
++  void OnStart(AutocompleteController* controller,
++               const AutocompleteInput& input) override {
++    Start start;
++    start.query = input.text();
++    for (const auto& match : controller->result()) {
++      start.urls.push_back(match.destination_url);
++    }
++    starts.push_back(std::move(start));
++  }
++  struct Start {
++    std::u16string query;
++    std::vector<GURL> urls;
++  };
++  std::vector<std::shared_ptr<AutocompleteController>> controllers;
++  std::vector<Start> starts;
++};
++
 +class RecordingCommandBrowserWindow : public TestBrowserWindow {
 + public:
 +  bool ShowArciumCommandBar(bool new_tab) override {
@@ -6618,7 +6970,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
    void SetUp() override {
      features_.InitAndEnableFeature(helium::kHeliumFavoritesAndPins);
      BrowserWithTestWindowTest::SetUp();
-@@ -334,6 +422,132 @@ class ArciumCommandActionRouterTest : pu
+@@ -334,6 +465,132 @@ class ArciumCommandActionRouterTest : pu
    raw_ptr<content::WebContents> accepted_source_ = nullptr;
  };
  
@@ -6751,7 +7103,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
  TEST_F(ArciumCommandActionRouterTest, NativeCurrentAcceptUsesCapturedTab) {
    auto* captured = AddOrdinaryTab("https://captured.test/");
    Capture(captured);
-@@ -454,6 +668,115 @@ TEST_F(ArciumCommandActionRouterTest, Sc
+@@ -454,6 +711,164 @@ TEST_F(ArciumCommandActionRouterTest, Sc
    EXPECT_EQ(1, browser()->tab_strip_model()->count());
  }
  
@@ -6784,6 +7136,55 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
 +  EXPECT_GT(corpus.index().revision(), revision);
 +  EXPECT_TRUE(corpus.index().Search(u"initial", kSavedScope).empty());
 +  EXPECT_EQ(1u, corpus.index().Search(u"replacement", kSavedScope).size());
++}
++
++TEST_F(ArciumCommandActionRouterTest,
++       TypingReusesNativeMatchesButCancellationRevokesThem) {
++  AddOrdinaryTab("https://source.test/");
++  NativeContinuityObserver native;
++  std::shared_ptr<CommandSessionContext> context;
++  auto session = CreateCommandSession(
++      browser(), context,
++      base::BindRepeating(&NativeContinuityObserver::Create,
++                          base::Unretained(&native)));
++  session->SetInvocation(CommandInvocationMode::kNewTab);
++  auto publish = base::BindLambdaForTesting(
++      [](std::shared_ptr<const CommandPublication>) {});
++  const GURL seed_url("https://retained-suggestion.test/");
++  auto seed = [&] {
++    AutocompleteMatch match(nullptr, 1000, false,
++                            AutocompleteMatchType::HISTORY_URL);
++    match.destination_url = seed_url;
++    match.contents = u"Retained suggestion";
++    match.fill_into_edit = u"https://retained-suggestion.test/";
++    native.controllers.back()->InjectAdHocMatch(match);
++    base::RunLoop().RunUntilIdle();
++  };
++  session->Search(kOmniScope, u"first", publish);
++  ASSERT_EQ(1u, native.controllers.size());
++  seed();
++  ASSERT_FALSE(native.controllers.back()->result().empty());
++  session->Search(kOmniScope, u"second", publish);
++  ASSERT_FALSE(native.starts.empty());
++  EXPECT_EQ(u"second", native.starts.back().query);
++  EXPECT_EQ(std::vector<GURL>{seed_url}, native.starts.back().urls);
++
++  seed();
++  session->Cancel();
++  EXPECT_TRUE(native.controllers.back()->result().empty());
++  session->Search(kOmniScope, u"third", publish);
++  seed();
++  session->SetInvocation(CommandInvocationMode::kNewTab);
++  EXPECT_TRUE(native.controllers.back()->result().empty());
++
++  session->Search(kOmniScope, u"fourth", publish);
++  seed();
++  const auto omni = native.controllers.back();
++  session->Search(kWebScope, u"fifth", publish);
++  EXPECT_TRUE(omni->result().empty());
++  EXPECT_EQ(2u, native.controllers.size());
++  EXPECT_EQ(u"fifth", native.starts.back().query);
++  EXPECT_TRUE(native.starts.back().urls.empty());
 +}
 +
 +TEST_F(ArciumCommandActionRouterTest, DeferredSessionCapturesSavedHomeBeforeIndexing) {
@@ -6952,7 +7353,56 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
  #include "url/gurl.h"
  
  namespace arcium {
-@@ -1841,6 +1843,98 @@ TEST_F(ArciumCommandIconCacheTest,
+@@ -80,6 +82,7 @@ struct FakeProviderState {
+   bool require_retained_target = false;
+   size_t menu_entry_count = 1;
+   size_t cancel_count = 0;
++  std::vector<std::optional<std::string>> next_scopes;
+   size_t reset_count = 0;
+   size_t destroy_count = 0;
+   std::optional<CommandProviderTarget> retained_target;
+@@ -118,7 +121,9 @@ class FakeCommandProvider final : public
+       state_->Publish(state_->callbacks.size() - 1, state_->initial_results);
+     }
+   }
+-  void Cancel() override {
++  void Cancel(std::optional<std::string_view> next_scope) override {
++    state_->next_scopes.push_back(next_scope ? std::optional<std::string>(*next_scope)
++                                           : std::nullopt);
+     ++state_->cancel_count;
+     if (state_->publish_on_cancel && !state_->callbacks.empty()) {
+       state_->Publish(state_->callbacks.size() - 1,
+@@ -265,6 +270,29 @@ class ArciumCommandSessionTest : public
+   std::unique_ptr<CommandSession> session_;
+ };
+ 
++TEST_F(ArciumCommandSessionTest, QueryRestartHintsPreserveCancellationAuthority) {
++  auto provider = AddProvider("native", {"web", "omni"});
++  provider->initial_results = {{MakeRow("native", "current")}, true};
++  provider->publish_on_cancel = true;
++  Search("web", u"first");
++  auto old = provider->callbacks.back();
++  Search("web", u"second");
++  ASSERT_TRUE(provider->next_scopes.back());
++  EXPECT_EQ("web", *provider->next_scopes.back());
++  const auto count = publications_.size();
++  old.Run({{MakeRow("native", "stale")}, true});
++  EXPECT_EQ(count, publications_.size());
++  ASSERT_FALSE(publications_.empty());
++  EXPECT_EQ(u"second", publications_.back()->query);
++  Search("omni", u"third");
++  ASSERT_TRUE(provider->next_scopes.back());
++  EXPECT_EQ("omni", *provider->next_scopes.back());
++  session_->Cancel();
++  EXPECT_FALSE(provider->next_scopes.back());
++  session_->SetInvocation(CommandInvocationMode::kCurrentTab);
++  EXPECT_FALSE(provider->next_scopes.back());
++}
++
+ TEST_F(ArciumCommandSessionTest, SynchronousStartPublishesInitializedEpoch) {
+   auto first = AddProvider("first", {"scope"});
+   auto second = AddProvider("second", {"second-scope"});
+@@ -1841,6 +1869,98 @@ TEST_F(ArciumCommandIconCacheTest,
  }
  
  TEST_F(ArciumCommandIconCacheTest,
@@ -7118,3 +7568,61 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_bar_material.h
    // True when the shared native profile decoration is installed. A configured
    // solid material can also need transparent Views for its color and grain.
    bool uses_native_material() const { return uses_native_material_; }
+Index: src/chrome/browser/ui/omnibox/arcium_command_session.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_session.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_session.cc
+@@ -41,7 +41,7 @@ class ProviderCommandSession final : pub
+   void Search(CommandScopeId scope_id,
+               std::u16string query,
+               CommandPublishCallback publish) override {
+-    Cancel();
++    Cancel(std::string_view(scope_id));
+     registry_->ResetRetainedTargets();
+     scope_id_ = std::move(scope_id);
+     query_ = std::move(query);
+@@ -69,14 +69,7 @@ class ProviderCommandSession final : pub
+     }
+   }
+ 
+-  void Cancel() override {
+-    // Invalidate first: Cancel itself may cause a provider's final callback.
+-    ++epoch_;
+-    weak_factory_.InvalidateWeakPtrs();
+-    publish_.Reset();
+-    active_.clear();
+-    registry_->Cancel();
+-  }
++  void Cancel() override { Cancel(std::nullopt); }
+ 
+   CommandMenu ResolveActions(const CommandTarget& target,
+                              std::string_view menu_id,
+@@ -114,6 +107,15 @@ class ProviderCommandSession final : pub
+   }
+ 
+  private:
++  void Cancel(std::optional<std::string_view> next_scope) {
++    // Invalidate first: Cancel itself may cause a provider's final callback.
++    ++epoch_;
++    weak_factory_.InvalidateWeakPtrs();
++    publish_.Reset();
++    active_.clear();
++    registry_->Cancel(next_scope);
++  }
++
+   struct ActiveProvider {
+     CommandQueryProvider* provider;
+     std::vector<CommandRow> rows;
+@@ -270,9 +272,10 @@ std::vector<CommandScopeDescriptor> Comm
+   }
+   return scopes;
+ }
+-void CommandProviderRegistry::Cancel() {
++void CommandProviderRegistry::Cancel(
++    std::optional<std::string_view> next_scope) {
+   for (const auto& provider : providers_) {
+-    provider->Cancel();
++    provider->Cancel(next_scope);
+   }
+ }
+ 
