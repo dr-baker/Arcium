@@ -12,6 +12,7 @@ REPLACEMENT_REGEXES_STR = [
     (r'(\w+) Root Program', r'\1_unreplace Root Program'),
     (r'(\w+) Web( S|s)tore', r'\1_unreplace Web Store'),
     (r'(\w+) Remote Desktop', r'\1_unreplace Remote Desktop'),
+    (r'The Chromium Authors', r'The Chromium_unreplace Authors'),
 
     # main replacement(s)
     (r'(\b)chrome://', r'\1helium://'),
