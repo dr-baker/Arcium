@@ -1,0 +1,159 @@
+Index: src/chrome/browser/importer/arcium_arc_import.cc
+===================================================================
+--- src.orig/chrome/browser/importer/arcium_arc_import.cc
++++ src/chrome/browser/importer/arcium_arc_import.cc
+@@ -433,6 +433,14 @@ bool ImportArcSidebarSnapshot(Profile* p
+                                     imported.id),
+       });
+     }
++    if (imported_spaces.empty() && !snapshot->favorites.empty()) {
++      imported_spaces.push_back(helium::ImportedPersistentSpace{
++          .id = base::StrCat(
++              {"arc:", snapshot->source_profile, ":favorites-space"}),
++          .name = u"Arc Favorites",
++          .pins = {},
++      });
++    }
+     service->ReconcileImportedPersistentItems(
+         snapshot->source_profile,
+         ToPersistentNodes(snapshot->favorites, snapshot->source_profile,
+Index: src/chrome/browser/importer/arcium_arc_import_browsertest.cc
+===================================================================
+--- src.orig/chrome/browser/importer/arcium_arc_import_browsertest.cc
++++ src/chrome/browser/importer/arcium_arc_import_browsertest.cc
+@@ -557,5 +557,109 @@ IN_PROC_BROWSER_TEST_F(ArciumArcImportBr
+   EXPECT_EQ(expected_space_b, space_b->pins());
+ }
+ 
++IN_PROC_BROWSER_TEST_F(ArciumArcImportBrowserTest,
++                       ImportsFavoritesWithoutSpacesAsDormantPins) {
++  constexpr char kFavoritesOnly[] = R"json({
++    "version":1,"source_profile":"arc-profile","spaces":[],
++    "favorites":[{"type":"tab","source_id":"favorite",
++                  "title":"Favorite","url":"https://favorite.test/"}]
++  })json";
++  auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(
++      browser()->profile());
++  ASSERT_TRUE(service);
++  const std::string local_id = service->GetDefaultSpace()->id();
++  const helium::PersistentNodes local_pins = {
++      Link("local-pin", u"Local", "https://local.test/")};
++  ASSERT_TRUE(service->GetOrCreateSpaceReplacingPins(local_id, u"Local",
++                                                     local_pins));
++  const helium::PersistentNodes other_pins = {
++      Link("other-pin", u"Other", "https://other.test/")};
++  service->ReconcileImportedPersistentItems(
++      "other-arc-profile", {},
++      {{.id = "other-space", .name = u"Other Arc", .pins = other_pins}});
++  const int original_tab_count = browser()->tab_strip_model()->count();
++  const helium::PersistentNodes expected_favorites = {
++      Link("arc:arc-profile:favorite:favorite", u"Favorite",
++           "https://favorite.test/")};
++
++  for (int pass = 0; pass < 2; ++pass) {
++    ASSERT_TRUE(ImportArcSidebarSnapshot(browser()->profile(), kFavoritesOnly,
++                                         ArcSidebarDestination::kPins));
++    EXPECT_EQ(original_tab_count, browser()->tab_strip_model()->count());
++    ASSERT_EQ(3u, service->GetSpaces().size());
++    auto* fallback = service->GetSpaceById("arc:arc-profile:favorites-space");
++    ASSERT_TRUE(fallback);
++    EXPECT_EQ("arc-profile", fallback->source_profile());
++    EXPECT_TRUE(fallback->pins().empty());
++    EXPECT_EQ(expected_favorites, service->GetFavoritesForSpace(*fallback));
++    auto* local = service->GetSpaceById(local_id);
++    ASSERT_TRUE(local);
++    EXPECT_EQ(local_pins, local->pins());
++    EXPECT_TRUE(service->GetFavoritesForSpace(*local).empty());
++    auto* other = service->GetSpaceById("other-space");
++    ASSERT_TRUE(other);
++    EXPECT_EQ("other-arc-profile", other->source_profile());
++    EXPECT_EQ(other_pins, other->pins());
++  }
++}
++
++IN_PROC_BROWSER_TEST_F(ArciumArcImportBrowserTest,
++                       EmptySourceRemovesOnlyItsFavoritesFallback) {
++  constexpr char kFavoritesOnly[] = R"json({
++    "version":1,"source_profile":"arc-profile","spaces":[],
++    "favorites":[{"type":"tab","source_id":"favorite",
++                  "title":"Favorite","url":"https://favorite.test/"}]
++  })json";
++  constexpr char kEmpty[] = R"json({
++    "version":1,"source_profile":"arc-profile","spaces":[],"favorites":[]
++  })json";
++  auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(
++      browser()->profile());
++  ASSERT_TRUE(service);
++  const std::string local_id = service->GetDefaultSpace()->id();
++  const helium::PersistentNodes local_pins = {
++      Link("local-pin", u"Local", "https://local.test/")};
++  ASSERT_TRUE(service->GetOrCreateSpaceReplacingPins(local_id, u"Local",
++                                                     local_pins));
++  ASSERT_TRUE(ImportArcSidebarSnapshot(browser()->profile(), kFavoritesOnly,
++                                       ArcSidebarDestination::kPins));
++  ASSERT_TRUE(service->GetSpaceById("arc:arc-profile:favorites-space"));
++  for (int pass = 0; pass < 2; ++pass) {
++    ASSERT_TRUE(ImportArcSidebarSnapshot(browser()->profile(), kEmpty,
++                                         ArcSidebarDestination::kPins));
++    ASSERT_EQ(1u, service->GetSpaces().size());
++    EXPECT_FALSE(service->GetSpaceById("arc:arc-profile:favorites-space"));
++    auto* local = service->GetSpaceById(local_id);
++    ASSERT_TRUE(local);
++    EXPECT_EQ(local_pins, local->pins());
++    EXPECT_TRUE(service->GetFavoritesForSpace(*local).empty());
++    const auto* favorites = browser()->profile()->GetPrefs()->GetDict(
++        helium::kHeliumArcFavoritesByProfilePref).FindList("arc-profile");
++    ASSERT_TRUE(favorites);
++    EXPECT_TRUE(favorites->empty());
++  }
++}
++
++IN_PROC_BROWSER_TEST_F(ArciumArcImportBrowserTest,
++                       EmptySourcePreservesUnusedStarterIdentity) {
++  constexpr char kEmpty[] = R"json({
++    "version":1,"source_profile":"arc-profile","spaces":[],"favorites":[]
++  })json";
++  auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(
++      browser()->profile());
++  ASSERT_TRUE(service);
++  const std::string starter_id = service->GetDefaultSpace()->id();
++  const int original_tab_count = browser()->tab_strip_model()->count();
++  for (int pass = 0; pass < 2; ++pass) {
++    ASSERT_TRUE(ImportArcSidebarSnapshot(browser()->profile(), kEmpty,
++                                         ArcSidebarDestination::kPins));
++    ASSERT_EQ(1u, service->GetSpaces().size());
++    EXPECT_EQ(starter_id, service->GetDefaultSpace()->id());
++    EXPECT_TRUE(service->GetDefaultSpace()->source_profile().empty());
++    EXPECT_TRUE(service->GetDefaultSpace()->pins().empty());
++    EXPECT_EQ(original_tab_count, browser()->tab_strip_model()->count());
++  }
++}
++
+ }  // namespace
+ }  // namespace arcium
+Index: src/chrome/browser/ui/helium/helium_space_service.cc
+===================================================================
+--- src.orig/chrome/browser/ui/helium/helium_space_service.cc
++++ src/chrome/browser/ui/helium/helium_space_service.cc
+@@ -1141,7 +1141,8 @@ void HeliumSpaceService::ReconcileImport
+ 
+   // Replace the untouched initial placeholder instead of leaving an empty
+   // extra Space beside the imported collection.
+-  if (spaces_.size() == 1u && spaces_.front()->name() == u"Space" &&
++  if (!imported_spaces.empty() && spaces_.size() == 1u &&
++      spaces_.front()->name() == u"Space" &&
+       spaces_.front()->pins().empty() &&
+       spaces_.front()->source_profile().empty() &&
+       spaces_.front()->icon().empty() &&
+Index: src/chrome/test/BUILD.gn
+===================================================================
+--- src.orig/chrome/test/BUILD.gn
++++ src/chrome/test/BUILD.gn
+@@ -11551,6 +11551,7 @@ if (!is_android && toolkit_views) {
+     defines = [ "HAS_OUT_OF_PROC_TEST_RUNNER" ]
+ 
+     sources = [
++      "../browser/importer/arcium_arc_import_browsertest.cc",
+       "../browser/ui/views/helium/peek_controller_browsertest.cc",
+       "../browser/ui/views/frame/multi_contents_view_browsertest.cc",
+       "../browser/ui/views/tabs/common/tab_view_browsertest.cc",
