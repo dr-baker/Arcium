@@ -3849,7 +3849,7 @@ Index: src/chrome/test/BUILD.gn
 ===================================================================
 --- src.orig/chrome/test/BUILD.gn
 +++ src/chrome/test/BUILD.gn
-@@ -7291,6 +7291,7 @@ test("unit_tests") {
+@@ -7294,6 +7294,7 @@ test("unit_tests") {
        "../browser/ui/webui/commerce/price_tracking_handler_unittest.cc",
        "../browser/ui/webui/commerce/shopping_list_context_menu_controller_unittest.cc",
        "../browser/ui/webui/constrained_web_dialog_ui_unittest.cc",
@@ -3857,7 +3857,7 @@ Index: src/chrome/test/BUILD.gn
        "../browser/ui/webui/managed_ui_handler_unittest.cc",
        "../browser/ui/webui/searchbox/contextual_searchbox_handler_unittest.cc",
        "../browser/ui/webui/settings/downloads_handler_unittest.cc",
-@@ -11465,6 +11466,8 @@ if (!is_android && toolkit_views) {
+@@ -11468,6 +11469,8 @@ if (!is_android && toolkit_views) {
    test("arcium_feature_settings_unit_tests") {
      sources = [
        "../browser/importer/arcium_arc_import_coordinator_unittest.cc",
@@ -3866,7 +3866,7 @@ Index: src/chrome/test/BUILD.gn
        "../browser/chrome_content_browser_client_unittest.cc",
        "../browser/ui/views/tabs/common/persistent_tab_view_unittest.cc",
        "../browser/extensions/api/settings_private/prefs_util_unittest.cc",
-@@ -11495,6 +11498,7 @@ if (!is_android && toolkit_views) {
+@@ -11498,6 +11501,7 @@ if (!is_android && toolkit_views) {
        "//chrome/browser/favicon",
        "//chrome/browser/importer",
        "//chrome/browser/importer:impl",
@@ -7230,16 +7230,24 @@ Index: src/components/helium_onboarding/src/pages/Finish.svelte
 ===================================================================
 --- src.orig/components/helium_onboarding/src/pages/Finish.svelte
 +++ src/components/helium_onboarding/src/pages/Finish.svelte
-@@ -8,10 +8,35 @@
+@@ -6,12 +6,43 @@
+         IconCheck,
+     } from "@imput/helium-prism";
      import { s } from "../lib/strings";
-     import { setPref } from "../lib/browser";
-     import { currentPage, previousPage } from "../lib/onboarding-flow";
+-    import { setPref } from "../lib/browser";
+-    import { currentPage, previousPage } from "../lib/onboarding-flow";
++    import { preferences, preferencesBootstrap, retryPreferences, completeOnboarding } from "../lib/browser";
++    import { currentPage, previousPage, standaloneImport } from "../lib/onboarding-flow";
 +    import { arcImport } from "../lib/arc";
  
 -    const done = async () => {
 -        await setPref('completed_onboarding', true);
 -        window.open("chrome://newtab", "_self");
 +    let finishing = $state(false);
++    let finished = $state(false);
++    const preferencesReady = () => typeof $preferences.completed_onboarding === "boolean";
++    const completed = () => finished ||
++        (!standaloneImport && $preferences.completed_onboarding === true);
 +    let openFailed = $state(false);
 +    let stepFailed = $state(false);
 +
@@ -7247,20 +7255,22 @@ Index: src/components/helium_onboarding/src/pages/Finish.svelte
 +    // so navigating away cannot drop its handler mid-batch. The handler opens
 +    // the first imported Space in its own window.
 +    const done = async (skipOpen = false) => {
-+        if (finishing) {
++        if (finishing || completed() || !preferencesReady()) {
 +            return;
 +        }
 +        finishing = true;
 +        stepFailed = false;
 +        try {
 +            const canOpen = arcImport.canOpen();
-+            if (!skipOpen && ((openFailed && !canOpen) ||
-+                (canOpen && !await arcImport.open()))) {
++            const opened = !skipOpen && canOpen && await arcImport.open();
++            if (!skipOpen && ((openFailed && !canOpen) || (canOpen && !opened))) {
 +                openFailed = true;
 +                return;
 +            }
-+            await setPref('completed_onboarding', true);
-+            window.open("chrome://newtab", "_self");
++            openFailed = false;
++            await completeOnboarding();
++            if (!opened) window.open("chrome://newtab", "_self");
++            finished = true;
 +        } catch {
 +            stepFailed = true;
 +        } finally {
@@ -7269,21 +7279,31 @@ Index: src/components/helium_onboarding/src/pages/Finish.svelte
      }
  
      const visible = $derived($currentPage === "Finish");
-@@ -33,15 +58,23 @@
+@@ -29,27 +60,41 @@
+                     <HeliumLogo height="64px" />
+                 </div>
+                 <div id="finish-text">
+-                    <h1>{s.finish.title}</h1>
++                    <h1>{completed() ? s.spaces.done : s.finish.title}</h1>
                      <p>{s.finish.body}</p>
                  </div>
              </div>
++            {#if !completed()}
++            {#if $preferencesBootstrap === "failed"}
++                <p role="alert">{s.button.failed}</p>
++                <Button onclick={retryPreferences}>{s.spaces.tryAgain}</Button>
++            {/if}
 +            {#if openFailed || stepFailed}
 +                <p role="alert">{openFailed ? s.spaces.openFailed : s.button.failed}</p>
 +            {/if}
              <div class="action-buttons">
 -                <Button onclick={previousPage}>
-+                <Button disabled={finishing} onclick={previousPage}>
++                <Button disabled={finishing || !preferencesReady()} onclick={previousPage}>
                      <IconArrowLeft />
                      {s.button.back}
                  </Button>
 -                <Button primary onclick={done}>
-+                <Button primary disabled={finishing} onclick={() => done()}>
++                <Button primary disabled={finishing || !preferencesReady()} onclick={() => done()}>
                      <IconCheck />
 -                    {s.button.letsGo}
 +                    {openFailed ? s.spaces.tryAgain : s.button.letsGo}
@@ -7294,9 +7314,10 @@ Index: src/components/helium_onboarding/src/pages/Finish.svelte
 +                    </Button>
 +                {/if}
              </div>
++            {/if}
          </div>
      </div>
-@@ -49,7 +82,7 @@
+ </div>
  
  <style>
      #finish-page {
@@ -7309,7 +7330,7 @@ Index: src/components/helium_onboarding/src/pages/Welcome.svelte
 ===================================================================
 --- src.orig/components/helium_onboarding/src/pages/Welcome.svelte
 +++ src/components/helium_onboarding/src/pages/Welcome.svelte
-@@ -1,342 +1,518 @@
+@@ -1,342 +1,542 @@
  <script lang="ts">
 -    import { flushSync, onMount } from "svelte";
 +    import { onDestroy } from "svelte";
@@ -7350,34 +7371,42 @@ Index: src/components/helium_onboarding/src/pages/Welcome.svelte
 -    let introLogoVisible = $state(!$hasSeenIntro);
 -    let introAnimating = $state(!$hasSeenIntro);
 -    const finalLogoVisible = $derived(!introLogoVisible);
-+    import { setPref } from "../lib/browser";
++    import { preferences, preferencesBootstrap, retryPreferences, completeOnboarding } from "../lib/browser";
 +    import { browserIconUrl } from "../lib/browser-icons";
-+    import { chooseRoute, currentPage, type SetupRoute } from "../lib/onboarding-flow";
++    import { chooseRoute, currentPage, standaloneImport, type SetupRoute } from "../lib/onboarding-flow";
 +    import { arcImport, oneClickStatus, Spaces } from "../lib/arc";
  
 -    const next = () => {
 -        markIntroSeen();
 -        nextPage();
 -    }
-+    import SpaceRow from "../components/SpaceRow.svelte";
- 
+-
 -    const transitionIntroLogo = async () => {
 -        const transition = document.startViewTransition(() => {
 -            flushSync(() => {
 -                introLogoVisible = false;
 -            });
 -        });
-+    const arc = arcImport.state;
-+    const arcIcon = browserIconUrl("Arc");
++    import SpaceRow from "../components/SpaceRow.svelte";
  
 -        await transition.finished;
 -        introAnimating = false;
 -    }
++    const arc = arcImport.state;
++    const arcIcon = browserIconUrl("Arc");
+ 
+-    onMount(() => {
+-        if ($hasSeenIntro) {
 +    const visible = $derived($currentPage === "Welcome");
 +    const view = $derived(Spaces.oneClickView($arc));
 +    const status = $derived(oneClickStatus($arc));
 +    const busy = $derived(Spaces.busy($arc));
 +    let finishing = $state(false);
++    let finished = $state(false);
++    // An absent bootstrap preference is unknown, never a fresh-profile signal.
++    const preferencesReady = () => typeof $preferences.completed_onboarding === "boolean";
++    const completed = () => finished ||
++        (!standaloneImport && $preferences.completed_onboarding === true);
 +    let openFailed = $state(false);
 +    let stepFailed = $state(false);
 +    const pending = $derived(finishing || view.kind === "finding" || view.kind === "importing");
@@ -7393,39 +7422,40 @@ Index: src/components/helium_onboarding/src/pages/Welcome.svelte
 +    // page so the click is quick; only the button starts an import. Leaving
 +    // the page drops a click that is still waiting for the inventory.
 +    $effect(() => {
-+        if (visible) {
++        if (completed()) {
++            finished = true;
+             return;
+         }
++        if (visible && preferencesReady()) {
 +            arcImport.prefetch();
-+        } else {
++        } else if (!visible) {
 +            arcImport.cancelOneClick();
 +        }
 +    });
 +    onDestroy(() => arcImport.cancelOneClick());
  
--    onMount(() => {
--        if ($hasSeenIntro) {
+-        const timer = window.setTimeout(
+-            transitionIntroLogo,
+-            LOGO_TRANSITION_DELAY_MS
+-        );
 +    const primary = async () => {
-+        if (finishing) return;
++        if (finishing || completed() || !preferencesReady()) return;
 +        switch (view.kind) {
 +        case "finding":
 +        case "importing":
-             return;
++            return;
 +        case "done":
 +            await done();
 +            return;
 +        default:
 +            arcImport.importAll();
-         }
++        }
 +    };
  
--        const timer = window.setTimeout(
--            transitionIntroLogo,
--            LOGO_TRANSITION_DELAY_MS
--        );
--
 -        return () => {
 -            window.clearTimeout(timer);
 +    const leave = (route: SetupRoute) => {
-+        if (busy || finishing) {
++        if (busy || finishing || completed() || !preferencesReady()) {
 +            return;
          }
 -    });
@@ -7435,19 +7465,23 @@ Index: src/components/helium_onboarding/src/pages/Welcome.svelte
 +    };
 +
 +    const done = async (skipOpen = false) => {
-+        if (busy || finishing || (view.kind !== "done" && view.kind !== "partial")) return;
++        if (busy || finishing || completed() || !preferencesReady() ||
++            (view.kind !== "done" && view.kind !== "partial")) return;
 +        finishing = true;
 +        stepFailed = false;
 +        try {
 +            const canOpen = arcImport.canOpen();
-+            if (!skipOpen && ((openFailed && !canOpen) ||
-+                (canOpen && !await arcImport.open()))) {
++            const opened = !skipOpen && canOpen && await arcImport.open();
++            if (!skipOpen && ((openFailed && !canOpen) || (canOpen && !opened))) {
 +                openFailed = true;
 +                return;
 +            }
 +            openFailed = false;
-+            await setPref('completed_onboarding', true);
-+            window.open("chrome://newtab", "_self");
++            await completeOnboarding();
++            // Opening the imported profile is the final focus operation. A
++            // later _self navigation would bring this setup window back.
++            if (!opened) window.open("chrome://newtab", "_self");
++            finished = true;
 +        } catch {
 +            stepFailed = true;
 +        } finally {
@@ -7504,10 +7538,9 @@ Index: src/components/helium_onboarding/src/pages/Welcome.svelte
 -                    {s.button.configure}
 -                </Button>
 +            <div id="welcome-text" class="enter">
-+                <h1>{view.kind === "done" ? s.welcome.doneTitle : s.welcome.arcTitle}</h1>
++                <h1>{completed() ? s.spaces.done : view.kind === "done" ? s.welcome.doneTitle : s.welcome.arcTitle}</h1>
              </div>
-+            <p class="status" class:failed={status.failed} role="status">{status.text}</p>
- 
+-
 -            <div id="welcome-footer">
 -                <p>
 -                    {#each termsParts as part}
@@ -7515,11 +7548,21 @@ Index: src/components/helium_onboarding/src/pages/Welcome.svelte
 -                            <Link href={privacyUrl}>{part.text}</Link>
 -                        {:else if part.kind === "linkTerms"}
 -                            <Link href={termsUrl}>{part.text}</Link>
++            <p class="status" class:failed={!completed() && status.failed} role="status">
++                {completed() ? s.finish.body : status.text}
++            </p>
++
++            {#if !completed()}
++            {#if $preferencesBootstrap === "failed"}
++                <p role="alert">{s.button.failed}</p>
++                <Button onclick={retryPreferences}>{s.spaces.tryAgain}</Button>
++            {/if}
 +            <div id="welcome-buttons">
 +                <Button
 +                    primary
++                    disabled={!preferencesReady()}
 +                    class={["hero", { pending }]}
-+                    aria-disabled={pending}
++                    aria-disabled={pending || !preferencesReady()}
 +                    aria-busy={pending}
 +                    onclick={primary}
 +                >
@@ -7567,22 +7610,22 @@ Index: src/components/helium_onboarding/src/pages/Welcome.svelte
 +                        {/if}
 +                    {/if}
 +                    {#if view.kind !== "importing" && view.kind !== "done"}
-+                        <Button transparent onclick={() => leave("arcCustom")}>
++                        <Button transparent disabled={!preferencesReady() || finishing} onclick={() => leave("arcCustom")}>
 +                            {s.welcome.choose}
 +                        </Button>
 +                    {/if}
 +                    {#if view.kind === "partial"}
-+                        <Button transparent disabled={finishing} onclick={() => done()}>
++                        <Button transparent disabled={finishing || !preferencesReady()} onclick={() => done()}>
 +                            {openFailed ? s.spaces.tryAgain : s.welcome.continue}
 +                        </Button>
 +                    {/if}
 +                    {#if view.kind === "done" || view.kind === "partial"}
-+                        <Button transparent disabled={finishing} onclick={() => leave("arc")}>
++                        <Button transparent disabled={finishing || !preferencesReady()} onclick={() => leave("arc")}>
 +                            {s.button.configure}
 +                        </Button>
 +                    {/if}
 +                    {#if openFailed}
-+                        <Button transparent disabled={finishing} onclick={() => done(true)}>
++                        <Button transparent disabled={finishing || !preferencesReady()} onclick={() => done(true)}>
 +                            {s.spaces.continueWithoutOpening}
 +                        </Button>
 +                    {/if}
@@ -7611,14 +7654,16 @@ Index: src/components/helium_onboarding/src/pages/Welcome.svelte
 +                <p class="note">{s.spaces.partialRead}</p>
 +            {/if}
 +            <p class="scope">{s.welcome.arcScope}</p>
++            {/if}
 +        </div>
 +
++        {#if !completed()}
 +        <div id="welcome-footer" class="glass-children">
 +            {#if !sent}
 +                <div class="routes">
 +                    <span>{s.welcome.notArc}</span>
-+                    <Button onclick={() => leave("other")}>{s.origin.other}</Button>
-+                    <Button onclick={() => leave("fresh")}>{s.origin.fresh}</Button>
++                    <Button disabled={!preferencesReady() || finishing} onclick={() => leave("other")}>{s.origin.other}</Button>
++                    <Button disabled={!preferencesReady() || finishing} onclick={() => leave("fresh")}>{s.origin.fresh}</Button>
 +                </div>
 +            {/if}
 +            <p>
@@ -7633,6 +7678,7 @@ Index: src/components/helium_onboarding/src/pages/Welcome.svelte
 +                {/each}
 +            </p>
          </div>
++        {/if}
      </div>
  </div>
  
@@ -7892,12 +7938,12 @@ Index: src/components/helium_onboarding/src/pages/Welcome.svelte
 -            opacity: 0;
 -            transform: translateY(360px);
 -            filter: blur(10px);
--        }
++            --rows-fade: 36px;
+         }
 -
 -        90% {
 -            filter: none;
-+            --rows-fade: 36px;
-         }
+-        }
 -
          to {
 -            opacity: 1;
@@ -8089,7 +8135,7 @@ Index: src/components/helium_onboarding/tests/arc-spaces.test.mjs
 ===================================================================
 --- /dev/null
 +++ src/components/helium_onboarding/tests/arc-spaces.test.mjs
-@@ -0,0 +1,1234 @@
+@@ -0,0 +1,1236 @@
 +import assert from 'node:assert/strict';
 +import {readFileSync} from 'node:fs';
 +import {createRequire} from 'node:module';
@@ -8922,9 +8968,10 @@ Index: src/components/helium_onboarding/tests/arc-spaces.test.mjs
 +    const make = () => {
 +        let succeeds = false, opens = 0, completed = 0, navigations = 0;
 +        const context = vm.createContext({$state: value => value, $derived: value => value,
-+            $currentPage: 'Finish', arcImport: {canOpen: () => true,
++            $currentPage: 'Finish', $preferences: {completed_onboarding: false}, $preferencesBootstrap: "ready", retryPreferences: () => {}, standaloneImport: false, arcImport: {canOpen: () => true,
 +                open: async () => { opens++; return succeeds; }},
 +            setPref: async () => { completed++; }, window: {open: () => { navigations++; }}});
++        context.completeOnboarding = () => context.setPref('completed_onboarding', true);
 +        vm.runInContext(transpile(script('src/pages/Finish.svelte'), true), context);
 +        return {done: skip => vm.runInContext(`done(${skip === true})`, context),
 +            failed: () => vm.runInContext('openFailed', context),
@@ -8936,7 +8983,7 @@ Index: src/components/helium_onboarding/tests/arc-spaces.test.mjs
 +    assert.deepEqual(retry.counts(), [1, 0, 0], 'failure does not silently finish setup');
 +    retry.allow();
 +    await retry.done();
-+    assert.deepEqual(retry.counts(), [2, 1, 1]);
++    assert.deepEqual(retry.counts(), [2, 1, 0]);
 +    const skip = make();
 +    await skip.done();
 +    await skip.done(true);
@@ -9235,7 +9282,7 @@ Index: src/components/helium_onboarding/tests/arc-spaces.test.mjs
 +    const record = name => (...args) => { calls.push([name, ...args]); };
 +    const context = vm.createContext({
 +        $state: value => value, $derived: value => value, $effect: fn => effects.push(fn), onDestroy: fn => destroyers.push(fn),
-+        $currentPage: page, $arc: model, Spaces: S,
++        $currentPage: page, $arc: model, Spaces: S, $preferences: {completed_onboarding: false}, $preferencesBootstrap: "ready", retryPreferences: () => {}, standaloneImport: false,
 +        oneClickStatus: () => ({text: '', failed: false}),
 +        arcImport: {state: {}, prefetch: record('prefetch'), importAll: record('importAll'),
 +            cancelOneClick: record('cancelOneClick'), cancel: record('cancel'),
@@ -9246,6 +9293,7 @@ Index: src/components/helium_onboarding/tests/arc-spaces.test.mjs
 +        acceptLatestSchema: record('acceptLatestSchema'),
 +        window: {open: record('open')},
 +    });
++    context.completeOnboarding = () => context.setPref('completed_onboarding', true);
 +    vm.runInContext(transpile(script('src/pages/Welcome.svelte'), true), context);
 +    return {context, calls, run: code => vm.runInContext(code, context),
 +        effects: () => effects.forEach(fn => fn()), destroy: () => destroyers.forEach(fn => fn())};
@@ -9283,8 +9331,8 @@ Index: src/components/helium_onboarding/tests/arc-spaces.test.mjs
 +    const result = welcome({model: done});
 +    assert.equal(result.run('view.kind'), 'done');
 +    await result.run('primary()');
-+    assert.deepEqual(result.calls, [['openImported'], ['setPref', 'completed_onboarding', true],
-+        ['open', 'chrome://newtab', '_self']], 'Start browsing opens the import without service opt-in');
++    assert.deepEqual(result.calls, [['openImported'], ['setPref', 'completed_onboarding', true]],
++        'Start browsing never navigates the original window after opening the import');
 +    const failedOpen = welcome({model: done, openResult: false});
 +    await failedOpen.run('primary()');
 +    assert.deepEqual(failedOpen.calls, [['openImported']], 'failed open leaves setup incomplete');
@@ -10094,3 +10142,346 @@ Index: src/components/helium_onboarding/index.html
      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
      <title>Arcium Setup</title>
  </head>
+Index: src/components/helium_onboarding/tests/prefs-bootstrap.test.mjs
+===================================================================
+--- /dev/null
++++ src/components/helium_onboarding/tests/prefs-bootstrap.test.mjs
+@@ -0,0 +1,111 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++import assert from 'node:assert/strict';
++import {readFileSync} from 'node:fs';
++import {createRequire} from 'node:module';
++import test from 'node:test';
++import vm from 'node:vm';
++import {get, readonly, writable} from 'svelte/store';
++const require = createRequire(import.meta.url);
++const ts = require('typescript');
++const tick = () => new Promise(resolve => setImmediate(resolve));
++const deferred = () => {
++    let resolve, reject;
++    const promise = new Promise((a, b) => {resolve = a; reject = b;});
++    return {promise, resolve, reject};
++};
++function harness() {
++    const requests = [], timers = new Map(), listeners = [];
++    let id = 0;
++    const context = vm.createContext({exports: {}, readonly, writable,
++        setTimeout: (callback, delay) => {timers.set(++id, {callback, delay}); return id;},
++        clearTimeout: key => timers.delete(key),
++        chrome: {send() {throw new Error('unexpected consent write');}},
++        cr: {
++            sendWithPromise: (...args) => {const d = deferred(); requests.push({...d, args}); return d.promise;},
++            addWebUiListener: (name, callback) => listeners.push({name, callback}),
++        }});
++    const source = readFileSync('src/lib/browser/prefs.ts', 'utf8');
++    const parsed = ts.createSourceFile('prefs.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
++    const clean = ts.createPrinter().printFile(ts.factory.updateSourceFile(parsed,
++        parsed.statements.filter(s => !ts.isImportDeclaration(s))));
++    vm.runInContext(ts.transpileModule(clean, {compilerOptions: {
++        target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS,
++    }}).outputText, context);
++    const api = context.exports;
++    return {api, requests, timers, listeners,
++        state: () => get(api.preferencesBootstrap), prefs: () => get(api.preferences),
++        event: prefs => listeners[0].callback(prefs),
++        timeout: () => {const pending = [...timers.values()]; timers.clear(); pending.forEach(t => t.callback());},
++    };
++}
++
++test('preference bootstrap accepts an immediate reply without any fixed wait and installs one listener', async () => {
++    const h = harness(); h.api.setup(); h.api.setup();
++    assert.equal(h.listeners.length, 1); assert.equal(h.requests.length, 1);
++    assert.equal(h.state(), 'pending'); assert.equal(h.prefs().completed_onboarding, undefined);
++    h.requests[0].resolve({completed_onboarding: false}); await tick();
++    assert.equal(h.state(), 'ready'); assert.equal(h.prefs().completed_onboarding, false);
++    assert.equal(h.timers.size, 0);
++});
++
++test('rejected bootstrap is recoverable only by an explicit read retry and never writes preferences', async () => {
++    const h = harness(); h.api.setup(); h.requests[0].reject(new Error('bridge failed')); await tick();
++    assert.equal(h.state(), 'failed'); assert.equal(h.prefs().completed_onboarding, undefined);
++    assert.equal(h.requests.length, 1);
++    h.api.retryPreferences(); assert.equal(h.state(), 'pending');
++    h.requests[1].resolve({completed_onboarding: true}); await tick();
++    assert.equal(h.state(), 'ready'); assert.equal(h.prefs().completed_onboarding, true);
++    assert.deepEqual(h.requests.map(r => r.args), [['getPrefs'], ['getPrefs']]);
++});
++
++test('lost bootstrap reply times out and stale late false cannot overwrite an explicitly retried completed reply', async () => {
++    const h = harness(); h.api.setup();
++    assert.equal([...h.timers.values()][0].delay, 10000);
++    h.timeout(); assert.equal(h.state(), 'failed');
++    h.api.retryPreferences(); h.requests[1].resolve({completed_onboarding: true}); await tick();
++    h.requests[0].resolve({completed_onboarding: false}); await tick();
++    assert.equal(h.state(), 'ready'); assert.equal(h.prefs().completed_onboarding, true);
++    assert.equal(h.timers.size, 0);
++});
++
++test('stale old rejection cannot fail a successful retry and an authoritative event supersedes outstanding reads', async () => {
++    const h = harness(); h.api.setup(); h.timeout(); h.api.retryPreferences();
++    h.event({completed_onboarding: true});
++    h.requests[1].resolve({completed_onboarding: false});
++    h.requests[0].reject(new Error('late failure')); await tick();
++    assert.equal(h.state(), 'ready'); assert.equal(h.prefs().completed_onboarding, true);
++    assert.equal(h.timers.size, 0);
++});
++
++test('malformed bootstrap never becomes a fresh-profile signal and can be retried', async () => {
++    for (const prefs of [undefined, null, {}, {completed_onboarding: 'false'}]) {
++        const h = harness(); h.api.setup(); h.requests[0].resolve(prefs); await tick();
++        assert.equal(h.state(), 'failed'); assert.equal(h.prefs().completed_onboarding, undefined);
++        h.api.retryPreferences(); h.requests[1].resolve({completed_onboarding: false}); await tick();
++        assert.equal(h.state(), 'ready');
++    }
++});
++
++test('completion write timeout is retryable, idempotent and does not reset a late authoritative completed event', async () => {
++    const h = harness(); h.api.setup(); h.requests[0].resolve({completed_onboarding: false}); await tick();
++    const first = h.api.completeOnboarding();
++    const rejected = assert.rejects(first, /timed out/); h.timeout(); await rejected;
++    assert.equal(h.prefs().completed_onboarding, false);
++    const retry = h.api.completeOnboarding();
++    h.event({completed_onboarding: true}); h.requests[2].resolve(); await retry;
++    h.requests[1].reject(new Error('late lost acknowledgement')); await tick();
++    assert.equal(h.prefs().completed_onboarding, true); assert.equal(h.timers.size, 0);
++    assert.deepEqual(h.requests.slice(1).map(r => r.args), [
++        ['setPref', 'completed_onboarding', true], ['setPref', 'completed_onboarding', true]]);
++});
++
++test('successful or rejected completion replies settle immediately and clear their timer', async () => {
++    const h = harness();
++    const ok = h.api.completeOnboarding(); h.requests[0].resolve(); await ok;
++    assert.equal(h.timers.size, 0);
++    const failed = h.api.completeOnboarding(); const caught = assert.rejects(failed, /denied/);
++    h.requests[1].reject(new Error('denied')); await caught;
++    assert.equal(h.timers.size, 0);
++});
+Index: src/components/helium_onboarding/tests/terminal-completion.test.mjs
+===================================================================
+--- /dev/null
++++ src/components/helium_onboarding/tests/terminal-completion.test.mjs
+@@ -0,0 +1,222 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++import assert from 'node:assert/strict';
++import {readFileSync} from 'node:fs';
++import {createRequire} from 'node:module';
++import test from 'node:test';
++import vm from 'node:vm';
++import * as stores from 'svelte/store';
++import {compile} from 'svelte/compiler';
++import * as S from '../src/lib/arc/spaces.ts';
++const require = createRequire(import.meta.url);
++const ts = require('typescript');
++const tick = () => new Promise(resolve => setImmediate(resolve));
++const transpile = source => {
++    const parsed = ts.createSourceFile('component.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
++    const clean = ts.createPrinter().printFile(ts.factory.updateSourceFile(parsed,
++        parsed.statements.filter(s => !ts.isImportDeclaration(s))));
++    return ts.transpileModule(clean, {compilerOptions: {
++        target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS,
++    }}).outputText;
++};
++const completedImport = () => {
++    const snapshot = {generation: 1, batchId: 0, phase: 'ready', failure: '', canOpen: false, jobs: [],
++        spaces: [{token: 'public-token', identity: 'public-space', profileToken: 'public-profile',
++            name: 'Example', profileLabel: 'Example', pins: 1, folders: 0, favorites: 0, favoritesOnly: false}]};
++    let m = S.applySnapshot(S.initialModel(), snapshot);
++    m = S.prepareOneClick(S.requestOneClick(m, 1));
++    const request = S.buildStart(m);
++    m = S.markStarting(m, request, true);
++    return S.applySnapshot(m, {...snapshot, batchId: 1, phase: 'finished', canOpen: true,
++        jobs: [{id: 1, tokens: request.tokens, profileLabel: 'Example', state: 'succeeded', failure: '',
++            mayHavePartialData: false, historyFinished: false, counts: {spaces: 1, pins: 1, folders: 0, favorites: 0}}]});
++};
++function page(name, {prefs = {completed_onboarding: false}, model = completedImport(), canOpen = true} = {}) {
++    const calls = [], effects = [];
++    const record = name => (...args) => calls.push([name, ...args]);
++    const proxy = {open: async () => true, setPref: async () => {}};
++    const context = vm.createContext({exports: {},
++        $state: value => value, $derived: value => value, $effect: fn => effects.push(fn), onDestroy: () => {},
++        $currentPage: name, $preferencesBootstrap: "ready", retryPreferences: () => {}, $preferences: prefs, standaloneImport: false, $arc: model, Spaces: S,
++        oneClickStatus: () => ({text: 'Imported', failed: false}),
++        arcImport: {state: {}, canOpen: () => canOpen,
++            open: () => { calls.push(['openImported']); return proxy.open(); },
++            prefetch: record('prefetch'), importAll: record('importAll'), cancelOneClick: record('cancelOneClick')},
++        chooseRoute: record('route'), browserIconUrl: () => '', parseLocalizedString: () => [],
++        s: {welcome: {terms: ''}},
++        setPref: (...args) => {calls.push(['setPref', ...args]); return proxy.setPref(...args);},
++        window: {open: record('navigate'), close: record('close'), focus: record('focus'),
++            location: {replace: record('replace')}},
++    });
++    context.completeOnboarding = () => context.setPref('completed_onboarding', true);
++    const source = readFileSync(`src/pages/${name}.svelte`, 'utf8').match(/<script lang="ts">([\s\S]*?)<\/script>/)[1];
++    vm.runInContext(transpile(source), context);
++    return {calls, proxy, context, run: code => vm.runInContext(code, context),
++        effect: () => effects.forEach(fn => fn()),
++        prefs: value => {context.$preferences = value;}};
++}
++
++test('loaded fresh-profile preferences permit the first Welcome click without a delay', () => {
++    const h = page('Welcome', {model: S.initialModel()});
++    h.effect();
++    h.run('primary()');
++    assert.deepEqual(h.calls, [['prefetch'], ['importAll']]);
++});
++
++test('unknown completion is never inferred false; a real preference reply unlocks the first click', async () => {
++    const h = page('Welcome', {prefs: {}, model: S.initialModel()});
++    h.effect();
++    h.run('primary()'); h.run('leave("fresh")'); await h.run('done(true)');
++    assert.equal(h.run('completed()'), false);
++    assert.equal(h.run('preferencesReady()'), false);
++    assert.deepEqual(h.calls, [], 'no discovery, import, route, completion or focus before native prefs arrive');
++    h.prefs({completed_onboarding: false});
++    h.effect();
++    h.run('primary()');
++    assert.deepEqual(h.calls, [['prefetch'], ['importAll']]);
++});
++
++test('completed-profile reload is terminal on Welcome and Finish and never imports again', async () => {
++    for (const name of ['Welcome', 'Finish']) {
++        const h = page(name, {prefs: {completed_onboarding: true}, model: S.initialModel()});
++        h.effect();
++        assert.equal(h.run('completed()'), true);
++        if (name === 'Welcome') { h.run('primary()'); h.run('leave("arcCustom")'); }
++        await h.run('done()'); await h.run('done(true)');
++        assert.deepEqual(h.calls, []);
++        assert.equal(h.run('finishing'), false);
++    }
++    const late = page('Welcome', {prefs: {}, model: S.initialModel()});
++    late.effect();
++    late.prefs({completed_onboarding: true});
++    late.effect();
++    late.run('primary()');
++    assert.equal(late.run('completed()'), true);
++    assert.deepEqual(late.calls, []);
++});
++
++test('explicit Settings Arc import stays on the picker for an already completed profile', () => {
++    const context = vm.createContext({exports: {}, SvelteSet: Set, URLSearchParams,
++        writable: stores.writable, derived: stores.derived, get: stores.get,
++        preferences: stores.writable({completed_onboarding: true}),
++        importableProfiles: stores.writable([]), isDefaultBrowser: stores.writable(false),
++        canBeDefaultBrowser: true, location: {search: '?import=arc'}});
++    vm.runInContext(transpile(readFileSync('src/lib/onboarding-flow.ts', 'utf8')), context);
++    assert.equal(context.exports.standaloneImport, true);
++    assert.equal(stores.get(context.exports.currentPage), 'ArcSpaces');
++});
++
++test('acknowledged imported-window completion is terminal and never navigates or refocuses its source', async () => {
++    for (const name of ['Welcome', 'Finish']) {
++        const h = page(name);
++        await h.run('done()');
++        assert.deepEqual(h.calls, [['openImported'], ['setPref', 'completed_onboarding', true]]);
++        assert.equal(h.run('completed()'), true);
++        assert.equal(h.run('finishing'), false);
++        await h.run('done()'); await h.run('done(true)');
++        if (name === 'Welcome') { await h.run('primary()'); h.run('leave("arc")'); }
++        assert.equal(h.calls.length, 2, 'returning to Done cannot reopen or opt in to services');
++    }
++});
++
++test('rejected or refused imported-window request stays incomplete and supports explicit retry', async () => {
++    for (const name of ['Welcome', 'Finish']) {
++        for (const fail of [() => Promise.resolve(false), () => Promise.reject('unavailable')]) {
++            const h = page(name);
++            h.proxy.open = fail;
++            await h.run('done()');
++            assert.equal(h.run('completed()'), false);
++            assert.equal(h.run('finishing'), false);
++            assert.deepEqual(h.calls, [['openImported']]);
++            h.proxy.open = async () => true;
++            await h.run('done()');
++            assert.equal(h.run('completed()'), true);
++            assert.deepEqual(h.calls.at(-1), ['setPref', 'completed_onboarding', true]);
++            assert.equal(h.calls.filter(c => c[0] === 'navigate').length, 0);
++        }
++    }
++});
++
++test('failed completion persistence stays retryable without any source navigation', async () => {
++    for (const name of ['Welcome', 'Finish']) {
++        const h = page(name);
++        h.proxy.setPref = async () => { throw new Error('bridge failed'); };
++        await h.run('done()');
++        assert.equal(h.run('completed()'), false);
++        assert.equal(h.run('stepFailed'), true);
++        h.proxy.setPref = async () => {};
++        await h.run('done()');
++        assert.equal(h.run('completed()'), true);
++        assert.equal(h.calls.filter(c => c[0] === 'navigate').length, 0);
++    }
++});
++
++test('explicit skip or no imported destination retains ordinary New Tab completion once', async () => {
++    for (const name of ['Welcome', 'Finish']) {
++        for (const skip of [false, true]) {
++            const h = page(name, {canOpen: skip});
++            await h.run(`done(${skip})`);
++            assert.deepEqual(h.calls, [['setPref', 'completed_onboarding', true], ['navigate', 'chrome://newtab', '_self']]);
++            await h.run('done()');
++            assert.equal(h.calls.length, 2);
++        }
++    }
++});
++
++test('two completion clicks share the in-flight action and settle without a spinner', async () => {
++    for (const name of ['Welcome', 'Finish']) {
++        const h = page(name);
++        let accept;
++        h.proxy.open = () => new Promise(resolve => {accept = resolve;});
++        const first = h.run('done()');
++        await tick();
++        await h.run('done()');
++        assert.equal(h.run('finishing'), true);
++        assert.equal(h.calls.length, 1);
++        accept(true);
++        await first;
++        assert.equal(h.run('completed()'), true);
++        assert.equal(h.run('finishing'), false);
++        assert.equal(h.calls.length, 2);
++    }
++});
++
++test('both terminal components compile and conditionally remove their action controls', () => {
++    for (const name of ['Welcome', 'Finish']) {
++        const source = readFileSync(`src/pages/${name}.svelte`, 'utf8');
++        assert.equal(compile(source, {filename: `${name}.svelte`, generate: 'client'}).warnings.length, 0);
++        const markup = source.slice(source.indexOf('</script>'), source.indexOf('<style>'));
++        assert.match(markup, /completed\(\) \? s\.spaces\.done/);
++        assert.match(markup, /\{#if !completed\(\)\}/);
++        assert.doesNotMatch(markup, /\{#if completed\(\)\}[\s\S]*?onclick=/);
++    }
++});
++
++test('a successful open clears the previous open error before a failed completion write', async () => {
++    for (const name of ['Welcome', 'Finish']) {
++        const h = page(name); h.proxy.open = async () => false;
++        await h.run('done()'); assert.equal(h.run('openFailed'), true);
++        h.proxy.open = async () => true;
++        h.proxy.setPref = async () => {throw new Error('completion unavailable');};
++        await h.run('done()');
++        assert.equal(h.run('openFailed'), false);
++        assert.equal(h.run('stepFailed'), true);
++        assert.equal(h.run('completed()'), false);
++    }
++});
++
++test('authoritative completed preferences win over an unresolved or failed completion acknowledgement', async () => {
++    for (const name of ['Welcome', 'Finish']) {
++        const h = page(name); let reject;
++        h.proxy.setPref = () => new Promise((_, no) => {reject = no;});
++        const pending = h.run('done()'); await tick();
++        h.prefs({completed_onboarding: true}); h.effect();
++        assert.equal(h.run('completed()'), true);
++        await h.run('done()');
++        reject(new Error('acknowledgement timed out')); await pending;
++        assert.equal(h.run('completed()'), true);
++        assert.equal(h.run('finishing'), false);
++        assert.equal(h.calls.length, 2);
++    }
++});
