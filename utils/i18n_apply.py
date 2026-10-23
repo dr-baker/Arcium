@@ -28,6 +28,7 @@ TRANSLATIONS_DIR = I18N_DIR / 'translations'
 def get_id(name, context, text, meaning):
     """Compute the fingerprint ID for a GRD message element."""
     message = xml.fromstring(f'<message>{text}</message>')
+    namesub.replace_grit_message(message)
     message.set('name', name)
     message.set('desc', context)
     if meaning:
@@ -154,7 +155,8 @@ def merge_into_xtb(xtb_path, source_entries, trans_by_key):
         if msg_id in seen_ids:
             continue
         seen_ids.add(msg_id)
-        entries.append((msg_id, to_xtb_message(trans['message'])))
+        translated, _ = namesub.replace_text(trans['message'])
+        entries.append((msg_id, to_xtb_message(translated)))
 
     if entries:
         insert_into_xtb(xtb_path, entries)
