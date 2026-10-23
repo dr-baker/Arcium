@@ -27,7 +27,7 @@ from _common import parse_series # pylint: disable=wrong-import-position
 
 def _target_path(patched_file) -> Path:
     path = Path(patched_file.target_file)
-    if path.parts[:1] in {("a",), ("b",), ("src",)}:
+    if path.parts[:1] in {("a", ), ("b", ), ("src", )}:
         return Path(*path.parts[1:])
     return path
 

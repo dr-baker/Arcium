@@ -21,9 +21,10 @@ def catalogue(source):
     assert literal.endswith(";"), "Unexpected catalogue suffix"
     tokens = tokenize.generate_tokens(io.StringIO(literal[:-1]).readline)
     converted = [
-        token._replace(string={"true": "True", "false": "False"}.get(
-            token.string, token.string))
-        if token.type == tokenize.NAME else token
+        token._replace(string={
+            "true": "True",
+            "false": "False"
+        }.get(token.string, token.string)) if token.type == tokenize.NAME else token
         for token in tokens
     ]
     groups = ast.literal_eval(tokenize.untokenize(converted))
@@ -53,15 +54,16 @@ def generate(src):
             codepoints = entry["base"]
             assert codepoints and all(
                 isinstance(cp, int) and 0 <= cp <= 0x10FFFF and not 0xD800 <= cp <= 0xDFFF
-                for cp in codepoints
-            )
+                for cp in codepoints)
             emoji = "".join(chr(cp) for cp in codepoints)
             metadata = annotations.get(emoji) or annotations.get(emoji.replace("\ufe0f", ""))
             assert metadata and metadata.get("name"), f"Missing CLDR name: {emoji}"
             name = metadata["name"]
             words = " ".join([
-                name, metadata.get("keywords", ""),
-                *entry.get("shortcodes", []), *entry.get("emoticons", []),
+                name,
+                metadata.get("keywords", ""),
+                *entry.get("shortcodes", []),
+                *entry.get("emoticons", []),
             ]).casefold()
             # Keep native names while accepting ordinary ASCII spellings such
             # as "sao tome" for the flag's accented English CLDR name.
@@ -88,10 +90,15 @@ def generate(src):
         "// Regenerate from the selected Chromium checkout; do not edit by hand.",
         "constexpr std::string_view kSpaceEmojiCategories[] = {",
         *[f"    {quote(label)}," for label in categories],
-        "};", "", "constexpr SpaceEmoji kSpaceEmoji[] = {",
-        *[f"    {{{quote(emoji)}, {quote(name)}, {quote(words)}, {category}}},"
-          for emoji, name, words, category in rows],
-        "};", "",
+        "};",
+        "",
+        "constexpr SpaceEmoji kSpaceEmoji[] = {",
+        *[
+            f"    {{{quote(emoji)}, {quote(name)}, {quote(words)}, {category}}},"
+            for emoji, name, words, category in rows
+        ],
+        "};",
+        "",
     ]
     return "\n".join(lines), len(rows)
 
