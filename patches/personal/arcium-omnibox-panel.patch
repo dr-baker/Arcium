@@ -6130,7 +6130,15 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
      if (query_.scope_id == kOmniScope && !query_.text.empty()) {
        // Native autocomplete owns nonempty Omni order and default selection.
        PostResults({}, index.revision());
-@@ -873,7 +907,7 @@ class LocalQueryProvider final : public
+@@ -864,6 +898,7 @@ class LocalQueryProvider final : public
+                CommandProviderResults results) {
+               if (!owner || generation != owner->generation_ ||
+                   epoch != owner->query_.epoch || owner->publish_.is_null() ||
++                  !owner->context_->corpus.ready() ||
+                   corpus_revision !=
+                       owner->context_->corpus.index().revision()) {
+                 return;
+@@ -873,7 +908,7 @@ class LocalQueryProvider final : public
              weak_factory_.GetWeakPtr(), generation_, query_.epoch,
              corpus_revision, std::move(callback), std::move(results)));
    }
@@ -6139,7 +6147,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
    base::CallbackListSubscription corpus_subscription_;
    CommandQuery query_;
    CommandProviderPublishCallback publish_;
-@@ -904,8 +938,18 @@ class RouterActionDelegate final : publi
+@@ -904,8 +939,18 @@ class RouterActionDelegate final : publi
  }  // namespace
  
  std::unique_ptr<CommandSession> CreateCommandSession(Browser* browser) {
@@ -6159,7 +6167,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
    auto registry = std::make_unique<CommandProviderRegistry>();
    auto native = std::make_unique<NativeQueryProvider>(context);
    const auto weak_native = native->GetWeakPtr();
-@@ -936,15 +980,17 @@ std::unique_ptr<CommandSession> CreateCo
+@@ -936,15 +981,17 @@ std::unique_ptr<CommandSession> CreateCo
    // rows, cancellation, and any lazy actions they add to their opaque targets.
    CHECK(registry->Register(std::move(native)));
    CHECK(registry->Register(std::make_unique<LocalQueryProvider>(context)));
@@ -6360,7 +6368,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
  TEST_F(ArciumCommandActionRouterTest, NativeCurrentAcceptUsesCapturedTab) {
    auto* captured = AddOrdinaryTab("https://captured.test/");
    Capture(captured);
-@@ -454,6 +573,75 @@ TEST_F(ArciumCommandActionRouterTest, Sc
+@@ -454,6 +573,109 @@ TEST_F(ArciumCommandActionRouterTest, Sc
    EXPECT_EQ(1, browser()->tab_strip_model()->count());
  }
  
@@ -6431,6 +6439,40 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
 +  session.reset();
 +  context.reset();
 +  base::RunLoop().RunUntilIdle();
++}
++
++TEST_F(ArciumCommandActionRouterTest,
++       ReopenedSessionNeverPublishesRowsInvalidatedBeforeDelivery) {
++  AddOrdinaryTab("https://source.test/");
++  SetPins({Link("old", "https://old.test/")});
++  std::shared_ptr<CommandSessionContext> context;
++  auto session = CreateCommandSession(browser(), context);
++  session->SetInvocation(CommandInvocationMode::kNewTab);
++  session->Search(kSavedScope, u"", base::BindLambdaForTesting(
++      [](std::shared_ptr<const CommandPublication>) {}));
++  base::RunLoop().RunUntilIdle();
++  session.reset();
++
++  session = CreateCommandSession(browser(), context);
++  session->SetInvocation(CommandInvocationMode::kNewTab);
++  std::vector<std::shared_ptr<const CommandPublication>> publications;
++  session->Search(kSavedScope, u"", base::BindLambdaForTesting(
++      [&publications](std::shared_ptr<const CommandPublication> update) {
++        publications.push_back(std::move(update));
++      }));
++  // Projection has queued old rows, but the revision changes only when the
++  // later refresh task runs. Delivery must also check readiness in this gap.
++  SetPins({Link("replacement", "https://replacement.test/")});
++  base::RunLoop().RunUntilIdle();
++  ASSERT_FALSE(publications.empty());
++  bool found_replacement = false;
++  for (const auto& publication : publications) {
++    for (const auto& row : publication->rows) {
++      EXPECT_NE(CommandTarget(Pin("old")), row.target);
++      found_replacement |= row.target == CommandTarget(Pin("replacement"));
++    }
++  }
++  EXPECT_TRUE(found_replacement);
 +}
 +
  TEST_F(ArciumCommandActionRouterTest, ClosedLiveIdentityNeverNavigatesItsUrl) {
