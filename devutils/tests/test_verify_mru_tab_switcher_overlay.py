@@ -12,6 +12,8 @@ sys.path.pop(0)
 
 def test_patch_paths_normalize_common_source_prefixes():
     """Patch paths should resolve relative to the Chromium source root."""
+    # Exercise the path parser directly, without fetching Chromium sources.
+    # pylint: disable=protected-access
     patch = """--- a/chrome/browser/ui/example.cc
 +++ b/chrome/browser/ui/example.cc
 @@ -1 +1 @@
@@ -38,6 +40,8 @@ def test_patch_paths_normalize_common_source_prefixes():
 
 def test_filtered_patch_uses_normalized_target_path():
     """Filtering should match a source-relative target regardless of prefix."""
+    # Exercise the filter directly, without running the full patch pipeline.
+    # pylint: disable=protected-access
     patch = """--- a/chrome/browser/ui/example.cc
 +++ b/chrome/browser/ui/example.cc
 @@ -1 +1 @@
