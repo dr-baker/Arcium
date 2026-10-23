@@ -9,8 +9,10 @@ import name_substitution_utils as namesub
 
 
 class ArciumBrandingTest(unittest.TestCase):
+    """Keep product branding separate from upstream attribution and identifiers."""
 
     def test_product_copy_and_attribution(self):
+        """Replace product copy while preserving upstream credits and identifiers."""
         name_substitution.replacement_sanity()
         for source, expected in (
             ("Meet Helium", "Meet Arcium"),
@@ -25,16 +27,19 @@ class ArciumBrandingTest(unittest.TestCase):
                 self.assertEqual(expected, namesub.replace_text(source)[0])
 
     def test_translation_id_uses_displayed_english(self):
+        """Fingerprint the branded English text shown to the user."""
         with patch.object(namesub, "compute_fp", side_effect=lambda msg: msg.text):
             self.assertEqual("Meet Arcium",
                              i18n_apply.get_id("IDS_WELCOME", "Greeting", "Meet Helium", ""))
 
     def test_upstream_link_label_keeps_its_fingerprint(self):
+        """Preserve the original fingerprint for a Chromium attribution link."""
         text = 'Built from <ph name="BEGIN_LINK_CHROMIUM">$1</ph>Chromium'
         with patch.object(namesub, "compute_fp", side_effect=lambda msg: msg.find("ph").tail):
             self.assertEqual("Chromium", i18n_apply.get_id("IDS_CREDIT", "Credit", text, ""))
 
     def test_translated_copy_matches_new_fingerprint(self):
+        """Write branded translations under their matching English fingerprint."""
         source = {"name": "IDS_WELCOME", "message": "Meet Helium", "context": "Greeting"}
         translations = {("IDS_WELCOME", "Meet Helium"): {"message": "Bienvenue dans Helium"}}
         with patch.object(namesub, "compute_fp", side_effect=lambda msg: msg.text), \
