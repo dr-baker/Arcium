@@ -1,0 +1,1556 @@
+Index: src/chrome/browser/importer/arcium_arc_import_browsertest.cc
+===================================================================
+--- src.orig/chrome/browser/importer/arcium_arc_import_browsertest.cc
++++ src/chrome/browser/importer/arcium_arc_import_browsertest.cc
+@@ -69,6 +69,27 @@
+ namespace arcium {
+ class ArcSpacesImportBrowserTestPeer {
+  public:
++  static void SetFinishDestination(ArcSpacesImport& importer,
++                                   Profile* profile,
++                                   std::string space_id,
++                                   std::string source_key) {
++    importer.phase_ = "finished";
++    importer.batch_id_ = 7;
++    importer.first_profile_path_ = profile->GetPath();
++    importer.first_space_id_ = std::move(space_id);
++    importer.first_source_key_ = std::move(source_key);
++  }
++  static base::OnceCallback<void(Profile*)> OpenReply(
++      ArcSpacesImport& importer,
++      base::OnceCallback<void(BrowserWindowInterface*)> opened) {
++    return base::BindOnce(&ArcSpacesImport::OpenProfileReady,
++                          importer.weak_factory_.GetWeakPtr(),
++                          importer.batch_id_, importer.first_profile_path_,
++                          importer.first_space_id_, importer.first_source_key_,
++                          std::move(opened));
++  }
++  static void AdvanceBatch(ArcSpacesImport& importer) { ++importer.batch_id_; }
++
+   static base::OnceCallback<void(Profile*)> DestinationReply(
+       ArcSpacesImport& importer, std::string source_key, bool newly_created) {
+     return base::BindOnce(&ArcSpacesImport::DestinationInitialized,
+@@ -194,6 +215,160 @@ std::map<std::u16string, bool> GroupColl
+ class ArciumArcImportBrowserTest : public InProcessBrowserTest {};
+ 
+ IN_PROC_BROWSER_TEST_F(ArciumArcImportBrowserTest,
++                       OpenActivatesStoredProfileAndSpace) {
++  base::test::TestFuture<Profile*> created;
++  std::unique_ptr<ScopedProfileKeepAlive> keep_alive;
++  ProfileManager::CreateMultiProfileAsync(
++      u"Open destination", 0, false,
++      base::BindLambdaForTesting([&](Profile* profile) {
++        if (profile) {
++          keep_alive = ScopedProfileKeepAlive::TryAcquire(
++              profile, ProfileKeepAliveOrigin::kArciumSettingsWindow);
++        }
++        created.SetValue(profile);
++      }));
++  Profile* target = created.Get();
++  ASSERT_TRUE(target);
++  ASSERT_TRUE(keep_alive);
++  auto* target_service =
++      helium::HeliumSpaceServiceFactory::GetForProfile(target);
++  auto* origin_service =
++      helium::HeliumSpaceServiceFactory::GetForProfile(browser()->profile());
++  ASSERT_TRUE(target_service);
++  ASSERT_TRUE(origin_service);
++  auto* imported = target_service->GetOrCreateSpace("open-target", u"Imported");
++  ASSERT_TRUE(imported);
++  ASSERT_TRUE(target_service->GetOrCreateSpace("other-target", u"Other"));
++  target_service->SetActiveSpace("other-target");
++  // The same Space ID in another profile must never win the lookup.
++  ASSERT_TRUE(origin_service->GetOrCreateSpace("open-target", u"Unrelated"));
++  const std::string origin_active = origin_service->GetActiveSpace()->id();
++  target->GetPrefs()->SetString(prefs::kArciumArcImportSourceMarker,
++                                "open-source");
++  {
++    ScopedDictPrefUpdate mapping(g_browser_process->local_state(),
++                                 prefs::kArciumArcImportDestinations);
++    mapping->Set("open-source", target->GetPath().BaseName().AsUTF8Unsafe());
++  }
++  ArcSpacesImport importer(base::BindRepeating([] {}));
++  ArcSpacesImportBrowserTestPeer::SetFinishDestination(
++      importer, target, imported->id(), "open-source");
++  base::test::TestFuture<BrowserWindowInterface*> wrong_profile;
++  auto reply = ArcSpacesImportBrowserTestPeer::OpenReply(
++      importer, wrong_profile.GetCallback());
++  std::move(reply).Run(browser()->profile());
++  EXPECT_FALSE(wrong_profile.Get());
++  EXPECT_FALSE(imported->GetPrimaryBrowser());
++  base::test::TestFuture<BrowserWindowInterface*> opened;
++  importer.Open(importer.batch_id(), opened.GetCallback());
++  BrowserWindowInterface* window = opened.Get();
++  ASSERT_TRUE(window);
++  EXPECT_EQ(target, window->GetProfile());
++  EXPECT_EQ(window, imported->GetPrimaryBrowser());
++  EXPECT_EQ(imported, target_service->GetActiveSpace());
++  EXPECT_EQ(origin_active, origin_service->GetActiveSpace()->id());
++  EXPECT_FALSE(target->GetPrefs()->GetBoolean(prefs::kHeliumServicesConsented));
++}
++
++IN_PROC_BROWSER_TEST_F(ArciumArcImportBrowserTest,
++                       ActivatedWindowRejectsReentrantSameProfileSpaceChange) {
++  Profile* profile = browser()->profile();
++  auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(profile);
++  ASSERT_TRUE(service);
++  auto* captured = service->GetOrCreateSpace("captured-space", u"Captured");
++  ASSERT_TRUE(captured);
++  ASSERT_TRUE(service->GetOrCreateSpace("replacement-space", u"Replacement"));
++  service->SetSpaceForBrowser(browser(), captured->id());
++  auto* window = captured->ActivateOrCreatePrimaryWindow();
++  ASSERT_TRUE(window);
++  ASSERT_TRUE(
++      ArcSpacesImport::IsActivatedSpaceWindow(profile, captured->id(), window));
++  // An activation observer can retain the same window and profile while
++  // changing its Space ownership. That must not become an Appearance target.
++  service->SetSpaceForBrowser(window->GetBrowserForMigrationOnly(),
++                              "replacement-space");
++  EXPECT_EQ(profile, window->GetProfile());
++  EXPECT_FALSE(
++      ArcSpacesImport::IsActivatedSpaceWindow(profile, captured->id(), window));
++  service->SetSpaceForBrowser(window->GetBrowserForMigrationOnly(),
++                              captured->id());
++  EXPECT_TRUE(
++      ArcSpacesImport::IsActivatedSpaceWindow(profile, captured->id(), window));
++  EXPECT_FALSE(ArcSpacesImport::IsActivatedSpaceWindow(profile, "deleted-space",
++                                                       window));
++}
++
++IN_PROC_BROWSER_TEST_F(ArciumArcImportBrowserTest,
++                       OpenRejectsWrongMarkerMissingMappingAndMissingSpace) {
++  Profile* target = browser()->profile();
++  auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(target);
++  ASSERT_TRUE(service);
++  auto* imported = service->GetOrCreateSpace("open-target", u"Imported");
++  ASSERT_TRUE(imported);
++  const std::string active_before = service->GetActiveSpace()->id();
++  const std::string directory = target->GetPath().BaseName().AsUTF8Unsafe();
++  {
++    ScopedDictPrefUpdate mapping(g_browser_process->local_state(),
++                                 prefs::kArciumArcImportDestinations);
++    mapping->Set("open-source", directory);
++  }
++  ArcSpacesImport importer(base::BindRepeating([] {}));
++  ArcSpacesImportBrowserTestPeer::SetFinishDestination(
++      importer, target, imported->id(), "open-source");
++  target->GetPrefs()->SetString(prefs::kArciumArcImportSourceMarker,
++                                "another-source");
++  base::test::TestFuture<BrowserWindowInterface*> wrong_marker;
++  importer.Open(importer.batch_id(), wrong_marker.GetCallback());
++  EXPECT_FALSE(wrong_marker.Get());
++  target->GetPrefs()->SetString(prefs::kArciumArcImportSourceMarker,
++                                "open-source");
++  {
++    ScopedDictPrefUpdate mapping(g_browser_process->local_state(),
++                                 prefs::kArciumArcImportDestinations);
++    mapping->Remove("open-source");
++  }
++  base::test::TestFuture<BrowserWindowInterface*> missing_mapping;
++  importer.Open(importer.batch_id(), missing_mapping.GetCallback());
++  EXPECT_FALSE(missing_mapping.Get());
++  {
++    ScopedDictPrefUpdate mapping(g_browser_process->local_state(),
++                                 prefs::kArciumArcImportDestinations);
++    mapping->Set("open-source", directory);
++  }
++  ArcSpacesImportBrowserTestPeer::SetFinishDestination(
++      importer, target, "deleted-space", "open-source");
++  base::test::TestFuture<BrowserWindowInterface*> missing_space;
++  importer.Open(importer.batch_id(), missing_space.GetCallback());
++  EXPECT_FALSE(missing_space.Get());
++  EXPECT_FALSE(imported->GetPrimaryBrowser());
++  EXPECT_EQ(active_before, service->GetActiveSpace()->id());
++}
++
++IN_PROC_BROWSER_TEST_F(ArciumArcImportBrowserTest,
++                       OpenRejectsStaleBatchAndDropsDestroyedOwnerReply) {
++  Profile* target = browser()->profile();
++  auto importer = std::make_unique<ArcSpacesImport>(base::BindRepeating([] {}));
++  ArcSpacesImportBrowserTestPeer::SetFinishDestination(
++      *importer, target, "not-opened", "open-source");
++  base::test::TestFuture<BrowserWindowInterface*> stale_request;
++  importer->Open(importer->batch_id() + 1, stale_request.GetCallback());
++  EXPECT_FALSE(stale_request.Get());
++  base::test::TestFuture<BrowserWindowInterface*> stale;
++  auto stale_reply =
++      ArcSpacesImportBrowserTestPeer::OpenReply(*importer, stale.GetCallback());
++  ArcSpacesImportBrowserTestPeer::AdvanceBatch(*importer);
++  std::move(stale_reply).Run(target);
++  EXPECT_FALSE(stale.Get());
++  base::test::TestFuture<BrowserWindowInterface*> destroyed;
++  auto destroyed_reply = ArcSpacesImportBrowserTestPeer::OpenReply(
++      *importer, destroyed.GetCallback());
++  importer.reset();
++  EXPECT_TRUE(destroyed_reply.IsCancelled());
++  std::move(destroyed_reply).Run(target);
++  EXPECT_FALSE(destroyed.IsReady());
++}
++
++IN_PROC_BROWSER_TEST_F(ArciumArcImportBrowserTest,
+                        NewDestinationKeepsAppearanceAfterWelcomeCloses) {
+   int notifications = 0;
+   auto importer = std::make_unique<ArcSpacesImport>(
+Index: src/chrome/browser/importer/arcium_arc_spaces_import.cc
+===================================================================
+--- src.orig/chrome/browser/importer/arcium_arc_spaces_import.cc
++++ src/chrome/browser/importer/arcium_arc_spaces_import.cc
+@@ -1,14 +1,14 @@
+ // Copyright 2026 The Helium Authors
+ // SPDX-License-Identifier: GPL-3.0-only
+ #include "chrome/browser/importer/arcium_arc_spaces_import.h"
+-#include "chrome/browser/importer/arcium_arc_import_prefs.h"
+-#include "chrome/common/pref_names.h"
+ 
+ #include <algorithm>
+ #include <iterator>
+ #include <utility>
++
+ #include "base/files/file_util.h"
+ #include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/hash/sha1.h"
+ #include "base/json/json_reader.h"
+ #include "base/json/json_writer.h"
+@@ -20,13 +20,23 @@
+ #include "base/uuid.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
++#include "chrome/browser/importer/arcium_arc_import_prefs.h"
+ #include "chrome/browser/importer/importer_list.h"
++#include "chrome/browser/lifetime/browser_shutdown.h"
+ #include "chrome/browser/profiles/keep_alive/profile_keep_alive_types.h"
+ #include "chrome/browser/profiles/keep_alive/scoped_profile_keep_alive.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_attributes_entry.h"
+ #include "chrome/browser/profiles/profile_attributes_storage.h"
+ #include "chrome/browser/profiles/profile_manager.h"
+-#include "chrome/browser/ui/helium/arcium_space_directory.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/helium/helium_space.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/common/importer/chrome_importer_utils.h"
++#include "chrome/common/pref_names.h"
+ #include "chrome/utility/importer/arc_sidebar_snapshot.h"
+ #include "components/helium_services/pref_names.h"
+ #include "components/prefs/pref_service.h"
+@@ -616,6 +626,7 @@ void ArcSpacesImport::CoordinatorChanged
+         coordinator_->destination()) {
+       first_profile_path_ = coordinator_->destination()->GetPath();
+       first_space_id_ = job->first_space_id;
++      first_source_key_ = groups_[current_].source_key;
+     }
+   }
+   CompleteCurrent(
+@@ -673,13 +684,126 @@ void ArcSpacesImport::Finish() {
+   phase_ = "finished";
+   Changed();
+ }
++bool ArcSpacesImport::CanOpen(int batch_id) const {
++  return batch_id == batch_id_ && !busy() && !first_profile_path_.empty() &&
++         !first_space_id_.empty() && !first_source_key_.empty();
++}
++bool ArcSpacesImport::HasValidOpenMapping() const {
++  auto* manager =
++      g_browser_process ? g_browser_process->profile_manager() : nullptr;
++  auto* local_state =
++      g_browser_process ? g_browser_process->local_state() : nullptr;
++  if (!manager || !local_state || g_browser_process->IsShuttingDown() ||
++      browser_shutdown::IsTryingToQuit()) {
++    return false;
++  }
++  const auto* entry =
++      manager->GetProfileAttributesStorage().GetProfileAttributesWithPath(
++          first_profile_path_);
++  const auto& mapping =
++      local_state->GetDict(prefs::kArciumArcImportDestinations);
++  const std::string directory = first_profile_path_.BaseName().AsUTF8Unsafe();
++  const std::string* mapped = mapping.FindString(first_source_key_);
++  return entry && !entry->IsOmitted() && !entry->IsSigninRequired() && mapped &&
++         *mapped == directory &&
++         ValidMapping(mapping, first_source_key_, directory) &&
++         manager->user_data_dir().Append(
++             base::FilePath::FromUTF8Unsafe(directory)) == first_profile_path_;
++}
++bool ArcSpacesImport::IsActivatedSpaceWindow(Profile* profile,
++                                             std::string_view space_id,
++                                             BrowserWindowInterface* window) {
++  auto* manager =
++      g_browser_process ? g_browser_process->profile_manager() : nullptr;
++  if (!manager || g_browser_process->IsShuttingDown() ||
++      browser_shutdown::IsTryingToQuit() || !profile ||
++      !manager->IsValidProfile(profile) || !profile->IsRegularProfile() ||
++      profile->IsOffTheRecord() || profile->ShutdownStarted() ||
++      space_id.empty() || !window) {
++    return false;
++  }
++  // Observers may have closed the returned window. Check membership before
++  // dereferencing it, rather than trusting a formerly valid raw pointer.
++  bool live = false;
++  ProfileBrowserCollection::GetForProfile(profile)->ForEach(
++      [&](BrowserWindowInterface* candidate) {
++        live = candidate == window;
++        return !live;
++      });
++  if (!live || window->IsDeleteScheduled() || window->GetProfile() != profile ||
++      window->GetType() != BrowserWindowInterface::TYPE_NORMAL) {
++    return false;
++  }
++  auto* browser = window->GetBrowserForMigrationOnly();
++  auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(profile);
++  auto* space = service ? service->GetSpaceById(space_id) : nullptr;
++  return browser && space && space->GetPrimaryBrowser() == window &&
++         service->GetExplicitSpaceIdForBrowser(browser) == space_id;
++}
+ bool ArcSpacesImport::Open(int batch_id) {
+-  if (batch_id != batch_id_ || busy() || first_space_id_.empty())
++  if (!CanOpen(batch_id) || !HasValidOpenMapping()) {
+     return false;
+-  helium::OpenSpaceFromDirectory(first_profile_path_, first_space_id_,
+-                                 std::nullopt);
++  }
++  Open(batch_id, base::DoNothing());
+   return true;
+ }
++void ArcSpacesImport::Open(
++    int batch_id,
++    base::OnceCallback<void(BrowserWindowInterface*)> opened) {
++  if (!CanOpen(batch_id) || !HasValidOpenMapping()) {
++    std::move(opened).Run(nullptr);
++    return;
++  }
++  auto* manager = g_browser_process->profile_manager();
++  // Load only the previously created destination. Never create a replacement
++  // profile if the user has deleted it since import completed.
++  manager->LoadProfileByPath(
++      first_profile_path_, false,
++      base::BindOnce(&ArcSpacesImport::OpenProfileReady,
++                     weak_factory_.GetWeakPtr(), batch_id, first_profile_path_,
++                     first_space_id_, first_source_key_, std::move(opened)));
++}
++void ArcSpacesImport::OpenProfileReady(
++    int batch_id,
++    base::FilePath profile_path,
++    std::string space_id,
++    std::string source_key,
++    base::OnceCallback<void(BrowserWindowInterface*)> opened,
++    Profile* profile) {
++  if (!CanOpen(batch_id) || profile_path != first_profile_path_ ||
++      space_id != first_space_id_ || source_key != first_source_key_ ||
++      !HasValidOpenMapping() || !profile ||
++      !g_browser_process->profile_manager()->IsValidProfile(profile) ||
++      profile->GetPath() != profile_path || !profile->IsRegularProfile() ||
++      profile->IsOffTheRecord() || profile->ShutdownStarted() ||
++      profile->GetPrefs()->GetString(prefs::kArciumArcImportSourceMarker) !=
++          source_key ||
++      Browser::GetCreationStatusForProfile(profile) !=
++          Browser::CreationStatus::kOk) {
++    std::move(opened).Run(nullptr);
++    return;
++  }
++  auto keep_alive = ScopedProfileKeepAlive::TryAcquire(
++      profile, ProfileKeepAliveOrigin::kArciumSettingsWindow);
++  auto* service =
++      keep_alive ? helium::HeliumSpaceServiceFactory::GetForProfile(profile)
++                 : nullptr;
++  auto* space = service ? service->GetSpaceById(space_id) : nullptr;
++  auto weak = weak_factory_.GetWeakPtr();
++  BrowserWindowInterface* window =
++      space ? space->ActivateOrCreatePrimaryWindow() : nullptr;
++  // Activation may run observers that close setup, start another batch or
++  // move this same-profile window to another Space.
++  if (!weak) {
++    return;
++  }
++  const bool valid =
++      weak->CanOpen(batch_id) && profile_path == weak->first_profile_path_ &&
++      space_id == weak->first_space_id_ &&
++      source_key == weak->first_source_key_ && weak->HasValidOpenMapping() &&
++      IsActivatedSpaceWindow(profile, space_id, window);
++  std::move(opened).Run(valid ? window : nullptr);
++}
+ base::DictValue ArcSpacesImport::Snapshot() const {
+   base::ListValue entries, jobs;
+   for (const auto& entry : entries_) {
+@@ -719,6 +843,6 @@ base::DictValue ArcSpacesImport::Snapsho
+       .Set("failure", failure_)
+       .Set("spaces", std::move(entries))
+       .Set("jobs", std::move(jobs))
+-      .Set("canOpen", !busy() && !first_space_id_.empty());
++      .Set("canOpen", CanOpen(batch_id_));
+ }
+ }  // namespace arcium
+Index: src/chrome/browser/importer/arcium_arc_spaces_import.h
+===================================================================
+--- src.orig/chrome/browser/importer/arcium_arc_spaces_import.h
++++ src/chrome/browser/importer/arcium_arc_spaces_import.h
+@@ -17,6 +17,7 @@
+ #include "base/values.h"
+ #include "chrome/browser/importer/arcium_arc_import_coordinator.h"
+ 
++class BrowserWindowInterface;
+ class ImporterList;
+ class Profile;
+ class ScopedProfileKeepAlive;
+@@ -67,7 +68,16 @@ class ArcSpacesImport {
+                     std::vector<std::string> tokens,
+                     bool history = false);
+   std::string Cancel(int batch_id);
++  // The legacy overload reports acceptance; the callback overload reports the
++  // actual activated window (or nullptr), after asynchronous profile loading.
+   bool Open(int batch_id);
++  void Open(int batch_id,
++            base::OnceCallback<void(BrowserWindowInterface*)> opened);
++  // Revalidate after activation, which can run reentrant browser/Space
++  // observers. Profile equality alone cannot identify the captured Space.
++  static bool IsActivatedSpaceWindow(Profile* profile,
++                                     std::string_view space_id,
++                                     BrowserWindowInterface* window);
+   int batch_id() const { return batch_id_; }
+   void SetInventoryForTesting(std::vector<Entry> entries);
+   static bool SourcesUnchangedForTesting(std::vector<Group> groups,
+@@ -103,6 +113,15 @@ class ArcSpacesImport {
+                                      bool newly_created,
+                                      base::DictValue appearance,
+                                      Profile* profile);
++  bool CanOpen(int batch_id) const;
++  bool HasValidOpenMapping() const;
++  void OpenProfileReady(
++      int batch_id,
++      base::FilePath profile_path,
++      std::string space_id,
++      std::string source_key,
++      base::OnceCallback<void(BrowserWindowInterface*)> opened,
++      Profile* profile);
+   void SourcesDetected(int generation);
+   void InventoryReady(int generation, Inventory inventory);
+   void Validated(int batch_id, bool unchanged);
+@@ -130,6 +149,7 @@ class ArcSpacesImport {
+   std::unique_ptr<ArcImportCoordinator> coordinator_;
+   base::FilePath first_profile_path_;
+   std::string first_space_id_;
++  std::string first_source_key_;
+   base::WeakPtrFactory<ArcSpacesImport> weak_factory_{this};
+ };
+ }  // namespace arcium
+Index: src/chrome/browser/importer/arcium_arc_spaces_import_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/importer/arcium_arc_spaces_import_unittest.cc
++++ src/chrome/browser/importer/arcium_arc_spaces_import_unittest.cc
+@@ -51,6 +51,7 @@ class ArcSpacesImportTestPeer {
+     importer.first_profile_path_ =
+         base::FilePath(FILE_PATH_LITERAL("/fixture/Profile 1"));
+     importer.first_space_id_ = "previously-imported-space";
++    importer.first_source_key_ = "previous-source";
+   }
+ 
+   static bool FinishDestinationPreserved(const ArcSpacesImport& importer) {
+Index: src/chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.cc
++++ src/chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.cc
+@@ -1,18 +1,31 @@
+ // Copyright 2026 The Helium Authors
+ // SPDX-License-Identifier: GPL-3.0-only
+ #include "chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.h"
++
+ #include "base/functional/bind.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/lifetime/browser_shutdown.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/chrome_pages.h"
+ #include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
+ #include "chrome/browser/ui/helium/arcium_settings_prefs.h"
+ #include "chrome/browser/ui/helium/helium_layout_state_controller.h"
++#include "chrome/browser/ui/helium/helium_space.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/browser/ui/views/helium/arcium_chrome_ui_scale.h"
+ #include "chrome/browser/ui/views/helium/glass_surface_configuration.h"
+ #include "chrome/browser/ui/views/helium/surface_style.h"
+ #include "chrome/common/pref_names.h"
++#include "chrome/common/webui_url_constants.h"
+ #include "components/prefs/pref_service.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_ui.h"
++#include "content/public/common/url_constants.h"
++#include "net/base/url_util.h"
+ 
+ base::DictValue ArcSpacesImportHandler::CaptureNewProfileAppearance(
+     const PrefService& source) {
+@@ -28,7 +41,7 @@ base::DictValue ArcSpacesImportHandler::
+   appearance.Set(prefs::kHeliumVerticalRightAligned, false);
+   appearance.Set(prefs::kHeliumLittleArcExternalLinks, true);
+   appearance.Set(prefs::kArciumOmniboxPersistentItemsEnabled, true);
+-  appearance.Set(prefs::kBrowserColorScheme, 1);
++  appearance.Set(prefs::kBrowserColorScheme, 0);
+   appearance.Set(arcium::kArcSidebarNavigationEnabledPref, false);
+   appearance.Set(arcium::kChromeUIScalePref, arcium::kChromeUIScaleDefault);
+   appearance.Set(arcium::kChromeFrameBorderWidthPref, 4);
+@@ -75,10 +88,15 @@ void ArcSpacesImportHandler::RegisterMes
+   web_ui()->RegisterMessageCallback(
+       "openArcImportedSpace", base::BindRepeating(&ArcSpacesImportHandler::Open,
+                                                   base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "openOnboardingAppearance",
++      base::BindRepeating(&ArcSpacesImportHandler::OpenAppearance,
++                          base::Unretained(this)));
+ }
+ void ArcSpacesImportHandler::OnJavascriptDisallowed() {
+   // Destroys the coordinator and cancels its host; weak discovery and worker
+   // replies cannot reach the former page. No promise is resolved afterwards.
++  weak_factory_.InvalidateWeakPtrs();
+   controller_.reset();
+ }
+ bool ArcSpacesImportHandler::BeginMessage(const base::ListValue& args) {
+@@ -170,26 +188,124 @@ void ArcSpacesImportHandler::Cancel(cons
+   }
+   Reply(args, controller_->Cancel(*batch_id));
+ }
++std::optional<std::pair<int, bool>> ArcSpacesImportHandler::ParseOpenRequest(
++    const base::ListValue& args) {
++  if (args.size() != 2 || !args[0].is_string() || !args[1].is_dict()) {
++    return std::nullopt;
++  }
++  const auto& request = args[1].GetDict();
++  const auto batch_id = request.FindInt("batchId");
++  const auto* customize = request.Find("customize");
++  if (!batch_id || (customize && !customize->is_bool())) {
++    return std::nullopt;
++  }
++  return std::pair(*batch_id, customize && customize->GetBool());
++}
+ void ArcSpacesImportHandler::Open(const base::ListValue& args) {
+   if (!BeginMessage(args))
+     return;
+-  const auto* dict = args.size() == 2 ? args[1].GetIfDict() : nullptr;
+-  const auto batch_id = dict ? dict->FindInt("batchId") : std::nullopt;
+-  if (!controller_ || !batch_id) {
++  const auto request = ParseOpenRequest(args);
++  if (!controller_ || !request) {
+     Reply(args, "invalid_arguments");
+     return;
+   }
+-  if (*batch_id != controller_->batch_id()) {
++  if (request->first != controller_->batch_id()) {
+     Reply(args, "stale_batch");
+     return;
+   }
+-  // Resolve before opening a Space: its browser may replace the welcome page.
+   if (!controller_->Snapshot().FindBool("canOpen").value_or(false)) {
+     Reply(args, "nothing_to_open");
+     return;
+   }
+-  ResolveJavascriptCallback(args[0], base::Value(true));
+-  controller_->Open(*batch_id);
++  controller_->Open(request->first,
++                    base::BindOnce(&ArcSpacesImportHandler::Opened,
++                                   weak_factory_.GetWeakPtr(), args[0].Clone(),
++                                   request->second));
++}
++bool ArcSpacesImportHandler::IsAppearanceOrigin(const GURL& url) {
++  std::string import;
++  return url.SchemeIs(content::kChromeUIScheme) &&
++         url.host_piece() == chrome::kHeliumSetupHost &&
++         !net::GetValueForKeyInQuery(url, "import", &import);
++}
++void ArcSpacesImportHandler::OpenAppearance(const base::ListValue& args) {
++  if (!BeginMessage(args)) {
++    return;
++  }
++  if (args.size() != 1) {
++    Reply(args, "invalid_arguments");
++    return;
++  }
++  content::WebContents* contents = web_ui()->GetWebContents();
++  auto* profile =
++      contents ? Profile::FromBrowserContext(contents->GetBrowserContext())
++               : nullptr;
++  const GURL url = contents ? contents->GetLastCommittedURL() : GURL();
++  if (!profile || !profile->IsRegularProfile() || profile->IsOffTheRecord() ||
++      profile->ShutdownStarted() || !g_browser_process ||
++      g_browser_process->IsShuttingDown() ||
++      browser_shutdown::IsTryingToQuit() || !IsAppearanceOrigin(url) ||
++      Browser::GetCreationStatusForProfile(profile) !=
++          Browser::CreationStatus::kOk) {
++    RejectJavascriptCallback(args[0], base::Value("unavailable"));
++    return;
++  }
++  // Resolve the window by this page, never by activity order or another
++  // profile's active Space. A standalone import page cannot finish onboarding.
++  auto* owner =
++      ProfileBrowserCollection::GetForProfile(profile)->FindBrowserWithTab(
++          contents);
++  auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(profile);
++  Browser* browser = owner ? owner->GetBrowserForMigrationOnly() : nullptr;
++  const std::string space_id =
++      service && browser
++          ? std::string(service->GetExplicitSpaceIdForBrowser(browser))
++          : "";
++  auto* space = service ? service->GetSpaceById(space_id) : nullptr;
++  if (!owner || owner->GetProfile() != profile ||
++      owner->GetType() != BrowserWindowInterface::TYPE_NORMAL || !space) {
++    RejectJavascriptCallback(args[0], base::Value("unavailable"));
++    return;
++  }
++  auto weak = weak_factory_.GetWeakPtr();
++  const base::Value callback_id = args[0].Clone();
++  auto* activated = space->ActivateOrCreatePrimaryWindow();
++  if (weak) {
++    weak->Opened(callback_id.Clone(), true,
++                 arcium::ArcSpacesImport::IsActivatedSpaceWindow(
++                     profile, space_id, activated)
++                     ? activated
++                     : nullptr);
++  }
++}
++void ArcSpacesImportHandler::Opened(base::Value callback_id,
++                                    bool customize,
++                                    BrowserWindowInterface* browser) {
++  if (!IsJavascriptAllowed()) {
++    return;
++  }
++  if (!browser) {
++    CompleteOpen(std::move(callback_id), false);
++    return;
++  }
++  auto weak = weak_factory_.GetWeakPtr();
++  const bool succeeded = !customize || chrome::ShowAppearanceSettings(browser);
++  // Routing can tear down the old page. Its callback must never reach a
++  // destroyed handler or a replacement document.
++  if (weak) {
++    weak->CompleteOpen(std::move(callback_id), succeeded);
++  }
++}
++void ArcSpacesImportHandler::CompleteOpen(base::Value callback_id,
++                                          bool succeeded) {
++  if (!IsJavascriptAllowed()) {
++    return;
++  }
++  if (!succeeded) {
++    RejectJavascriptCallback(callback_id, base::Value("open_failed"));
++    return;
++  }
++  ResolveJavascriptCallback(callback_id, base::Value(true));
+ }
+ void ArcSpacesImportHandler::Changed() {
+   if (controller_ && IsJavascriptAllowed())
+Index: src/chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.h
+===================================================================
+--- src.orig/chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.h
++++ src/chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.h
+@@ -3,9 +3,14 @@
+ #ifndef CHROME_BROWSER_UI_WEBUI_ONBOARDING_ARC_SPACES_IMPORT_HANDLER_H_
+ #define CHROME_BROWSER_UI_WEBUI_ONBOARDING_ARC_SPACES_IMPORT_HANDLER_H_
+ #include <memory>
++#include <optional>
++#include <utility>
++
++#include "base/memory/weak_ptr.h"
+ #include "chrome/browser/importer/arcium_arc_spaces_import.h"
+ #include "content/public/browser/web_ui_message_handler.h"
+ 
++class GURL;
+ class PrefService;
+ 
+ class ArcSpacesImportHandler : public content::WebUIMessageHandler {
+@@ -17,15 +22,25 @@ class ArcSpacesImportHandler : public co
+   static base::DictValue CaptureNewProfileAppearance(const PrefService& prefs);
+ 
+  private:
++  friend class ArcSpacesImportHandlerTestPeer;
++  static std::optional<std::pair<int, bool>> ParseOpenRequest(
++      const base::ListValue& args);
++  static bool IsAppearanceOrigin(const GURL& url);
+   void OnJavascriptDisallowed() override;
+   void Initialize(const base::ListValue& args);
+   void GetState(const base::ListValue& args);
+   void Start(const base::ListValue& args);
+   void Cancel(const base::ListValue& args);
+   void Open(const base::ListValue& args);
++  void OpenAppearance(const base::ListValue& args);
++  void Opened(base::Value callback_id,
++              bool customize,
++              BrowserWindowInterface* browser);
++  void CompleteOpen(base::Value callback_id, bool succeeded);
+   bool BeginMessage(const base::ListValue& args);
+   void Reply(const base::ListValue& args, std::string error);
+   void Changed();
+   std::unique_ptr<arcium::ArcSpacesImport> controller_;
++  base::WeakPtrFactory<ArcSpacesImportHandler> weak_factory_{this};
+ };
+ #endif
+Index: src/chrome/browser/ui/webui/onboarding/onboarding_handler_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/onboarding/onboarding_handler_unittest.cc
++++ src/chrome/browser/ui/webui/onboarding/onboarding_handler_unittest.cc
+@@ -3,23 +3,45 @@
+ 
+ #include "chrome/browser/ui/webui/onboarding/onboarding_handler.h"
+ 
+-#include "chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.h"
+-#include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
+-#include "chrome/browser/ui/helium/arcium_settings_prefs.h"
+-#include "chrome/browser/ui/views/helium/glass_surface_configuration.h"
+-#include "chrome/common/pref_names.h"
+-
+ #include <memory>
+ #include <utility>
+ 
++#include "base/functional/bind.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/values.h"
++#include "chrome/browser/ui/chrome_pages.h"
++#include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
++#include "chrome/browser/ui/helium/arcium_settings_prefs.h"
++#include "chrome/browser/ui/views/helium/glass_surface_configuration.h"
++#include "chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.h"
++#include "chrome/common/pref_names.h"
+ #include "chrome/test/base/testing_profile.h"
+ #include "components/helium_services/pref_names.h"
++#include "components/prefs/testing_pref_service.h"
+ #include "components/sync_preferences/testing_pref_service_syncable.h"
+ #include "content/public/test/browser_task_environment.h"
+ #include "content/public/test/test_web_ui.h"
+ #include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++
++class ArcSpacesImportHandlerTestPeer {
++ public:
++  static std::optional<std::pair<int, bool>> ParseOpenRequest(
++      const base::ListValue& args) {
++    return ArcSpacesImportHandler::ParseOpenRequest(args);
++  }
++  static void CompleteOpen(ArcSpacesImportHandler& handler, bool succeeded) {
++    handler.CompleteOpen(base::Value("callback"), succeeded);
++  }
++  static bool IsAppearanceOrigin(const GURL& url) {
++    return ArcSpacesImportHandler::IsAppearanceOrigin(url);
++  }
++  static base::OnceClosure PendingOpenReply(ArcSpacesImportHandler& handler) {
++    return base::BindOnce(&ArcSpacesImportHandler::Opened,
++                          handler.weak_factory_.GetWeakPtr(),
++                          base::Value("callback"), true, nullptr);
++  }
++};
+ 
+ namespace {
+ constexpr char kPrivatePref[] = "helium.onboarding_test_saved_tree";
+@@ -66,6 +88,145 @@ TEST_F(OnboardingMessageHandlerTest, Imp
+             appearance.FindBool(prefs::kArciumOmniboxPersistentItemsEnabled));
+ }
+ 
++TEST_F(OnboardingMessageHandlerTest, ImportAppearanceDefaultsToSystem) {
++  TestingPrefServiceSimple pref_service;
++  // Registered defaults from an older build must not force Light on a new
++  // destination; only an explicit user or managed choice overrides System.
++  pref_service.registry()->RegisterIntegerPref(prefs::kBrowserColorScheme, 1);
++  const auto appearance =
++      ArcSpacesImportHandler::CaptureNewProfileAppearance(pref_service);
++  EXPECT_EQ(0, appearance.FindInt(prefs::kBrowserColorScheme));
++}
++
++TEST_F(OnboardingMessageHandlerTest, ImportAppearancePreservesLightAndDark) {
++  for (int scheme : {1, 2}) {
++    profile_.GetPrefs()->SetInteger(prefs::kBrowserColorScheme, scheme);
++    const auto appearance = ArcSpacesImportHandler::CaptureNewProfileAppearance(
++        *profile_.GetPrefs());
++    EXPECT_EQ(scheme, appearance.FindInt(prefs::kBrowserColorScheme));
++  }
++}
++
++TEST(ArcSpacesImportOpenRequestTest, MissingCustomizePreservesNormalOpen) {
++  const auto request = ArcSpacesImportHandlerTestPeer::ParseOpenRequest(
++      base::ListValue()
++          .Append("callback")
++          .Append(base::DictValue().Set("batchId", 7)));
++  ASSERT_TRUE(request);
++  EXPECT_EQ(7, request->first);
++  EXPECT_FALSE(request->second);
++}
++
++TEST(ArcSpacesImportOpenRequestTest, AcceptsOnlyBooleanCustomize) {
++  for (bool customize : {false, true}) {
++    const auto request = ArcSpacesImportHandlerTestPeer::ParseOpenRequest(
++        base::ListValue()
++            .Append("callback")
++            .Append(base::DictValue()
++                        .Set("batchId", 7)
++                        .Set("customize", customize)));
++    ASSERT_TRUE(request);
++    EXPECT_EQ(customize, request->second);
++  }
++  base::ListValue invalid;
++  invalid.Append(base::Value());
++  invalid.Append(1);
++  invalid.Append("true");
++  for (const auto& customize : invalid) {
++    EXPECT_FALSE(ArcSpacesImportHandlerTestPeer::ParseOpenRequest(
++        base::ListValue()
++            .Append("callback")
++            .Append(base::DictValue()
++                        .Set("batchId", 7)
++                        .Set("customize", customize.Clone()))));
++  }
++}
++
++TEST(ArcSpacesImportOpenRequestTest, RejectsMalformedBatchAndEnvelope) {
++  EXPECT_FALSE(ArcSpacesImportHandlerTestPeer::ParseOpenRequest(
++      base::ListValue().Append("callback")));
++  EXPECT_FALSE(ArcSpacesImportHandlerTestPeer::ParseOpenRequest(
++      base::ListValue().Append(7).Append(base::DictValue().Set("batchId", 7))));
++  EXPECT_FALSE(ArcSpacesImportHandlerTestPeer::ParseOpenRequest(
++      base::ListValue()
++          .Append("callback")
++          .Append(base::DictValue().Set("batchId", "7"))));
++  EXPECT_FALSE(ArcSpacesImportHandlerTestPeer::ParseOpenRequest(
++      base::ListValue()
++          .Append("callback")
++          .Append(base::DictValue().Set("batchId", 7))
++          .Append(false)));
++}
++
++TEST(ArcSpacesImportOpenRequestTest, OwnAppearanceRejectsStandaloneImport) {
++  EXPECT_TRUE(ArcSpacesImportHandlerTestPeer::IsAppearanceOrigin(
++      GURL("chrome://setup/")));
++  for (const char* url :
++       {"chrome://setup/?import=arc", "chrome://setup/?other=1&import=arc",
++        "chrome://setup/?import=", "chrome://settings/", "https://setup/"}) {
++    EXPECT_FALSE(ArcSpacesImportHandlerTestPeer::IsAppearanceOrigin(GURL(url)));
++  }
++}
++
++TEST_F(OnboardingMessageHandlerTest,
++       AppearanceBridgeRejectsPayloadAndNoWindow) {
++  auto handler = std::make_unique<ArcSpacesImportHandler>();
++  web_ui_.AddMessageHandler(std::move(handler));
++  web_ui_.HandleReceivedMessage(
++      "openOnboardingAppearance",
++      base::ListValue().Append("callback").Append(base::DictValue()));
++  ASSERT_EQ(1u, web_ui_.call_data().size());
++  EXPECT_FALSE(web_ui_.call_data().back()->arg2()->GetBool());
++  EXPECT_EQ("invalid_arguments",
++            web_ui_.call_data().back()->arg3()->GetString());
++  web_ui_.ClearTrackedCalls();
++  web_ui_.HandleReceivedMessage("openOnboardingAppearance",
++                                base::ListValue().Append("callback"));
++  ASSERT_EQ(1u, web_ui_.call_data().size());
++  EXPECT_FALSE(web_ui_.call_data().back()->arg2()->GetBool());
++  EXPECT_EQ("unavailable", web_ui_.call_data().back()->arg3()->GetString());
++  EXPECT_FALSE(
++      profile_.GetPrefs()->GetBoolean(prefs::kHeliumServicesConsented));
++}
++
++TEST_F(OnboardingMessageHandlerTest, AppearanceRouteFailureRejectsAndCanRetry) {
++  auto handler = std::make_unique<ArcSpacesImportHandler>();
++  auto* bridge = handler.get();
++  web_ui_.AddMessageHandler(std::move(handler));
++  bridge->AllowJavascriptForTesting();
++  const bool services_before =
++      profile_.GetPrefs()->GetBoolean(prefs::kHeliumServicesConsented);
++  const bool completed_before =
++      profile_.GetPrefs()->GetBoolean(prefs::kHeliumDidOnboarding);
++  const bool routed = chrome::ShowAppearanceSettings(nullptr);
++  ASSERT_FALSE(routed);
++  ArcSpacesImportHandlerTestPeer::CompleteOpen(*bridge, routed);
++  ASSERT_EQ(1u, web_ui_.call_data().size());
++  EXPECT_FALSE(web_ui_.call_data().back()->arg2()->GetBool());
++  EXPECT_EQ("open_failed", web_ui_.call_data().back()->arg3()->GetString());
++  EXPECT_EQ(services_before,
++            profile_.GetPrefs()->GetBoolean(prefs::kHeliumServicesConsented));
++  EXPECT_EQ(completed_before,
++            profile_.GetPrefs()->GetBoolean(prefs::kHeliumDidOnboarding));
++  web_ui_.ClearTrackedCalls();
++  ArcSpacesImportHandlerTestPeer::CompleteOpen(*bridge, true);
++  ASSERT_EQ(1u, web_ui_.call_data().size());
++  EXPECT_TRUE(web_ui_.call_data().back()->arg2()->GetBool());
++  EXPECT_TRUE(web_ui_.call_data().back()->arg3()->GetBool());
++}
++
++TEST_F(OnboardingMessageHandlerTest, DisallowJavascriptDropsPendingOpenReply) {
++  auto handler = std::make_unique<ArcSpacesImportHandler>();
++  auto* bridge = handler.get();
++  web_ui_.AddMessageHandler(std::move(handler));
++  bridge->AllowJavascriptForTesting();
++  auto reply = ArcSpacesImportHandlerTestPeer::PendingOpenReply(*bridge);
++  bridge->DisallowJavascript();
++  ASSERT_TRUE(reply.IsCancelled());
++  std::move(reply).Run();
++  EXPECT_TRUE(web_ui_.call_data().empty());
++}
++
+ TEST_F(OnboardingMessageHandlerTest, ImportAppearanceOwnsExplicitChoices) {
+   auto* prefs = profile_.GetPrefs();
+   prefs->SetInteger(prefs::kHeliumLayout, 0);
+Index: src/components/helium_onboarding/helium_onboarding_strings.grdp
+===================================================================
+--- src.orig/components/helium_onboarding/helium_onboarding_strings.grdp
++++ src/components/helium_onboarding/helium_onboarding_strings.grdp
+@@ -455,4 +455,17 @@
+   Free, local, and open-source password manager for advanced users. Requires technical knowledge to set up and use. Cannot sync without extra software.
+ </message>
+ 
++<message name="IDS_HELIUM_ONBOARDING_APPEARANCE_TITLE" desc="Optional action on a ready screen that opens native Appearance settings and finishes setup.">
++  Customize appearance
++</message>
++<message name="IDS_HELIUM_ONBOARDING_APPEARANCE_HINT" desc="Short explanation below the optional appearance action.">
++  Colors, glass, and layout
++</message>
++<message name="IDS_HELIUM_ONBOARDING_APPEARANCE_OPTIONAL" desc="Badge identifying appearance customization as optional; browsing is already available.">
++  Optional
++</message>
++<message name="IDS_HELIUM_ONBOARDING_APPEARANCE_FAILED" desc="Appearance did not open; setup is not marked complete, so the user can retry or choose Start browsing.">
++  Appearance settings couldn’t open. Try again, or start browsing.
++</message>
++
+ </grit-part>
+\ No newline at end of file
+Index: src/components/helium_onboarding/src/components/AppearanceAction.svelte
+===================================================================
+--- /dev/null
++++ src/components/helium_onboarding/src/components/AppearanceAction.svelte
+@@ -0,0 +1,47 @@
++<!-- Copyright 2026 The Helium Authors; SPDX-License-Identifier: GPL-3.0-only -->
++<script lang="ts">
++    import { Button } from "@imput/helium-prism";
++    import { s } from "../lib/strings";
++
++    let { disabled = false, onclick }: { disabled?: boolean; onclick: () => void } = $props();
++</script>
++
++<Button class="appearance-action" {disabled} {onclick} aria-label={s.appearance.title}>
++    <span class="swatches" aria-hidden="true"><i></i><i></i><i></i></span>
++    <span class="copy">
++        <span class="title">{s.appearance.title}</span>
++        <span class="hint">{s.appearance.hint}</span>
++    </span>
++    <span class="optional">{s.appearance.optional}</span>
++</Button>
++
++<style>
++    :global(.button.appearance-action) {
++        --size: auto;
++        display: flex;
++        gap: 13px;
++        min-height: 68px;
++        padding: 12px 16px;
++        border: 1px solid color-mix(in srgb, var(--primary) 12%, transparent);
++        border-radius: 18px;
++        background: color-mix(in srgb, var(--bg-gradient-start) 72%, transparent);
++        text-align: left;
++        color: var(--primary);
++    }
++    .swatches { display: flex; flex: 0 0 auto; padding-left: 4px; }
++    .swatches i {
++        width: 19px;
++        height: 30px;
++        margin-left: -4px;
++        border-radius: 10px;
++        border: 1px solid rgb(255 255 255 / 0.7);
++        background: linear-gradient(155deg, #f4deee, #dba9cd);
++        transform: rotate(-12deg);
++    }
++    .swatches i:nth-child(2) { background: linear-gradient(155deg, #dceee6, #abd3c1); transform: none; }
++    .swatches i:nth-child(3) { background: linear-gradient(155deg, #e6e2fa, #beb3e2); transform: rotate(12deg); }
++    .copy { display: flex; flex-direction: column; gap: 3px; }
++    .title { font-size: 15px; font-weight: 600; }
++    .hint, .optional { color: var(--secondary); font-size: 12px; font-weight: 400; }
++    .optional { margin-left: 8px; }
++</style>
+Index: src/components/helium_onboarding/src/lib/arc/controller.ts
+===================================================================
+--- src.orig/components/helium_onboarding/src/lib/arc/controller.ts
++++ src/components/helium_onboarding/src/lib/arc/controller.ts
+@@ -36,7 +36,7 @@ export type ArcImportController = {
+     cancel: () => Promise<void>;
+     canOpen: () => boolean;
+     /** Opens the first imported Space. Call only on an explicit finish. */
+-    open: () => Promise<boolean>;
++    open: (customize?: boolean) => Promise<boolean>;
+ };
+ 
+ export const createArcImportController = (deps: ArcImportDeps): ArcImportController => {
+@@ -64,9 +64,9 @@ export const createArcImportController =
+     /** Snapshots accepted so far; proves the handler is alive. */
+     let received = 0;
+     let rereadFor = '';
+-    let openedBatch = 0;
++    const openedRequests = new Set<string>();
+     let opening: Promise<boolean> | null = null;
+-    let openingBatch = 0;
++    let openingKey = '';
+ 
+     const update = (fn: (model: Spaces.Model) => Spaces.Model) => state.update(fn);
+ 
+@@ -415,7 +415,7 @@ export const createArcImportController =
+             }
+         },
+         canOpen: () => Spaces.canOpen(get(state)),
+-        open: async () => {
++        open: async (customize = false) => {
+             const model = get(state);
+             const batch = model.snapshot?.batchId ?? 0;
+             const generation = model.snapshot?.generation;
+@@ -427,26 +427,27 @@ export const createArcImportController =
+             }
+             // A confirmed previous request is idempotent. Failed or unanswered
+             // requests can be retried; never record them as already opened.
+-            if (openedBatch === batch) {
++            const key = `${generation}:${batch}:${customize ? 'appearance' : 'browse'}`;
++            if (openedRequests.has(key)) {
+                 return true;
+             }
+             if (opening) {
+-                return openingBatch === batch ? opening : false;
++                return openingKey === key ? opening : false;
+             }
+-            openingBatch = batch;
++            openingKey = key;
+             opening = (async () => {
+                 // Assign opening before invoking a potentially synchronous mock.
+                 await Promise.resolve();
+                 let timer: ReturnType<typeof setTimeout> | undefined;
+                 try {
+                     const result = await Promise.race([
+-                        Promise.resolve().then(() => deps.proxy().open(batch)),
++                        Promise.resolve().then(() => deps.proxy().open(batch, customize)),
+                         new Promise((_, reject) => {
+                             timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+                         }),
+                     ]);
+                     if (result === true) {
+-                        openedBatch = batch;
++                        openedRequests.add(key);
+                         notice(null);
+                         return true;
+                     }
+Index: src/components/helium_onboarding/src/lib/browser/appearance.ts
+===================================================================
+--- /dev/null
++++ src/components/helium_onboarding/src/lib/browser/appearance.ts
+@@ -0,0 +1,21 @@
++// Copyright 2026 The Helium Authors
++// SPDX-License-Identifier: GPL-3.0-only
++import * as cr from "../cr";
++
++// The native handler opens Appearance for this setup tab's own profile/Space.
++// It must acknowledge the actual window, not merely queue an open request.
++export const openOnboardingAppearance = async (): Promise<boolean> => {
++    let timeout: ReturnType<typeof setTimeout> | undefined;
++    try {
++        return await Promise.race([
++            cr.sendWithPromise<unknown>('openOnboardingAppearance'),
++            new Promise<false>(resolve => {
++                timeout = setTimeout(() => resolve(false), 10_000);
++            }),
++        ]) === true;
++    } catch {
++        return false;
++    } finally {
++        if (timeout !== undefined) clearTimeout(timeout);
++    }
++};
+Index: src/components/helium_onboarding/src/lib/browser/index.ts
+===================================================================
+--- src.orig/components/helium_onboarding/src/lib/browser/index.ts
++++ src/components/helium_onboarding/src/lib/browser/index.ts
+@@ -1,4 +1,5 @@
+ export * from "./prefs";
++export * from "./appearance";
+ export * from "./profile";
+ export * from "./importer";
+ export * from "./extensions";
+Index: src/components/helium_onboarding/src/lib/chrome-send-polyfill.ts
+===================================================================
+--- src.orig/components/helium_onboarding/src/lib/chrome-send-polyfill.ts
++++ src/components/helium_onboarding/src/lib/chrome-send-polyfill.ts
+@@ -250,6 +250,10 @@ const _send_polyfill = (msg: string, par
+                 : cr.ImportDataStatus.SUCCEEDED
+             );
+         }, 2000);
++    } else if (msg === 'openOnboardingAppearance' ||
++               (msg === 'openArcImportedSpace' && params?.[1]?.customize === true)) {
++        // A web preview cannot open the browser's native Appearance window.
++        cr.webUIResponse(params![0], false, 'unavailable');
+     } else if (msg === 'initializeArcSpacesImport' || msg === 'getArcSpacesImportState' ||
+                msg === 'startArcSpacesImport' ||
+                msg === 'cancelArcSpacesImport' || msg === 'openArcImportedSpace') {
+Index: src/components/helium_onboarding/src/lib/cr/arc_space_import_proxy.ts
+===================================================================
+--- src.orig/components/helium_onboarding/src/lib/cr/arc_space_import_proxy.ts
++++ src/components/helium_onboarding/src/lib/cr/arc_space_import_proxy.ts
+@@ -82,7 +82,7 @@ export interface ArcSpacesImportProxy {
+     getState(): Promise<unknown>;
+     start(request: ArcStartRequest): Promise<unknown>;
+     cancel(batchId: number): Promise<unknown>;
+-    open(batchId: number): Promise<unknown>;
++    open(batchId: number, customize?: boolean): Promise<unknown>;
+     onStateChanged(callback: (state: unknown) => void): () => void;
+ }
+ 
+@@ -103,8 +103,8 @@ export class ArcSpacesImportProxyImpl im
+         return sendWithPromise<unknown>('cancelArcSpacesImport', { batchId });
+     }
+ 
+-    open(batchId: number) {
+-        return sendWithPromise<unknown>('openArcImportedSpace', { batchId });
++    open(batchId: number, customize = false) {
++        return sendWithPromise<unknown>('openArcImportedSpace', { batchId, customize });
+     }
+ 
+     onStateChanged(callback: (state: unknown) => void) {
+Index: src/components/helium_onboarding/src/pages/Finish.svelte
+===================================================================
+--- src.orig/components/helium_onboarding/src/pages/Finish.svelte
++++ src/components/helium_onboarding/src/pages/Finish.svelte
+@@ -6,9 +6,10 @@
+         IconCheck,
+     } from "@imput/helium-prism";
+     import { s } from "../lib/strings";
+-    import { preferences, preferencesBootstrap, retryPreferences, completeOnboarding } from "../lib/browser";
++    import { preferences, preferencesBootstrap, retryPreferences, completeOnboarding, openOnboardingAppearance } from "../lib/browser";
+     import { currentPage, previousPage, standaloneImport } from "../lib/onboarding-flow";
+     import { arcImport } from "../lib/arc";
++    import AppearanceAction from "../components/AppearanceAction.svelte";
+ 
+     let finishing = $state(false);
+     let finished = $state(false);
+@@ -16,30 +17,41 @@
+     const completed = () => finished ||
+         (!standaloneImport && $preferences.completed_onboarding === true);
+     let openFailed = $state(false);
++    let appearanceFailed = $state(false);
+     let stepFailed = $state(false);
+ 
+     // Only an explicit click leaves setup. The Arc import is finished by now,
+     // so navigating away cannot drop its handler mid-batch. The handler opens
+     // the first imported Space in its own window.
+-    const done = async (skipOpen = false) => {
++    const done = async (skipOpen = false, customize = false) => {
+         if (finishing || completed() || !preferencesReady()) {
+             return;
+         }
+         finishing = true;
+         stepFailed = false;
++        appearanceFailed = false;
++        let appearanceOpened = false;
+         try {
+             const canOpen = arcImport.canOpen();
+-            const opened = !skipOpen && canOpen && await arcImport.open();
+-            if (!skipOpen && ((openFailed && !canOpen) || (canOpen && !opened))) {
++            const opened = !skipOpen && (canOpen
++                ? await arcImport.open(customize)
++                : customize && await openOnboardingAppearance());
++            if (customize && !opened) {
++                appearanceFailed = true;
++                return;
++            }
++            if (!skipOpen && ((openFailed && !canOpen && !opened) || (canOpen && !opened))) {
+                 openFailed = true;
+                 return;
+             }
++            appearanceOpened = customize && opened;
+             openFailed = false;
+             await completeOnboarding();
+             if (!opened) window.open("chrome://newtab", "_self");
+             finished = true;
+         } catch {
+-            stepFailed = true;
++            if (customize && !appearanceOpened) appearanceFailed = true;
++            else stepFailed = true;
+         } finally {
+             finishing = false;
+         }
+@@ -72,6 +84,9 @@
+             {#if openFailed || stepFailed}
+                 <p role="alert">{openFailed ? s.spaces.openFailed : s.button.failed}</p>
+             {/if}
++            {#if appearanceFailed}
++                <p role="alert">{s.appearance.failed}</p>
++            {/if}
+             <div class="action-buttons">
+                 <Button disabled={finishing || !preferencesReady()} onclick={previousPage}>
+                     <IconArrowLeft />
+@@ -87,6 +102,8 @@
+                     </Button>
+                 {/if}
+             </div>
++            <AppearanceAction disabled={finishing || !preferencesReady()}
++                onclick={() => done(false, true)} />
+             {/if}
+         </div>
+     </div>
+Index: src/components/helium_onboarding/src/pages/Welcome.svelte
+===================================================================
+--- src.orig/components/helium_onboarding/src/pages/Welcome.svelte
++++ src/components/helium_onboarding/src/pages/Welcome.svelte
+@@ -16,6 +16,7 @@
+     import { arcImport, oneClickStatus, Spaces } from "../lib/arc";
+ 
+     import SpaceRow from "../components/SpaceRow.svelte";
++    import AppearanceAction from "../components/AppearanceAction.svelte";
+ 
+     const arc = arcImport.state;
+     const arcIcon = browserIconUrl("Arc");
+@@ -31,6 +32,7 @@
+     const completed = () => finished ||
+         (!standaloneImport && $preferences.completed_onboarding === true);
+     let openFailed = $state(false);
++    let appearanceFailed = $state(false);
+     let stepFailed = $state(false);
+     const pending = $derived(finishing || view.kind === "finding" || view.kind === "importing");
+     const sent = $derived(
+@@ -79,18 +81,25 @@
+         chooseRoute(route);
+     };
+ 
+-    const done = async (skipOpen = false) => {
++    const done = async (skipOpen = false, customize = false) => {
+         if (busy || finishing || completed() || !preferencesReady() ||
+             (view.kind !== "done" && view.kind !== "partial")) return;
+         finishing = true;
+         stepFailed = false;
++        appearanceFailed = false;
++        let appearanceOpened = false;
+         try {
+             const canOpen = arcImport.canOpen();
+-            const opened = !skipOpen && canOpen && await arcImport.open();
++            const opened = !skipOpen && canOpen && await arcImport.open(customize);
++            if (customize && !opened) {
++                appearanceFailed = true;
++                return;
++            }
+             if (!skipOpen && ((openFailed && !canOpen) || (canOpen && !opened))) {
+                 openFailed = true;
+                 return;
+             }
++            appearanceOpened = customize && opened;
+             openFailed = false;
+             await completeOnboarding();
+             // Opening the imported profile is the final focus operation. A
+@@ -98,7 +107,8 @@
+             if (!opened) window.open("chrome://newtab", "_self");
+             finished = true;
+         } catch {
+-            stepFailed = true;
++            if (customize && !appearanceOpened) appearanceFailed = true;
++            else stepFailed = true;
+         } finally {
+             finishing = false;
+         }
+@@ -166,6 +176,11 @@
+                     </span>
+                 </Button>
+ 
++                {#if (view.kind === "done" || view.kind === "partial") && arcImport.canOpen()}
++                    <AppearanceAction disabled={finishing || !preferencesReady()}
++                        onclick={() => done(false, true)} />
++                {/if}
++
+                 <div class="more">
+                     {#if view.kind === "finding"}
+                         <Button transparent onclick={() => arcImport.cancelOneClick()}>
+@@ -201,6 +216,9 @@
+                 </div>
+             </div>
+ 
++            {#if appearanceFailed}
++                <p class="note" role="alert">{s.appearance.failed}</p>
++            {/if}
+             {#if openFailed || stepFailed}
+                 <p class="note" role="alert">{openFailed ? s.spaces.openFailed : s.button.failed}</p>
+             {/if}
+Index: src/components/helium_onboarding/tests/appearance-completion.test.mjs
+===================================================================
+--- /dev/null
++++ src/components/helium_onboarding/tests/appearance-completion.test.mjs
+@@ -0,0 +1,251 @@
++// Copyright 2026 The Helium Authors
++// SPDX-License-Identifier: GPL-3.0-only
++import assert from 'node:assert/strict';
++import {readFileSync} from 'node:fs';
++import {createRequire} from 'node:module';
++import test from 'node:test';
++import vm from 'node:vm';
++import * as stores from 'svelte/store';
++import {compile} from 'svelte/compiler';
++import * as S from '../src/lib/arc/spaces.ts';
++const require = createRequire(import.meta.url);
++const ts = require('typescript');
++const tick = () => new Promise(resolve => setImmediate(resolve));
++const transpile = source => {
++    const parsed = ts.createSourceFile('x.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
++    const stripped = ts.createPrinter().printFile(ts.factory.updateSourceFile(parsed,
++        parsed.statements.filter(s => !ts.isImportDeclaration(s))));
++    return ts.transpileModule(stripped, {compilerOptions: {
++        target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS,
++    }}).outputText;
++};
++const entry = {token: 'token', identity: 'space', profileToken: 'profile', name: 'Example',
++    profileLabel: 'Example', pins: 1, folders: 0, favorites: 0, favoritesOnly: false};
++const ready = {generation: 1, batchId: 0, phase: 'ready', failure: '', spaces: [entry], jobs: [], canOpen: false};
++const imported = {...ready, batchId: 1, phase: 'finished', canOpen: true,
++    jobs: [{id: 1, tokens: ['token'], profileLabel: 'Example', state: 'succeeded', failure: '',
++        mayHavePartialData: false, historyFinished: false, counts: {spaces: 1, pins: 1, folders: 0, favorites: 0}}]};
++function controller() {
++    let emit;
++    const calls = [];
++    const proxy = {initialize: async () => ready, onStateChanged: fn => {emit = fn; return () => {};},
++        open: async (batch, customize) => {calls.push([batch, customize]); return true;}};
++    const context = vm.createContext({exports: {}, writable: stores.writable, get: stores.get,
++        Spaces: S, setTimeout, clearTimeout});
++    vm.runInContext(transpile(readFileSync('src/lib/arc/controller.ts', 'utf8')), context);
++    const c = context.exports.createArcImportController({proxy: () => proxy, timeoutMs: 8});
++    return {c, calls, proxy, init: async () => {await c.reload(); emit(imported);}};
++}
++function page(name, {canOpen = true, completed = false, model = null} = {}) {
++    if (!model) {
++        model = S.applySnapshot(S.initialModel(), ready);
++        model = S.prepareOneClick(S.requestOneClick(model, 1));
++        model = S.markStarting(model, S.buildStart(model), true);
++        model = S.applySnapshot(model, imported);
++    }
++    const calls = [], record = name => (...args) => calls.push([name, ...args]);
++    const result = {open: async () => true, appearance: async () => true, complete: async () => {}};
++    const context = vm.createContext({exports: {},
++        $state: value => value, $derived: value => value, $effect: () => {}, onDestroy: () => {},
++        $currentPage: name, $preferencesBootstrap: 'ready', retryPreferences: record('retryPrefs'),
++        $preferences: {completed_onboarding: completed}, standaloneImport: false, $arc: model, Spaces: S,
++        oneClickStatus: () => ({text: 'Imported', failed: false}),
++        arcImport: {state: {}, canOpen: () => canOpen,
++            open: mode => {calls.push(['imported', mode]); return result.open();},
++            prefetch: record('prefetch'), importAll: record('importAll'), cancelOneClick: record('cancel')},
++        chooseRoute: record('route'), browserIconUrl: () => '', parseLocalizedString: () => [],
++        completeOnboarding: () => {calls.push(['complete']); return result.complete();},
++        openOnboardingAppearance: () => {calls.push(['ownAppearance']); return result.appearance();},
++        s: {welcome: {terms: ''}}, window: {open: record('navigate')},
++    });
++    const source = readFileSync(`src/pages/${name}.svelte`, 'utf8').match(/<script lang="ts">([\s\S]*?)<\/script>/)[1];
++    vm.runInContext(transpile(source), context);
++    return {calls, result, setCanOpen: value => {canOpen = value;},
++        run: code => vm.runInContext(code, context)};
++}
++
++test('Browse and Appearance opens each cache their own native acknowledgement', async () => {
++    const h = controller(); await h.init();
++    assert.equal(await h.c.open(), true);
++    assert.equal(await h.c.open(), true);
++    assert.equal(await h.c.open(true), true);
++    assert.equal(await h.c.open(true), true);
++    assert.deepEqual(h.calls, [[1, false], [1, true]]);
++});
++
++test('a pending Appearance open deduplicates itself and does not masquerade as Browse', async () => {
++    const h = controller(); await h.init();
++    let resolve;
++    h.proxy.open = (batch, mode) => {h.calls.push([batch, mode]); return new Promise(ok => {resolve = ok;});};
++    const first = h.c.open(true), duplicate = h.c.open(true);
++    await tick();
++    assert.equal(await h.c.open(false), false);
++    assert.deepEqual(h.calls, [[1, true]]);
++    resolve(true);
++    assert.deepEqual(await Promise.all([first, duplicate]), [true, true]);
++    assert.equal(await h.c.open(true), true);
++    assert.equal(h.calls.length, 1);
++});
++
++test('failed and timed-out Appearance opens remain retryable', async () => {
++    for (const failure of [() => false, () => Promise.reject('unavailable'), () => new Promise(() => {})]) {
++        const h = controller(); await h.init();
++        h.proxy.open = failure;
++        assert.equal(await h.c.open(true), false);
++        h.proxy.open = async () => true;
++        assert.equal(await h.c.open(true), true);
++    }
++});
++
++test('Arc appearance completion opens the imported target and never navigates setup again', async () => {
++    for (const name of ['Welcome', 'Finish']) {
++        const h = page(name);
++        await h.run('done(false, true)');
++        assert.deepEqual(h.calls, [['imported', true], ['complete']]);
++        assert.equal(h.run('completed()'), true);
++        await h.run('done()'); await h.run('done(false, true)');
++        assert.equal(h.calls.length, 2);
++    }
++});
++
++test('appearance failure leaves Browse available and does not complete or grant service consent', async () => {
++    for (const name of ['Welcome', 'Finish']) {
++        for (const fail of [async () => false, async () => {throw Error('unavailable');}]) {
++            const h = page(name); h.result.open = fail;
++            await h.run('done(false, true)');
++            assert.equal(h.run('appearanceFailed'), true);
++            assert.equal(h.run('completed()'), false);
++            assert.equal(h.run('finishing'), false);
++            assert.deepEqual(h.calls, [['imported', true]]);
++            h.result.open = async () => true;
++            await h.run('done()');
++            assert.deepEqual(h.calls, [['imported', true], ['imported', false], ['complete']]);
++        }
++    }
++});
++
++test('customization shares the completion guard with Start browsing and Configure', async () => {
++    for (const name of ['Welcome', 'Finish']) {
++        const h = page(name); let resolve;
++        h.result.open = () => new Promise(ok => {resolve = ok;});
++        const first = h.run('done(false, true)');
++        await h.run('done(false, true)'); await h.run('done()');
++        if (name === 'Welcome') h.run('leave("arc")');
++        assert.deepEqual(h.calls, [['imported', true]]);
++        resolve(true); await first;
++        assert.deepEqual(h.calls, [['imported', true], ['complete']]);
++    }
++});
++
++test('fresh Finish opens Appearance for its own profile and completes without setup navigation', async () => {
++    const h = page('Finish', {canOpen: false});
++    await h.run('done(false, true)');
++    assert.deepEqual(h.calls, [['ownAppearance'], ['complete']]);
++    assert.equal(h.run('completed()'), true);
++});
++
++test('fresh Appearance failure permits explicit retry without completion', async () => {
++    const h = page('Finish', {canOpen: false});
++    h.result.appearance = async () => false;
++    await h.run('done(false, true)');
++    assert.deepEqual(h.calls, [['ownAppearance']]);
++    assert.equal(h.run('completed()'), false);
++    h.result.appearance = async () => true;
++    await h.run('done(false, true)');
++    assert.deepEqual(h.calls, [['ownAppearance'], ['ownAppearance'], ['complete']]);
++});
++
++test('critical completion failure stays retryable after Appearance opened', async () => {
++    const h = page('Welcome');
++    h.result.complete = async () => {throw Error('lost reply');};
++    await h.run('done(false, true)');
++    assert.equal(h.run('completed()'), false);
++    assert.equal(h.run('stepFailed'), true);
++    assert.equal(h.run('appearanceFailed'), false, 'completion failure must not claim Appearance failed to open');
++    h.result.complete = async () => {};
++    await h.run('done(false, true)');
++    assert.equal(h.run('completed()'), true);
++});
++
++test('already completed setup never opens Appearance again', async () => {
++    for (const name of ['Welcome', 'Finish']) {
++        const h = page(name, {completed: true});
++        await h.run('done(false, true)');
++        assert.deepEqual(h.calls, []);
++    }
++});
++
++test('appearance bridge forwards strict native success, rejects failure, and times out without preferences writes', async () => {
++    for (const [response, expected] of [[true, true], [false, false], ['true', false], [null, false]]) {
++        const calls = [];
++        const context = vm.createContext({exports: {}, setTimeout, clearTimeout,
++            cr: {sendWithPromise: async (...args) => {calls.push(args); return response;}}});
++        vm.runInContext(transpile(readFileSync('src/lib/browser/appearance.ts', 'utf8')), context);
++        assert.equal(await context.exports.openOnboardingAppearance(), expected);
++        assert.deepEqual(calls, [['openOnboardingAppearance']]);
++    }
++    for (const reply of [() => Promise.reject('unavailable'), () => new Promise(() => {})]) {
++        const context = vm.createContext({exports: {}, setTimeout: (fn) => setTimeout(fn, 2), clearTimeout,
++            cr: {sendWithPromise: reply}});
++        vm.runInContext(transpile(readFileSync('src/lib/browser/appearance.ts', 'utf8')), context);
++        assert.equal(await context.exports.openOnboardingAppearance(), false);
++    }
++});
++
++test('existing Open message forwards the optional customization boolean', async () => {
++    const calls = [];
++    const context = vm.createContext({exports: {}, sendWithPromise: (...args) => {calls.push(JSON.parse(JSON.stringify(args))); return Promise.resolve(true);}});
++    vm.runInContext(transpile(readFileSync('src/lib/cr/arc_space_import_proxy.ts', 'utf8')), context);
++    const proxy = new context.exports.ArcSpacesImportProxyImpl();
++    await proxy.open(8); await proxy.open(8, true);
++    assert.deepEqual(calls, [['openArcImportedSpace', {batchId: 8, customize: false}],
++        ['openArcImportedSpace', {batchId: 8, customize: true}]]);
++});
++
++test('ready screens compile with an optional swatch action; Welcome keeps it after the primary and off the initial screen', () => {
++    for (const name of ['Welcome', 'Finish']) {
++        const source = readFileSync(`src/pages/${name}.svelte`, 'utf8');
++        compile(source, {filename: `${name}.svelte`, generate: 'client'});
++        const markup = source.split('</script>')[1].split('<style>')[0];
++        assert.ok(markup.indexOf('<Button primary') >= 0 || /<Button\s+primary/.test(markup));
++        assert.ok(markup.indexOf('<AppearanceAction') > markup.indexOf('primary'));
++    }
++    const welcome = readFileSync('src/pages/Welcome.svelte', 'utf8');
++    assert.match(welcome, /\{#if \(view.kind === "done" \|\| view.kind === "partial"\) && arcImport.canOpen\(\)\}/);
++    assert.ok(welcome.indexOf('<AppearanceAction') < welcome.indexOf('<div class="more">'));
++    const action = readFileSync('src/components/AppearanceAction.svelte', 'utf8');
++    const compiled = compile(action, {filename: 'AppearanceAction.svelte', generate: 'client'});
++    assert.equal(compiled.warnings.length, 0);
++    assert.match(action, /aria-hidden="true"/);
++    assert.match(action, /aria-label=\{s.appearance.title\}/);
++    assert.match(action, /s.appearance.hint/);
++    assert.match(action, /s.appearance.optional/);
++    assert.equal((action.match(/<i><\/i>/g) ?? []).length, 3);
++});
++
++
++test('Finish customization can recover after a stale imported Open failure', async () => {
++    for (const success of [true, false]) {
++        const h = page('Finish');
++        h.result.open = async () => false;
++        await h.run('done()');
++        assert.equal(h.run('openFailed'), true);
++        assert.equal(h.run('completed()'), false);
++        h.setCanOpen(false);
++        h.result.appearance = async () => success;
++        await h.run('done(false, true)');
++        if (success) {
++            assert.equal(h.run('completed()'), true);
++            assert.equal(h.run('openFailed'), false);
++            assert.equal(h.run('appearanceFailed'), false);
++            assert.deepEqual(h.calls, [['imported', false], ['ownAppearance'], ['complete']]);
++            await h.run('done(false, true)');
++            assert.equal(h.calls.length, 3, 'terminal completion cannot reopen native Appearance');
++        } else {
++            assert.equal(h.run('completed()'), false);
++            assert.equal(h.run('appearanceFailed'), true);
++            assert.equal(h.run('finishing'), false);
++            assert.deepEqual(h.calls, [['imported', false], ['ownAppearance']]);
++        }
++    }
++});
+Index: src/chrome/browser/ui/chrome_pages.cc
+===================================================================
+--- src.orig/chrome/browser/ui/chrome_pages.cc
++++ src/chrome/browser/ui/chrome_pages.cc
+@@ -460,6 +460,14 @@ void ShowSettings(BrowserWindowInterface
+   ShowSettingsSubPage(browser, std::string());
+ }
+ 
++bool ShowAppearanceSettings(BrowserWindowInterface* browser) {
++  if (!browser) {
++    return false;
++  }
++  ShowSettingsSubPage(browser, kAppearanceSubPage);
++  return true;
++}
++
+ void ShowSettingsSubPage(BrowserWindowInterface* browser,
+                          std::string_view sub_page) {
+ #if BUILDFLAG(IS_CHROMEOS)
+Index: src/chrome/browser/ui/chrome_pages.h
+===================================================================
+--- src.orig/chrome/browser/ui/chrome_pages.h
++++ src/chrome/browser/ui/chrome_pages.h
+@@ -107,6 +107,8 @@ bool IsTrustedPopupWindowWithScheme(cons
+ // Various things that open in a settings UI.
+ // NOTE: For Chrome OS settings, use SettingsWindowManager::ShowOSSettings().
+ void ShowSettings(BrowserWindowInterface* browser);
++// Opens Appearance for this window. Returns false if no route was available.
++bool ShowAppearanceSettings(BrowserWindowInterface* browser);
+ void ShowSettingsSubPage(BrowserWindowInterface* browser,
+                          std::string_view sub_page);
+ void ShowSettingsSubPageForProfile(Profile* profile, std::string_view sub_page);
