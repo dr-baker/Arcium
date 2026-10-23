@@ -10488,3 +10488,103 @@ Index: src/components/helium_onboarding/tests/terminal-completion.test.mjs
 +        assert.equal(h.calls.length, 2);
 +    }
 +});
+Index: src/components/helium_onboarding/src/lib/browser/prefs.ts
+===================================================================
+--- src.orig/components/helium_onboarding/src/lib/browser/prefs.ts
++++ src/components/helium_onboarding/src/lib/browser/prefs.ts
+@@ -16,16 +16,59 @@ export type Preferences = {
+ export type PrefKey = keyof Preferences;
+ 
+ const _preferences = writable({} as Preferences);
++const _bootstrap = writable<'pending' | 'ready' | 'failed'>('pending');
++export const preferencesBootstrap = readonly(_bootstrap);
++const replyTimeoutMs = 10_000;
++let generation = 0;
++let started = false;
++let timer: ReturnType<typeof setTimeout> | undefined;
++
++const clearReplyTimer = () => {
++    if (timer !== undefined) clearTimeout(timer);
++    timer = undefined;
++};
++
++const isPreferences = (prefs: Preferences) =>
++    prefs !== null && typeof prefs === 'object' &&
++    typeof prefs.completed_onboarding === 'boolean';
++
++export const retryPreferences = () => {
++    const request = ++generation;
++    clearReplyTimer();
++    _bootstrap.set('pending');
++    const failed = () => {
++        if (request !== generation) return;
++        ++generation;
++        clearReplyTimer();
++        _bootstrap.set('failed');
++    };
++    timer = setTimeout(failed, replyTimeoutMs);
++    try {
++        cr.sendWithPromise<Preferences>('getPrefs').then(prefs => {
++            if (request !== generation) return;
++            if (!isPreferences(prefs)) { failed(); return; }
++            ++generation;
++            clearReplyTimer();
++            _preferences.set(prefs);
++            _bootstrap.set('ready');
++        }, failed);
++    } catch {
++        failed();
++    }
++};
++
+ export const setup = () => {
+-    cr.sendWithPromise<Preferences>('getPrefs').then(
+-        prefs => _preferences.set(prefs)
+-    );
+-
+-    cr.addWebUiListener(
+-        'helium-prefs-changed',
+-        (prefs: Preferences) => _preferences.set(prefs)
+-    );
+-}
++    if (started) return;
++    started = true;
++    cr.addWebUiListener('helium-prefs-changed', (prefs: Preferences) => {
++        if (!isPreferences(prefs)) return;
++        ++generation;
++        clearReplyTimer();
++        _preferences.set(prefs);
++        _bootstrap.set('ready');
++    });
++    retryPreferences();
++};
+ 
+ export const preferences = readonly(_preferences);
+ 
+@@ -34,8 +77,24 @@ export const setPref = async <
+     Value extends Preferences[PrefKey]
+ >(name: Key, value: Value): Promise<void> => {
+     await cr.sendWithPromise('setPref', name, value);
+-}
++};
++
++// Completion must remain explicitly retryable if the native reply is lost.
++// A later authoritative preferences event still takes precedence in the UI.
++export const completeOnboarding = async (): Promise<void> => {
++    let timeout: ReturnType<typeof setTimeout> | undefined;
++    try {
++        await Promise.race([
++            setPref('completed_onboarding', true),
++            new Promise<never>((_, reject) => {
++                timeout = setTimeout(() => reject(new Error('Completion reply timed out')), replyTimeoutMs);
++            }),
++        ]);
++    } finally {
++        if (timeout !== undefined) clearTimeout(timeout);
++    }
++};
+ 
+ export const acceptLatestSchema = () => {
+     chrome.send("acceptLatestSchema");
+-}
++};
