@@ -260,7 +260,7 @@ Index: src/chrome/browser/ui/helium/arcium_peek_auth.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/helium/arcium_peek_auth.cc
-@@ -0,0 +1,326 @@
+@@ -0,0 +1,351 @@
 +// Copyright 2026 The Arcium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -337,6 +337,29 @@ Index: src/chrome/browser/ui/helium/arcium_peek_auth.cc
 +             : nullptr;
 +}
 +
++// Snowflake can send an expired workspace to its bare account landing page
++// before exposing a recognizable login endpoint. Keep this contextual: a
++// deliberate homepage visit or a root-based application route is not sign-in.
++bool IsSnowflakeRootAuthNavigation(content::NavigationHandle& handle,
++                                   const GURL& initial_destination) {
++  const GURL& target = handle.GetURL();
++  if (!target.SchemeIsHTTPOrHTTPS() ||
++      target.host_piece() != "app.snowflake.com" ||
++      target.path_piece() != "/" || !target.query_piece().empty() ||
++      !target.ref_piece().empty()) {
++    return false;
++  }
++  const auto is_deep_page = [&target](const GURL& url) {
++    return url::Origin::Create(url) == url::Origin::Create(target) &&
++           url.path_piece() != "/" && !IsPeekAuthURL(url);
++  };
++  if (handle.WasServerRedirect() && is_deep_page(initial_destination)) {
++    return true;
++  }
++  return handle.IsRendererInitiated() && !handle.HasUserGesture() &&
++         is_deep_page(handle.GetWebContents()->GetLastCommittedURL());
++}
++
 +// Activating a cached or prerendered page skips ordinary navigation throttles.
 +class PeekAuthCommitGuard : public content::CommitDeferringCondition {
 + public:
@@ -392,7 +415,9 @@ Index: src/chrome/browser/ui/helium/arcium_peek_auth.cc
 +      return CANCEL_AND_IGNORE;
 +    }
 +    if (bypass_ || handle->IsPost() || handle->IsFormSubmission() ||
-+        handle->IsSameDocument() || !IsPeekAuthURL(handle->GetURL()) ||
++        handle->IsSameDocument() ||
++        (!IsPeekAuthURL(handle->GetURL()) &&
++         !IsSnowflakeRootAuthNavigation(*handle, destination_)) ||
 +        !ControllerFor(source) || ControllerFor(source)->is_showing()) {
 +      return PROCEED;
 +    }
@@ -982,7 +1007,7 @@ Index: src/chrome/browser/ui/views/helium/peek_controller_browsertest.cc
  #include "ui/views/view_utils.h"
  
  namespace helium {
-@@ -713,4 +718,347 @@ IN_PROC_BROWSER_TEST_F(PeekControllerBro
+@@ -713,4 +718,544 @@ IN_PROC_BROWSER_TEST_F(PeekControllerBro
    ASSERT_TRUE(content::ExecJs(bulk_preview, "window.onbeforeunload = null"));
  }
  
@@ -1003,11 +1028,20 @@ Index: src/chrome/browser/ui/views/helium/peek_controller_browsertest.cc
 +            if (cookie == request.headers.end() ||
 +                cookie->second.find("authed=yes") == std::string::npos) {
 +              response->set_code(net::HTTP_FOUND);
-+              response->AddCustomHeader("Location", "/login");
++              // The reported bare landing page drops the workspace fragment.
++              // A separate response keeps it to cover a root-based app route.
++              response->AddCustomHeader(
++                  "Location",
++                  request.relative_url.starts_with(
++                      "/protected-root-keep-fragment")
++                      ? "/"
++                  : request.relative_url.starts_with("/protected-root")
++                      ? "/#"
++                      : "/login");
 +              return response;
 +            }
 +          }
-+          if (request.relative_url == "/login") {
++          if (request.relative_url == "/login" || request.relative_url == "/") {
 +            response->set_content(
 +                "<title>Sign in</title><button>Sign in</button>");
 +          } else {
@@ -1055,6 +1089,194 @@ Index: src/chrome/browser/ui/views/helium/peek_controller_browsertest.cc
 +    base::RunLoop().RunUntilIdle();
 +  }
 +};
++
++IN_PROC_BROWSER_TEST_F(PeekAuthBrowserTest,
++                       SnowflakeRootExpiryPreservesDocument) {
++  const auto root = embedded_test_server()->GetURL("app.snowflake.com", "/");
++  const auto worksheet = embedded_test_server()->GetURL(
++      "app.snowflake.com", "/worksheet?quarter=Q4#draft");
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), worksheet));
++  auto* source = Source();
++  auto* document = source->GetPrimaryMainFrame();
++  SetPeekAuthEnabledForSite(browser()->profile(), root, true);
++  ASSERT_TRUE(content::ExecJs(source, "draft.value = 'unsent Snowflake work'",
++                              content::EXECUTE_SCRIPT_NO_USER_GESTURE));
++  const auto identity = content::EvalJs(source, "identity",
++                                        content::EXECUTE_SCRIPT_NO_USER_GESTURE)
++                            .ExtractDouble();
++  ASSERT_TRUE(content::ExecJs(source,
++                              content::JsReplace("location.replace($1)", root),
++                              content::EXECUTE_SCRIPT_NO_USER_GESTURE));
++  WaitForPeek();
++  EXPECT_EQ(root,
++            Controller()->web_contents_for_testing()->GetLastCommittedURL());
++  EXPECT_EQ(worksheet, source->GetLastCommittedURL());
++  EXPECT_TRUE(IsPeekAuthSourceProtected(source));
++  ClosePeek();
++  EXPECT_EQ(document, source->GetPrimaryMainFrame());
++  EXPECT_EQ(identity, content::EvalJs(source, "identity"));
++  EXPECT_EQ("unsent Snowflake work", content::EvalJs(source, "draft.value"));
++  EXPECT_EQ(worksheet, source->GetLastCommittedURL());
++}
++
++IN_PROC_BROWSER_TEST_F(PeekAuthBrowserTest,
++                       SnowflakeRootRedirectRecoversDeepDestinationOnce) {
++  const auto root = embedded_test_server()->GetURL("app.snowflake.com", "/");
++  const auto referrer =
++      embedded_test_server()->GetURL("app.snowflake.com", "/referrer");
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), referrer));
++  auto* source = Source();
++  SetPeekAuthEnabledForSite(browser()->profile(), root, true);
++  const auto target = embedded_test_server()->GetURL(
++      "app.snowflake.com", "/protected-root?quarter=Q4#draft");
++  source->GetController().LoadURL(target, content::Referrer(),
++                                  ui::PAGE_TRANSITION_TYPED, std::string());
++  WaitForPeek();
++  EXPECT_EQ(referrer, source->GetLastCommittedURL());
++  ASSERT_TRUE(content::ExecJs(Controller()->web_contents_for_testing(),
++                              "document.cookie = 'authed=yes; path=/'"));
++  content::TestNavigationObserver restored(source);
++  ClosePeek();
++  restored.Wait();
++  EXPECT_TRUE(restored.last_navigation_succeeded());
++  EXPECT_EQ(target, source->GetLastCommittedURL());
++  EXPECT_FALSE(Controller()->is_showing());
++
++  ASSERT_TRUE(content::ExecJs(
++      source, "document.cookie = 'authed=; Max-Age=0; path=/'"));
++  const auto other_target = embedded_test_server()->GetURL(
++      "app.snowflake.com", "/protected-root?quarter=Q3#draft");
++  source->GetController().LoadURL(other_target, content::Referrer(),
++                                  ui::PAGE_TRANSITION_TYPED, std::string());
++  WaitForPeek();
++  content::TestNavigationObserver cancelled_recovery(source);
++  ClosePeek();
++  cancelled_recovery.Wait();
++  EXPECT_EQ(embedded_test_server()->GetURL("app.snowflake.com", "/#"),
++            source->GetLastCommittedURL());
++  EXPECT_FALSE(Controller()->is_showing());
++}
++
++IN_PROC_BROWSER_TEST_F(PeekAuthBrowserTest,
++                       SnowflakeRootReloadPreservesCommittedDocument) {
++  const auto root = embedded_test_server()->GetURL("app.snowflake.com", "/");
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), root));
++  ASSERT_TRUE(
++      content::ExecJs(Source(), "document.cookie = 'authed=yes; path=/'"));
++  const auto worksheet = embedded_test_server()->GetURL(
++      "app.snowflake.com", "/protected-root?quarter=Q4#draft");
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), worksheet));
++  auto* source = Source();
++  auto* document = source->GetPrimaryMainFrame();
++  SetPeekAuthEnabledForSite(browser()->profile(), root, true);
++  ASSERT_TRUE(content::ExecJs(source,
++                              "draft.value = 'retained'; document.cookie = "
++                              "'authed=; Max-Age=0; path=/'"));
++  source->GetController().Reload(content::ReloadType::NORMAL, false);
++  WaitForPeek();
++  ClosePeek();
++  EXPECT_EQ(document, source->GetPrimaryMainFrame());
++  EXPECT_EQ(worksheet, source->GetLastCommittedURL());
++  EXPECT_EQ("retained", content::EvalJs(source, "draft.value"));
++}
++
++IN_PROC_BROWSER_TEST_F(PeekAuthBrowserTest,
++                       SnowflakeIntentionalRootAndApplicationRoutesStayInTab) {
++  const auto root = embedded_test_server()->GetURL("app.snowflake.com", "/");
++  const auto worksheet =
++      embedded_test_server()->GetURL("app.snowflake.com", "/worksheet");
++  SetPeekAuthEnabledForSite(browser()->profile(), root, true);
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), worksheet));
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), root));
++  EXPECT_FALSE(Controller()->is_showing());
++
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), worksheet));
++  content::TestNavigationObserver home(Source());
++  // ExecJs supplies a user gesture, like an intentional Home link.
++  ASSERT_TRUE(content::ExecJs(Source(),
++                              content::JsReplace("location.href = $1", root)));
++  home.Wait();
++  EXPECT_EQ(root, Source()->GetLastCommittedURL());
++  EXPECT_FALSE(Controller()->is_showing());
++
++  for (const auto* path : {"/?route=worksheet", "/#/workspaces"}) {
++    ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), worksheet));
++    const auto route =
++        embedded_test_server()->GetURL("app.snowflake.com", path);
++    content::TestNavigationObserver navigation(Source());
++    ASSERT_TRUE(content::ExecJs(Source(),
++                                content::JsReplace("location.href = $1", route),
++                                content::EXECUTE_SCRIPT_NO_USER_GESTURE));
++    navigation.Wait();
++    EXPECT_EQ(route, Source()->GetLastCommittedURL());
++    EXPECT_FALSE(Controller()->is_showing());
++  }
++}
++
++IN_PROC_BROWSER_TEST_F(PeekAuthBrowserTest,
++                       SnowflakeRedirectWithApplicationFragmentStaysInTab) {
++  const auto root = embedded_test_server()->GetURL("app.snowflake.com", "/");
++  SetPeekAuthEnabledForSite(browser()->profile(), root, true);
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(
++      browser(),
++      embedded_test_server()->GetURL("app.snowflake.com", "/worksheet")));
++  const auto target = embedded_test_server()->GetURL(
++      "app.snowflake.com",
++      "/protected-root-keep-fragment?quarter=Q4#/workspaces");
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), target));
++  EXPECT_EQ(
++      embedded_test_server()->GetURL("app.snowflake.com", "/#/workspaces"),
++      Source()->GetLastCommittedURL());
++  EXPECT_FALSE(Controller()->is_showing());
++}
++
++IN_PROC_BROWSER_TEST_F(PeekAuthBrowserTest,
++                       SnowflakeRootRequiresOptInAndExactOrigin) {
++  const auto root = embedded_test_server()->GetURL("app.snowflake.com", "/");
++  const auto worksheet =
++      embedded_test_server()->GetURL("app.snowflake.com", "/worksheet");
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), worksheet));
++  content::TestNavigationObserver opted_out(Source());
++  ASSERT_TRUE(content::ExecJs(Source(),
++                              content::JsReplace("location.replace($1)", root),
++                              content::EXECUTE_SCRIPT_NO_USER_GESTURE));
++  opted_out.Wait();
++  EXPECT_FALSE(Controller()->is_showing());
++
++  const auto lookalike =
++      embedded_test_server()->GetURL("app.snowflake.com.other.test", "/");
++  SetPeekAuthEnabledForSite(browser()->profile(), lookalike, true);
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(
++      browser(), embedded_test_server()->GetURL("app.snowflake.com.other.test",
++                                                "/worksheet")));
++  content::TestNavigationObserver other_site(Source());
++  ASSERT_TRUE(content::ExecJs(
++      Source(), content::JsReplace("location.replace($1)", lookalike),
++      content::EXECUTE_SCRIPT_NO_USER_GESTURE));
++  other_site.Wait();
++  EXPECT_FALSE(Controller()->is_showing());
++
++  SetPeekAuthEnabledForSite(browser()->profile(), root, true);
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), worksheet));
++  net::EmbeddedTestServer other_port;
++  other_port.RegisterRequestHandler(base::BindRepeating(
++      [](const net::test_server::HttpRequest&)
++          -> std::unique_ptr<net::test_server::HttpResponse> {
++        auto response = std::make_unique<net::test_server::BasicHttpResponse>();
++        response->set_content_type("text/html");
++        response->set_content("<title>Other origin</title>");
++        return response;
++      }));
++  ASSERT_TRUE(other_port.Start());
++  const auto different_origin = other_port.GetURL("app.snowflake.com", "/");
++  content::TestNavigationObserver other_origin(Source());
++  ASSERT_TRUE(content::ExecJs(
++      Source(), content::JsReplace("location.replace($1)", different_origin),
++      content::EXECUTE_SCRIPT_NO_USER_GESTURE));
++  other_origin.Wait();
++  EXPECT_EQ(different_origin, Source()->GetLastCommittedURL());
++  EXPECT_FALSE(Controller()->is_showing());
++}
 +
 +IN_PROC_BROWSER_TEST_F(PeekAuthBrowserTest,
 +                       PreservesFrozenDocumentAndTabStorage) {
