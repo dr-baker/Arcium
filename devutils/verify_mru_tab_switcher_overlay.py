@@ -123,11 +123,12 @@ def verify(
     series_path: Path,
 ) -> Path:
     """Materialize the sparse source state and strictly apply the feature."""
+    # Each argument corresponds to an independent verifier command-line input.
+    # pylint: disable=too-many-arguments
     target_paths, added_paths = _patch_paths(patch_path)
     if not target_paths:
         raise RuntimeError(f"feature patch has no files: {patch_path}")
 
-    created_fixture = fixture is None
     fixture_path = fixture or Path(tempfile.mkdtemp(prefix="helium-mru-overlay-"))
     fixture_path.mkdir(parents=True, exist_ok=True)
     print(f"fixture: {fixture_path}")
@@ -160,7 +161,7 @@ def verify(
     for path in sorted(target_paths):
         print(f"verified: {path}")
 
-    if created_fixture:
+    if fixture is None:
         shutil.rmtree(fixture_path)
         print("fixture removed")
     return fixture_path
