@@ -1,11 +1,17 @@
 <div align="center">
-    <img src="resources/branding/app_icon/raw.png"
+    <img src="https://raw.githubusercontent.com/dr-baker/Arcium-macOS/main/resources/assets/legacy_crop.png"
         title="Arcium" alt="Arcium logo" width="120" />
     <h1>Arcium</h1>
     <p>
-        Daniel's AI-enabled, Arc-style browser fork, based on Helium and Chromium.
+        Helium's privacy and speed, with Arc-inspired polish.
     </p>
 </div>
+
+[Download for macOS](https://github.com/dr-baker/Arcium-macOS/releases) · [Quickstart](https://github.com/dr-baker/Arcium-macOS#start-browsing) · [Import from Arc](https://github.com/dr-baker/Arcium-macOS/blob/main/docs/import-from-arc.md) · [Roadmap](https://github.com/dr-baker/Arcium-macOS#whats-next)
+
+![Arcium with Spaces, Favorites, and a pastel sidebar](https://raw.githubusercontent.com/dr-baker/Arcium-macOS/main/docs/assets/arcium-layout.png)
+
+The macOS preview runs without building from source. See its [release notes](https://github.com/dr-baker/Arcium-macOS/blob/main/docs/preview-release.md) for requirements and limits.
 
 ## Repository structure
 
