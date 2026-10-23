@@ -967,7 +967,7 @@ Index: src/chrome/browser/ui/views/helium/peek_controller_browsertest.cc
  #include "chrome/browser/ui/tabs/split_tab_metrics.h"
  #include "chrome/browser/ui/tabs/tab_close_types_data.h"
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
-@@ -59,6 +61,7 @@
+@@ -59,11 +61,14 @@
  #include "content/public/browser/web_contents.h"
  #include "content/public/test/browser_test.h"
  #include "content/public/test/browser_test_utils.h"
@@ -975,7 +975,14 @@ Index: src/chrome/browser/ui/views/helium/peek_controller_browsertest.cc
  #include "net/dns/mock_host_resolver.h"
  #include "net/test/embedded_test_server/embedded_test_server.h"
  #include "net/test/embedded_test_server/http_request.h"
-@@ -713,4 +716,308 @@ IN_PROC_BROWSER_TEST_F(PeekControllerBro
+ #include "net/test/embedded_test_server/http_response.h"
++#include "ui/base/accelerators/accelerator.h"
+ #include "ui/views/controls/webview/webview.h"
++#include "ui/views/focus/focus_manager.h"
+ #include "ui/views/view_utils.h"
+ 
+ namespace helium {
+@@ -713,4 +718,347 @@ IN_PROC_BROWSER_TEST_F(PeekControllerBro
    ASSERT_TRUE(content::ExecJs(bulk_preview, "window.onbeforeunload = null"));
  }
  
@@ -1124,6 +1131,45 @@ Index: src/chrome/browser/ui/views/helium/peek_controller_browsertest.cc
 +                      source, "window.frozenTicks === window.resumedTicks"));
 +  EXPECT_EQ(true, content::EvalJs(
 +                      source, "fetch('/protected').then(r => !r.redirected)"));
++}
++
++IN_PROC_BROWSER_TEST_F(PeekAuthBrowserTest, EscapeRestoresFrozenSource) {
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), URL("/worksheet")));
++  auto* source = Source();
++  auto* document = source->GetPrimaryMainFrame();
++  ASSERT_TRUE(content::ExecJs(source, "draft.value = 'keep me'; draft.focus()"));
++  Enable();
++  ASSERT_TRUE(content::ExecJs(source, "location.href = '/login'"));
++  WaitForPeek();
++  auto* focus_manager =
++      BrowserView::GetBrowserViewForBrowser(browser())->GetFocusManager();
++  auto* preview = Controller()->web_contents_for_testing();
++  preview->Focus();
++  ASSERT_TRUE(content::ExecJs(preview, "document.querySelector('button').focus()"));
++  focus_manager->ProcessAccelerator(ui::Accelerator(
++      ui::VKEY_ESCAPE, ui::EF_NONE, ui::Accelerator::KeyState::RELEASED));
++  EXPECT_TRUE(Controller()->is_showing());
++  focus_manager->ProcessAccelerator(
++      ui::Accelerator(ui::VKEY_ESCAPE, ui::EF_SHIFT_DOWN));
++  EXPECT_TRUE(Controller()->is_showing());
++  ASSERT_TRUE(focus_manager->ProcessAccelerator(
++      ui::Accelerator(ui::VKEY_ESCAPE, ui::EF_NONE)));
++  ASSERT_TRUE(base::test::RunUntil([&] { return !Controller()->is_showing(); }));
++  EXPECT_EQ(source, Source());
++  EXPECT_EQ(document, source->GetPrimaryMainFrame());
++  EXPECT_FALSE(IsPeekAuthSourceProtected(source));
++  EXPECT_EQ("keep me", content::EvalJs(source, "draft.value"));
++  EXPECT_EQ("draft", content::EvalJs(source, "document.activeElement.id"));
++
++  // The same accelerator must also close an ordinary Peek.
++  ASSERT_TRUE(Controller()->Show(PeekNavigationParams(URL("/ordinary")), source));
++  WaitForPeek();
++  Controller()->web_contents_for_testing()->Focus();
++  ASSERT_TRUE(focus_manager->ProcessAccelerator(
++      ui::Accelerator(ui::VKEY_ESCAPE, ui::EF_NONE)));
++  ASSERT_TRUE(base::test::RunUntil([&] { return !Controller()->is_showing(); }));
++  EXPECT_EQ(source, Source());
++  EXPECT_EQ(document, source->GetPrimaryMainFrame());
 +}
 +
 +IN_PROC_BROWSER_TEST_F(PeekAuthBrowserTest,
@@ -1371,3 +1417,24 @@ Index: src/tools/metrics/histograms/metadata/ui/enums.xml
  </enum>
  
  <!-- LINT.ThenChange(//chrome/browser/renderer_context_menu/render_view_context_menu.cc:RenderViewContextMenuItem) -->
+Index: src/chrome/browser/ui/views/frame/browser_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_view.cc
++++ src/chrome/browser/ui/views/frame/browser_view.cc
+@@ -7046,6 +7046,16 @@ bool BrowserView::AcceleratorPressed(con
+     return true;
+   }
+ 
++  // Keep exclusive-access Escape handling first, then dismiss the live Peek
++  // before falling back to the browser's stop/find command.
++  if (accelerator.key_code() == ui::VKEY_ESCAPE &&
++      accelerator.modifiers() == ui::EF_NONE &&
++      accelerator.key_state() == ui::Accelerator::KeyState::PRESSED &&
++      peek_controller_ && peek_controller_->is_showing()) {
++    peek_controller_->Close();
++    return true;
++  }
++
+   int command_id;
+   // Though AcceleratorManager should not send unknown |accelerator| to us, it's
+   // still possible the command cannot be executed now.
