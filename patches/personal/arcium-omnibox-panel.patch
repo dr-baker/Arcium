@@ -568,7 +568,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
-@@ -0,0 +1,2286 @@
+@@ -0,0 +1,2280 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -1762,18 +1762,12 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    if (desired == current) {
 +      height_resize_timer_.Stop();
 +    } else {
-+      const bool growing = desired > current;
-+      // Growth has a bounded coalescing window; continuous publications must
-+      // not postpone it. Contraction waits for the desired height to settle.
-+      const bool keep_growth_deadline =
-+          growing && pending_height_growth_ && height_resize_timer_.IsRunning();
-+      pending_height_growth_ = growing;
-+      if (!keep_growth_deadline) {
-+        height_resize_timer_.Start(
-+            FROM_HERE, base::Milliseconds(growing ? 40 : 80),
-+            base::BindOnce(&CommandPanelView::ApplyPendingHeight,
-+                           weak_ptr_factory_.GetWeakPtr()));
-+      }
++      // Both directions wait for a stable target. Identical publications do
++      // not restart the debounce; growth snaps and contraction uses a spring.
++      height_resize_timer_.Start(
++          FROM_HERE, base::Milliseconds(40),
++          base::BindOnce(&CommandPanelView::ApplyPendingHeight,
++                         weak_ptr_factory_.GetWeakPtr()));
 +    }
 +  }
 +  // Rows, selection and input update immediately inside the retained frame.
@@ -1789,7 +1783,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    const auto duration =
 +        *requested_height_ < current &&
 +                gfx::Animation::ShouldRenderRichAnimation()
-+            ? base::Milliseconds(40)
++            ? base::Milliseconds(60)
 +            : base::TimeDelta();
 +    height_resize_.Run(requested_height_, duration);
 +  }
@@ -2859,7 +2853,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,253 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -3072,7 +3066,6 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 +  HeightResizeCallback height_resize_;
 +  base::OneShotTimer height_resize_timer_;
 +  std::optional<int> requested_height_;
-+  bool pending_height_growth_ = false;
 +  base::RepeatingCallback<int()> available_width_provider_;
 +  CommandPanelAppearance appearance_;
 +  float ui_scale_ = 1.0f;
@@ -3787,7 +3780,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  std::optional<int> presentation_height_;
 +};
 +
-+TEST_F(ArciumPanelHeightTest, GrowthSnapsToLatestHeightWithinFortyMilliseconds) {
++TEST_F(ArciumPanelHeightTest, GrowthWaitsForFortyMillisecondsOfStableHeight) {
 +  Open();
 +  Rows(1);
 +  const int initial = Height();
@@ -3796,7 +3789,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  Rows(6);
 +  Advance(20);
 +  Rows(8);
-+  Advance(19);
++  Advance(39);
 +  EXPECT_EQ(initial, Height());
 +  EXPECT_TRUE(requests_.empty());
 +  Advance(1);
@@ -3806,7 +3799,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  EXPECT_EQ(origin, widget_->GetWindowBoundsInScreen().origin());
 +}
 +
-+TEST_F(ArciumPanelHeightTest, ShorterResultsLeaveSpaceUntilEightyMilliseconds) {
++TEST_F(ArciumPanelHeightTest, ShorterResultsLeaveSpaceUntilFortyMilliseconds) {
 +  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
 +      gfx::Animation::RichAnimationRenderMode::FORCE_ENABLED);
 +  Open();
@@ -3817,12 +3810,12 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  EXPECT_EQ(2u, panel()->row_count_for_testing());
 +  EXPECT_LT(panel()->GetPreferredSize().height(), initial);
 +  EXPECT_FALSE(PaintPanel().empty());
-+  Advance(79);
++  Advance(39);
 +  EXPECT_EQ(initial, Height());
 +  EXPECT_TRUE(requests_.empty());
 +  Advance(1);
 +  ASSERT_EQ(1u, requests_.size());
-+  EXPECT_EQ(base::Milliseconds(40), requests_.back().duration);
++  EXPECT_EQ(base::Milliseconds(60), requests_.back().duration);
 +  EXPECT_EQ(panel()->GetPreferredSize().height(), requests_.back().height);
 +}
 +
@@ -3832,9 +3825,9 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  const int initial = Height();
 +  Stabilize();
 +  Rows(1);
-+  Advance(40);
++  Advance(20);
 +  Rows(3);
-+  Advance(79);
++  Advance(39);
 +  EXPECT_EQ(initial, Height());
 +  EXPECT_TRUE(requests_.empty());
 +  Advance(1);
@@ -3847,9 +3840,9 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  Rows(8);
 +  Stabilize();
 +  Rows(2);
-+  Advance(50);
++  Advance(20);
 +  Rows(2);
-+  Advance(29);
++  Advance(19);
 +  EXPECT_TRUE(requests_.empty());
 +  Advance(1);
 +  ASSERT_EQ(1u, requests_.size());
@@ -3894,15 +3887,15 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  const int initial = Height();
 +  Stabilize();
 +  Rows(1);
-+  Advance(80);
++  Advance(40);
 +  ASSERT_EQ(1u, requests_.size());
 +  presentation_height_ = (initial + Height()) / 2;
 +  Rows(3);
-+  Advance(40);
++  Advance(39);
 +  EXPECT_EQ(1u, requests_.size());
-+  Advance(40);
++  Advance(1);
 +  ASSERT_EQ(2u, requests_.size());
-+  EXPECT_EQ(base::Milliseconds(40), requests_.back().duration);
++  EXPECT_EQ(base::Milliseconds(60), requests_.back().duration);
 +}
 +
 +TEST_F(ArciumPanelHeightTest, ReduceMotionContractsWithoutAnimation) {
@@ -3912,7 +3905,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  Rows(8);
 +  Stabilize();
 +  Rows(2);
-+  Advance(80);
++  Advance(40);
 +  ASSERT_EQ(1u, requests_.size());
 +  EXPECT_EQ(base::TimeDelta(), requests_.back().duration);
 +}
