@@ -5994,7 +5994,24 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
  #include "base/memory/raw_ptr.h"
  #include "base/memory/weak_ptr.h"
  #include "base/scoped_observation.h"
-@@ -219,10 +222,12 @@ class FaviconFetcher {
+@@ -23,6 +26,7 @@
+ #include "chrome/browser/autocomplete/chrome_autocomplete_provider_client.h"
+ #include "chrome/browser/autocomplete/chrome_autocomplete_scheme_classifier.h"
+ #include "chrome/browser/favicon/favicon_service_factory.h"
++#include "chrome/browser/history/history_service_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/search_engines/template_url_service_factory.h"
+ #include "chrome/browser/ui/browser.h"
+@@ -40,6 +44,8 @@
+ #include "chrome/common/pref_names.h"
+ #include "components/favicon/core/favicon_service.h"
+ #include "components/favicon_base/favicon_callback.h"
++#include "components/history/core/browser/history_service.h"
++#include "components/history/core/browser/history_service_observer.h"
+ #include "components/omnibox/browser/actions/omnibox_action.h"
+ #include "components/omnibox/browser/autocomplete_classifier.h"
+ #include "components/omnibox/browser/autocomplete_controller.h"
+@@ -219,15 +225,41 @@ class FaviconFetcher {
    base::CancelableTaskTracker tracker_;
  };
  
@@ -6002,7 +6019,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
 -  explicit ProductionContext(Browser* browser)
 +}  // namespace
 +
-+struct CommandSessionContext {
++struct CommandSessionContext : history::HistoryServiceObserver {
 +  explicit CommandSessionContext(Browser* browser)
        : owner(browser->GetWeakPtr()),
 -        corpus(browser),
@@ -6010,8 +6027,44 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
          fetcher(browser->profile()),
          icons(base::BindRepeating(&FaviconFetcher::Fetch,
                                    base::Unretained(&fetcher)),
-@@ -239,13 +244,15 @@ struct ProductionContext {
+               base::BindRepeating(&FaviconFetcher::Cancel,
+-                                  base::Unretained(&fetcher))) {}
++                                  base::Unretained(&fetcher))) {
++    if (auto* history = HistoryServiceFactory::GetForProfile(
++            browser->profile(), ServiceAccessType::EXPLICIT_ACCESS)) {
++      history_observation.Observe(history);
++      favicons_changed = history->AddFaviconsChangedCallback(
++          base::BindRepeating(&CommandIconCache::Invalidate,
++                              base::Unretained(&icons)));
++    }
++  }
++  void OnHistoryDeletions(history::HistoryService*,
++                         const history::DeletionInfo& deletion) override {
++    if (deletion.IsAllHistory()) {
++      icons.Clear();
++      return;
++    }
++    std::set<GURL> pages;
++    for (const auto& row : deletion.deleted_rows()) {
++      pages.insert(row.url());
++    }
++    icons.Invalidate(pages, GURL());
++  }
++  void HistoryServiceBeingDeleted(history::HistoryService*) override {
++    favicons_changed = {};
++    history_observation.Reset();
++  }
+   Browser* browser() const {
+     return owner && !owner->IsDeleteScheduled()
+                ? owner->GetBrowserForMigrationOnly()
+@@ -237,15 +269,21 @@ struct ProductionContext {
+   CommandLocalCorpus corpus;
+   FaviconFetcher fetcher;
    CommandIconCache icons;
++  base::ScopedObservation<history::HistoryService,
++                          history::HistoryServiceObserver>
++      history_observation{this};
++  base::CallbackListSubscription favicons_changed;
  };
  
 +namespace {
@@ -6028,7 +6081,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
                    auto* browser = context->browser();
                    return browser ? browser->tab_strip_model()
                                         ->GetActiveWebContents()
-@@ -271,14 +278,14 @@ class CachedAutocompleteClient final : p
+@@ -271,14 +309,14 @@ class CachedAutocompleteClient final : p
    }
  
   private:
@@ -6045,7 +6098,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
        : context_(std::move(context)),
          engines_(TemplateURLServiceFactory::GetForProfile(
              context_->browser()->profile())) {
-@@ -713,7 +720,7 @@ class NativeQueryProvider final : public
+@@ -713,7 +751,7 @@ class NativeQueryProvider final : public
              lease_.revision(), std::move(callback), std::move(results)));
    }
  
@@ -6054,7 +6107,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
    raw_ptr<TemplateURLService> engines_;
    base::ScopedObservation<TemplateURLService, TemplateURLServiceObserver>
        engine_observation_{this};
-@@ -733,11 +740,12 @@ class NativeQueryProvider final : public
+@@ -733,11 +771,12 @@ class NativeQueryProvider final : public
  
  class LocalQueryProvider final : public CommandQueryProvider {
   public:
@@ -6068,7 +6121,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
    std::string_view id() const override { return kBuiltinCommandProvider; }
    bool SupportsScope(std::string_view scope_id) const override {
      return scope_id == kOmniScope ||
-@@ -761,6 +769,7 @@ class LocalQueryProvider final : public
+@@ -761,6 +800,7 @@ class LocalQueryProvider final : public
               CommandProviderPublishCallback publish) override {
      query_ = std::move(query);
      publish_ = std::move(publish);
@@ -6076,7 +6129,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
      Publish();
    }
    void Cancel() override {
-@@ -779,6 +788,12 @@ class LocalQueryProvider final : public
+@@ -779,6 +819,12 @@ class LocalQueryProvider final : public
        return;
      }
      const auto& index = context_->corpus.index();
@@ -6089,7 +6142,15 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
      if (query_.scope_id == kOmniScope && !query_.text.empty()) {
        // Native autocomplete owns nonempty Omni order and default selection.
        PostResults({}, index.revision());
-@@ -873,7 +888,7 @@ class LocalQueryProvider final : public
+@@ -864,6 +910,7 @@ class LocalQueryProvider final : public
+                CommandProviderResults results) {
+               if (!owner || generation != owner->generation_ ||
+                   epoch != owner->query_.epoch || owner->publish_.is_null() ||
++                  !owner->context_->corpus.ready() ||
+                   corpus_revision !=
+                       owner->context_->corpus.index().revision()) {
+                 return;
+@@ -873,7 +920,7 @@ class LocalQueryProvider final : public
              weak_factory_.GetWeakPtr(), generation_, query_.epoch,
              corpus_revision, std::move(callback), std::move(results)));
    }
@@ -6098,7 +6159,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
    base::CallbackListSubscription corpus_subscription_;
    CommandQuery query_;
    CommandProviderPublishCallback publish_;
-@@ -904,8 +919,18 @@ class RouterActionDelegate final : publi
+@@ -904,8 +951,18 @@ class RouterActionDelegate final : publi
  }  // namespace
  
  std::unique_ptr<CommandSession> CreateCommandSession(Browser* browser) {
@@ -6118,7 +6179,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
    auto registry = std::make_unique<CommandProviderRegistry>();
    auto native = std::make_unique<NativeQueryProvider>(context);
    const auto weak_native = native->GetWeakPtr();
-@@ -936,15 +961,17 @@ std::unique_ptr<CommandSession> CreateCo
+@@ -936,15 +993,17 @@ std::unique_ptr<CommandSession> CreateCo
    // rows, cancellation, and any lazy actions they add to their opaque targets.
    CHECK(registry->Register(std::move(native)));
    CHECK(registry->Register(std::make_unique<LocalQueryProvider>(context)));
@@ -6174,17 +6235,23 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
 +++ src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
-@@ -11,9 +11,18 @@
+@@ -10,10 +10,24 @@
+ #include <vector>
  
  #include "base/functional/bind.h"
++#include "base/location.h"
  #include "base/run_loop.h"
 +#include "chrome/browser/ui/omnibox/arcium_command_providers.h"
 +#include "chrome/browser/ui/omnibox/arcium_command_corpus.h"
  #include "base/strings/string_number_conversions.h"
  #include "base/test/bind.h"
++#include "base/test/scoped_run_loop_timeout.h"
  #include "base/test/scoped_feature_list.h"
 +#include "base/test/task_environment.h"
++#include "base/time/time.h"
 +#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/history/history_service_factory.h"
++#include "chrome/browser/favicon/favicon_service_factory.h"
 +#include "chrome/browser/ui/actions/chrome_action_id.h"
 +#include "chrome/browser/ui/browser_actions.h"
 +#include "chrome/browser/ui/browser_commands.h"
@@ -6193,7 +6260,31 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
  #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
  #include "chrome/browser/profiles/profile.h"
  #include "chrome/browser/ui/browser.h"
-@@ -110,8 +119,76 @@ CommandIntent Intent(CommandTarget targe
+@@ -29,8 +43,12 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/common/pref_names.h"
+ #include "chrome/test/base/browser_with_test_window_test.h"
++#include "chrome/test/base/testing_profile.h"
+ #include "components/content_settings/core/browser/host_content_settings_map.h"
+ #include "components/prefs/pref_service.h"
++#include "components/history/core/browser/history_service.h"
++#include "components/favicon_base/favicon_types.h"
++#include "components/favicon/core/favicon_service.h"
+ #include "components/sessions/content/session_tab_helper.h"
+ #include "components/split_tabs/split_tab_visual_data.h"
+ #include "components/tabs/public/split_tab_data.h"
+@@ -39,8 +57,10 @@
+ #include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/web_contents.h"
+ #include "testing/gtest/include/gtest/gtest.h"
++#include "third_party/skia/include/core/SkBitmap.h"
+ #include "ui/base/models/list_selection_model.h"
+ #include "ui/gfx/image/image_skia_rep.h"
++#include "ui/gfx/image/image.h"
+ 
+ namespace arcium {
+ namespace {
+@@ -110,8 +130,76 @@ CommandIntent Intent(CommandTarget targe
            .target = std::move(target)};
  }
  
@@ -6270,10 +6361,94 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
    void SetUp() override {
      features_.InitAndEnableFeature(helium::kHeliumFavoritesAndPins);
      BrowserWithTestWindowTest::SetUp();
-@@ -334,6 +411,48 @@ class ArciumCommandActionRouterTest : pu
+@@ -334,6 +422,132 @@ class ArciumCommandActionRouterTest : pu
    raw_ptr<content::WebContents> accepted_source_ = nullptr;
  };
  
++class ArciumCommandContextHistoryTest : public ArciumCommandActionRouterTest {
++ protected:
++  TestingProfile::TestingFactories GetTestingFactories() override {
++    auto factories = BrowserWithTestWindowTest::GetTestingFactories();
++    factories.emplace_back(HistoryServiceFactory::GetInstance(),
++                           HistoryServiceFactory::GetDefaultFactory());
++    factories.emplace_back(FaviconServiceFactory::GetInstance(),
++                           FaviconServiceFactory::GetDefaultFactory());
++    return factories;
++  }
++
++  void FlushHistory(history::HistoryService* service) {
++    base::RunLoop loop;
++    service->FlushForTest(loop.QuitClosure());
++    loop.Run();
++    base::RunLoop().RunUntilIdle();
++  }
++};
++
++TEST_F(ArciumCommandContextHistoryTest,
++       ClosedSessionReceivesFaviconChangesAndHistoryShutdown) {
++  base::test::ScopedRunLoopTimeout timeout(FROM_HERE, base::Seconds(10));
++  AddOrdinaryTab("https://source.test/");
++  const GURL page("https://cached-favicon.test/");
++  const GURL icon("https://cached-favicon.test/favicon.ico");
++  SetPins({Link("favicon-pin", page.spec().c_str())});
++  auto* history = HistoryServiceFactory::GetForProfile(
++      profile(), ServiceAccessType::EXPLICIT_ACCESS);
++  auto* favicons = FaviconServiceFactory::GetForProfile(
++      profile(), ServiceAccessType::EXPLICIT_ACCESS);
++  ASSERT_TRUE(history);
++  ASSERT_TRUE(favicons);
++  history->AddPageNoVisitForBookmark(page, u"Saved page");
++  FlushHistory(history);
++
++  std::shared_ptr<CommandSessionContext> context;
++  std::shared_ptr<const CommandPublication> publication;
++  auto session = CreateCommandSession(browser(), context);
++  const auto search = [&](CommandSession* current) {
++    publication.reset();
++    current->SetInvocation(CommandInvocationMode::kNewTab);
++    current->Search(kSavedScope, u"cached-favicon", base::BindLambdaForTesting(
++        [&publication](std::shared_ptr<const CommandPublication> update) {
++          publication = std::move(update);
++        }));
++    // Start the visible favicon request before flushing the backend response.
++    base::RunLoop().RunUntilIdle();
++    FlushHistory(history);
++  };
++  search(session.get());
++  ASSERT_TRUE(publication);
++  ASSERT_EQ(1u, publication->rows.size());
++  EXPECT_EQ(CommandTarget(Pin("favicon-pin")), publication->rows.front().target);
++  EXPECT_TRUE(publication->rows.front().icon.isNull());
++  session.reset();
++  const auto* retained = context.get();
++
++  SkBitmap bitmap;
++  bitmap.allocN32Pixels(16, 16);
++  bitmap.eraseColor(SK_ColorRED);
++  favicons->SetFavicons({page}, icon, favicon_base::IconType::kFavicon,
++                        gfx::Image::CreateFrom1xBitmap(bitmap));
++  FlushHistory(history);
++  session = CreateCommandSession(browser(), context);
++  EXPECT_EQ(retained, context.get());
++  search(session.get());
++  ASSERT_TRUE(publication);
++  ASSERT_EQ(1u, publication->rows.size());
++  const auto& refreshed = publication->rows.front();
++  EXPECT_EQ(CommandTarget(Pin("favicon-pin")), refreshed.target);
++  ASSERT_FALSE(refreshed.icon.isNull());
++  EXPECT_EQ(SK_ColorRED,
++            refreshed.icon.GetRepresentation(1.0f).GetBitmap().getColor(0, 0));
++
++  // Destroy tab history helpers while the service still accepts their cleanup.
++  // Context survives the subsequent real service shutdown notification.
++  session.reset();
++  browser()->tab_strip_model()->CloseAllTabs();
++  base::RunLoop().RunUntilIdle();
++  history->Shutdown();
++  context.reset();
++  base::RunLoop().RunUntilIdle();
++}
++
 +class ArciumCommandCorpusTimeTest : public ArciumCommandActionRouterTest {
 + public:
 +  ArciumCommandCorpusTimeTest()
@@ -6319,7 +6494,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
  TEST_F(ArciumCommandActionRouterTest, NativeCurrentAcceptUsesCapturedTab) {
    auto* captured = AddOrdinaryTab("https://captured.test/");
    Capture(captured);
-@@ -454,6 +573,75 @@ TEST_F(ArciumCommandActionRouterTest, Sc
+@@ -454,6 +668,115 @@ TEST_F(ArciumCommandActionRouterTest, Sc
    EXPECT_EQ(1, browser()->tab_strip_model()->count());
  }
  
@@ -6392,6 +6567,230 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
 +  base::RunLoop().RunUntilIdle();
 +}
 +
++TEST_F(ArciumCommandActionRouterTest,
++       ReopenedSessionNeverPublishesRowsInvalidatedBeforeDelivery) {
++  AddOrdinaryTab("https://source.test/");
++  SetPins({Link("old", "https://old.test/")});
++  std::shared_ptr<CommandSessionContext> context;
++  auto session = CreateCommandSession(browser(), context);
++  session->SetInvocation(CommandInvocationMode::kNewTab);
++  std::shared_ptr<const CommandPublication> primed;
++  session->Search(kSavedScope, u"saved", base::BindLambdaForTesting(
++      [&primed](std::shared_ptr<const CommandPublication> update) {
++        primed = std::move(update);
++      }));
++  base::RunLoop().RunUntilIdle();
++  ASSERT_TRUE(primed);
++  ASSERT_EQ(1u, primed->rows.size());
++  ASSERT_EQ(CommandTarget(Pin("old")), primed->rows.front().target);
++  session.reset();
++
++  session = CreateCommandSession(browser(), context);
++  session->SetInvocation(CommandInvocationMode::kNewTab);
++  std::vector<std::shared_ptr<const CommandPublication>> publications;
++  session->Search(kSavedScope, u"saved", base::BindLambdaForTesting(
++      [&publications](std::shared_ptr<const CommandPublication> update) {
++        publications.push_back(std::move(update));
++      }));
++  // Projection has queued old rows, but the revision changes only when the
++  // later refresh task runs. Delivery must also check readiness in this gap.
++  SetPins({Link("replacement", "https://replacement.test/")});
++  base::RunLoop().RunUntilIdle();
++  ASSERT_FALSE(publications.empty());
++  bool found_replacement = false;
++  for (const auto& publication : publications) {
++    for (const auto& row : publication->rows) {
++      EXPECT_NE(CommandTarget(Pin("old")), row.target);
++      found_replacement |= row.target == CommandTarget(Pin("replacement"));
++    }
++  }
++  EXPECT_TRUE(found_replacement);
++}
++
  TEST_F(ArciumCommandActionRouterTest, ClosedLiveIdentityNeverNavigatesItsUrl) {
    auto* target = AddOrdinaryTab("https://target.test/");
    const CommandLiveTarget identity = Live(target);
+Index: src/chrome/browser/ui/omnibox/arcium_command_icon_cache.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_icon_cache.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_icon_cache.cc
+@@ -51,6 +51,30 @@ class CommandIconCache::Impl {
+     return {};
+   }
+ 
++  void Invalidate(const std::set<GURL>& page_urls, const GURL& icon_url) {
++    bool cancel_pending = false;
++    const auto invalidate = [&](const std::string& key) {
++      cache_.erase(key);
++      std::erase(lru_, key);
++      cancel_pending |= pending_.contains(key);
++    };
++    for (const GURL& url : page_urls) {
++      invalidate("page:" + url.spec());
++    }
++    invalidate("icon:" + icon_url.spec());
++    // An old queued completion must not fill an invalidated entry or consume
++    // a newer request for the same URL. Unrelated completed icons stay cached.
++    if (cancel_pending) {
++      Cancel();
++    }
++  }
++
++  void Clear() {
++    Cancel();
++    cache_.clear();
++    lru_.clear();
++  }
++
+   void Cancel() {
+     weak_factory_.InvalidateWeakPtrs();
+     pending_.clear();
+@@ -106,6 +130,13 @@ gfx::ImageSkia CommandIconCache::GetEngi
+     base::RepeatingClosure refreshed) {
+   return impl_->Get(url, true, std::move(refreshed));
+ }
++void CommandIconCache::Invalidate(const std::set<GURL>& page_urls,
++                                  const GURL& icon_url) {
++  impl_->Invalidate(page_urls, icon_url);
++}
++void CommandIconCache::Clear() {
++  impl_->Clear();
++}
+ void CommandIconCache::Cancel() {
+   impl_->Cancel();
+ }
+Index: src/chrome/browser/ui/omnibox/arcium_command_icon_cache.h
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_icon_cache.h
++++ src/chrome/browser/ui/omnibox/arcium_command_icon_cache.h
+@@ -6,6 +6,7 @@
+ 
+ #include <cstddef>
+ #include <memory>
++#include <set>
+ 
+ #include "base/functional/callback.h"
+ #include "ui/gfx/image/image_skia.h"
+@@ -29,6 +30,9 @@ class CommandIconCache {
+   gfx::ImageSkia GetPageIcon(const GURL& url, base::RepeatingClosure refreshed);
+   gfx::ImageSkia GetEngineIcon(const GURL& url,
+                                base::RepeatingClosure refreshed);
++  // Preserve unrelated cached icons, including across command sessions.
++  void Invalidate(const std::set<GURL>& page_urls, const GURL& icon_url);
++  void Clear();
+   void Cancel();
+   size_t pending_for_testing() const;
+   size_t cached_for_testing() const;
+Index: src/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
+@@ -41,7 +41,9 @@
+ #include "components/search_engines/template_url.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ #include "third_party/metrics_proto/omnibox_event.pb.h"
++#include "third_party/skia/include/core/SkBitmap.h"
+ #include "ui/gfx/image/image_skia.h"
++#include "ui/gfx/image/image_skia_rep.h"
+ #include "url/gurl.h"
+ 
+ namespace arcium {
+@@ -1841,6 +1843,98 @@ TEST_F(ArciumCommandIconCacheTest,
+ }
+ 
+ TEST_F(ArciumCommandIconCacheTest,
++       FaviconChangesRefreshMissesAndImagesAcrossSessions) {
++  const GURL page("https://changed.test/");
++  const GURL engine("https://changed.test/favicon.ico");
++  const GURL unchanged("https://unchanged.test/");
++  cache_->GetPageIcon(page, Refreshed());
++  Complete(0);
++  cache_->GetPageIcon(unchanged, Refreshed());
++  Complete(1);
++  task_environment_.RunUntilIdle();
++  cache_->Cancel();
++  cache_->GetPageIcon(page, Refreshed());
++  EXPECT_EQ(2u, requests_.size());
++
++  cache_->Invalidate({page}, engine);
++  cache_->GetPageIcon(unchanged, Refreshed());
++  EXPECT_EQ(2u, requests_.size());
++  cache_->GetPageIcon(page, Refreshed());
++  ASSERT_EQ(3u, requests_.size());
++  SkBitmap bitmap;
++  bitmap.allocN32Pixels(16, 16);
++  bitmap.eraseColor(SK_ColorRED);
++  std::move(requests_[2].callback).Run(
++      gfx::ImageSkia::CreateFrom1xBitmap(bitmap));
++  task_environment_.RunUntilIdle();
++  EXPECT_FALSE(cache_->GetPageIcon(page, Refreshed()).isNull());
++  cache_->Cancel();
++  EXPECT_FALSE(cache_->GetPageIcon(page, Refreshed()).isNull());
++  EXPECT_EQ(3u, requests_.size());
++
++  cache_->GetEngineIcon(engine, Refreshed());
++  Complete(3);
++  task_environment_.RunUntilIdle();
++  cache_->Invalidate({page}, engine);
++  EXPECT_TRUE(cache_->GetPageIcon(page, Refreshed()).isNull());
++  bitmap.eraseColor(SK_ColorBLUE);
++  std::move(requests_[4].callback).Run(
++      gfx::ImageSkia::CreateFrom1xBitmap(bitmap));
++  cache_->GetEngineIcon(engine, Refreshed());
++  ASSERT_EQ(6u, requests_.size());
++  task_environment_.RunUntilIdle();
++  const auto updated = cache_->GetPageIcon(page, Refreshed());
++  ASSERT_FALSE(updated.isNull());
++  EXPECT_EQ(SK_ColorBLUE,
++            updated.GetRepresentation(1.0f).GetBitmap().getColor(0, 0));
++}
++
++TEST_F(ArciumCommandIconCacheTest,
++       FaviconChangeRejectsQueuedCompletionBeforeReplacementRequest) {
++  const GURL page("https://changed.test/");
++  cache_->GetPageIcon(page, Refreshed());
++  Complete(0);
++  cache_->Invalidate({page}, GURL());
++  cache_->GetPageIcon(page, Refreshed());
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(0u, cache_->cached_for_testing());
++  EXPECT_EQ(1u, cache_->pending_for_testing());
++  Complete(1);
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(1u, cache_->cached_for_testing());
++  EXPECT_EQ(1u, refresh_count_);
++}
++
++TEST_F(ArciumCommandIconCacheTest,
++       ClearHistoryDropsPagesEnginesMissesAndQueuedCompletions) {
++  const GURL page("https://removed.test/");
++  const GURL engine("https://removed.test/favicon.ico");
++  cache_->GetPageIcon(page, Refreshed());
++  SkBitmap bitmap;
++  bitmap.allocN32Pixels(16, 16);
++  bitmap.eraseColor(SK_ColorRED);
++  std::move(requests_[0].callback).Run(
++      gfx::ImageSkia::CreateFrom1xBitmap(bitmap));
++  cache_->GetEngineIcon(engine, Refreshed());
++  Complete(1);
++  task_environment_.RunUntilIdle();
++  ASSERT_EQ(2u, cache_->cached_for_testing());
++  const GURL pending("https://pending.test/");
++  cache_->GetPageIcon(pending, Refreshed());
++  Complete(2);
++  cache_->Clear();
++  EXPECT_EQ(0u, cache_->cached_for_testing());
++  EXPECT_EQ(0u, cache_->pending_for_testing());
++  cache_->GetPageIcon(pending, Refreshed());
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(0u, cache_->cached_for_testing());
++  EXPECT_EQ(1u, cache_->pending_for_testing());
++  EXPECT_TRUE(cache_->GetPageIcon(page, Refreshed()).isNull());
++  EXPECT_TRUE(cache_->GetEngineIcon(engine, Refreshed()).isNull());
++  EXPECT_EQ(6u, requests_.size());
++}
++
++TEST_F(ArciumCommandIconCacheTest,
+        OversizedValidUrlsNeverFetchOrEnterTheCache) {
+   const std::string prefix = "https://visible.test/";
+   const GURL oversized(
