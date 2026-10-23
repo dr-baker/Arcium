@@ -1,0 +1,123 @@
+Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
+@@ -2,6 +2,7 @@
+ // Use of this source code is governed by the GPL-3.0 license.
+ 
+ #include "chrome/browser/ui/omnibox/arcium_command_action_router.h"
++#include "chrome/browser/ui/omnibox/arcium_command_providers.h"
+ 
+ #include <algorithm>
+ #include <memory>
+@@ -454,6 +455,110 @@ TEST_F(ArciumCommandActionRouterTest, Sc
+   EXPECT_EQ(1, browser()->tab_strip_model()->count());
+ }
+ 
++TEST_F(ArciumCommandActionRouterTest,
++       ChatGPTCurrentTabQueryNavigatesToRootInsteadOfExistingConversation) {
++  auto* source = AddOrdinaryTab("https://chatgpt.com/c/existing-conversation");
++  Capture(source);
++  const auto url = BuildCommandSearchUrl(kChatGPTScope, u"  a fresh question  ");
++  ASSERT_TRUE(url);
++  ASSERT_TRUE(router_->Execute(Intent(CommandUrlTarget{.url = *url})).success);
++
++  ASSERT_EQ(1, browser()->tab_strip_model()->count());
++  EXPECT_EQ(source->GetContents(),
++            browser()->tab_strip_model()->GetActiveWebContents());
++  const auto* pending = source->GetContents()->GetController().GetPendingEntry();
++  ASSERT_TRUE(pending);
++  EXPECT_EQ(GURL("https://chatgpt.com/?q=a%20fresh%20question"),
++            pending->GetURL());
++  EXPECT_TRUE(ui::PageTransitionCoreTypeIs(pending->GetTransitionType(),
++                                          ui::PAGE_TRANSITION_GENERATED));
++}
++
++TEST_F(ArciumCommandActionRouterTest,
++       ChatGPTNewTabQueryPreservesExistingConversationAndNavigatesToRoot) {
++  auto* source = AddOrdinaryTab("https://chatgpt.com/c/existing-conversation");
++  content::WebContents* original = source->GetContents();
++  Capture(source, CommandInvocationMode::kNewTab);
++  const auto url = BuildCommandSearchUrl(kChatGPTScope, u"a fresh question");
++  ASSERT_TRUE(url);
++  ASSERT_TRUE(router_->Execute(Intent(CommandUrlTarget{.url = *url})).success);
++
++  ASSERT_EQ(2, browser()->tab_strip_model()->count());
++  auto* destination = browser()->tab_strip_model()->GetActiveWebContents();
++  ASSERT_NE(original, destination);
++  EXPECT_EQ(GURL("https://chatgpt.com/c/existing-conversation"),
++            original->GetLastCommittedURL());
++  EXPECT_EQ(nullptr, original->GetController().GetPendingEntry());
++  const auto* pending = destination->GetController().GetPendingEntry();
++  ASSERT_TRUE(pending);
++  EXPECT_EQ(GURL("https://chatgpt.com/?q=a%20fresh%20question"),
++            pending->GetURL());
++  EXPECT_TRUE(ui::PageTransitionCoreTypeIs(pending->GetTransitionType(),
++                                          ui::PAGE_TRANSITION_GENERATED));
++}
++
++TEST_F(ArciumCommandActionRouterTest,
++       ProductionRemoteScopeSearchIsDefaultDespiteLiveAndSavedMatches) {
++  struct SearchCase {
++    const char* scope;
++    const char* live_url;
++    const char* saved_url;
++  };
++  for (const SearchCase& item : {
++           SearchCase{kYouTubeScope,
++                      "https://www.youtube.com/watch?v=scope-default-live",
++                      "https://www.youtube.com/watch?v=scope-default-saved"},
++           SearchCase{kChatGPTScope,
++                      "https://chatgpt.com/c/scope-default-live",
++                      "https://chatgpt.com/c/scope-default-saved"}}) {
++    SCOPED_TRACE(item.scope);
++    auto* live = AddOrdinaryTab(item.live_url);
++    const CommandTarget live_target = Live(live);
++    SetPins({Link("scope-default-pin", item.saved_url)});
++    const CommandTarget saved_target = Pin("scope-default-pin");
++    auto session = CreateCommandSession(browser());
++    session->SetInvocation(CommandInvocationMode::kNewTab);
++    std::shared_ptr<const CommandPublication> publication;
++    session->Search(
++        item.scope, u"scope-default",
++        base::BindLambdaForTesting(
++            [&publication](std::shared_ptr<const CommandPublication> update) {
++              publication = std::move(update);
++            }));
++    base::RunLoop().RunUntilIdle();
++
++    ASSERT_TRUE(publication);
++    const auto& rows = publication->rows;
++    const auto typed = std::ranges::find_if(rows, [](const CommandRow& row) {
++      return row.kind == CommandRowKind::kTypedSearch;
++    });
++    ASSERT_NE(rows.end(), typed);
++    EXPECT_TRUE(typed->is_default);
++    EXPECT_EQ(1, std::ranges::count_if(rows, [](const CommandRow& row) {
++      return row.is_default;
++    }));
++    const auto expected_url = BuildCommandSearchUrl(item.scope, u"scope-default");
++    ASSERT_TRUE(expected_url);
++    EXPECT_EQ(CommandTarget(CommandUrlTarget{.url = *expected_url}),
++              typed->target);
++    const auto live_match = std::ranges::find_if(
++        rows, [&live_target](const CommandRow& row) {
++          return row.target == live_target;
++        });
++    ASSERT_NE(rows.end(), live_match);
++    EXPECT_FALSE(live_match->is_default);
++    const auto saved_match = std::ranges::find_if(
++        rows, [&saved_target](const CommandRow& row) {
++          return row.target == saved_target;
++        });
++    ASSERT_NE(rows.end(), saved_match);
++    EXPECT_FALSE(saved_match->is_default);
++    session->Cancel();
++    session.reset();
++    base::RunLoop().RunUntilIdle();
++  }
++}
++
+ TEST_F(ArciumCommandActionRouterTest, ClosedLiveIdentityNeverNavigatesItsUrl) {
+   auto* target = AddOrdinaryTab("https://target.test/");
+   const CommandLiveTarget identity = Live(target);
