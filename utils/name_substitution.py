@@ -3,7 +3,7 @@
 # Copyright 2025 The Helium Authors
 # You can use, redistribute, and/or modify this source code under
 # the terms of the GPL-3.0 license that can be found in the LICENSE file.
-"""Script to replace instances of Chrome/Chromium with Helium"""
+"""Replace displayed Chrome, Chromium, and Helium product names with Arcium"""
 
 from concurrent.futures import ProcessPoolExecutor
 from tarfile import TarInfo
@@ -23,14 +23,17 @@ def replacement_sanity():
     before_after = [
         ('chrome://about', 'helium://about'),
         ('Chrome Root Program', 'Chrome Root Program'),
-        (' Chrome  ', ' Helium  '),
+        (' Chrome  ', ' Arcium  '),
         ('Chrome Web Store', 'Chrome Web Store'),
         ('Chromium Web Store', 'Chromium Web Store'),
         ('Chrome Remote Desktop', 'Chrome Remote Desktop'),
-        ('Google Chrome', 'Helium'),
-        ('Chrome Google Chrome Chrome Chromium', 'Helium Helium Helium Helium'),
-        ('Chrome', 'Helium'),
-        ('Chromium', 'Helium'),
+        ('Google Chrome', 'Arcium'),
+        ('Chrome Google Chrome Chrome Chromium', 'Arcium Arcium Arcium Arcium'),
+        ('Helium', 'Arcium'),
+        ('The Helium Authors', 'The Helium Authors'),
+        ('upstream Helium', 'upstream Helium'),
+        ('Chrome', 'Arcium'),
+        ('Chromium', 'Arcium'),
     ]
 
     for source, expected in before_after:
