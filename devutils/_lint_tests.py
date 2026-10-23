@@ -3,9 +3,9 @@
 # You can use, redistribute, and/or modify this source code under
 # the terms of the GPL-3.0 license that can be found in the LICENSE file.
 
-from third_party import unidiff
-
 from _common import parse_series as _parse_series
+
+from third_party import unidiff
 
 LICENSE_HEADER_IGNORES = ["html", "license", "readme", "deps"]
 
