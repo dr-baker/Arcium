@@ -51,6 +51,7 @@ def _assert_no_backend_selection(files):
 
 
 def test_mru_consumers_do_not_select_glass_backend():
+    """Keep MRU consumers on the shared glass policy."""
     files = {
         path: content
         for path, content in _read_patch("arcium-mru-tab-switcher.patch").items()
@@ -62,6 +63,7 @@ def test_mru_consumers_do_not_select_glass_backend():
 
 
 def test_performance_patch_consumer_does_not_select_glass_backend():
+    """Keep performance instrumentation independent of renderer selection."""
     files = _read_patch("arcium-feature-performance.patch")
     path = "chrome/browser/ui/views/frame/browser_view.cc"
     assert path in files, "Expected performance patch browser consumer is missing"
@@ -70,6 +72,7 @@ def test_performance_patch_consumer_does_not_select_glass_backend():
 
 
 def test_glass_surface_params_do_not_expose_backend():
+    """Expose appearance inputs without leaking the selected renderer."""
     files = _read_patch("arcium-glass-system.patch")
     header = files["chrome/browser/ui/views/helium/glass_surface.h"]
     params = re.search(r"\bstruct GlassSurfaceParams\s*\{(.*?)^\};", header, re.M | re.S)
@@ -79,6 +82,7 @@ def test_glass_surface_params_do_not_expose_backend():
 
 
 def test_native_widget_does_not_select_glass_backend():
+    """Keep native widget consumers independent of renderer selection."""
     files = _read_patch("arcium-glass-system.patch")
     native_widgets = {
         path: content
@@ -91,6 +95,7 @@ def test_native_widget_does_not_select_glass_backend():
 
 
 def test_browser_widget_translucency_uses_shared_glass_policy():
+    """Route window translucency through the shared glass policy."""
     files = _read_patch("arcium-glass-system.patch")
     path = "chrome/browser/ui/views/frame/browser_widget.cc"
     assert path in files, "BrowserWidget translucency must integrate the shared glass policy"
@@ -105,6 +110,7 @@ def test_browser_widget_translucency_uses_shared_glass_policy():
 
 
 def test_native_glass_integration_does_not_use_legacy_controls():
+    """Exclude legacy renderer controls from the new glass integration."""
     files = _read_patch("arcium-glass-system.patch")
     integration = {
         path: content
@@ -127,6 +133,7 @@ def test_native_glass_integration_does_not_use_legacy_controls():
 
 
 def test_glass_patch_removes_legacy_control_registrations():
+    """Require explicit removal of every legacy control registration."""
     patch = (PATCHES / "arcium-glass-system.patch").read_text(encoding="utf-8")
     removed = "\n".join(line[1:] for line in patch.splitlines()
                         if line.startswith("-") and not line.startswith("--- "))
