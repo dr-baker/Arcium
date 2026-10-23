@@ -1,0 +1,737 @@
+--- a/chrome/browser/ui/helium/helium_sidebar_pin_projection.cc
++++ b/chrome/browser/ui/helium/helium_sidebar_pin_projection.cc
+@@ -41,6 +41,23 @@ std::u16string LinkTitle(const Persisten
+   return title;
+ }
+ 
++std::optional<SidebarPinSplit> SplitPages(const PersistentLink* link) {
++  if (!link || !link->split) {
++    return std::nullopt;
++  }
++  const auto page_title = [](const std::u16string& title, const GURL& url) {
++    return title.empty()
++               ? base::UTF8ToUTF16(url.host().empty() ? url.spec() : url.host())
++               : title;
++  };
++  return SidebarPinSplit{
++      .first_title = page_title(link->title, link->url),
++      .second_title =
++          page_title(link->split->second_title, link->split->second_url),
++      .second_url = link->split->second_url,
++  };
++}
++
+ bool HasActiveDescendant(const PersistentNode& node,
+                          const std::optional<std::string>& active_item_id) {
+   if (const auto* link = std::get_if<PersistentLink>(&node.data)) {
+@@ -174,6 +191,7 @@ void HeliumSidebarPinProjection::AppendN
+         .collapsed = folder && folder->collapsed,
+         .selected = selected,
+         .split = link && link->split.has_value(),
++        .split_pages = SplitPages(link),
+         .live_tab_handle = !folder && binding != live_bindings.end()
+                                ? std::optional<int32_t>(binding->second)
+                                : std::nullopt,
+@@ -199,6 +217,7 @@ void HeliumSidebarPinProjection::AppendN
+           .collapsed = folder && folder->collapsed,
+           .selected = selected,
+           .split = link && link->split.has_value(),
++          .split_pages = SplitPages(link),
+           .title = folder ? folder->title : LinkTitle(*link),
+           .url = link ? link->url : GURL(),
+       };
+@@ -493,6 +512,7 @@ std::optional<std::vector<SidebarPinRow>
+               .collapsed = node->second.collapsed,
+               .selected = node->second.selected,
+               .split = node->second.split,
++              .split_pages = node->second.split_pages,
+               .live_tab_handle = node->second.live_tab_handle,
+               .title = node->second.title,
+               .url = node->second.url,
+--- a/chrome/browser/ui/helium/helium_sidebar_pin_projection.h
++++ b/chrome/browser/ui/helium/helium_sidebar_pin_projection.h
+@@ -28,6 +28,15 @@ struct SidebarPinKey {
+ 
+ enum class SidebarPinRowKind { kPin, kFolder };
+ 
++// Independent page identities for a split Pin. Keep the combined row title for
++// accessibility, dragging and menus; rendering must not parse that title.
++struct SidebarPinSplit {
++  std::u16string first_title;
++  std::u16string second_title;
++  GURL second_url;
++  bool operator==(const SidebarPinSplit&) const = default;
++};
++
+ // A renderer-facing row. The live handle is opaque session metadata and does
+ // not transfer ownership of either persistence or a TabInterface.
+ struct SidebarPinRow {
+@@ -38,6 +47,7 @@ struct SidebarPinRow {
+   bool collapsed = false;
+   bool selected = false;
+   bool split = false;
++  std::optional<SidebarPinSplit> split_pages;
+   std::optional<int32_t> live_tab_handle;
+   std::u16string title;
+   GURL url;
+@@ -111,6 +121,7 @@ class HeliumSidebarPinProjection {
+     bool collapsed = false;
+     bool selected = false;
+     bool split = false;
++    std::optional<SidebarPinSplit> split_pages;
+     std::optional<int32_t> live_tab_handle;
+     std::u16string title;
+     GURL url;
+--- a/chrome/browser/ui/helium/helium_sidebar_pin_projection_unittest.cc
++++ b/chrome/browser/ui/helium/helium_sidebar_pin_projection_unittest.cc
+@@ -404,6 +404,11 @@ TEST(HeliumSidebarPinProjectionTest, Spl
+   ASSERT_EQ(2u, projection.rows().size());
+   EXPECT_TRUE(projection.rows()[0].split);
+   EXPECT_EQ(u"Pin / Second", projection.rows()[0].title);
++  ASSERT_TRUE(projection.rows()[0].split_pages);
++  EXPECT_EQ(u"Pin", projection.rows()[0].split_pages->first_title);
++  EXPECT_EQ(u"Second", projection.rows()[0].split_pages->second_title);
++  EXPECT_EQ(GURL("https://second.test/"),
++            projection.rows()[0].split_pages->second_url);
+   EXPECT_FALSE(projection.rows()[1].split);
+   const auto intent = ResolveSidebarPinDrop(
+       projection, Key("split"), Drop("plain", SidebarPinDropPosition::kAfter));
+@@ -413,6 +418,8 @@ TEST(HeliumSidebarPinProjectionTest, Spl
+   EXPECT_FALSE(preview->front().split);
+   EXPECT_TRUE(preview->back().split);
+   EXPECT_EQ(Key("split"), preview->back().key);
++  EXPECT_EQ(projection.rows()[0].split_pages, preview->back().split_pages);
++  EXPECT_FALSE(preview->front().split_pages);
+ }
+ 
+ }  // namespace
+--- a/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
++++ b/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
+@@ -54,6 +54,7 @@
+ #include "ui/gfx/image/image.h"
+ #include "ui/gfx/image/image_skia.h"
+ #include "ui/gfx/image/image_skia_rep.h"
++#include "ui/gfx/text_constants.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/controls/focus_ring.h"
+ #include "ui/views/controls/highlight_path_generator.h"
+@@ -118,9 +119,8 @@ void AppendPersistentItemMenuItems(ui::S
+                    l10n_util::GetStringUTF16(IDS_TAB_CXMENU_PIN_TAB));
+   }
+   model->AddItem(static_cast<int>(PersistentItemMenuCommand::kRemove),
+-                 l10n_util::GetStringUTF16(
+-                     is_pin ? IDS_TAB_CXMENU_REMOVE_PIN
+-                            : IDS_TAB_CXMENU_UNPIN_TAB));
++                 l10n_util::GetStringUTF16(is_pin ? IDS_TAB_CXMENU_REMOVE_PIN
++                                                  : IDS_TAB_CXMENU_UNPIN_TAB));
+ }
+ 
+ PersistentTabView::PersistentTabView(Profile* profile,
+@@ -138,8 +138,11 @@ PersistentTabView::PersistentTabView(Pro
+       presentation_mode_(presentation_mode),
+       tab_style_(TabStyle::Get()),
+       icon_(AddChildView(std::make_unique<TabIcon>())),
+-      title_(AddChildView(std::make_unique<TabTitle>(
+-          profile, TabTitle::FadeStyle::kSidebar))),
++      title_(AddChildView(
++          std::make_unique<TabTitle>(profile, TabTitle::FadeStyle::kSidebar))),
++      second_icon_(AddChildView(std::make_unique<TabIcon>())),
++      second_title_(AddChildView(
++          std::make_unique<TabTitle>(profile, TabTitle::FadeStyle::kSidebar))),
+       close_button_(AddChildView(std::make_unique<TabCloseButton>(
+           base::BindRepeating(&PersistentTabView::CloseButtonPressed,
+                               base::Unretained(this)),
+@@ -148,6 +151,7 @@ PersistentTabView::PersistentTabView(Pro
+       favorite_callback_(std::move(favorite_callback)),
+       drag_delegate_(drag_delegate),
+       url_(std::move(url)),
++      accessible_title_(title),
+       hover_animation_(this),
+       selection_animation_(this) {
+   CHECK(profile_);
+@@ -178,6 +182,12 @@ PersistentTabView::PersistentTabView(Pro
+   title_->SetText(std::move(title));
+   title_->SetVisible(presentation_mode_ != PresentationMode::kCompactGrid);
+   close_button_->SetVisible(false);
++  second_icon_->SetVisible(false);
++  second_title_->SetVisible(false);
++  second_title_->SetElideBehavior(gfx::ELIDE_TAIL);
++  second_title_->GetViewAccessibility().SetIsIgnored(true);
++  second_icon_->SetCanProcessEventsWithinSubtree(false);
++  second_title_->SetCanProcessEventsWithinSubtree(false);
+   if (presentation_mode_ == PresentationMode::kCompactGrid) {
+     icon_->SetFaviconSize(kFavoriteIconDesignWidth);
+   }
+@@ -214,6 +224,7 @@ void PersistentTabView::Update(std::u16s
+                                const GURL& url,
+                                bool selected) {
+   UpdateContent(std::move(title), url);
++  title_->SetText(accessible_title_);
+   SetSelected(selected);
+ }
+ 
+@@ -225,9 +236,7 @@ void PersistentTabView::UpdatePresentati
+ }
+ 
+ void PersistentTabView::UpdateContent(std::u16string title, const GURL& url) {
+-  if (title_->GetText() != title) {
+-    title_->SetText(title);
+-  }
++  accessible_title_ = title;
+   title_->SetVisible(presentation_mode_ != PresentationMode::kCompactGrid);
+   UpdateAccessibleName();
+ 
+@@ -241,10 +250,11 @@ void PersistentTabView::UpdateContent(st
+ }
+ 
+ void PersistentTabView::UpdateAccessibleName() {
+-  const std::u16string description = presentation_state_.split
+-      ? l10n_util::GetStringUTF16(IDS_OVERFLOW_MENU_ITEM_TEXT_SPLIT_VIEW)
+-      : std::u16string();
+-  const std::u16string title(title_->GetText());
++  const std::u16string description =
++      presentation_state_.split
++          ? l10n_util::GetStringUTF16(IDS_OVERFLOW_MENU_ITEM_TEXT_SPLIT_VIEW)
++          : std::u16string();
++  const std::u16string& title = accessible_title_;
+   SetTooltipText(description.empty() ? title
+                                      : title + u" (" + description + u")");
+   GetViewAccessibility().SetName(title);
+@@ -254,7 +264,27 @@ void PersistentTabView::UpdateAccessible
+ void PersistentTabView::ApplyPresentationState(PresentationState state) {
+   const bool was_live = presentation_state_.live;
+   const bool was_selected = selected_;
++  const bool was_split = presentation_state_.split;
++  const bool second_page_changed =
++      presentation_state_.split_pages != state.split_pages;
+   presentation_state_ = std::move(state);
++  const bool has_pages =
++      presentation_state_.split && presentation_state_.split_pages.has_value();
++  title_->SetText(has_pages ? presentation_state_.split_pages->first_title
++                            : accessible_title_);
++  title_->SetElideBehavior(has_pages ? gfx::ELIDE_TAIL : gfx::FADE_TAIL);
++  second_title_->SetText(has_pages
++                             ? presentation_state_.split_pages->second_title
++                             : std::u16string());
++  const GURL second_url =
++      has_pages ? presentation_state_.split_pages->second_url : GURL();
++  if (second_favicon_url_ != second_url ||
++      (was_live && !presentation_state_.live)) {
++    LoadSecondFavicon();
++  }
++  if (second_page_changed || was_split != presentation_state_.split) {
++    InvalidateLayout();
++  }
+   UpdateAccessibleName();
+   SetSelected(presentation_state_.selected);
+   RefreshIconData();
+@@ -280,6 +310,16 @@ void PersistentTabView::Layout(PassKey)
+     return;
+   }
+ 
++  const bool show_split_segments =
++      presentation_state_.split && presentation_state_.split_pages &&
++      contents.width() >= arcium::ScaleChromeDip(this, 96);
++  if (show_split_segments_ != show_split_segments) {
++    show_split_segments_ = show_split_segments;
++    RefreshIconData();
++  }
++  second_icon_->SetVisible(show_split_segments_);
++  second_title_->SetVisible(show_split_segments_);
++  split_divider_ = gfx::Rect();
+   const arcium::SidebarRowBounds bounds = arcium::CalculateSidebarRowBounds(
+       contents, arcium::GetSidebarRowMetrics(this), icon_->GetPreferredSize(),
+       title_->GetLineHeight(),
+@@ -289,6 +329,29 @@ void PersistentTabView::Layout(PassKey)
+   icon_->SetBoundsRect(bounds.icon);
+   close_button_->SetBoundsRect(bounds.close_button);
+   title_->SetBoundsRect(bounds.title);
++  if (show_split_segments_) {
++    const auto metrics = arcium::GetSidebarRowMetrics(this);
++    const int leading = contents.x() + metrics.horizontal_inset;
++    const int trailing = bounds.title.right();
++    const int middle = leading + std::max(0, trailing - leading) / 2;
++    const int gap = arcium::ScaleChromeDip(this, 8);
++    const int divider_height = arcium::ScaleChromeDip(this, 16);
++    split_divider_ =
++        gfx::Rect(middle, contents.CenterPoint().y() - divider_height / 2,
++                  arcium::ScaleChromeDip(this, 1), divider_height);
++    title_->SetBoundsRect(gfx::Rect(
++        bounds.title.x(), bounds.title.y(),
++        std::max(0, middle - gap - bounds.title.x()), bounds.title.height()));
++    const int second_slot = middle + gap;
++    second_icon_->SetBoundsRect(arcium::CenterSidebarRowChild(
++        contents, second_slot, metrics.icon_slot_width,
++        second_icon_->GetPreferredSize()));
++    const int second_title_x =
++        second_slot + metrics.icon_slot_width + metrics.icon_title_gap;
++    second_title_->SetBoundsRect(gfx::Rect(
++        second_title_x, bounds.title.y(),
++        std::max(0, trailing - second_title_x), bounds.title.height()));
++  }
+   LayoutSuperclass<views::Button>(this);
+ }
+ 
+@@ -389,6 +452,10 @@ void PersistentTabView::PaintButtonConte
+         outline_flags);
+   }
+ 
++  if (!split_divider_.IsEmpty() && GetColorProvider()) {
++    canvas->FillRect(GetMirroredRect(split_divider_),
++                     GetColorProvider()->GetColor(ui::kColorSeparator));
++  }
+   views::Button::PaintButtonContents(canvas);
+ }
+ 
+@@ -414,6 +481,7 @@ void PersistentTabView::OnThemeChanged()
+           : arcium::GetChromeLayoutConstant(
+                 this, LayoutConstant::kVerticalTabCornerRadius));
+   ApplyMonogramFavicon();
++  LoadSecondFavicon();
+   UpdateColors();
+   PreferredSizeChanged();
+ }
+@@ -507,6 +575,16 @@ void PersistentTabView::SetSelected(bool
+   // The durable home row mirrors the associated foreground tab's native
+   // active treatment while ownership remains with the ordinary live tab.
+   icon_->SetActiveState(selected_);
++  if (presentation_state_.split_pages) {
++    tabs::TabData second_data;
++    second_data.favicon = second_favicon_model_;
++    second_data.visible_url = presentation_state_.split_pages->second_url;
++    second_data.should_themify_favicon =
++        second_favicon_resolved_ &&
++        favicon::ShouldThemifyFavicon(second_data.visible_url);
++    second_icon_->SetData(second_data);
++    second_icon_->SetActiveState(selected_);
++  }
+   GetViewAccessibility().SetIsSelected(selected_);
+   UpdateCloseButtonVisibility();
+   UpdateColors();
+@@ -560,9 +638,10 @@ void PersistentTabView::UpdateColors() {
+       TabStyle::TabSelectionState::kActive, false, 0.0, IsFrameActive(),
+       GetColorProvider());
+   outline_color_ = helium::favorite_favicon::EnsureContrast(
+-      favicon_accent_color_.value_or(SK_ColorTRANSPARENT),
+-      selected_background, neutral_outline);
++      favicon_accent_color_.value_or(SK_ColorTRANSPARENT), selected_background,
++      neutral_outline);
+   title_->SetEnabledColor(colors.foreground_color);
++  second_title_->SetEnabledColor(colors.foreground_color);
+   close_button_->SetColors(colors);
+   views::FocusRing::Get(this)->SetColorId(colors.focus_ring_color);
+   SchedulePaint();
+@@ -664,17 +743,85 @@ void PersistentTabView::SetFavicon(const
+ 
+ void PersistentTabView::RefreshIconData() {
+   tabs::TabData data;
+-  data.favicon = presentation_state_.split
+-      ? ui::ImageModel::FromVectorIcon(kSplitSceneIcon, ui::kColorIcon)
+-      : favicon_model_;
++  data.favicon =
++      presentation_state_.split && !show_split_segments_
++          ? ui::ImageModel::FromVectorIcon(kSplitSceneIcon, ui::kColorIcon)
++          : favicon_model_;
+   data.visible_url = url_;
+   data.network_state = presentation_state_.network_state;
+   data.should_themify_favicon =
+-      !presentation_state_.split &&
++      (!presentation_state_.split || show_split_segments_) &&
+       favicon_state_ == PersistentFaviconState::kResolved &&
+       favicon::ShouldThemifyFavicon(url_);
+   icon_->SetData(data);
+   icon_->SetActiveState(selected_);
++  if (presentation_state_.split_pages) {
++    tabs::TabData second_data;
++    second_data.favicon = second_favicon_model_;
++    second_data.visible_url = presentation_state_.split_pages->second_url;
++    second_data.should_themify_favicon =
++        second_favicon_resolved_ &&
++        favicon::ShouldThemifyFavicon(second_data.visible_url);
++    second_icon_->SetData(second_data);
++    second_icon_->SetActiveState(selected_);
++  }
++}
++
++void PersistentTabView::LoadSecondFavicon() {
++  second_favicon_task_tracker_.TryCancelAll();
++  if (!presentation_state_.split || !presentation_state_.split_pages) {
++    second_favicon_url_ = GURL();
++    second_favicon_model_ = ui::ImageModel();
++    second_favicon_resolved_ = false;
++    return;
++  }
++  const GURL& url = presentation_state_.split_pages->second_url;
++  if (url != second_favicon_url_ || !second_favicon_resolved_) {
++    second_favicon_url_ = url;
++    second_favicon_resolved_ = false;
++    second_favicon_model_ = MakeMonogramFavicon(url, kIconDesignWidth,
++                                                arcium::GetChromeUIScale(this));
++    RefreshIconData();
++  }
++  auto* service = FaviconServiceFactory::GetForProfile(
++      profile_, ServiceAccessType::EXPLICIT_ACCESS);
++  if (!service || !url.is_valid()) {
++    return;
++  }
++  // Reuse the profile's favicon cache, including its host fallback. Never
++  // fetch icons from the network or persist image data on the split record.
++  service->GetRawFaviconForPageURL(
++      url, GetPersistentIconTypes(),
++      GetDesiredFaviconSizeInPixels(this, kIconDesignWidth),
++      /*fallback_to_host=*/true,
++      base::BindOnce(&PersistentTabView::OnSecondFaviconAvailable,
++                     weak_ptr_factory_.GetWeakPtr(), url),
++      &second_favicon_task_tracker_);
++}
++
++void PersistentTabView::OnSecondFaviconAvailable(
++    const GURL& requested_url,
++    const favicon_base::FaviconRawBitmapResult& result) {
++  if (!presentation_state_.split || !presentation_state_.split_pages ||
++      requested_url != presentation_state_.split_pages->second_url ||
++      !result.is_valid() || result.pixel_size.width() <= 0) {
++    return;
++  }
++  const gfx::Image decoded =
++      gfx::Image::CreateFrom1xPNGBytes(result.bitmap_data);
++  if (decoded.IsEmpty()) {
++    return;
++  }
++  const float scale =
++      std::max(1.0f, static_cast<float>(result.pixel_size.width()) /
++                         static_cast<float>(arcium::GetChromeUIScale(this) *
++                                            kIconDesignWidth));
++  gfx::ImageSkia image =
++      gfx::ImageSkia::CreateFromBitmap(decoded.AsBitmap(), scale);
++  image.EnsureRepsForSupportedScales();
++  second_favicon_model_ = ui::ImageModel::FromImageSkia(image);
++  second_favicon_resolved_ = true;
++  RefreshIconData();
+ }
+ 
+ void PersistentTabView::ScheduleFaviconColorAnalysis() {
+@@ -765,6 +912,18 @@ void PersistentTabView::OnFaviconsChange
+   if (page_urls.empty() || page_urls.contains(url_) || matching_host) {
+     LoadFavicon();
+   }
++  if (presentation_state_.split_pages) {
++    const GURL& second_url = presentation_state_.split_pages->second_url;
++    const bool matching_second_host =
++        std::ranges::any_of(page_urls, [&second_url](const GURL& changed_url) {
++          return changed_url.SchemeIsHTTPOrHTTPS() &&
++                 changed_url.host() == second_url.host();
++        });
++    if (page_urls.empty() || page_urls.contains(second_url) ||
++        matching_second_host) {
++      LoadSecondFavicon();
++    }
++  }
+ }
+ 
+ bool PersistentTabView::IsFrameActive() const {
+--- a/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
++++ b/chrome/browser/ui/views/tabs/common/persistent_tab_view.h
+@@ -17,6 +17,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/task/cancelable_task_tracker.h"
++#include "chrome/browser/ui/helium/helium_sidebar_pin_projection.h"
+ #include "components/tabs/public/tab_network_state.h"
+ #include "third_party/skia/include/core/SkColor.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+@@ -25,6 +26,7 @@
+ #include "ui/events/event.h"
+ #include "ui/gfx/animation/slide_animation.h"
+ #include "ui/gfx/geometry/point.h"
++#include "ui/gfx/geometry/rect.h"
+ #include "ui/menus/simple_menu_model.h"
+ #include "ui/views/context_menu_controller.h"
+ #include "ui/views/controls/button/button.h"
+@@ -103,6 +105,7 @@ class PersistentTabView : public views::
+     bool live = false;
+     bool selected = false;
+     bool split = false;
++    std::optional<helium::SidebarPinSplit> split_pages;
+     tabs::TabNetworkState network_state = tabs::TabNetworkState::kNone;
+     base::RepeatingCallback<bool()> dematerialize_callback;
+     base::RepeatingCallback<bool()> return_home_callback;
+@@ -144,6 +147,18 @@ class PersistentTabView : public views::
+   void SetResolvedFaviconStateForTesting();
+   void ApplyGeneratedFaviconForTesting();
+   bool title_visible_for_testing() const;
++  bool split_segments_visible_for_testing() const {
++    return show_split_segments_;
++  }
++  const TabTitle* first_title_for_testing() const { return title_; }
++  const TabTitle* second_title_for_testing() const { return second_title_; }
++  const TabIcon* second_icon_for_testing() const { return second_icon_; }
++  gfx::Rect split_divider_for_testing() const {
++    return GetMirroredRect(split_divider_);
++  }
++  const ui::ImageModel& second_favicon_for_testing() const {
++    return second_favicon_model_;
++  }
+   TabCloseButton* close_button_for_testing() { return close_button_; }
+ 
+   // Reconciles presentation state without replacing the view, preserving
+@@ -203,6 +218,10 @@ class PersistentTabView : public views::
+   void SetFavicon(const ui::ImageModel& favicon_model,
+                   PersistentFaviconState state);
+   void RefreshIconData();
++  void LoadSecondFavicon();
++  void OnSecondFaviconAvailable(
++      const GURL& requested_url,
++      const favicon_base::FaviconRawBitmapResult& bitmap_result);
+   void ScheduleFaviconColorAnalysis();
+   void OnFaviconColorAvailable(const GURL& requested_url,
+                                uint64_t generation,
+@@ -221,6 +240,8 @@ class PersistentTabView : public views::
+   const raw_ptr<const TabStyle> tab_style_;
+   const raw_ptr<TabIcon> icon_;
+   const raw_ptr<TabTitle> title_;
++  const raw_ptr<TabIcon> second_icon_;
++  const raw_ptr<TabTitle> second_title_;
+   const raw_ptr<TabCloseButton> close_button_;
+   base::RepeatingClosure remove_callback_;
+   base::RepeatingClosure favorite_callback_;
+@@ -230,6 +251,12 @@ class PersistentTabView : public views::
+   bool drag_threshold_exceeded_ = false;
+ 
+   GURL url_;
++  std::u16string accessible_title_;
++  GURL second_favicon_url_;
++  ui::ImageModel second_favicon_model_;
++  bool second_favicon_resolved_ = false;
++  bool show_split_segments_ = false;
++  gfx::Rect split_divider_;
+   bool selected_ = false;
+   bool has_selection_state_ = false;
+   PresentationState presentation_state_;
+@@ -243,6 +270,7 @@ class PersistentTabView : public views::
+   std::unique_ptr<ui::SimpleMenuModel> context_menu_model_;
+   std::unique_ptr<views::MenuRunner> context_menu_runner_;
+   base::CancelableTaskTracker favicon_task_tracker_;
++  base::CancelableTaskTracker second_favicon_task_tracker_;
+   base::CallbackListSubscription favicons_changed_subscription_;
+   base::CallbackListSubscription paint_as_active_subscription_;
+   base::WeakPtrFactory<PersistentTabView> weak_ptr_factory_{this};
+--- a/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
++++ b/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
+@@ -13,6 +13,8 @@
+ 
+ #include "base/check.h"
+ #include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/i18n/rtl.h"
+ #include "base/memory/ref_counted_memory.h"
+ #include "base/time/time.h"
+ #include "chrome/browser/favicon/favicon_service_factory.h"
+@@ -324,7 +326,9 @@ TEST_F(PersistentTabViewTest, UsesNative
+   // The row's icon, title and close button share the host with its focus ring.
+   ASSERT_NE(nullptr, views::FocusRing::Get(row.get()));
+   EXPECT_EQ(row.get(), views::FocusRing::Get(row.get())->parent());
+-  EXPECT_EQ(4u, row->children().size());
++  EXPECT_FALSE(row->split_segments_visible_for_testing());
++  EXPECT_FALSE(row->second_icon_for_testing()->GetVisible());
++  EXPECT_FALSE(row->second_title_for_testing()->GetVisible());
+   EXPECT_EQ(GetLayoutConstant(LayoutConstant::kVerticalTabHeight),
+             row->GetPreferredSize().height());
+   EXPECT_TRUE(row->title_visible_for_testing());
+@@ -907,8 +911,128 @@ TEST_F(PersistentTabViewTest, ReturnHome
+       [](std::unique_ptr<PersistentTabView>* row) {
+         row->reset();
+         return true;
+-      }, &row);
+-  row->UpdatePresentation(u"Split", GURL("https://example.test/"), std::move(state));
+-  row->ExecuteCommand(static_cast<int>(PersistentItemMenuCommand::kReturnHome), 0);
++      },
++      &row);
++  row->UpdatePresentation(u"Split", GURL("https://example.test/"),
++                          std::move(state));
++  row->ExecuteCommand(static_cast<int>(PersistentItemMenuCommand::kReturnHome),
++                      0);
+   EXPECT_EQ(nullptr, row);
+ }
++
++TEST_F(PersistentTabViewTest, SplitSegmentsKeepBothPagesAndOneAccessibleRow) {
++  auto row = MakeView(PersistentTabView::PresentationMode::kFullRow);
++  PersistentTabView::PresentationState state;
++  state.split = true;
++  state.split_pages = helium::SidebarPinSplit{
++      .first_title = u"Cursor",
++      .second_title = u"Best Way to Build a Very Long Page Title",
++      .second_url = GURL("https://second.test/")};
++  row->UpdatePresentation(u"Cursor / Best Way", GURL("https://example.test/"),
++                          state);
++  for (int width : {96, 160, 240, 400}) {
++    row->SetBounds(0, 0, width, row->GetPreferredSize().height());
++    views::test::RunScheduledLayout(row.get());
++    ASSERT_TRUE(row->split_segments_visible_for_testing());
++    EXPECT_EQ(u"Cursor", row->first_title_for_testing()->GetText());
++    EXPECT_EQ(state.split_pages->second_title,
++              row->second_title_for_testing()->GetText());
++    EXPECT_LE(row->first_title_for_testing()->bounds().right(),
++              row->split_divider_for_testing().x());
++    EXPECT_GT(row->second_icon_for_testing()->x(),
++              row->split_divider_for_testing().right());
++    EXPECT_LE(row->second_title_for_testing()->bounds().right(), width);
++    EXPECT_GE(row->first_title_for_testing()->width(), 0);
++    EXPECT_GE(row->second_title_for_testing()->width(), 0);
++  }
++  ui::AXNodeData node;
++  row->GetViewAccessibility().GetAccessibleNodeData(&node);
++  EXPECT_EQ(u"Cursor / Best Way",
++            node.GetString16Attribute(ax::mojom::StringAttribute::kName));
++  // A narrow icon rail retains the split glyph, rather than overlapping two
++  // full-size icons or exposing labels outside the row.
++  row->SetBounds(0, 0, 48, row->GetPreferredSize().height());
++  views::test::RunScheduledLayout(row.get());
++  EXPECT_FALSE(row->split_segments_visible_for_testing());
++  EXPECT_FALSE(row->second_icon_for_testing()->GetVisible());
++  row->UpdatePresentation(u"Single", GURL("https://example.test/"), {});
++  row->SetBounds(0, 0, 240, row->GetPreferredSize().height());
++  views::test::RunScheduledLayout(row.get());
++  EXPECT_EQ(u"Single", row->first_title_for_testing()->GetText());
++  EXPECT_FALSE(row->second_title_for_testing()->GetVisible());
++}
++
++TEST_F(PersistentTabViewTest, LateSplitFaviconCannotReplaceAnotherPage) {
++  auto* service = InstallMockFaviconService();
++  EXPECT_CALL(*service,
++              GetRawFaviconForPageURL(testing::_, testing::_, testing::_,
++                                      testing::_, testing::_, testing::_))
++      .WillRepeatedly(testing::Return(base::CancelableTaskTracker::kBadTaskId));
++  std::vector<favicon_base::FaviconRawBitmapCallback> callbacks;
++  const auto capture =
++      [&callbacks](const GURL&, const favicon_base::IconTypeSet&, int, bool,
++                   favicon_base::FaviconRawBitmapCallback callback,
++                   base::CancelableTaskTracker*) {
++        callbacks.push_back(std::move(callback));
++        return base::CancelableTaskTracker::kBadTaskId;
++      };
++  EXPECT_CALL(*service,
++              GetRawFaviconForPageURL(GURL("https://second.test/"), testing::_,
++                                      testing::_, true, testing::_, testing::_))
++      .WillOnce(capture);
++  EXPECT_CALL(*service, GetRawFaviconForPageURL(
++                            GURL("https://replacement.test/"), testing::_,
++                            testing::_, true, testing::_, testing::_))
++      .WillOnce(capture);
++  auto row = MakeView(PersistentTabView::PresentationMode::kFullRow);
++  PersistentTabView::PresentationState state;
++  state.split = true;
++  state.split_pages =
++      helium::SidebarPinSplit{.first_title = u"First",
++                              .second_title = u"Second",
++                              .second_url = GURL("https://second.test/")};
++  row->UpdatePresentation(u"First / Second", GURL("https://example.test/"),
++                          state);
++  state.split_pages->second_url = GURL("https://replacement.test/");
++  state.split_pages->second_title = u"Replacement";
++  row->UpdatePresentation(u"First / Replacement", GURL("https://example.test/"),
++                          state);
++  ASSERT_EQ(2u, callbacks.size());
++  std::move(callbacks[1])
++      .Run(MakeCachedFaviconResult(
++          SK_ColorGREEN, GURL("https://replacement.test/favicon.png"), 32));
++  std::move(callbacks[0])
++      .Run(MakeCachedFaviconResult(
++          SK_ColorRED, GURL("https://second.test/favicon.png"), 32));
++  const auto image = row->second_favicon_for_testing().Rasterize(nullptr);
++  EXPECT_EQ(SK_ColorGREEN,
++            image.GetRepresentation(1.0f).GetBitmap().getColor(0, 0));
++}
++
++TEST_F(PersistentTabViewTest, SplitDividerMirrorsWithLiveCloseButton) {
++  const bool was_rtl = base::i18n::IsRTL();
++  base::ScopedClosureRunner restore_direction(
++      base::BindOnce(&base::i18n::SetRTLForTesting, was_rtl));
++  base::i18n::SetRTLForTesting(true);
++  auto row = MakeView(PersistentTabView::PresentationMode::kFullRow);
++  PersistentTabView::PresentationState state;
++  state.live = true;
++  state.selected = true;
++  state.split = true;
++  state.split_pages =
++      helium::SidebarPinSplit{.first_title = u"First",
++                              .second_title = u"Second",
++                              .second_url = GURL("https://second.test/")};
++  state.dematerialize_callback = base::BindRepeating([] { return true; });
++  row->UpdatePresentation(u"First / Second", GURL("https://example.test/"),
++                          state);
++  row->SetBounds(0, 0, 240, row->GetPreferredSize().height());
++  views::test::RunScheduledLayout(row.get());
++  ASSERT_TRUE(row->close_button_for_testing()->GetVisible());
++  ASSERT_TRUE(row->split_segments_visible_for_testing());
++  const gfx::Rect divider = row->split_divider_for_testing();
++  EXPECT_LT(row->second_icon_for_testing()->GetMirroredBounds().right(),
++            divider.x());
++  EXPECT_GT(row->first_title_for_testing()->GetMirroredBounds().x(),
++            divider.right());
++}
+--- a/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/pin_tab_container_view.cc
+@@ -964,12 +964,15 @@ void PinTabContainerView::ReconcilePersi
+   displayed_collapsed.reserve(row_count);
+   size_t target_index = 0;
+   views::View* replacement_native_row = nullptr;
+-  auto reconcile_row =
+-      [&](const std::string& key, std::string_view id,
+-          helium::PersistentRecordKind kind, int depth,
+-          std::string_view parent_id, bool folder, bool collapsed,
+-          bool selected, tabs::TabInterface* live_tab,
+-          const std::u16string& title, const GURL& url, bool split) {
++  auto reconcile_row = [&](const std::string& key, std::string_view id,
++                           helium::PersistentRecordKind kind, int depth,
++                           std::string_view parent_id, bool folder,
++                           bool collapsed, bool selected,
++                           tabs::TabInterface* live_tab,
++                           const std::u16string& title, const GURL& url,
++                           bool split,
++                           const std::optional<helium::SidebarPinSplit>&
++                               split_pages) {
+     const std::string item_id(id);
+     desired_keys.insert(key);
+     views::View* row = nullptr;
+@@ -1026,10 +1029,10 @@ void PinTabContainerView::ReconcilePersi
+             .live = live_tab != nullptr,
+             .selected = selected,
+             .split = split,
+-            .network_state = live_tab
+-                                 ? tabs::TabNetworkStateForWebContents(
+-                                       live_tab->GetContents())
+-                                 : tabs::TabNetworkState::kNone,
++            .split_pages = split_pages,
++            .network_state = live_tab ? tabs::TabNetworkStateForWebContents(
++                                            live_tab->GetContents())
++                                      : tabs::TabNetworkState::kNone,
+         };
+         if (live_tab) {
+           presentation.dematerialize_callback = base::BindRepeating(
+@@ -1104,16 +1107,15 @@ void PinTabContainerView::ReconcilePersi
+     tabs::TabInterface* live_tab =
+         row.live_tab_handle ? tabs::TabHandle(*row.live_tab_handle).Get()
+                             : nullptr;
+-    reconcile_row(folder ? PersistentFolderKey(
+-                               helium::PersistentRecordKind::kPin, space_id,
+-                               row.key.item_id)
+-                         : PersistentLinkKey(
+-                               helium::PersistentRecordKind::kPin, space_id,
+-                               row.key.item_id),
+-                  row.key.item_id, helium::PersistentRecordKind::kPin,
+-                  static_cast<int>(row.depth),
+-                  row.parent ? row.parent->item_id : std::string(), folder,
+-                  row.collapsed, row.selected, live_tab, row.title, row.url, row.split);
++    reconcile_row(
++        folder ? PersistentFolderKey(helium::PersistentRecordKind::kPin,
++                                     space_id, row.key.item_id)
++               : PersistentLinkKey(helium::PersistentRecordKind::kPin, space_id,
++                                   row.key.item_id),
++        row.key.item_id, helium::PersistentRecordKind::kPin,
++        static_cast<int>(row.depth),
++        row.parent ? row.parent->item_id : std::string(), folder, row.collapsed,
++        row.selected, live_tab, row.title, row.url, row.split, row.split_pages);
+   }
+ 
+   for (auto it = persistent_rows_.begin(); it != persistent_rows_.end();) {
