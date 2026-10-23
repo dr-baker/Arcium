@@ -1,0 +1,105 @@
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
+@@ -1432,39 +1432,49 @@ void CommandPanelView::PaintConnectedSco
+   gfx::ScopedCanvas restore(canvas);
+   const auto contour = GetContourPath();
+   canvas->ClipPath(contour, true);
+-  const auto geometry = GeometryForReveal(appearance_.reveal);
+-  const float y = BodyBounds().y() + (4 - geometry.resting_rise) * ui_scale_;
+-  const auto glow = [&](SkColor tint, float x, float spread, float alpha) {
++  // Each scope casts its own color from its upper edge into the glass.
++  // Keep the profile accent for selection chrome, not website identity.
++  const auto glow = [&](SkColor tint, float x, float y, float spread,
++                        float alpha) {
+     if (tint == SK_ColorTRANSPARENT || spread <= 0) {
+       return;
+     }
+-    for (const bool tail : {false, true}) {
+-      auto matrix = SkMatrix::Scale(spread, (tail ? 96 : 26) * ui_scale_);
+-      matrix.postTranslate(x, y - (tail ? 70 * ui_scale_ : 0));
+-      const SkColor4f stops[] = {
+-          SkColor4f::FromColor(
+-              Alpha(tint, base::ClampRound(255 * alpha * appearance_.glow_strength * (tail ? .65f : 1)))),
+-          SkColors::kTransparent};
+-      cc::PaintFlags flags;
+-      flags.setShader(cc::PaintShader::MakeRadialGradient(
+-          {0, 0}, 1, stops, nullptr, 2, SkTileMode::kClamp,
+-          SkGradient::Interpolation{}, 0, &matrix));
+-      canvas->DrawPath(contour, flags);
+-    }
++    gfx::ScopedCanvas layer(canvas);
++    canvas->ClipRect(gfx::Rect(0, base::ClampFloor(y), width(), height()));
++    auto matrix = SkMatrix::Scale(spread, 130 * ui_scale_);
++    matrix.postTranslate(x, y);
++    const auto color = [&](float strength) {
++      return SkColor4f::FromColor(Alpha(
++          tint, std::clamp(base::ClampRound(
++                    255 * alpha * strength * appearance_.glow_strength),
++                0, 255)));
++    };
++    const SkColor4f stops[] = {color(1), color(.58f), color(.16f),
++                              SkColors::kTransparent};
++    const SkScalar positions[] = {0, .25f, .65f, 1};
++    cc::PaintFlags flags;
++    flags.setShader(cc::PaintShader::MakeRadialGradient(
++        {0, 0}, 1, stops, positions, 4, SkTileMode::kClamp,
++        SkGradient::Interpolation{}, 0, &matrix));
++    canvas->DrawPath(contour, flags);
+   };
+   for (size_t i = 0; i < scopes_.size(); ++i) {
+     const auto* button = scope_buttons_[i].get();
++    if (!button->GetVisible()) {
++      continue;
++    }
+     const float x = button->x() + button->width() / 2.f;
+-    const float reach = button->width() * .9f;
+-    const float alpha = .14f + .08f * ScopeWeight(i);
++    const float y = button->y();
++    const float reach = button->width() * 1.05f;
++    const float alpha = .20f + .08f * ScopeWeight(i);
+     if (scopes_[i].id == kOmniScope) {
+-      glow(accent_color_, x - button->width() * .24f,
+-           reach * .8f, alpha);
+-      glow(accent_color_, x + button->width() * .24f,
+-           reach * .8f, alpha);
+-      glow(accent_color_, x, reach, alpha * .6f);
++      glow(SkColorSetRGB(174, 112, 245), x - button->width() * .24f,
++           y, reach * .72f, alpha);
++      glow(SkColorSetRGB(100, 159, 255), x + button->width() * .24f,
++           y, reach * .72f, alpha);
++      glow(SkColorSetRGB(89, 206, 157), x, y, reach, alpha * .45f);
+     } else {
+-      glow(accent_color_, x, reach, alpha);
++      glow(scopes_[i].tint, x, y, reach, alpha);
+     }
+   }
+ }
+@@ -1726,13 +1736,16 @@ void CommandPanelView::PaintScope(gfx::C
+     cc::PaintFlags glow;
+     if (scope.id == kOmniScope) {
+       constexpr std::array<float, 3> centers = {.5f, .88f, .12f};
++      constexpr std::array<SkColor, 3> tints = {
++          SkColorSetRGB(174, 112, 245), SkColorSetRGB(100, 159, 255),
++          SkColorSetRGB(89, 206, 157)};
+       for (size_t i = 0; i < centers.size(); ++i) {
+         const float fade = i == 0 ? .9f : .85f;
+         auto matrix = SkMatrix::Scale(width * (i == 0 ? .6f : .65f) * fade,
+                                       height * fade);
+         matrix.postTranslate(width * centers[i], 0);
+         const SkColor4f stops[] = {
+-            SkColor4f::FromColor(Alpha(accent_color_, base::ClampRound((46 + 25 * weight) * appearance_.glow_strength))),
++            SkColor4f::FromColor(Alpha(tints[i], base::ClampRound((46 + 25 * weight) * appearance_.glow_strength))),
+             SkColors::kTransparent};
+         glow.setShader(cc::PaintShader::MakeRadialGradient(
+             {0, 0}, 1, stops, nullptr, 2, SkTileMode::kClamp,
+@@ -1740,7 +1753,7 @@ void CommandPanelView::PaintScope(gfx::C
+         canvas->DrawRect(gfx::Rect(0, 0, width, height), glow);
+       }
+     } else {
+-      const auto tint = accent_color_;
++      const auto tint = scope.tint;
+       const SkPoint points[] = {{0, 0}, {0, static_cast<float>(height)}};
+       const SkScalar positions[] = {0, .7f, 1};
+       const SkColor4f colors[] = {
