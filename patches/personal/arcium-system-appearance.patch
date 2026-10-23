@@ -1,0 +1,339 @@
+Index: src/chrome/browser/chrome_content_browser_client.cc
+===================================================================
+--- src.orig/chrome/browser/chrome_content_browser_client.cc
++++ src/chrome/browser/chrome_content_browser_client.cc
+@@ -4200,8 +4200,8 @@ GetPreferredColorScheme(const WebPrefere
+     preferred_color_scheme = ToBlinkPreferredColorScheme(
+         ui::NativeTheme::GetInstanceForWeb()->preferred_color_scheme());
+   } else {
+-    // WebUI and regular pages follow the browser theme color mode, provided by
+-    // the color provider.
++    // Content System follows the native system scheme independently of window
++    // chrome. Explicit Space content modes are resolved by the provider.
+     preferred_color_scheme = helium::GetSpaceContentColorMode(web_contents) ==
+                                      ui::ColorProviderKey::ColorMode::kLight
+                                  ? blink::mojom::PreferredColorScheme::kLight
+Index: src/chrome/browser/ui/helium/helium_space.h
+===================================================================
+--- src.orig/chrome/browser/ui/helium/helium_space.h
++++ src/chrome/browser/ui/helium/helium_space.h
+@@ -73,7 +73,7 @@ struct SpaceTheme {
+   std::optional<SkColor> color;
+   // Light or dark browser chrome.
+   Mode mode = Mode::kAuto;
+-  // Light or dark web pages; kAuto follows the chrome.
++  // Light or dark web pages; kAuto follows the system independently of chrome.
+   Mode web_mode = Mode::kAuto;
+   std::optional<SpaceBackground> background;
+   // Stable palette source; absent or deleted selections use the first glow.
+Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/helium/helium_space_service_unittest.cc
++++ src/chrome/browser/ui/helium/helium_space_service_unittest.cc
+@@ -29,6 +29,7 @@
+ #include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
+ #include "chrome/browser/ui/helium/helium_space.h"
+ #include "chrome/browser/ui/helium/helium_space_service_factory.h"
++#include "chrome/browser/ui/helium/space_content_appearance.h"
+ #include "chrome/browser/ui/helium/space_palette.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/pinned_tab_codec.h"
+@@ -45,6 +46,11 @@
+ #include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/web_contents.h"
+ #include "testing/gtest/include/gtest/gtest.h"
++#include "ui/color/color_provider_manager.h"
++#include "ui/color/color_provider_source.h"
++#include "ui/color/color_provider_utils.h"
++#include "ui/native_theme/mock_os_settings_provider.h"
++#include "ui/native_theme/native_theme.h"
+ #include "url/gurl.h"
+ 
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+@@ -3009,4 +3015,91 @@ TEST_F(HeliumSpaceServiceTest, WebModeDe
+   EXPECT_FALSE(only_web.IsDefault());
+ }
+ 
++TEST(SpaceContentAppearanceTest, SystemIgnoresWindowSchemeAndKeepsPalette) {
++  using ColorMode = ui::ColorProviderKey::ColorMode;
++  for (const auto system : {ColorMode::kLight, ColorMode::kDark}) {
++    for (const auto chrome : {ColorMode::kLight, ColorMode::kDark}) {
++      ui::ColorProviderKey window_key;
++      window_key.color_mode = chrome;
++      window_key.user_color = SK_ColorMAGENTA;
++      SpaceTheme theme;
++      theme.mode = chrome == ColorMode::kDark ? SpaceTheme::Mode::kDark
++                                              : SpaceTheme::Mode::kLight;
++      const auto resolved =
++          ResolveSpaceContentColorProviderKey(window_key, &theme, system);
++      EXPECT_EQ(system, resolved.color_mode);
++      EXPECT_EQ(window_key.user_color, resolved.user_color);
++      EXPECT_EQ(system,
++                ResolveSpaceContentColorProviderKey(window_key, nullptr, system)
++                    .color_mode);
++      for (const auto explicit_mode :
++           {SpaceTheme::Mode::kLight, SpaceTheme::Mode::kDark}) {
++        theme.web_mode = explicit_mode;
++        EXPECT_EQ(
++            explicit_mode == SpaceTheme::Mode::kDark ? ColorMode::kDark
++                                                     : ColorMode::kLight,
++            ResolveSpaceContentColorProviderKey(window_key, &theme, system)
++                .color_mode);
++      }
++    }
++  }
++}
++
++TEST(SpaceContentAppearanceTest, AccessibilityOverridesRetainWindowProvider) {
++  ui::ColorProviderKey key;
++  key.color_mode = ui::ColorProviderKey::ColorMode::kDark;
++  key.contrast_mode = ui::ColorProviderKey::ContrastMode::kHigh;
++  EXPECT_EQ(key, ResolveSpaceContentColorProviderKey(
++                     key, nullptr, ui::ColorProviderKey::ColorMode::kLight));
++  key.contrast_mode = ui::ColorProviderKey::ContrastMode::kNormal;
++  key.forced_colors = ui::ColorProviderKey::ForcedColors::kSystem;
++  EXPECT_EQ(key, ResolveSpaceContentColorProviderKey(
++                     key, nullptr, ui::ColorProviderKey::ColorMode::kLight));
++}
++
++namespace {
++class FixedChromeColorSource : public ui::ColorProviderSource {
++ public:
++  const ui::ColorProvider* GetColorProvider() const override {
++    return ui::ColorProviderManager::Get().GetColorProviderFor(
++        GetColorProviderKey());
++  }
++  ui::RendererColorMap GetRendererColorMap(
++      ui::ColorProviderKey::ColorMode mode,
++      ui::ColorProviderKey::ForcedColors forced) const override {
++    auto key = GetColorProviderKey();
++    key.color_mode = mode;
++    key.forced_colors = forced;
++    return ui::CreateRendererColorMap(
++        *ui::ColorProviderManager::Get().GetColorProviderFor(key));
++  }
++
++ protected:
++  ui::ColorProviderKey GetColorProviderKey() const override {
++    ui::ColorProviderKey key;
++    key.color_mode = ui::ColorProviderKey::ColorMode::kLight;
++    return key;
++  }
++};
++}  // namespace
++
++TEST_F(HeliumSpaceServiceTest, SystemContentUpdatesWithoutSpaceOrWindowTheme) {
++  ui::MockOsSettingsProvider os;
++  FixedChromeColorSource fixed_chrome;
++  auto* contents = AddOrdinaryTab("https://example.org/")->GetContents();
++  contents->SetColorProviderSource(&fixed_chrome);
++  os.SetPreferredColorScheme(ui::NativeTheme::PreferredColorScheme::kDark);
++  EXPECT_EQ(ui::ColorProviderKey::ColorMode::kLight, contents->GetColorMode());
++  EXPECT_EQ(ui::ColorProviderKey::ColorMode::kDark,
++            GetSpaceContentColorMode(contents));
++  EXPECT_EQ(ui::ColorProviderKey::ColorMode::kDark,
++            GetSpaceContentColorMode(nullptr));
++  os.SetPreferredColorScheme(ui::NativeTheme::PreferredColorScheme::kLight);
++  EXPECT_EQ(ui::ColorProviderKey::ColorMode::kLight,
++            GetSpaceContentColorMode(contents));
++  // Detach before the fixed source is destroyed; the live tab keeps its own
++  // default native provider and no dangling source observation.
++  contents->SetColorProviderSource(nullptr);
++}
++
+ }  // namespace helium
+Index: src/chrome/browser/ui/helium/space_content_appearance.cc
+===================================================================
+--- src.orig/chrome/browser/ui/helium/space_content_appearance.cc
++++ src/chrome/browser/ui/helium/space_content_appearance.cc
+@@ -9,6 +9,7 @@
+ #include "build/build_config.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/common/url_constants.h"
++#include "content/public/common/url_utils.h"
+ #include "ui/color/color_provider_manager.h"
+ #include "ui/native_theme/native_theme.h"
+ #include "url/gurl.h"
+@@ -35,13 +36,6 @@ std::optional<ui::ColorProviderKey> Cont
+                        ->IsOffTheRecord()) {
+     return std::nullopt;
+   }
+-  const auto& url = contents->GetVisibleURL();
+-  if (!url.SchemeIs(content::kChromeUIScheme) ||
+-      !(url.host() == chrome::kChromeUINewTabHost ||
+-        url.host() == chrome::kChromeUINewTabPageHost ||
+-        url.host() == chrome::kChromeUINewTabPageThirdPartyHost)) {
+-    return std::nullopt;
+-  }
+   if (ui::NativeTheme::GetInstanceForWeb()->forced_colors() !=
+       ui::ColorProviderKey::ForcedColors::kNone) {
+     return std::nullopt;
+@@ -57,26 +51,51 @@ std::optional<ui::ColorProviderKey> Cont
+   auto* view =
+       browser ? BrowserView::GetBrowserViewForBrowser(browser) : nullptr;
+   auto* widget = view ? view->browser_widget() : nullptr;
+-  if (!theme || !widget) {
++  if (!widget) {
+     return std::nullopt;
+   }
+   auto key = widget->GetSpaceContentColorProviderKey();
+-  if (key.forced_colors != ui::ColorProviderKey::ForcedColors::kNone ||
+-      key.contrast_mode == ui::ColorProviderKey::ContrastMode::kHigh) {
+-    return std::nullopt;
+-  }
+-  if (theme->web_mode != SpaceTheme::Mode::kAuto) {
+-    key.color_mode = theme->web_mode == SpaceTheme::Mode::kDark
+-                         ? ui::ColorProviderKey::ColorMode::kDark
+-                         : ui::ColorProviderKey::ColorMode::kLight;
+-  }
+-  return key;
++  // Keep the existing explicit-mode exception for setup and other WebUI.
++  // New Tab and ordinary sites support a Space's explicit content mode.
++  const auto& url = contents->GetVisibleURL();
++  const bool is_new_tab =
++      url.SchemeIs(content::kChromeUIScheme) &&
++      (url.host() == chrome::kChromeUINewTabHost ||
++       url.host() == chrome::kChromeUINewTabPageHost ||
++       url.host() == chrome::kChromeUINewTabPageThirdPartyHost);
++  if (content::HasWebUIScheme(url) && !is_new_tab) {
++    theme = nullptr;
++  }
++  return ResolveSpaceContentColorProviderKey(
++      key, theme,
++      ui::NativeTheme::GetInstanceForWeb()
++          ->GetColorProviderKey(nullptr)
++          .color_mode);
+ #else
+   return std::nullopt;
+ #endif
+ }
+ }  // namespace
+ 
++ui::ColorProviderKey ResolveSpaceContentColorProviderKey(
++    ui::ColorProviderKey window_key,
++    const SpaceTheme* theme,
++    ui::ColorProviderKey::ColorMode system_mode) {
++  if (window_key.forced_colors != ui::ColorProviderKey::ForcedColors::kNone ||
++      window_key.contrast_mode == ui::ColorProviderKey::ContrastMode::kHigh) {
++    return window_key;
++  }
++  window_key.color_mode = system_mode;
++#if !BUILDFLAG(IS_ANDROID)
++  if (theme && theme->web_mode != SpaceTheme::Mode::kAuto) {
++    window_key.color_mode = theme->web_mode == SpaceTheme::Mode::kDark
++                                ? ui::ColorProviderKey::ColorMode::kDark
++                                : ui::ColorProviderKey::ColorMode::kLight;
++  }
++#endif
++  return window_key;
++}
++
+ const ui::ColorProvider& GetSpaceContentColorProvider(
+     content::WebContents* contents) {
+   if (auto key = ContentColorProviderKey(contents)) {
+@@ -90,6 +109,18 @@ ui::ColorProviderKey::ColorMode GetSpace
+   if (auto key = ContentColorProviderKey(contents)) {
+     return key->color_mode;
+   }
+-  return contents->GetColorMode();
++  const auto system_key =
++      ui::NativeTheme::GetInstanceForWeb()->GetColorProviderKey(nullptr);
++#if !BUILDFLAG(IS_ANDROID)
++  if (contents &&
++      (Profile::FromBrowserContext(contents->GetBrowserContext())
++           ->IsOffTheRecord() ||
++       system_key.forced_colors != ui::ColorProviderKey::ForcedColors::kNone ||
++       system_key.contrast_mode == ui::ColorProviderKey::ContrastMode::kHigh)) {
++    return contents->GetColorMode();
++  }
++#endif
++  // A fresh profile or unattached WebContents may not have a Space/widget yet.
++  return system_key.color_mode;
+ }
+ }  // namespace helium
+Index: src/chrome/browser/ui/helium/space_content_appearance.h
+===================================================================
+--- src.orig/chrome/browser/ui/helium/space_content_appearance.h
++++ src/chrome/browser/ui/helium/space_content_appearance.h
+@@ -15,8 +15,15 @@ class ColorProvider;
+ }
+ 
+ namespace helium {
+-// Built-in New Tab pages may choose a scheme independently of their window.
+-// Other contents and accessibility color overrides retain their usual provider.
++struct SpaceTheme;
++// Preserve the window's palette while resolving content System independently.
++// Accessibility color overrides retain their original key.
++ui::ColorProviderKey ResolveSpaceContentColorProviderKey(
++    ui::ColorProviderKey window_key,
++    const SpaceTheme* theme,
++    ui::ColorProviderKey::ColorMode system_mode);
++
++// Websites and built-in pages use their content scheme, not window chrome.
+ const ui::ColorProvider& GetSpaceContentColorProvider(
+     content::WebContents* contents);
+ ui::ColorProviderKey::ColorMode GetSpaceContentColorMode(
+Index: src/chrome/browser/ui/views/helium/arcium_space_editor_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/arcium_space_editor_view.cc
++++ src/chrome/browser/ui/views/helium/arcium_space_editor_view.cc
+@@ -445,8 +445,8 @@ void ArciumSpaceEditorView::OnSelectedPr
+ }
+ 
+ helium::SpaceTheme ArciumSpaceEditorView::PreviewForSelectedProfile() const {
+-  // "Profile theme" and "Match profile" mean the chosen profile's look, which
+-  // can differ from this window's profile.
++  // Palette and material can come from the selected profile. System mode
++  // always follows the OS, independently of either profile's saved scheme.
+   helium::SpaceTheme preview = theme_;
+   Profile* target = SelectedProfile();
+   if (!preview.background && target != browser_->GetProfile()) {
+@@ -462,18 +462,6 @@ helium::SpaceTheme ArciumSpaceEditorView
+   if (!preview.color) {
+     preview.color = themes->GetUserColor();
+   }
+-  if (preview.mode == Mode::kAuto) {
+-    switch (themes->GetBrowserColorScheme()) {
+-      case ThemeService::BrowserColorScheme::kLight:
+-        preview.mode = Mode::kLight;
+-        break;
+-      case ThemeService::BrowserColorScheme::kDark:
+-        preview.mode = Mode::kDark;
+-        break;
+-      case ThemeService::BrowserColorScheme::kSystem:
+-        break;
+-    }
+-  }
+   return preview;
+ }
+ 
+Index: src/chrome/browser/ui/views/helium/arcium_space_theme_editor.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/helium/arcium_space_theme_editor.cc
++++ src/chrome/browser/ui/views/helium/arcium_space_theme_editor.cc
+@@ -490,8 +490,7 @@ ArciumSpaceThemeEditor::ArciumSpaceTheme
+     label->SetProperty(views::kMarginsKey,
+                        gfx::Insets::TLBR(0, 0, 0, kPadding - 2));
+     const std::tuple<Mode, const char*, std::u16string> modes[] = {
+-        {Mode::kAuto, "circle-half",
+-         pages ? u"Match the browser" : u"Match the profile"},
++        {Mode::kAuto, "circle-half", u"System"},
+         {Mode::kLight, "sun", u"Light"},
+         {Mode::kDark, "moon", u"Dark"},
+     };
+Index: src/chrome/test/BUILD.gn
+===================================================================
+--- src.orig/chrome/test/BUILD.gn
++++ src/chrome/test/BUILD.gn
+@@ -11532,9 +11532,11 @@ if (!is_android && toolkit_views) {
+       "//testing/gmock",
+       "//testing/gtest",
+       "//ui/base",
++      "//ui/color",
+       "//ui/events:test_support",
+       "//ui/gfx",
+       "//ui/menus",
++      "//ui/native_theme:test_support",
+       "//ui/views",
+       "//url",
+     ]
