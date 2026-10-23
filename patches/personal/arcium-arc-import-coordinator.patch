@@ -1,0 +1,1501 @@
+Index: src/chrome/browser/importer/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/importer/BUILD.gn
++++ src/chrome/browser/importer/BUILD.gn
+@@ -7,6 +7,7 @@ assert(is_win || is_mac || is_linux || i
+ source_set("importer") {
+   sources = [
+     "arcium_arc_import.h",
++    "arcium_arc_import_coordinator.h",
+     "brave_external_process_importer_client.h",
+     "brave_external_process_importer_host.h",
+     "brave_in_process_importer_bridge.h",
+@@ -27,6 +28,7 @@ source_set("importer") {
+     "//chrome/app:generated_resources",
+     "//chrome/common/importer",
+     "//chrome/common/importer:interfaces",
++    "//chrome/browser/profiles:profile",
+     "//components/bookmarks/browser",
+     "//components/favicon_base",
+     "//components/history/core/browser",
+@@ -43,6 +45,7 @@ source_set("impl") {
+ 
+   sources = [
+     "arcium_arc_import.cc",
++    "arcium_arc_import_coordinator.cc",
+     "brave_external_process_importer_client.cc",
+     "brave_external_process_importer_host.cc",
+     "brave_in_process_importer_bridge.cc",
+@@ -59,18 +62,22 @@ source_set("impl") {
+   deps = [
+     ":importer",
+     "//chrome/browser:shell_integration",
++    "//chrome/browser:browser_process",
+     "//chrome/browser/bookmarks",
+     "//chrome/browser/favicon",
+     "//chrome/browser/first_run",
+     "//chrome/browser/history",
+     "//chrome/browser/password_manager/factories",
+     "//chrome/browser/profiles:profile",
++    "//chrome/browser/profiles:profile_manager",
++    "//chrome/browser/profiles:profile_util",
+     "//chrome/browser/search_engines",
+     "//chrome/browser/webdata_services",
+     "//chrome/common/importer:interfaces",
+     "//components/bookmarks/browser",
+     "//components/bookmarks/common",
+     "//components/favicon/core",
++    "//components/history/core/common",
+     "//components/password_manager/core/browser:password_form",
+     "//components/password_manager/core/browser/password_store:password_store_interface",
+   ]
+@@ -126,12 +133,14 @@ source_set("browser_tests") {
+ source_set("unit_tests") {
+   testonly = true
+   sources = [
++    "arcium_arc_import_coordinator_unittest.cc",
+     "firefox_profile_lock_unittest.cc",
+     "profile_writer_unittest.cc",
+   ]
+ 
+   deps = [
+     ":importer",
++    ":impl",
+     "//base",
+     "//base/test:test_support",
+     "//chrome/browser",
+@@ -152,6 +161,7 @@ source_set("unit_tests") {
+     "//components/query_parser",
+     "//components/user_data_importer/common",
+     "//content/test:test_support",
++    "//extensions/buildflags",
+     "//testing/gtest",
+   ]
+ }
+Index: src/chrome/browser/importer/arcium_arc_import_coordinator.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/importer/arcium_arc_import_coordinator.cc
+@@ -0,0 +1,634 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/importer/arcium_arc_import_coordinator.h"
++
++#include <algorithm>
++#include <tuple>
++#include <variant>
++
++#include "base/containers/contains.h"
++#include "base/functional/bind.h"
++#include "base/no_destructor.h"
++#include "base/notreached.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/importer/arcium_arc_import.h"
++#include "chrome/browser/importer/external_process_importer_host.h"
++#include "chrome/browser/importer/importer_list.h"
++#include "chrome/browser/importer/profile_writer.h"
++#include "chrome/browser/profiles/profile_attributes_entry.h"
++#include "chrome/browser/profiles/profile_attributes_storage.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/ui/helium/helium_persistent_item_model.h"
++#include "chrome/browser/ui/helium/helium_space.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
++#include "chrome/common/pref_names.h"
++#include "components/history/core/common/pref_names.h"
++#include "components/prefs/pref_service.h"
++
++namespace arcium {
++
++namespace {
++
++using user_data_importer::FAVORITES;
++using user_data_importer::HISTORY;
++
++// One job per destination across every Settings and setup window.
++std::set<const void*>& BusyDestinations() {
++  static base::NoDestructor<std::set<const void*>> busy;
++  return *busy;
++}
++
++int NextJobId() {
++  static int next = 0;
++  return ++next;
++}
++
++void CountNodes(const helium::PersistentNodes& nodes,
++                int* links,
++                int* folders) {
++  for (const helium::PersistentNode& node : nodes) {
++    if (const auto* folder = std::get_if<helium::PersistentFolder>(&node.data)) {
++      ++*folders;
++      CountNodes(folder->children, links, folders);
++    } else {
++      ++*links;
++    }
++  }
++}
++
++int CountLinks(const helium::PersistentNodes& nodes) {
++  int links = 0;
++  int folders = 0;
++  CountNodes(nodes, &links, &folders);
++  return links;
++}
++
++bool ManagedOff(const PrefService* prefs, const char* name) {
++  const PrefService::Preference* pref = prefs ? prefs->FindPreference(name)
++                                              : nullptr;
++  return pref && pref->IsManaged() && !pref->GetValue()->GetBool();
++}
++
++const char* PhaseName(ArcImportCoordinator::Phase phase) {
++  switch (phase) {
++    case ArcImportCoordinator::Phase::kDiscovering:
++      return "discovering";
++    case ArcImportCoordinator::Phase::kReady:
++      return "ready";
++    case ArcImportCoordinator::Phase::kRunning:
++      return "running";
++    case ArcImportCoordinator::Phase::kFinished:
++      return "finished";
++  }
++  NOTREACHED();
++}
++
++const char* OutcomeName(ArcImportCoordinator::Outcome outcome) {
++  switch (outcome) {
++    case ArcImportCoordinator::Outcome::kNone:
++      return "none";
++    case ArcImportCoordinator::Outcome::kSucceeded:
++      return "succeeded";
++    case ArcImportCoordinator::Outcome::kEmpty:
++      return "empty";
++    case ArcImportCoordinator::Outcome::kFailed:
++      return "failed";
++    case ArcImportCoordinator::Outcome::kCancelled:
++      return "cancelled";
++  }
++  NOTREACHED();
++}
++
++const char* FailureName(ArcImportCoordinator::Failure failure) {
++  switch (failure) {
++    case ArcImportCoordinator::Failure::kNone:
++      return "none";
++    case ArcImportCoordinator::Failure::kBusy:
++      return "busy";
++    case ArcImportCoordinator::Failure::kNothingSelected:
++      return "nothing_selected";
++    case ArcImportCoordinator::Failure::kSourceChanged:
++      return "source_changed";
++    case ArcImportCoordinator::Failure::kSidebarUnreadable:
++      return "sidebar_unreadable";
++    case ArcImportCoordinator::Failure::kSidebarNotSaved:
++      return "sidebar_not_saved";
++    case ArcImportCoordinator::Failure::kHistoryIncomplete:
++      return "history_incomplete";
++    case ArcImportCoordinator::Failure::kDestinationClosed:
++      return "destination_closed";
++  }
++  NOTREACHED();
++}
++
++const char* StepName(ArcImportCoordinator::Step step) {
++  switch (step) {
++    case ArcImportCoordinator::Step::kNone:
++      return "none";
++    case ArcImportCoordinator::Step::kSidebar:
++      return "sidebar";
++    case ArcImportCoordinator::Step::kHistory:
++      return "history";
++  }
++  NOTREACHED();
++}
++
++}  // namespace
++
++// static
++std::pair<ArcImportCoordinator::Outcome, ArcImportCoordinator::Failure>
++ArcImportCoordinator::ResolveOutcome(const OutcomeInput& input) {
++  if (!input.destination_alive) {
++    return {Outcome::kFailed, Failure::kDestinationClosed};
++  }
++  if (input.cancelled) {
++    return {Outcome::kCancelled, Failure::kNone};
++  }
++  if (input.sidebar_requested) {
++    // The sidebar result gate from arcium-arc-import-result.patch. A History
++    // category ending never proves the sidebar was saved.
++    if (!input.sidebar_received) {
++      return {Outcome::kFailed, Failure::kSidebarUnreadable};
++    }
++    if (!input.sidebar_saved) {
++      return {Outcome::kFailed, Failure::kSidebarNotSaved};
++    }
++  }
++  if (input.history_requested && !input.history_finished) {
++    return {Outcome::kFailed, Failure::kHistoryIncomplete};
++  }
++  if (input.sidebar_requested && input.counts.empty()) {
++    return {Outcome::kEmpty, Failure::kNone};
++  }
++  return {Outcome::kSucceeded, Failure::kNone};
++}
++
++// static
++std::vector<ArcImportCoordinator::Source> ArcImportCoordinator::BuildSources(
++    const std::vector<user_data_importer::SourceProfile>& detected,
++    int generation,
++    const std::set<std::string>& imported_source_ids) {
++  auto title_for = [](const user_data_importer::SourceProfile& source) {
++    return source.profile.empty() ? std::u16string(u"Arc") : source.profile;
++  };
++  std::map<std::u16string, int> title_counts;
++  for (const auto& source : detected) {
++    if (source.importer_type == user_data_importer::TYPE_ARC) {
++      ++title_counts[title_for(source)];
++    }
++  }
++  std::vector<Source> sources;
++  for (size_t i = 0; i < detected.size(); ++i) {
++    const auto& source = detected[i];
++    if (source.importer_type != user_data_importer::TYPE_ARC) {
++      continue;
++    }
++    Source entry;
++    entry.token = base::StrCat({"g", base::NumberToString(generation), "-",
++                                base::NumberToString(i)});
++    entry.source_id = source.source_path.BaseName().AsUTF8Unsafe();
++    entry.title = title_for(source);
++    if (title_counts[entry.title] > 1) {
++      entry.detail = source.source_path.BaseName().LossyDisplayName();
++    }
++    entry.can_import_sidebar = (source.services_supported & FAVORITES) != 0;
++    entry.can_import_history = (source.services_supported & HISTORY) != 0;
++    entry.previously_imported =
++        base::Contains(imported_source_ids, entry.source_id);
++    sources.push_back(std::move(entry));
++  }
++  return sources;
++}
++
++// static
++ArcImportCoordinator::Counts ArcImportCoordinator::CountImportedRecords(
++    Profile* profile,
++    std::string_view source_id,
++    std::string* first_space_id) {
++  Counts counts;
++  auto* service =
++      profile ? helium::HeliumSpaceServiceFactory::GetForProfile(profile)
++              : nullptr;
++  if (!service || source_id.empty()) {
++    return counts;
++  }
++  const helium::HeliumSpace* first = nullptr;
++  for (const helium::HeliumSpace* space : service->GetSpaces()) {
++    if (space->source_profile() != source_id) {
++      continue;
++    }
++    first = first ? first : space;
++    ++counts.spaces;
++    CountNodes(space->pins(), &counts.pins, &counts.folders);
++  }
++  if (first) {
++    // Imported Favorites are visible only in Spaces from the same source.
++    counts.favorites =
++        std::max(0, CountLinks(service->GetFavoritesForSpace(*first)) -
++                        CountLinks(service->GetLocalFavorites()));
++    if (first_space_id) {
++      *first_space_id = first->id();
++    }
++  }
++  return counts;
++}
++
++// static
++std::set<std::string> ArcImportCoordinator::ImportedSourceIds(
++    Profile* profile) {
++  std::set<std::string> ids;
++  auto* service =
++      profile ? helium::HeliumSpaceServiceFactory::GetForProfile(profile)
++              : nullptr;
++  if (!service) {
++    return ids;
++  }
++  for (const helium::HeliumSpace* space : service->GetSpaces()) {
++    if (!space->source_profile().empty()) {
++      ids.insert(space->source_profile());
++    }
++  }
++  return ids;
++}
++
++ArcImportCoordinator::ArcImportCoordinator(Profile* destination,
++                                           base::RepeatingClosure changed)
++    : destination_(destination), changed_(std::move(changed)) {
++  if (destination_) {
++    profile_observation_.Observe(destination_);
++  }
++}
++
++ArcImportCoordinator::~ArcImportCoordinator() {
++  if (host_) {
++    // Without an observer, Cancel() deletes the host without calling back.
++    ExternalProcessImporterHost* host = host_;
++    host_ = nullptr;
++    host->set_observer(nullptr);
++    host->Cancel();
++  }
++  if (busy_key_) {
++    BusyDestinations().erase(busy_key_);
++  }
++}
++
++bool ArcImportCoordinator::sidebar_allowed() const {
++  return destination_ &&
++         !ManagedOff(destination_->GetPrefs(), prefs::kImportDialogBookmarks);
++}
++
++bool ArcImportCoordinator::history_allowed() const {
++  const PrefService* prefs = destination_ ? destination_->GetPrefs() : nullptr;
++  return prefs && !prefs->GetBoolean(prefs::kSavingBrowserHistoryDisabled) &&
++         !ManagedOff(prefs, prefs::kImportDialogHistory);
++}
++
++std::u16string ArcImportCoordinator::DestinationName() const {
++  ProfileManager* manager =
++      g_browser_process ? g_browser_process->profile_manager() : nullptr;
++  ProfileAttributesEntry* entry =
++      manager && destination_
++          ? manager->GetProfileAttributesStorage().GetProfileAttributesWithPath(
++                destination_->GetPath())
++          : nullptr;
++  return entry ? entry->GetLocalProfileName() : u"This profile";
++}
++
++void ArcImportCoordinator::Discover() {
++  if (phase_ == Phase::kRunning || !destination_) {
++    return;
++  }
++  phase_ = Phase::kDiscovering;
++  ++generation_;
++  job_.reset();
++  sources_.clear();
++  source_profiles_.clear();
++  NotifyChanged();
++  if (detected_for_testing_) {
++    ApplyDetectedSources(*detected_for_testing_);
++    return;
++  }
++  // Replacing the list drops any callback from the previous generation.
++  importer_list_ = std::make_unique<ImporterList>();
++  importer_list_->DetectSourceProfiles(
++      g_browser_process->GetApplicationLocale(),
++      /*include_interactive_profiles=*/false,
++      base::BindOnce(&ArcImportCoordinator::OnSourcesDetected,
++                     weak_factory_.GetWeakPtr(), generation_));
++}
++
++void ArcImportCoordinator::OnSourcesDetected(int generation) {
++  if (generation != generation_ || !importer_list_ ||
++      phase_ != Phase::kDiscovering) {
++    return;
++  }
++  std::vector<user_data_importer::SourceProfile> detected;
++  for (size_t i = 0; i < importer_list_->count(); ++i) {
++    detected.push_back(importer_list_->GetSourceProfileAt(i));
++  }
++  ApplyDetectedSources(detected);
++}
++
++void ArcImportCoordinator::ApplyDetectedSources(
++    const std::vector<user_data_importer::SourceProfile>& detected) {
++  sources_ =
++      BuildSources(detected, generation_, ImportedSourceIds(destination_));
++  source_profiles_.clear();
++  for (const Source& source : sources_) {
++    const size_t index = source.token.find('-');
++    size_t detected_index = 0;
++    if (index != std::string::npos &&
++        base::StringToSizeT(source.token.substr(index + 1), &detected_index) &&
++        detected_index < detected.size()) {
++      source_profiles_[source.token] = detected[detected_index];
++    }
++  }
++  phase_ = Phase::kReady;
++  NotifyChanged();
++}
++
++ArcImportCoordinator::Failure ArcImportCoordinator::Start(
++    std::string_view token,
++    bool include_sidebar,
++    bool include_history) {
++  if (phase_ == Phase::kRunning || host_) {
++    return Failure::kBusy;
++  }
++  if (!destination_) {
++    return Failure::kDestinationClosed;
++  }
++  const std::string token_string(token);
++  auto profile_it = source_profiles_.find(token_string);
++  auto source_it = std::ranges::find(sources_, token_string, &Source::token);
++  if (profile_it == source_profiles_.end() || source_it == sources_.end()) {
++    return Failure::kSourceChanged;
++  }
++  const void* key = destination_.get();
++  if (base::Contains(BusyDestinations(), key) ||
++      ExternalProcessImporterHost::IsImportRunning(destination_)) {
++    return Failure::kBusy;
++  }
++  // Only the saved sidebar and History. EXTENSIONS would make the host wait
++  // for extension preparation, and its lock dialog, before any other category.
++  uint16_t items = static_cast<uint16_t>(
++      (include_sidebar && sidebar_allowed() ? FAVORITES : 0) |
++      (include_history && history_allowed() ? HISTORY : 0));
++  items &= profile_it->second.services_supported;
++  if (!items) {
++    return Failure::kNothingSelected;
++  }
++
++  Job job;
++  job.id = NextJobId();
++  job.token = source_it->token;
++  job.source_id = source_it->source_id;
++  job.source_title = source_it->title;
++  job.destination_name = DestinationName();
++  job.includes_sidebar = (items & FAVORITES) != 0;
++  job.includes_history = (items & HISTORY) != 0;
++  job.refresh = job.includes_sidebar && source_it->previously_imported;
++  job_ = std::move(job);
++
++  frozen_source_ = profile_it->second;
++  writer_ = base::MakeRefCounted<ProfileWriter>(destination_,
++                                                ArcSidebarDestination::kPins);
++  cancel_requested_ = false;
++  busy_key_ = key;
++  BusyDestinations().insert(key);
++  phase_ = Phase::kRunning;
++  NotifyChanged();
++
++  if (start_for_testing_) {
++    start_for_testing_.Run(frozen_source_, items);
++    return Failure::kNone;
++  }
++  host_ = new ExternalProcessImporterHost();
++  host_->set_observer(this);
++  // Arc never needs the Firefox lock prompt. Keep the job free of modal UI.
++  host_->set_headless();
++  if (parent_window_) {
++    host_->set_parent_window(parent_window_);
++  }
++  // May finish synchronously; ImportEnded() clears host_ first.
++  host_->StartImportSettings(frozen_source_, destination_, items,
++                             writer_.get());
++  return Failure::kNone;
++}
++
++void ArcImportCoordinator::Cancel() {
++  if (phase_ != Phase::kRunning || cancel_requested_) {
++    return;
++  }
++  cancel_requested_ = true;
++  if (host_) {
++    // Cancel() synchronously calls ImportEnded() and deletes the host.
++    ExternalProcessImporterHost* host = host_;
++    host->Cancel();
++    return;
++  }
++  if (start_for_testing_) {
++    ImportEnded();
++  }
++}
++
++void ArcImportCoordinator::Reset() {
++  if (phase_ != Phase::kFinished) {
++    return;
++  }
++  job_.reset();
++  phase_ = Phase::kReady;
++  NotifyChanged();
++}
++
++void ArcImportCoordinator::ImportStarted() {}
++
++void ArcImportCoordinator::ImportItemStarted(
++    user_data_importer::ImportItem item) {
++  if (!job_ || phase_ != Phase::kRunning) {
++    return;
++  }
++  job_->may_have_partial_data = true;
++  job_->step = item == HISTORY ? Step::kHistory : Step::kSidebar;
++  NotifyChanged();
++}
++
++void ArcImportCoordinator::ImportItemEnded(
++    user_data_importer::ImportItem item) {
++  if (job_ && phase_ == Phase::kRunning && item == HISTORY) {
++    job_->history_finished = true;
++  }
++}
++
++void ArcImportCoordinator::ImportEnded() {
++  // The host deletes itself after this returns.
++  host_ = nullptr;
++  Finish();
++}
++
++void ArcImportCoordinator::Finish() {
++  if (!job_ || phase_ != Phase::kRunning) {
++    return;
++  }
++  bool received = false;
++  bool saved = false;
++  if (sidebar_result_for_testing_) {
++    std::tie(received, saved) = *sidebar_result_for_testing_;
++  } else if (writer_) {
++    received = writer_->arc_sidebar_snapshot_received();
++    saved = writer_->arc_sidebar_snapshot_import_succeeded();
++  }
++  std::string first_space_id;
++  const Counts counts =
++      destination_ ? CountImportedRecords(destination_, job_->source_id,
++                                          &first_space_id)
++                   : Counts();
++  const auto [outcome, failure] = ResolveOutcome({
++      .sidebar_requested = job_->includes_sidebar,
++      .history_requested = job_->includes_history,
++      .sidebar_received = received,
++      .sidebar_saved = saved,
++      .history_finished = job_->history_finished,
++      .cancelled = cancel_requested_,
++      .destination_alive = destination_ != nullptr,
++      .counts = counts,
++  });
++  job_->outcome = outcome;
++  job_->failure = failure;
++  job_->step = Step::kNone;
++  // A saved sidebar remains committed even if a separately requested History
++  // category did not finish. Preserve its counts and refresh identity without
++  // reporting the whole job as successful.
++  if (job_->includes_sidebar && received && saved && destination_) {
++    job_->counts = counts;
++    job_->first_space_id = first_space_id;
++    for (Source& source : sources_) {
++      if (source.source_id == job_->source_id && job_->includes_sidebar) {
++        source.previously_imported = true;
++      }
++    }
++  }
++  writer_ = nullptr;
++  if (busy_key_) {
++    BusyDestinations().erase(busy_key_);
++    busy_key_ = nullptr;
++  }
++  finished_jobs_.push_back(*job_);
++  phase_ = Phase::kFinished;
++  NotifyChanged();
++}
++
++void ArcImportCoordinator::OnProfileWillBeDestroyed(Profile* profile) {
++  DetachDestination();
++}
++
++void ArcImportCoordinator::DetachDestination() {
++  profile_observation_.Reset();
++  destination_ = nullptr;
++  importer_list_.reset();
++  if (phase_ != Phase::kRunning) {
++    NotifyChanged();
++    return;
++  }
++  cancel_requested_ = true;
++  if (host_) {
++    ExternalProcessImporterHost* host = host_;
++    host->Cancel();
++  } else if (start_for_testing_) {
++    ImportEnded();
++  }
++}
++
++void ArcImportCoordinator::NotifyChanged() {
++  if (changed_pending_ || !changed_) {
++    return;
++  }
++  changed_pending_ = true;
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&ArcImportCoordinator::RunChanged,
++                                weak_factory_.GetWeakPtr()));
++}
++
++void ArcImportCoordinator::RunChanged() {
++  changed_pending_ = false;
++  // Copy: the callback may destroy this coordinator.
++  base::RepeatingClosure changed = changed_;
++  changed.Run();
++}
++
++base::DictValue ArcImportCoordinator::Snapshot() const {
++  base::ListValue sources;
++  for (const Source& source : sources_) {
++    sources.Append(base::DictValue()
++                       .Set("token", source.token)
++                       .Set("title", source.title)
++                       .Set("detail", source.detail)
++                       .Set("canImportSidebar", source.can_import_sidebar)
++                       .Set("canImportHistory", source.can_import_history)
++                       .Set("previouslyImported", source.previously_imported));
++  }
++  base::ListValue finished;
++  for (const Job& job : finished_jobs_) {
++    finished.Append(JobToDict(job));
++  }
++  base::DictValue snapshot;
++  snapshot.Set("phase", PhaseName(phase_));
++  snapshot.Set("destinationAvailable", destination_ != nullptr);
++  snapshot.Set("destinationName", DestinationName());
++  snapshot.Set("sidebarAllowed", sidebar_allowed());
++  snapshot.Set("historyAllowed", history_allowed());
++  snapshot.Set("sources", std::move(sources));
++  snapshot.Set("finishedJobs", std::move(finished));
++  if (job_) {
++    snapshot.Set("job", JobToDict(*job_));
++  }
++  return snapshot;
++}
++
++// static
++const char* ArcImportCoordinator::FailureToString(Failure failure) {
++  return FailureName(failure);
++}
++
++// static
++base::DictValue ArcImportCoordinator::JobToDict(const Job& job) {
++  return base::DictValue()
++      .Set("id", job.id)
++      .Set("token", job.token)
++      .Set("sourceTitle", job.source_title)
++      .Set("destinationName", job.destination_name)
++      .Set("includesSidebar", job.includes_sidebar)
++      .Set("includesHistory", job.includes_history)
++      .Set("refresh", job.refresh)
++      .Set("step", StepName(job.step))
++      .Set("outcome", OutcomeName(job.outcome))
++      .Set("failure", FailureName(job.failure))
++      .Set("partial", job.may_have_partial_data)
++      .Set("historyFinished", job.history_finished)
++      .Set("spaces", job.counts.spaces)
++      .Set("pins", job.counts.pins)
++      .Set("folders", job.counts.folders)
++      .Set("favorites", job.counts.favorites)
++      .Set("firstSpaceID", job.first_space_id);
++}
++
++void ArcImportCoordinator::SetDetectedSourcesForTesting(
++    std::vector<user_data_importer::SourceProfile> detected) {
++  detected_for_testing_ = std::move(detected);
++}
++
++void ArcImportCoordinator::SetStartForTesting(StartForTesting start) {
++  start_for_testing_ = std::move(start);
++}
++
++void ArcImportCoordinator::SetSidebarResultForTesting(bool received,
++                                                      bool saved) {
++  sidebar_result_for_testing_ = std::make_pair(received, saved);
++}
++
++}  // namespace arcium
+Index: src/chrome/browser/importer/arcium_arc_import_coordinator.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/importer/arcium_arc_import_coordinator.h
+@@ -0,0 +1,221 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_IMPORTER_ARCIUM_ARC_IMPORT_COORDINATOR_H_
++#define CHROME_BROWSER_IMPORTER_ARCIUM_ARC_IMPORT_COORDINATOR_H_
++
++#include <stdint.h>
++
++#include <map>
++#include <memory>
++#include <optional>
++#include <set>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "base/values.h"
++#include "chrome/browser/importer/importer_progress_observer.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_observer.h"
++#include "components/user_data_importer/common/importer_data_types.h"
++#include "ui/gfx/native_ui_types.h"
++
++class ExternalProcessImporterHost;
++class ImporterList;
++class ProfileWriter;
++
++namespace arcium {
++
++// Imports one detected Arc profile into one Arcium profile at a time.
++//
++// The coordinator owns discovery, the frozen job, the importer host while it
++// runs, and the final result. Native UI renders Snapshot() and sends intent
++// through Start() and Cancel(); it never receives filesystem paths or Profile
++// pointers. Saved sidebar data always uses ArcSidebarDestination::kPins, the
++// utility-process parser, ProfileWriter, and HeliumSpaceService reconciliation.
++class ArcImportCoordinator : public importer::ImporterProgressObserver,
++                             public ProfileObserver {
++ public:
++  enum class Phase { kDiscovering, kReady, kRunning, kFinished };
++  enum class Outcome { kNone, kSucceeded, kEmpty, kFailed, kCancelled };
++  enum class Failure {
++    kNone,
++    kBusy,
++    kNothingSelected,
++    kSourceChanged,
++    kSidebarUnreadable,
++    kSidebarNotSaved,
++    kHistoryIncomplete,
++    kDestinationClosed,
++  };
++  enum class Step { kNone, kSidebar, kHistory };
++
++  struct Source {
++    // Opaque, valid only for the discovery generation that produced it.
++    std::string token;
++    // Arc profile directory name. Matches HeliumSpace::source_profile().
++    std::string source_id;
++    std::u16string title;
++    // Set only when another detected Arc profile has the same title.
++    std::u16string detail;
++    bool can_import_sidebar = false;
++    bool can_import_history = false;
++    bool previously_imported = false;
++  };
++
++  struct Counts {
++    int spaces = 0;
++    int pins = 0;
++    int folders = 0;
++    int favorites = 0;
++    bool empty() const { return spaces == 0 && favorites == 0; }
++    bool operator==(const Counts&) const = default;
++  };
++
++  struct Job {
++    int id = 0;
++    std::string token;
++    std::string source_id;
++    std::u16string source_title;
++    std::u16string destination_name;
++    bool includes_sidebar = false;
++    bool includes_history = false;
++    bool refresh = false;
++    Step step = Step::kNone;
++    Outcome outcome = Outcome::kNone;
++    Failure failure = Failure::kNone;
++    // True after the importer started writing any category. Cancel does not
++    // roll back delivered data.
++    bool may_have_partial_data = false;
++    bool history_finished = false;
++    Counts counts;
++    std::string first_space_id;
++  };
++
++  struct OutcomeInput {
++    bool sidebar_requested = false;
++    bool history_requested = false;
++    bool sidebar_received = false;
++    bool sidebar_saved = false;
++    bool history_finished = false;
++    bool cancelled = false;
++    bool destination_alive = true;
++    Counts counts;
++  };
++
++  // Pure helpers, exposed for unit tests.
++  static std::pair<Outcome, Failure> ResolveOutcome(const OutcomeInput& input);
++  static std::vector<Source> BuildSources(
++      const std::vector<user_data_importer::SourceProfile>& detected,
++      int generation,
++      const std::set<std::string>& imported_source_ids);
++  static Counts CountImportedRecords(Profile* profile,
++                                     std::string_view source_id,
++                                     std::string* first_space_id);
++  static std::set<std::string> ImportedSourceIds(Profile* profile);
++
++  // `changed` runs asynchronously on the UI thread after every state change.
++  ArcImportCoordinator(Profile* destination, base::RepeatingClosure changed);
++  ArcImportCoordinator(const ArcImportCoordinator&) = delete;
++  ArcImportCoordinator& operator=(const ArcImportCoordinator&) = delete;
++  ~ArcImportCoordinator() override;
++
++  // Starts a new discovery generation. Ignored while a job runs.
++  void Discover();
++  // Freezes the source, destination, and categories, then starts one job.
++  // Returns kNone when the job started.
++  Failure Start(std::string_view token,
++                bool include_sidebar,
++                bool include_history);
++  // Requests cancellation. Already delivered data stays in the profile.
++  void Cancel();
++  // Returns to source selection after a finished job. Finished jobs remain in
++  // finished_jobs() so callers can show everything imported this session.
++  void Reset();
++
++  void set_parent_window(gfx::NativeWindow window) { parent_window_ = window; }
++
++  Phase phase() const { return phase_; }
++  const std::vector<Source>& sources() const { return sources_; }
++  const std::optional<Job>& job() const { return job_; }
++  const std::vector<Job>& finished_jobs() const { return finished_jobs_; }
++  Profile* destination() const { return destination_; }
++  bool sidebar_allowed() const;
++  bool history_allowed() const;
++  std::u16string DestinationName() const;
++
++  // Property-list-compatible state for native UI. Keys are documented in
++  // DESIGN.md and covered by ArciumArcImportTests.swift.
++  base::DictValue Snapshot() const;
++  static base::DictValue JobToDict(const Job& job);
++  static const char* FailureToString(Failure failure);
++
++  // importer::ImporterProgressObserver:
++  void ImportStarted() override;
++  void ImportItemStarted(user_data_importer::ImportItem item) override;
++  void ImportItemEnded(user_data_importer::ImportItem item) override;
++  void ImportEnded() override;
++
++  // ProfileObserver:
++  void OnProfileWillBeDestroyed(Profile* profile) override;
++
++  // Test seams. With a start callback set, Start() does not create an
++  // importer host; tests drive the observer methods directly.
++  using StartForTesting = base::RepeatingCallback<
++      void(const user_data_importer::SourceProfile& source, uint16_t items)>;
++  void SetDetectedSourcesForTesting(
++      std::vector<user_data_importer::SourceProfile> detected);
++  void SetStartForTesting(StartForTesting start);
++  void SetSidebarResultForTesting(bool received, bool saved);
++
++ private:
++  void OnSourcesDetected(int generation);
++  void ApplyDetectedSources(
++      const std::vector<user_data_importer::SourceProfile>& detected);
++  void Finish();
++  void DetachDestination();
++  void NotifyChanged();
++  void RunChanged();
++
++  raw_ptr<Profile> destination_;
++  base::RepeatingClosure changed_;
++  gfx::NativeWindow parent_window_ = gfx::NativeWindow();
++
++  Phase phase_ = Phase::kDiscovering;
++  int generation_ = 0;
++  std::unique_ptr<ImporterList> importer_list_;
++  std::vector<Source> sources_;
++  std::map<std::string, user_data_importer::SourceProfile> source_profiles_;
++
++  std::optional<Job> job_;
++  std::vector<Job> finished_jobs_;
++  user_data_importer::SourceProfile frozen_source_;
++  scoped_refptr<ProfileWriter> writer_;
++  // Self-deleting. Cleared in ImportEnded() before the host deletes itself and
++  // never dereferenced after Cancel().
++  raw_ptr<ExternalProcessImporterHost> host_ = nullptr;
++  bool cancel_requested_ = false;
++  bool changed_pending_ = false;
++  // Process-wide guard key for the running destination, cleared in Finish().
++  const void* busy_key_ = nullptr;
++
++  std::optional<std::vector<user_data_importer::SourceProfile>>
++      detected_for_testing_;
++  StartForTesting start_for_testing_;
++  std::optional<std::pair<bool, bool>> sidebar_result_for_testing_;
++
++  base::ScopedObservation<Profile, ProfileObserver> profile_observation_{this};
++  base::WeakPtrFactory<ArcImportCoordinator> weak_factory_{this};
++};
++
++}  // namespace arcium
++
++#endif  // CHROME_BROWSER_IMPORTER_ARCIUM_ARC_IMPORT_COORDINATOR_H_
+Index: src/chrome/browser/importer/arcium_arc_import_coordinator_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/importer/arcium_arc_import_coordinator_unittest.cc
+@@ -0,0 +1,423 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/importer/arcium_arc_import_coordinator.h"
++
++#include <optional>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/json/json_writer.h"
++#include "base/run_loop.h"
++#include "base/test/bind.h"
++#include "chrome/browser/importer/brave_external_process_importer_host.h"
++#include "chrome/browser/importer/external_process_importer_host.h"
++#include "chrome/browser/importer/profile_writer.h"
++#include "chrome/test/base/testing_profile.h"
++#include "content/public/test/browser_task_environment.h"
++#include "extensions/buildflags/buildflags.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace arcium {
++namespace {
++
++using Coordinator = ArcImportCoordinator;
++using user_data_importer::FAVORITES;
++using user_data_importer::HISTORY;
++
++user_data_importer::SourceProfile MakeSource(
++    user_data_importer::ImporterType type,
++    const std::u16string& name,
++    const char* directory,
++    uint16_t services = FAVORITES | HISTORY) {
++  user_data_importer::SourceProfile source;
++  source.importer_type = type;
++  source.importer_name = type == user_data_importer::TYPE_ARC ? u"Arc" : u"X";
++  source.profile = name;
++  source.source_path =
++      base::FilePath(FILE_PATH_LITERAL("/fixture/User Data")).AppendASCII(directory);
++  source.services_supported = services;
++  return source;
++}
++
++class ArcImportCoordinatorTest : public testing::Test {
++ protected:
++  std::unique_ptr<Coordinator> MakeCoordinator(
++      std::vector<user_data_importer::SourceProfile> detected) {
++    auto coordinator = std::make_unique<Coordinator>(
++        &profile_, base::BindLambdaForTesting([this] { ++changes_; }));
++    coordinator->SetDetectedSourcesForTesting(std::move(detected));
++    coordinator->SetStartForTesting(base::BindLambdaForTesting(
++        [this](const user_data_importer::SourceProfile& source,
++               uint16_t items) {
++          started_items_.push_back(items);
++          started_paths_.push_back(source.source_path);
++        }));
++    coordinator->Discover();
++    return coordinator;
++  }
++
++  content::BrowserTaskEnvironment task_environment_;
++  TestingProfile profile_;
++  int changes_ = 0;
++  std::vector<uint16_t> started_items_;
++  std::vector<base::FilePath> started_paths_;
++};
++
++TEST(ArcImportCoordinatorOutcomeTest, SidebarGateDecidesSuccess) {
++  Coordinator::OutcomeInput input;
++  input.sidebar_requested = true;
++  EXPECT_EQ(Coordinator::ResolveOutcome(input),
++            std::make_pair(Coordinator::Outcome::kFailed,
++                           Coordinator::Failure::kSidebarUnreadable));
++
++  input.sidebar_received = true;
++  EXPECT_EQ(Coordinator::ResolveOutcome(input),
++            std::make_pair(Coordinator::Outcome::kFailed,
++                           Coordinator::Failure::kSidebarNotSaved));
++
++  // A finished History category never proves the sidebar was saved.
++  input.history_requested = true;
++  input.history_finished = true;
++  EXPECT_EQ(Coordinator::ResolveOutcome(input).first,
++            Coordinator::Outcome::kFailed);
++
++  input.sidebar_saved = true;
++  EXPECT_EQ(Coordinator::ResolveOutcome(input).first,
++            Coordinator::Outcome::kEmpty);
++
++  input.counts.spaces = 4;
++  input.counts.pins = 123;
++  EXPECT_EQ(Coordinator::ResolveOutcome(input).first,
++            Coordinator::Outcome::kSucceeded);
++
++  input.cancelled = true;
++  EXPECT_EQ(Coordinator::ResolveOutcome(input).first,
++            Coordinator::Outcome::kCancelled);
++
++  input.destination_alive = false;
++  EXPECT_EQ(Coordinator::ResolveOutcome(input).second,
++            Coordinator::Failure::kDestinationClosed);
++}
++
++TEST(ArcImportCoordinatorOutcomeTest, SidebarCannotHideUnfinishedHistory) {
++  Coordinator::OutcomeInput input;
++  input.sidebar_requested = input.sidebar_received = input.sidebar_saved = true;
++  input.history_requested = true;
++  input.counts.spaces = 1;
++  EXPECT_EQ(Coordinator::ResolveOutcome(input),
++            std::make_pair(Coordinator::Outcome::kFailed,
++                           Coordinator::Failure::kHistoryIncomplete));
++
++  // The same rule applies to an empty successful sidebar snapshot.
++  input.counts = {};
++  EXPECT_EQ(Coordinator::ResolveOutcome(input).second,
++            Coordinator::Failure::kHistoryIncomplete);
++  input.history_finished = true;
++  EXPECT_EQ(Coordinator::ResolveOutcome(input).first,
++            Coordinator::Outcome::kEmpty);
++}
++
++TEST(ArcImportCoordinatorOutcomeTest, HistoryOnlyRequiresItsOwnCompletion) {
++  Coordinator::OutcomeInput input;
++  input.history_requested = true;
++  EXPECT_EQ(Coordinator::ResolveOutcome(input).second,
++            Coordinator::Failure::kHistoryIncomplete);
++  input.history_finished = true;
++  EXPECT_EQ(Coordinator::ResolveOutcome(input).first,
++            Coordinator::Outcome::kSucceeded);
++}
++
++TEST(ArcImportCoordinatorOutcomeTest, FavoritesOnlyIsNotEmpty) {
++  Coordinator::OutcomeInput input;
++  input.sidebar_requested = input.sidebar_received = input.sidebar_saved = true;
++  input.counts.spaces = 1;
++  input.counts.favorites = 4;
++  EXPECT_EQ(Coordinator::ResolveOutcome(input).first,
++            Coordinator::Outcome::kSucceeded);
++}
++
++TEST(ArcImportCoordinatorSourcesTest, KeepsArcAndDisambiguatesDuplicates) {
++  const auto sources = Coordinator::BuildSources(
++      {MakeSource(user_data_importer::TYPE_CHROME, u"Person", "Default"),
++       MakeSource(user_data_importer::TYPE_ARC, u"Work", "Default"),
++       MakeSource(user_data_importer::TYPE_ARC, u"Work", "Profile 2"),
++       MakeSource(user_data_importer::TYPE_ARC, u"Home", "Profile 3",
++                  HISTORY)},
++      7, {"Profile 2"});
++  ASSERT_EQ(sources.size(), 3u);
++  EXPECT_EQ(sources[0].token, "g7-1");
++  EXPECT_EQ(sources[0].detail, u"Default");
++  EXPECT_EQ(sources[1].detail, u"Profile 2");
++  EXPECT_TRUE(sources[1].previously_imported);
++  EXPECT_FALSE(sources[0].previously_imported);
++  EXPECT_TRUE(sources[2].detail.empty());
++  EXPECT_FALSE(sources[2].can_import_sidebar);
++  EXPECT_TRUE(sources[2].can_import_history);
++}
++
++TEST_F(ArcImportCoordinatorTest, HistoryStaysOffUnlessRequested) {
++  auto coordinator = MakeCoordinator(
++      {MakeSource(user_data_importer::TYPE_ARC, u"Work", "Default")});
++  ASSERT_EQ(coordinator->phase(), Coordinator::Phase::kReady);
++  const std::string token = coordinator->sources()[0].token;
++  EXPECT_EQ(coordinator->Start(token, /*include_sidebar=*/true,
++                               /*include_history=*/false),
++            Coordinator::Failure::kNone);
++  ASSERT_EQ(started_items_.size(), 1u);
++  EXPECT_EQ(started_items_[0], FAVORITES);
++  EXPECT_FALSE(coordinator->job()->includes_history);
++}
++
++TEST_F(ArcImportCoordinatorTest, NeverRequestsExtensionsOrCredentials) {
++  auto coordinator = MakeCoordinator({MakeSource(
++      user_data_importer::TYPE_ARC, u"Work", "Default",
++      user_data_importer::ALL)});
++  ASSERT_EQ(coordinator->Start(coordinator->sources()[0].token, true, true),
++            Coordinator::Failure::kNone);
++  ASSERT_EQ(started_items_.size(), 1u);
++  EXPECT_EQ(started_items_[0], FAVORITES | HISTORY);
++  EXPECT_EQ(started_items_[0] & (user_data_importer::EXTENSIONS |
++                                 user_data_importer::PASSWORDS |
++                                 user_data_importer::COOKIES),
++            0);
++}
++
++TEST_F(ArcImportCoordinatorTest, NothingSelectedDoesNotStart) {
++  auto coordinator = MakeCoordinator(
++      {MakeSource(user_data_importer::TYPE_ARC, u"Work", "Default", HISTORY)});
++  EXPECT_EQ(coordinator->Start(coordinator->sources()[0].token, true, false),
++            Coordinator::Failure::kNothingSelected);
++  EXPECT_TRUE(started_items_.empty());
++  EXPECT_EQ(coordinator->phase(), Coordinator::Phase::kReady);
++}
++
++TEST_F(ArcImportCoordinatorTest, StaleTokenIsRejectedAfterRediscovery) {
++  auto coordinator = MakeCoordinator(
++      {MakeSource(user_data_importer::TYPE_ARC, u"Work", "Default")});
++  const std::string stale = coordinator->sources()[0].token;
++  coordinator->Discover();
++  EXPECT_NE(coordinator->sources()[0].token, stale);
++  EXPECT_EQ(coordinator->Start(stale, true, false),
++            Coordinator::Failure::kSourceChanged);
++  EXPECT_TRUE(started_items_.empty());
++}
++
++TEST_F(ArcImportCoordinatorTest, SecondStartIsBlockedEverywhere) {
++  auto first = MakeCoordinator(
++      {MakeSource(user_data_importer::TYPE_ARC, u"Work", "Default"),
++       MakeSource(user_data_importer::TYPE_ARC, u"Home", "Profile 1")});
++  auto second = MakeCoordinator(
++      {MakeSource(user_data_importer::TYPE_ARC, u"Work", "Default")});
++  ASSERT_EQ(first->Start(first->sources()[0].token, true, false),
++            Coordinator::Failure::kNone);
++  EXPECT_EQ(first->Start(first->sources()[1].token, true, false),
++            Coordinator::Failure::kBusy);
++  EXPECT_EQ(second->Start(second->sources()[0].token, true, false),
++            Coordinator::Failure::kBusy);
++  EXPECT_EQ(started_items_.size(), 1u);
++  // Rediscovery cannot swap sources under a running job.
++  first->Discover();
++  EXPECT_EQ(first->phase(), Coordinator::Phase::kRunning);
++}
++
++TEST_F(ArcImportCoordinatorTest, FailureIsRetainedAndRetryGetsNewJob) {
++  auto coordinator = MakeCoordinator(
++      {MakeSource(user_data_importer::TYPE_ARC, u"Work", "Default")});
++  const std::string token = coordinator->sources()[0].token;
++  ASSERT_EQ(coordinator->Start(token, true, true), Coordinator::Failure::kNone);
++  const int first_id = coordinator->job()->id;
++  coordinator->ImportItemStarted(FAVORITES);
++  coordinator->ImportItemEnded(FAVORITES);
++  coordinator->ImportItemStarted(HISTORY);
++  coordinator->ImportItemEnded(HISTORY);
++  coordinator->SetSidebarResultForTesting(/*received=*/false, false);
++  coordinator->ImportEnded();
++
++  ASSERT_EQ(coordinator->phase(), Coordinator::Phase::kFinished);
++  EXPECT_EQ(coordinator->job()->outcome, Coordinator::Outcome::kFailed);
++  EXPECT_EQ(coordinator->job()->failure,
++            Coordinator::Failure::kSidebarUnreadable);
++  EXPECT_FALSE(coordinator->sources()[0].previously_imported);
++  ASSERT_EQ(coordinator->finished_jobs().size(), 1u);
++
++  coordinator->SetSidebarResultForTesting(true, true);
++  ASSERT_EQ(coordinator->Start(token, true, false),
++            Coordinator::Failure::kNone);
++  EXPECT_NE(coordinator->job()->id, first_id);
++  EXPECT_EQ(started_paths_[0], started_paths_[1]);
++  coordinator->ImportEnded();
++  EXPECT_EQ(coordinator->finished_jobs().size(), 2u);
++  EXPECT_EQ(coordinator->finished_jobs()[0].outcome,
++            Coordinator::Outcome::kFailed);
++}
++
++TEST_F(ArcImportCoordinatorTest, CancelReportsPossiblePartialData) {
++  auto coordinator = MakeCoordinator(
++      {MakeSource(user_data_importer::TYPE_ARC, u"Work", "Default")});
++  const std::string token = coordinator->sources()[0].token;
++
++  ASSERT_EQ(coordinator->Start(token, true, false),
++            Coordinator::Failure::kNone);
++  coordinator->Cancel();
++  EXPECT_EQ(coordinator->job()->outcome, Coordinator::Outcome::kCancelled);
++  EXPECT_FALSE(coordinator->job()->may_have_partial_data);
++
++  ASSERT_EQ(coordinator->Start(token, true, false),
++            Coordinator::Failure::kNone);
++  coordinator->ImportItemStarted(FAVORITES);
++  coordinator->Cancel();
++  coordinator->Cancel();  // Repeated cancel is a no-op.
++  EXPECT_EQ(coordinator->job()->outcome, Coordinator::Outcome::kCancelled);
++  EXPECT_TRUE(coordinator->job()->may_have_partial_data);
++  EXPECT_EQ(coordinator->finished_jobs().size(), 2u);
++}
++
++TEST_F(ArcImportCoordinatorTest, DestinationShutdownFailsRunningJob) {
++  auto coordinator = MakeCoordinator(
++      {MakeSource(user_data_importer::TYPE_ARC, u"Work", "Default")});
++  ASSERT_EQ(coordinator->Start(coordinator->sources()[0].token, true, false),
++            Coordinator::Failure::kNone);
++  coordinator->OnProfileWillBeDestroyed(&profile_);
++  EXPECT_EQ(coordinator->job()->failure,
++            Coordinator::Failure::kDestinationClosed);
++  EXPECT_EQ(coordinator->destination(), nullptr);
++  EXPECT_EQ(coordinator->Start("g1-0", true, false),
++            Coordinator::Failure::kDestinationClosed);
++}
++
++TEST_F(ArcImportCoordinatorTest, SavedSidebarRemainsRefreshableIfHistoryStops) {
++  auto coordinator = MakeCoordinator(
++      {MakeSource(user_data_importer::TYPE_ARC, u"Work", "Default")});
++  ASSERT_EQ(coordinator->Start(coordinator->sources()[0].token, true, true),
++            Coordinator::Failure::kNone);
++  coordinator->ImportItemStarted(FAVORITES);
++  coordinator->SetSidebarResultForTesting(true, true);
++  coordinator->ImportEnded();
++  EXPECT_EQ(coordinator->job()->failure,
++            Coordinator::Failure::kHistoryIncomplete);
++  EXPECT_TRUE(coordinator->sources()[0].previously_imported);
++  EXPECT_TRUE(coordinator->job()->may_have_partial_data);
++
++  // Completion released the destination slot, despite the partial failure.
++  auto retry = MakeCoordinator(
++      {MakeSource(user_data_importer::TYPE_ARC, u"Work", "Default")});
++  EXPECT_EQ(retry->Start(retry->sources()[0].token, true, false),
++            Coordinator::Failure::kNone);
++}
++
++TEST_F(ArcImportCoordinatorTest, ProfileDestructionInvalidatesReadySnapshot) {
++  int changed = 0;
++  auto profile = std::make_unique<TestingProfile>();
++  auto coordinator = std::make_unique<Coordinator>(
++      profile.get(), base::BindLambdaForTesting([&] { ++changed; }));
++  coordinator->SetDetectedSourcesForTesting(
++      {MakeSource(user_data_importer::TYPE_ARC, u"Work", "Default")});
++  coordinator->Discover();
++  base::RunLoop().RunUntilIdle();
++  const int before = changed;
++  profile.reset();
++  EXPECT_EQ(coordinator->destination(), nullptr);
++  EXPECT_FALSE(coordinator->Snapshot().FindBool("destinationAvailable").value());
++  base::RunLoop().RunUntilIdle();
++  EXPECT_GT(changed, before);
++}
++
++#if BUILDFLAG(ENABLE_EXTENSIONS)
++class ImportEndObserver : public importer::ImporterProgressObserver {
++ public:
++  void ImportStarted() override { ++started; }
++  void ImportItemStarted(user_data_importer::ImportItem) override {
++    ++items_started;
++  }
++  void ImportItemEnded(user_data_importer::ImportItem) override {
++    ++items_ended;
++  }
++  void ImportEnded() override { ++ended; }
++
++  int started = 0;
++  int items_started = 0;
++  int items_ended = 0;
++  int ended = 0;
++};
++
++class DestructionTrackingWriter : public ProfileWriter {
++ public:
++  DestructionTrackingWriter(Profile* profile, bool* destroyed)
++      : ProfileWriter(profile), destroyed_(destroyed) {}
++  ~DestructionTrackingWriter() override { *destroyed_ = true; }
++
++ private:
++  bool* destroyed_;
++};
++
++TEST_F(ArcImportCoordinatorTest, LegacyHostBlocksEveryEntryUntilActualTeardown) {
++  const auto source = MakeSource(user_data_importer::TYPE_ARC, u"Work",
++                                 "Default", user_data_importer::EXTENSIONS);
++  auto writer = base::MakeRefCounted<ProfileWriter>(&profile_);
++  ImportEndObserver first_observer;
++  auto* first = new BraveExternalProcessImporterHost();
++  first->set_observer(&first_observer);
++  // Preparation posts a fixture-only task and returns without launching the
++  // utility importer. Do not pump the UI loop before cancelling this host.
++  first->StartImportSettings(source, &profile_, user_data_importer::EXTENSIONS,
++                             writer.get());
++  ASSERT_TRUE(ExternalProcessImporterHost::IsImportRunning(&profile_));
++
++  ImportEndObserver rejected_observer;
++  bool rejected_writer_destroyed = false;
++  auto* rejected = new ExternalProcessImporterHost();
++  rejected->set_observer(&rejected_observer);
++  // first_run and bookmark-manager imports transfer a raw refcount-zero writer.
++  // The rejected host must retain/release it even though no import starts.
++  rejected->StartImportSettings(
++      source, &profile_, FAVORITES,
++      new DestructionTrackingWriter(&profile_, &rejected_writer_destroyed));
++  EXPECT_TRUE(rejected_writer_destroyed);
++  // Rejection is synchronous, emits no category success, and self-deletes.
++  EXPECT_EQ(rejected_observer.ended, 1);
++  EXPECT_EQ(rejected_observer.started, 0);
++  EXPECT_EQ(rejected_observer.items_started, 0);
++  EXPECT_EQ(rejected_observer.items_ended, 0);
++  EXPECT_FALSE(writer->arc_sidebar_snapshot_received());
++  EXPECT_TRUE(ExternalProcessImporterHost::IsImportRunning(&profile_));
++
++  auto native = MakeCoordinator(
++      {MakeSource(user_data_importer::TYPE_ARC, u"Work", "Default")});
++  EXPECT_EQ(native->Start(native->sources()[0].token, true, false),
++            Coordinator::Failure::kBusy);
++  EXPECT_TRUE(started_items_.empty());
++
++  // Legacy WebUI unload detaches its observer; it does not cancel the host.
++  first->set_observer(nullptr);
++  EXPECT_TRUE(ExternalProcessImporterHost::IsImportRunning(&profile_));
++  first->Cancel();  // Deletes first. Never access it again.
++  EXPECT_EQ(first_observer.ended, 0);
++  EXPECT_FALSE(ExternalProcessImporterHost::IsImportRunning(&profile_));
++  EXPECT_EQ(native->Start(native->sources()[0].token, true, false),
++            Coordinator::Failure::kNone);
++}
++#endif  // BUILDFLAG(ENABLE_EXTENSIONS)
++
++TEST_F(ArcImportCoordinatorTest, SnapshotHasNoFilesystemPaths) {
++  auto coordinator = MakeCoordinator(
++      {MakeSource(user_data_importer::TYPE_ARC, u"Work", "Default")});
++  std::string json;
++  ASSERT_TRUE(base::JSONWriter::Write(coordinator->Snapshot(), &json));
++  EXPECT_EQ(json.find("/fixture"), std::string::npos);
++  EXPECT_NE(json.find("\"phase\":\"ready\""), std::string::npos);
++}
++
++TEST_F(ArcImportCoordinatorTest, ChangeNotificationsAreAsynchronous) {
++  auto coordinator = MakeCoordinator(
++      {MakeSource(user_data_importer::TYPE_ARC, u"Work", "Default")});
++  const int before = changes_;
++  coordinator->Start(coordinator->sources()[0].token, true, false);
++  EXPECT_EQ(changes_, before);
++  base::RunLoop().RunUntilIdle();
++  EXPECT_GT(changes_, before);
++}
++
++}  // namespace
++}  // namespace arcium
+Index: src/chrome/browser/importer/external_process_importer_host.cc
+===================================================================
+--- src.orig/chrome/browser/importer/external_process_importer_host.cc
++++ src/chrome/browser/importer/external_process_importer_host.cc
+@@ -5,8 +5,10 @@
+ #include "chrome/browser/importer/external_process_importer_host.h"
+ 
+ #include <memory>
++#include <set>
+ 
+ #include "base/functional/bind.h"
++#include "base/no_destructor.h"
+ #include "chrome/browser/bookmarks/bookmark_model_factory.h"
+ #include "chrome/browser/importer/brave_external_process_importer_client.h"
+ #include "chrome/browser/importer/brave_in_process_importer_bridge.h"
+@@ -24,6 +26,21 @@
+ using bookmarks::BookmarkModel;
+ using content::BrowserThread;
+ 
++namespace {
++
++std::set<const void*>& ImportDestinations() {
++  static base::NoDestructor<std::set<const void*>> destinations;
++  return *destinations;
++}
++
++}  // namespace
++
++// static
++bool ExternalProcessImporterHost::IsImportRunning(Profile* target_profile) {
++  DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  return ImportDestinations().contains(target_profile);
++}
++
+ ExternalProcessImporterHost::ExternalProcessImporterHost()
+     : headless_(false),
+       parent_window_(gfx::NativeWindow()),
+@@ -48,11 +65,25 @@ void ExternalProcessImporterHost::StartI
+     uint16_t items,
+     ProfileWriter* writer) {
+   // We really only support importing from one host at a time.
++  DCHECK_CURRENTLY_ON(BrowserThread::UI);
+   DCHECK(!profile_);
+   DCHECK(target_profile);
+ 
+-  profile_ = target_profile;
++  // Some callers transfer a freshly allocated, refcount-zero writer. Retain
++  // it even for rejection so the self-deleting host releases that ownership.
++  // Retaining the writer performs no import or destination writes.
+   writer_ = writer;
++  if (IsImportRunning(target_profile)) {
++    // No item has started or written data. Report the normal terminal failure
++    // path, bypassing Brave's optional extension preparation/completion work.
++    // The observer may clear its pointer here; this host deletes itself.
++    ExternalProcessImporterHost::NotifyImportEnded();
++    return;
++  }
++  import_destination_key_ = target_profile;
++  ImportDestinations().insert(import_destination_key_);
++
++  profile_ = target_profile;
+   source_profile_ = source_profile;
+   items_ = items;
+ 
+@@ -91,7 +122,12 @@ void ExternalProcessImporterHost::Notify
+   delete this;
+ }
+ 
+-ExternalProcessImporterHost::~ExternalProcessImporterHost() = default;
++ExternalProcessImporterHost::~ExternalProcessImporterHost() {
++  DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (import_destination_key_) {
++    ImportDestinations().erase(import_destination_key_);
++  }
++}
+ 
+ void ExternalProcessImporterHost::LaunchImportIfReady() {
+   if (bookmark_model_observation_for_loading_.IsObserving() ||
+Index: src/chrome/browser/importer/external_process_importer_host.h
+===================================================================
+--- src.orig/chrome/browser/importer/external_process_importer_host.h
++++ src/chrome/browser/importer/external_process_importer_host.h
+@@ -45,6 +45,11 @@ class ExternalProcessImporterHost
+ 
+   void Cancel();
+ 
++  // UI-thread query shared by native and WebUI import entry points. The slot
++  // remains occupied until the actual host is destroyed, even if its UI stops
++  // observing it. The key is compared by address and never dereferenced.
++  static bool IsImportRunning(Profile* target_profile);
++
+   // Starts the process of importing the settings and data depending on what the
+   // user selected.
+   // |source_profile| - importer profile to import.
+@@ -127,6 +132,10 @@ class ExternalProcessImporterHost
+   // which are to be imported.
+   void CheckForLoadedModels(uint16_t items);
+ 
++  // Claimed by StartImportSettings and released only by this host's destructor.
++  // Null for a rejected start, so it cannot release another host's slot.
++  const void* import_destination_key_ = nullptr;
++
+   // True if UI is not to be shown.
+   bool headless_;
+ 
+Index: src/chrome/test/BUILD.gn
+===================================================================
+--- src.orig/chrome/test/BUILD.gn
++++ src/chrome/test/BUILD.gn
+@@ -11465,6 +11465,7 @@ if (toolkit_views) {
+ if (!is_android && toolkit_views) {
+   test("arcium_feature_settings_unit_tests") {
+     sources = [
++      "../browser/importer/arcium_arc_import_coordinator_unittest.cc",
+       "../browser/chrome_content_browser_client_unittest.cc",
+       "../browser/ui/views/tabs/common/persistent_tab_view_unittest.cc",
+       "../browser/extensions/api/settings_private/prefs_util_unittest.cc",
+@@ -11493,6 +11494,8 @@ if (!is_android && toolkit_views) {
+       "//chrome/browser/extensions:extensions",
+       "//chrome/browser/extensions:test_support",
+       "//chrome/browser/favicon",
++      "//chrome/browser/importer",
++      "//chrome/browser/importer:impl",
+       "//chrome/browser/renderer_context_menu:impl",
+       "//chrome/browser/renderer_context_menu:mock_test_support",
+       "//chrome/browser/renderer_context_menu:renderer_context_menu",
+@@ -11519,6 +11522,7 @@ if (!is_android && toolkit_views) {
+       "//components/variations:test_support",
+       "//content/public/browser",
+       "//content/test:test_support",
++      "//extensions/buildflags",
+       "//testing/gmock",
+       "//testing/gtest",
+       "//ui/base",
