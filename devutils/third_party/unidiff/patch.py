@@ -304,6 +304,13 @@ class PatchedFile(list):
         elif (self.target_file.startswith('b/') and
               self.source_file == '/dev/null'):
             filepath = self.target_file[2:]
+        elif (self.source_file.startswith('src.orig/') and
+              (self.target_file.startswith('src/') or
+               self.target_file == '/dev/null')):
+            filepath = self.source_file[len('src.orig/'):]
+        elif (self.target_file.startswith('src/') and
+              self.source_file == '/dev/null'):
+            filepath = self.target_file[len('src/'):]
         else:
             filepath = self.source_file
         return filepath

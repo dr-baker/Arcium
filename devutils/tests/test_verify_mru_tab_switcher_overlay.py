@@ -6,6 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import verify_mru_tab_switcher_overlay
+
 sys.path.pop(0)
 
 

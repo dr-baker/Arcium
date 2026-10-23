@@ -7,13 +7,11 @@ post-change side of each hunk so deleted backend selection cannot fail a check.
 import re
 from pathlib import Path
 
-
 PATCHES = Path(__file__).resolve().parents[2] / "patches" / "personal"
 BACKEND_SELECTION = re.compile(
     r"\b(?:GlassBackend|GetRequestedGlassBackend|ResolveGlassBackend|"
     r"ResolveGlassSurface|SetBackend|GetGlassFrameBackend|kArciumGlassBackendSwitch)\b"
-    r"|\bparams\s*\.\s*backend\b|(?:->|\.)\s*backend\s*\("
-)
+    r"|\bparams\s*\.\s*backend\b|(?:->|\.)\s*backend\s*\(")
 
 
 def _post_change_files(patch):
@@ -46,10 +44,8 @@ def _read_patch(name):
 
 def _assert_no_backend_selection(files):
     violations = [
-        f"{path}: {line.strip()}"
-        for path, content in files.items()
-        for line in content.splitlines()
-        if BACKEND_SELECTION.search(line)
+        f"{path}: {line.strip()}" for path, content in files.items()
+        for line in content.splitlines() if BACKEND_SELECTION.search(line)
     ]
     assert not violations, "Consumer chooses a glass backend:\n" + "\n".join(violations)
 
@@ -60,9 +56,8 @@ def test_mru_consumers_do_not_select_glass_backend():
         for path, content in _read_patch("arcium-mru-tab-switcher.patch").items()
         if not Path(path).stem.endswith(("_unittest", "_browsertest"))
     }
-    assert any("GlassSurface" in content for content in files.values()), (
-        "Expected MRU glass consumer is missing"
-    )
+    assert any("GlassSurface" in content
+               for content in files.values()), ("Expected MRU glass consumer is missing")
     _assert_no_backend_selection(files)
 
 
@@ -80,8 +75,7 @@ def test_glass_surface_params_do_not_expose_backend():
     params = re.search(r"\bstruct GlassSurfaceParams\s*\{(.*?)^\};", header, re.M | re.S)
     assert params, "Expected complete GlassSurfaceParams definition in glass patch"
     assert not re.search(r"\b(?:backend|GlassBackend)\b", params.group(1)), (
-        "GlassSurfaceParams must describe appearance without exposing backend selection"
-    )
+        "GlassSurfaceParams must describe appearance without exposing backend selection")
 
 
 def test_native_widget_does_not_select_glass_backend():
@@ -91,9 +85,8 @@ def test_native_widget_does_not_select_glass_backend():
         for path, content in files.items()
         if Path(path).name in ("browser_native_widget_mac.h", "browser_native_widget_mac.mm")
     }
-    assert any(path.endswith(".mm") for path in native_widgets), (
-        "Expected native widget glass integration is missing"
-    )
+    assert any(path.endswith(".mm")
+               for path in native_widgets), ("Expected native widget glass integration is missing")
     _assert_no_backend_selection(native_widgets)
 
 
@@ -118,44 +111,37 @@ def test_native_glass_integration_does_not_use_legacy_controls():
         for path, content in files.items()
         if not Path(path).stem.endswith(("_unittest", "_browsertest"))
     }
-    assert any(Path(path).name == "native_frame_materials.cc" for path in integration), (
-        "Expected shared native material policy is missing"
-    )
+    assert any(Path(path).name == "native_frame_materials.cc"
+               for path in integration), ("Expected shared native material policy is missing")
     legacy_controls = re.compile(
         r"\b(?:HeliumNativeFrameAvailable|ShouldUseNativeFrameMaterials|"
         r"OnNativeFrameMaterialsPrefChanged|kHeliumNativeFrameMaterials\w*|"
         r"heliumNativeFrameMaterials|nativeFrameMaterials\w*|"
         r"showNativeFrameMaterialsOption_?|IDS_SETTINGS_NATIVE_FRAME_MATERIALS\w*)\b"
-        r"|helium-native-frame-materials|helium\.(?:browser\.)?native_frame_materials"
-    )
+        r"|helium-native-frame-materials|helium\.(?:browser\.)?native_frame_materials")
     violations = [
-        f"{path}: {line.strip()}"
-        for path, content in integration.items()
-        for line in content.splitlines()
-        if legacy_controls.search(line)
+        f"{path}: {line.strip()}" for path, content in integration.items()
+        for line in content.splitlines() if legacy_controls.search(line)
     ]
     assert not violations, "Legacy controls survive glass integration:\n" + "\n".join(violations)
 
 
 def test_glass_patch_removes_legacy_control_registrations():
     patch = (PATCHES / "arcium-glass-system.patch").read_text(encoding="utf-8")
-    removed = "\n".join(
-        line[1:] for line in patch.splitlines()
-        if line.startswith("-") and not line.startswith("--- ")
-    )
+    removed = "\n".join(line[1:] for line in patch.splitlines()
+                        if line.startswith("-") and not line.startswith("--- "))
     # Absence in post-change hunks alone cannot prove untouched registrations
     # were removed. Require explicit removal evidence for every control family.
     for control in (
-        "kHeliumNativeFrameMaterialsCommandLine",
-        "kHeliumNativeFrameMaterials",
-        "helium.browser.native_frame_materials",
-        "showNativeFrameMaterialsOption",
-        "showNativeFrameMaterialsOption_",
-        "IDS_SETTINGS_NATIVE_FRAME_MATERIALS",
-        "IDS_SETTINGS_NATIVE_FRAME_MATERIALS_DESCRIPTION",
-        "nativeFrameMaterials",
-        "OnNativeFrameMaterialsPrefChanged",
+            "kHeliumNativeFrameMaterialsCommandLine",
+            "kHeliumNativeFrameMaterials",
+            "helium.browser.native_frame_materials",
+            "showNativeFrameMaterialsOption",
+            "showNativeFrameMaterialsOption_",
+            "IDS_SETTINGS_NATIVE_FRAME_MATERIALS",
+            "IDS_SETTINGS_NATIVE_FRAME_MATERIALS_DESCRIPTION",
+            "nativeFrameMaterials",
+            "OnNativeFrameMaterialsPrefChanged",
     ):
-        assert re.search(r"(?<!\w)" + re.escape(control) + r"(?!\w)", removed), (
-            f"Glass patch must explicitly remove legacy control {control}"
-        )
+        assert re.search(r"(?<!\w)" + re.escape(control) + r"(?!\w)",
+                         removed), (f"Glass patch must explicitly remove legacy control {control}")

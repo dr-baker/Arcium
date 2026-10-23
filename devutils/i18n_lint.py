@@ -13,6 +13,7 @@ I18N_DIR = Path(__file__).resolve().parent.parent / 'i18n'
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'utils'))
 from i18n_apply import to_xtb_message # pylint: disable=wrong-import-position
+import name_substitution_utils as namesub # pylint: disable=wrong-import-position
 
 sys.path.pop(0)
 
@@ -63,7 +64,7 @@ def main():
                 errors += 1
                 continue
 
-            key = (entry['name'], entry['source'])
+            key = (entry['name'], namesub.replace_text(entry['source'])[0])
             source_entry = source_by_key.get(key)
             if source_entry is None:
                 print(f'{path.name}[{i}] ({entry["name"]}): '

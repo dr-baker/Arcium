@@ -5,6 +5,8 @@
 
 from third_party import unidiff
 
+from _common import parse_series as _parse_series
+
 LICENSE_HEADER_IGNORES = ["html", "license", "readme", "deps"]
 
 patches_dir = None
@@ -24,7 +26,7 @@ def _init(root):
     global patches_dir
     global series
     patches_dir = root / "patches"
-    series = set(_read_text("series"))
+    series = set(_parse_series(patches_dir / "series"))
 
 
 def a_all_patches_in_series_exist():

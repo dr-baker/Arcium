@@ -10,7 +10,9 @@ import inspect
 import argparse
 from pathlib import Path
 
-import _lint_tests
+sys.path.append(str(Path(__file__).resolve().parent.parent / "utils"))
+
+import _lint_tests # pylint: disable=wrong-import-position
 
 
 def parse_args():

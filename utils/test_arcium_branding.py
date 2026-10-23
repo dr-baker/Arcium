@@ -9,6 +9,7 @@ import name_substitution_utils as namesub
 
 
 class ArciumBrandingTest(unittest.TestCase):
+
     def test_product_copy_and_attribution(self):
         name_substitution.replacement_sanity()
         for source, expected in (
@@ -25,8 +26,8 @@ class ArciumBrandingTest(unittest.TestCase):
 
     def test_translation_id_uses_displayed_english(self):
         with patch.object(namesub, "compute_fp", side_effect=lambda msg: msg.text):
-            self.assertEqual("Meet Arcium", i18n_apply.get_id(
-                "IDS_WELCOME", "Greeting", "Meet Helium", ""))
+            self.assertEqual("Meet Arcium",
+                             i18n_apply.get_id("IDS_WELCOME", "Greeting", "Meet Helium", ""))
 
     def test_upstream_link_label_keeps_its_fingerprint(self):
         text = 'Built from <ph name="BEGIN_LINK_CHROMIUM">$1</ph>Chromium'
