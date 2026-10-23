@@ -1,0 +1,986 @@
+Index: src/chrome/browser/importer/arcium_arc_spaces_import.cc
+===================================================================
+--- src.orig/chrome/browser/importer/arcium_arc_spaces_import.cc
++++ src/chrome/browser/importer/arcium_arc_spaces_import.cc
+@@ -229,44 +229,65 @@ void ArcSpacesImport::SourcesDetected(in
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+       base::BindOnce(&ArcSpacesImport::ReadInventory, std::move(sources),
+-                     base::Uuid::GenerateRandomV4().AsLowercaseString()),
++                     base::Uuid::GenerateRandomV4().AsLowercaseString(),
++                     std::nullopt),
+       base::BindOnce(&ArcSpacesImport::InventoryReady,
+                      weak_factory_.GetWeakPtr(), generation));
+ }
+ ArcSpacesImport::Inventory ArcSpacesImport::ReadInventory(
+     std::vector<user_data_importer::SourceProfile> sources,
+-    std::string nonce) {
++    std::string nonce,
++    std::optional<std::string> machine_id_override) {
+   Inventory inventory;
+-  const std::string local_machine_id = LocalMachineId();
++  const std::string local_machine_id =
++      machine_id_override ? *machine_id_override : LocalMachineId();
+   std::map<base::FilePath, std::optional<std::string>> files;
+   std::set<std::string> identities;
++  using RecordKey = std::pair<base::FilePath, std::string>;
++  std::set<RecordKey> foreign_spaces, foreign_favorites;
++  std::set<RecordKey> available_spaces, available_favorites;
+   std::map<std::u16string, int> label_counts, label_ordinals;
+   for (const auto& source : sources)
+     ++label_counts[source.profile.empty() ? u"Arc" : source.profile];
+   for (const auto& source : sources) {
+     const auto path = SidebarPath(source);
++    const std::string source_id = source.source_path.BaseName().AsUTF8Unsafe();
++    const std::string source_machine_id = local_machine_id;
++    std::string identity_material = path.AsUTF8Unsafe();
++    identity_material.append(1, '\0').append(source_id).append(1, '\0').append(
++        source_machine_id);
++    const std::string identity = Digest(identity_material);
++    // Discovery can repeat a source. Deduplicate exclusions as well as imports.
++    if (!identities.insert(identity).second)
++      continue;
+     if (!files.contains(path))
+       files.emplace(path, ReadStable(path));
+     const auto& bytes = files.at(path);
+     auto root = bytes ? base::JSONReader::ReadDict(
+                             *bytes, base::JSON_PARSE_CHROMIUM_EXTENSIONS)
+                       : std::nullopt;
+-    const std::string source_id = source.source_path.BaseName().AsUTF8Unsafe();
+-    auto snapshot =
+-        root ? ParseArcSidebarSnapshot(*root, source_id, local_machine_id)
+-             : std::nullopt;
++    ArcSidebarUnavailable unavailable;
++    auto snapshot = root ? ParseArcSidebarSnapshot(
++                               *root, source_id, local_machine_id, &unavailable)
++                         : std::nullopt;
+     if (!snapshot) {
+-      // Do not silently report a successful empty inventory on parse failure.
+-      inventory.failure = "sidebar_unreadable";
++      if (unavailable.foreign_profile) {
++        for (const auto& id : unavailable.space_ids)
++          foreign_spaces.emplace(path, id);
++        for (const auto& id : unavailable.favorite_ids)
++          foreign_favorites.emplace(path, id);
++      }
++      if (!unavailable.foreign_profile || unavailable.incomplete) {
++        ++inventory.availability.unreadable_sources;
++        // A genuine read/identity failure must not look like an empty source.
++        inventory.failure = "sidebar_unreadable";
++      }
+       continue;
+     }
+-    const std::string source_machine_id = local_machine_id;
+-    std::string identity_material = path.AsUTF8Unsafe();
+-    identity_material.append(1, '\0').append(source_id).append(1, '\0').append(
+-        source_machine_id);
+-    const std::string identity = Digest(identity_material);
+-    if (!identities.insert(identity).second)
+-      continue;
++    for (const auto& space : snapshot->spaces)
++      available_spaces.emplace(path, space.id);
++    for (const auto& favorite : snapshot->favorites)
++      available_favorites.emplace(path, favorite.source_id);
+     int favorites = 0, favorite_folders = 0;
+     Count(snapshot->favorites, favorites, favorite_folders);
+     const std::u16string base_label =
+@@ -305,6 +326,16 @@ ArcSpacesImport::Inventory ArcSpacesImpo
+       inventory.entries.push_back(std::move(entry));
+     }
+   }
++  // A shared root can occur under several profiles. Count each excluded saved
++  // record once, and never call a record missing if a local source provides it.
++  for (const auto& key : foreign_spaces) {
++    if (!available_spaces.contains(key))
++      ++inventory.availability.foreign_spaces;
++  }
++  for (const auto& key : foreign_favorites) {
++    if (!available_favorites.contains(key))
++      ++inventory.availability.foreign_favorites;
++  }
+   return inventory;
+ }
+ void ArcSpacesImport::InventoryReady(int generation, Inventory inventory) {
+@@ -312,6 +343,7 @@ void ArcSpacesImport::InventoryReady(int
+     return;
+   entries_ = std::move(inventory.entries);
+   failure_ = std::move(inventory.failure);
++  availability_ = inventory.availability;
+   phase_ = entries_.empty() && !failure_.empty() ? "failed" : "ready";
+   Changed();
+ }
+@@ -841,6 +873,11 @@ base::DictValue ArcSpacesImport::Snapsho
+       .Set("batchId", batch_id_)
+       .Set("phase", phase_)
+       .Set("failure", failure_)
++      .Set("availability",
++           base::DictValue()
++               .Set("foreignSpaces", availability_.foreign_spaces)
++               .Set("foreignFavorites", availability_.foreign_favorites)
++               .Set("unreadableSources", availability_.unreadable_sources))
+       .Set("spaces", std::move(entries))
+       .Set("jobs", std::move(jobs))
+       .Set("canOpen", CanOpen(batch_id_));
+Index: src/chrome/browser/importer/arcium_arc_spaces_import.h
+===================================================================
+--- src.orig/chrome/browser/importer/arcium_arc_spaces_import.h
++++ src/chrome/browser/importer/arcium_arc_spaces_import.h
+@@ -90,9 +90,15 @@ class ArcSpacesImport {
+   friend class ArcSpacesImportTestPeer;
+   friend class ArcSpacesImportBrowserTestPeer;
+ 
++  struct Availability {
++    int foreign_spaces = 0;
++    int foreign_favorites = 0;
++    int unreadable_sources = 0;
++  };
+   struct Inventory {
+     std::vector<Entry> entries;
+     std::string failure;
++    Availability availability;
+   };
+   struct Result {
+     int id = 0;
+@@ -104,7 +110,8 @@ class ArcSpacesImport {
+   struct SourceLease;
+   static Inventory ReadInventory(
+       std::vector<user_data_importer::SourceProfile> sources,
+-      std::string nonce);
++      std::string nonce,
++      std::optional<std::string> machine_id_override);
+   static bool SourcesUnchanged(std::vector<Group> groups,
+                                std::optional<std::string> machine_id_override);
+   static void DestinationInitialized(base::WeakPtr<ArcSpacesImport> owner,
+@@ -139,6 +146,7 @@ class ArcSpacesImport {
+   std::string phase_ = "ready", failure_;
+   std::optional<std::string> machine_id_for_testing_;
+   std::vector<Entry> entries_;
++  Availability availability_;
+   std::vector<Group> groups_;
+   std::vector<Result> results_, previous_results_;
+   size_t current_ = 0;
+Index: src/chrome/browser/importer/arcium_arc_spaces_import_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/importer/arcium_arc_spaces_import_unittest.cc
++++ src/chrome/browser/importer/arcium_arc_spaces_import_unittest.cc
+@@ -43,6 +43,23 @@ class ArcSpacesImportTestPeer {
+                           importer.generation_, std::move(inventory));
+   }
+ 
++  static void ReadFixture(
++      ArcSpacesImport& importer,
++      std::vector<user_data_importer::SourceProfile> sources) {
++    BeginLoading(importer);
++    importer.InventoryReady(importer.generation_,
++                            ArcSpacesImport::ReadInventory(
++                                std::move(sources), "nonce", "local-mac"));
++  }
++
++  static base::OnceClosure AvailabilityReply(ArcSpacesImport& importer) {
++    ArcSpacesImport::Inventory inventory;
++    inventory.availability.foreign_favorites = 4;
++    return base::BindOnce(&ArcSpacesImport::InventoryReady,
++                          importer.weak_factory_.GetWeakPtr(),
++                          importer.generation_, std::move(inventory));
++  }
++
+   static bool HasDiscovery(const ArcSpacesImport& importer) {
+     return !!importer.importer_list_;
+   }
+@@ -318,5 +335,97 @@ TEST_F(ArcSpacesImportLifecycleTest,
+   ASSERT_TRUE(base::WriteFile(entry_.sidebar_path, changed));
+   EXPECT_FALSE(ArcSpacesImport::SourcesUnchangedForTesting(*groups));
+ }
++TEST_F(ArcSpacesImportLifecycleTest,
++       AvailabilityCountsExcludedRecordsOnceAcrossSources) {
++  const char* fixture = R"json({"sidebar":{"containers":[{"global":{}},{
++    "items":["favorites",{"childrenIds":["f1","f2","f3","f4"],"data":{"itemContainer":{}}},
++      "f1",{"data":{"tab":{"savedURL":"https://same.example/"}}},
++      "f2",{"data":{"tab":{"savedURL":"https://same.example/"}}},
++      "f3",{"data":{"tab":{"savedURL":"https://three.example/"}}},
++      "f4",{"data":{"tab":{"savedURL":"https://four.example/"}}}],
++    "spaces":[],
++    "topAppsContainerIDs":[
++      {"custom":{"directoryBasename":"Profile 1","machineID":"foreign-mac"}},"favorites",
++      {"custom":{"directoryBasename":"Profile 2","machineID":"foreign-mac"}},"favorites"]
++  }]}})json";
++  auto root = base::JSONReader::ReadDict(fixture, base::JSON_PARSE_RFC);
++  ASSERT_TRUE(root);
++  auto& data =
++      (*root->FindDict("sidebar")->FindList("containers"))[1].GetDict();
++  for (int i = 0; i < 7; ++i) {
++    data.FindList("spaces")->Append("s" + base::NumberToString(i));
++    data.FindList("spaces")->Append(
++        base::DictValue()
++            .Set("title", "Saved Space")
++            .Set("profile", base::DictValue().Set("default", true)));
++  }
++  std::string json;
++  ASSERT_TRUE(base::JSONWriter::Write(*root, &json));
++  ASSERT_TRUE(base::WriteFile(entry_.sidebar_path, json));
++  auto first = entry_.source;
++  first.source_path = temp_.GetPath().AppendASCII("Profile 1");
++  auto second = first;
++  second.source_path = temp_.GetPath().AppendASCII("Profile 2");
++  ASSERT_TRUE(base::CreateDirectory(first.source_path));
++  ASSERT_TRUE(base::CreateDirectory(second.source_path));
++  ArcSpacesImport importer(base::DoNothing());
++  ArcSpacesImportTestPeer::ReadFixture(importer,
++                                       {entry_.source, first, first, second});
++  auto result = importer.Snapshot();
++  EXPECT_EQ("ready", *result.FindString("phase"));
++  EXPECT_TRUE(result.FindString("failure")->empty());
++  ASSERT_EQ(7u, result.FindList("spaces")->size());
++  auto* availability = result.FindDict("availability");
++  ASSERT_TRUE(availability);
++  EXPECT_EQ(0, availability->FindInt("foreignSpaces"));
++  EXPECT_EQ(4, availability->FindInt("foreignFavorites"));
++  EXPECT_EQ(0, availability->FindInt("unreadableSources"));
++  // A local profile with the same saved records makes them available, not
++  // excluded. Favorites count by ID, so two links with one URL remain two.
++  data.FindList("topAppsContainerIDs")
++      ->Append(base::DictValue().Set("default", true));
++  data.FindList("topAppsContainerIDs")->Append("favorites");
++  ASSERT_TRUE(base::JSONWriter::Write(*root, &json));
++  ASSERT_TRUE(base::WriteFile(entry_.sidebar_path, json));
++  ArcSpacesImportTestPeer::ReadFixture(importer,
++                                       {first, second, entry_.source});
++  result = importer.Snapshot();
++  EXPECT_EQ(0, result.FindDict("availability")->FindInt("foreignFavorites"));
++}
++
++TEST_F(ArcSpacesImportLifecycleTest,
++       AvailabilityReplacesCountsAndRejectsLateDiscovery) {
++  ArcSpacesImport importer(base::DoNothing());
++  ArcSpacesImportTestPeer::BeginLoading(importer);
++  auto obsolete = ArcSpacesImportTestPeer::AvailabilityReply(importer);
++  ArcSpacesImportTestPeer::BeginLoading(importer);
++  auto accepted = ArcSpacesImportTestPeer::AvailabilityReply(importer);
++  std::move(accepted).Run();
++  EXPECT_EQ(4, importer.Snapshot()
++                   .FindDict("availability")
++                   ->FindInt("foreignFavorites"));
++  // A later completed empty inventory clears the old count. The stale reply
++  // must not put it back.
++  ArcSpacesImportTestPeer::ReadFixture(importer, {});
++  std::move(obsolete).Run();
++  EXPECT_EQ(0, importer.Snapshot()
++                   .FindDict("availability")
++                   ->FindInt("foreignFavorites"));
++}
++
++TEST_F(ArcSpacesImportLifecycleTest,
++       UnreadableSourceCountDeduplicatesDiscoveryRows) {
++  ArcSpacesImport importer(base::DoNothing());
++  // SetUp writes deliberately invalid sidebar JSON.
++  ArcSpacesImportTestPeer::ReadFixture(importer,
++                                       {entry_.source, entry_.source});
++  auto result = importer.Snapshot();
++  EXPECT_EQ("failed", *result.FindString("phase"));
++  EXPECT_EQ("sidebar_unreadable", *result.FindString("failure"));
++  EXPECT_EQ(1, result.FindDict("availability")->FindInt("unreadableSources"));
++  EXPECT_EQ(0, result.FindDict("availability")->FindInt("foreignSpaces"));
++  EXPECT_EQ(0, result.FindDict("availability")->FindInt("foreignFavorites"));
++}
++
+ }  // namespace
+ }  // namespace arcium
+Index: src/chrome/utility/importer/arc_sidebar_snapshot.cc
+===================================================================
+--- src.orig/chrome/utility/importer/arc_sidebar_snapshot.cc
++++ src/chrome/utility/importer/arc_sidebar_snapshot.cc
+@@ -171,7 +171,8 @@ std::optional<ProfileIdentity> ParseProf
+ std::optional<ProfileIdentity> ResolveLocalProfileIdentity(
+     const base::DictValue& sidebar_data,
+     std::string_view directory,
+-    std::string_view local_machine_id) {
++    std::string_view local_machine_id,
++    std::vector<ProfileIdentity>* foreign_profiles) {
+   if (directory == "Default") {
+     return ProfileIdentity{.directory = "Default", .is_default = true};
+   }
+@@ -208,8 +209,16 @@ std::optional<ProfileIdentity> ResolveLo
+   if (!machines.empty()) {
+     // A basename is only a local directory hint, not a cross-device identity.
+     // Other machines' descriptors may coexist in the global synced sidebar.
+-    if (local_machine_id.empty() ||
+-        !machines.contains(std::string(local_machine_id))) {
++    if (local_machine_id.empty()) {
++      return std::nullopt;
++    }
++    if (!machines.contains(std::string(local_machine_id))) {
++      if (foreign_profiles) {
++        for (const auto& machine : machines) {
++          foreign_profiles->push_back(ProfileIdentity{
++              .directory = std::string(directory), .machine_id = machine});
++        }
++      }
+       return std::nullopt;
+     }
+     return ProfileIdentity{.directory = std::string(directory),
+@@ -283,9 +292,13 @@ void AppendNodes(const std::string& item
+                  WalkMode mode,
+                  const std::map<std::string, RawItem>& items,
+                  std::unordered_set<std::string>* ancestors,
+-                 std::vector<ArcSidebarNode>* output) {
++                 std::vector<ArcSidebarNode>* output,
++                 bool* incomplete = nullptr) {
+   const auto item_it = items.find(item_id);
+   if (item_it == items.end() || !ancestors->insert(item_id).second) {
++    if (incomplete) {
++      *incomplete = true;
++    }
+     return;
+   }
+ 
+@@ -309,7 +322,7 @@ void AppendNodes(const std::string& item
+         // contains a structural wrapper here, retain its tab order without
+         // emitting a folder that the normalized model cannot represent.
+         for (const std::string& child_id : item.children_ids) {
+-          AppendNodes(child_id, mode, items, ancestors, output);
++          AppendNodes(child_id, mode, items, ancestors, output, incomplete);
+         }
+         break;
+       }
+@@ -321,7 +334,8 @@ void AppendNodes(const std::string& item
+           .collapsed = item.collapsed,
+       };
+       for (const std::string& child_id : item.children_ids) {
+-        AppendNodes(child_id, mode, items, ancestors, &folder.children);
++        AppendNodes(child_id, mode, items, ancestors, &folder.children,
++                    incomplete);
+       }
+       output->push_back(std::move(folder));
+       break;
+@@ -333,7 +347,7 @@ void AppendNodes(const std::string& item
+       // model has no split node. Flatten their children at the split's exact
+       // position so tabs and folders retain relative sidebar order.
+       for (const std::string& child_id : item.children_ids) {
+-        AppendNodes(child_id, mode, items, ancestors, output);
++        AppendNodes(child_id, mode, items, ancestors, output, incomplete);
+       }
+       break;
+   }
+@@ -359,7 +373,8 @@ std::string FindPinnedContainerId(const
+ void ParseFavorites(const base::DictValue& sidebar_data,
+                     const ProfileIdentity& source_profile,
+                     const std::map<std::string, RawItem>& items,
+-                    std::vector<ArcSidebarNode>* favorites) {
++                    std::vector<ArcSidebarNode>* favorites,
++                    bool* incomplete = nullptr) {
+   const base::ListValue* top_apps =
+       sidebar_data.FindList("topAppsContainerIDs");
+   if (!top_apps) {
+@@ -369,30 +384,38 @@ void ParseFavorites(const base::DictValu
+   for (size_t i = 0; i + 1 < top_apps->size(); i += 2) {
+     const base::DictValue* profile = (*top_apps)[i].GetIfDict();
+     const std::string* container_id = (*top_apps)[i + 1].GetIfString();
+-    if (!container_id ||
+-        !MatchesProfile(profile, source_profile)) {
++    if (!MatchesProfile(profile, source_profile)) {
++      continue;
++    }
++    if (!container_id || container_id->empty()) {
++      if (incomplete) {
++        *incomplete = true;
++      }
+       continue;
+     }
+     std::unordered_set<std::string> ancestors;
+     AppendNodes(*container_id, WalkMode::kFavorites, items, &ancestors,
+-                favorites);
++                favorites, incomplete);
+   }
+ }
+ 
+ void ParseSpaces(const base::DictValue& sidebar_data,
+                  const ProfileIdentity& source_profile,
+                  const std::map<std::string, RawItem>& items,
+-                 std::vector<ArcSidebarSpace>* spaces) {
++                 std::vector<ArcSidebarSpace>* spaces,
++                 bool* incomplete = nullptr) {
+   const base::ListValue* space_values = sidebar_data.FindList("spaces");
+   if (!space_values) {
+     return;
+   }
+ 
++  std::set<std::string> seen;
+   for (size_t i = 0; i + 1 < space_values->size(); i += 2) {
+     const std::string* space_id = (*space_values)[i].GetIfString();
+     const base::DictValue* space_value = (*space_values)[i + 1].GetIfDict();
+     if (!space_id || space_id->empty() || !space_value ||
+-        !MatchesProfile(space_value->FindDict("profile"), source_profile)) {
++        !MatchesProfile(space_value->FindDict("profile"), source_profile) ||
++        !seen.insert(*space_id).second) {
+       continue;
+     }
+ 
+@@ -408,7 +431,7 @@ void ParseSpaces(const base::DictValue&
+     if (!pinned_container_id.empty()) {
+       std::unordered_set<std::string> ancestors;
+       AppendNodes(pinned_container_id, WalkMode::kPins, items, &ancestors,
+-                  &space.pins);
++                  &space.pins, incomplete);
+     }
+     spaces->push_back(std::move(space));
+   }
+@@ -466,7 +489,11 @@ base::DictValue ArcSidebarSnapshot::ToDi
+ std::optional<ArcSidebarSnapshot> ParseArcSidebarSnapshot(
+     const base::DictValue& root,
+     std::string_view source_profile_directory,
+-    std::string_view local_machine_id) {
++    std::string_view local_machine_id,
++    ArcSidebarUnavailable* unavailable) {
++  if (unavailable) {
++    *unavailable = {};
++  }
+   if (source_profile_directory.empty()) {
+     return std::nullopt;
+   }
+@@ -479,9 +506,45 @@ std::optional<ArcSidebarSnapshot> ParseA
+   if (!item_values) {
+     return std::nullopt;
+   }
++  // A saved Space ID identifies one record in the global sidebar. Conflicting
++  // copies cannot establish either a local import or an exclusion count.
++  std::map<std::string, const base::DictValue*> saved_spaces;
++  if (const auto* spaces = sidebar_data->FindList("spaces")) {
++    for (size_t i = 0; i + 1 < spaces->size(); i += 2) {
++      const auto* id = (*spaces)[i].GetIfString();
++      const auto* space = (*spaces)[i + 1].GetIfDict();
++      if (!id || !space) {
++        continue;
++      }
++      auto [it, inserted] = saved_spaces.emplace(*id, space);
++      if (!inserted && *it->second != *space) {
++        return std::nullopt;
++      }
++    }
++  }
++  std::vector<ProfileIdentity> foreign_profiles;
+   const auto source_profile = ResolveLocalProfileIdentity(
+-      *sidebar_data, source_profile_directory, local_machine_id);
++      *sidebar_data, source_profile_directory, local_machine_id,
++      unavailable ? &foreign_profiles : nullptr);
+   if (!source_profile) {
++    if (unavailable && !foreign_profiles.empty()) {
++      unavailable->foreign_profile = true;
++      const auto items = ParseItems(*item_values);
++      for (const auto& foreign : foreign_profiles) {
++        std::vector<ArcSidebarSpace> spaces;
++        std::vector<ArcSidebarNode> favorites;
++        ParseSpaces(*sidebar_data, foreign, items, &spaces,
++                    &unavailable->incomplete);
++        ParseFavorites(*sidebar_data, foreign, items, &favorites,
++                       &unavailable->incomplete);
++        for (const auto& space : spaces) {
++          unavailable->space_ids.insert(space.id);
++        }
++        for (const auto& favorite : favorites) {
++          unavailable->favorite_ids.insert(favorite.source_id);
++        }
++      }
++    }
+     return std::nullopt;
+   }
+   const std::map<std::string, RawItem> items = ParseItems(*item_values);
+Index: src/chrome/utility/importer/arc_sidebar_snapshot.h
+===================================================================
+--- src.orig/chrome/utility/importer/arc_sidebar_snapshot.h
++++ src/chrome/utility/importer/arc_sidebar_snapshot.h
+@@ -6,6 +6,7 @@
+ #define CHROME_UTILITY_IMPORTER_ARC_SIDEBAR_SNAPSHOT_H_
+ 
+ #include <optional>
++#include <set>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -56,6 +57,18 @@ struct ArcSidebarSnapshot {
+   base::DictValue ToDict() const;
+ };
+ 
++// Diagnostic counts for a rejected, explicitly foreign-machine profile. These
++// are valid saved records, not cached profile names or guesses about other
++// Macs. A foreign profile with no saved records has nothing to warn about.
++struct ArcSidebarUnavailable {
++  bool foreign_profile = false;
++  bool incomplete = false;
++  // Internal identities allow inventory-wide deduplication within one sidebar.
++  // They are never serialized to the onboarding page.
++  std::set<std::string> space_ids;
++  std::set<std::string> favorite_ids;
++};
++
+ // Parses one Arc profile from a decoded StorableSidebar.json root. Returns a
+ // snapshot even when that profile currently has no favorites or Spaces.
+ // Returns nullopt when the root schema is missing or the requested profile is
+@@ -66,7 +79,8 @@ struct ArcSidebarSnapshot {
+ std::optional<ArcSidebarSnapshot> ParseArcSidebarSnapshot(
+     const base::DictValue& root,
+     std::string_view source_profile_directory,
+-    std::string_view local_machine_id = {});
++    std::string_view local_machine_id = {},
++    ArcSidebarUnavailable* unavailable = nullptr);
+ 
+ }  // namespace arcium
+ 
+Index: src/chrome/utility/importer/arc_sidebar_snapshot_unittest.cc
+===================================================================
+--- src.orig/chrome/utility/importer/arc_sidebar_snapshot_unittest.cc
++++ src/chrome/utility/importer/arc_sidebar_snapshot_unittest.cc
+@@ -695,5 +695,127 @@ TEST(ArcSidebarSnapshotTest, RejectsMixe
+   EXPECT_FALSE(ParseArcSidebarSnapshot(*root, kProfile, "local-machine"));
+ }
+ 
++TEST(ArcSidebarSnapshotTest, ForeignNoticeCountsSavedRecordsNotProfiles) {
++  auto root = ParseFixture();
++  ASSERT_TRUE(root);
++  SetFixtureMachine(*root, "foreign-machine");
++  ArcSidebarUnavailable unavailable;
++  EXPECT_FALSE(
++      ParseArcSidebarSnapshot(*root, kProfile, "local-machine", &unavailable));
++  EXPECT_TRUE(unavailable.foreign_profile);
++  EXPECT_EQ(2, unavailable.space_ids.size());
++  EXPECT_EQ(2, unavailable.favorite_ids.size());
++  FixtureSidebarData(*root).Set("spaces", base::ListValue());
++  EXPECT_FALSE(
++      ParseArcSidebarSnapshot(*root, kProfile, "local-machine", &unavailable));
++  EXPECT_TRUE(unavailable.foreign_profile);
++  EXPECT_EQ(0, unavailable.space_ids.size());
++  EXPECT_EQ(2, unavailable.favorite_ids.size());
++}
++
++TEST(ArcSidebarSnapshotTest, ForeignEmptySourceDoesNotInventMissingRecords) {
++  auto root = ParseFixture();
++  ASSERT_TRUE(root);
++  SetFixtureMachine(*root, "foreign-machine");
++  auto& data = FixtureSidebarData(*root);
++  data.Set("spaces", base::ListValue());
++  // The foreign profile still exists, but its Favorites root is empty.
++  (*data.FindList("items"))[1].GetDict().Set("childrenIds", base::ListValue());
++  ArcSidebarUnavailable unavailable;
++  EXPECT_FALSE(
++      ParseArcSidebarSnapshot(*root, kProfile, "local-machine", &unavailable));
++  EXPECT_TRUE(unavailable.foreign_profile);
++  EXPECT_EQ(0, unavailable.space_ids.size());
++  EXPECT_EQ(0, unavailable.favorite_ids.size());
++}
++
++TEST(ArcSidebarSnapshotTest, ForeignNoticeDeduplicatesIdsAcrossMachineRecords) {
++  auto root = ParseFixture();
++  ASSERT_TRUE(root);
++  SetFixtureMachine(*root, "first-foreign-machine");
++  auto* top_apps = FixtureSidebarData(*root).FindList("topAppsContainerIDs");
++  top_apps->Append(CustomIdentity("second-foreign-machine"));
++  top_apps->Append("favorites-container");
++  top_apps->Append(CustomIdentity("third-foreign-machine"));
++  top_apps->Append("other-favorites");
++  ArcSidebarUnavailable unavailable;
++  EXPECT_FALSE(
++      ParseArcSidebarSnapshot(*root, kProfile, "local-machine", &unavailable));
++  EXPECT_TRUE(unavailable.foreign_profile);
++  EXPECT_EQ(2, unavailable.space_ids.size());
++  EXPECT_EQ(3, unavailable.favorite_ids.size());
++}
++
++TEST(ArcSidebarSnapshotTest, UnknownIdentityIsNotDescribedAsAnotherMac) {
++  auto root = ParseFixture();
++  ASSERT_TRUE(root);
++  SetFixtureMachine(*root, "foreign-machine");
++  ArcSidebarUnavailable unavailable;
++  EXPECT_FALSE(ParseArcSidebarSnapshot(*root, kProfile, "", &unavailable));
++  EXPECT_FALSE(unavailable.foreign_profile);
++  EXPECT_EQ(0, unavailable.space_ids.size());
++  EXPECT_EQ(0, unavailable.favorite_ids.size());
++  SetFixtureMachine(*root, "");
++  EXPECT_FALSE(
++      ParseArcSidebarSnapshot(*root, kProfile, "local-machine", &unavailable));
++  EXPECT_FALSE(unavailable.foreign_profile);
++}
++
++TEST(ArcSidebarSnapshotTest, LocalReadClearsEarlierForeignDiagnostics) {
++  auto root = ParseFixture();
++  ASSERT_TRUE(root);
++  SetFixtureMachine(*root, "foreign-machine");
++  ArcSidebarUnavailable unavailable;
++  EXPECT_FALSE(
++      ParseArcSidebarSnapshot(*root, kProfile, "local-machine", &unavailable));
++  ASSERT_GT(unavailable.favorite_ids.size(), 0);
++  EXPECT_TRUE(ParseArcSidebarSnapshot(*root, kProfile, "foreign-machine",
++                                      &unavailable));
++  EXPECT_FALSE(unavailable.foreign_profile);
++  EXPECT_EQ(0, unavailable.space_ids.size());
++  EXPECT_EQ(0, unavailable.favorite_ids.size());
++}
++
++TEST(ArcSidebarSnapshotTest, BrokenForeignRootIsNotAnEmptyProfile) {
++  auto root = ParseFixture();
++  ASSERT_TRUE(root);
++  SetFixtureMachine(*root, "foreign-machine");
++  auto& data = FixtureSidebarData(*root);
++  data.Set("spaces", base::ListValue());
++  auto* top_apps = data.FindList("topAppsContainerIDs");
++  top_apps->Append(CustomIdentity("foreign-machine"));
++  top_apps->Append("missing-container");
++  ArcSidebarUnavailable unavailable;
++  EXPECT_FALSE(
++      ParseArcSidebarSnapshot(*root, kProfile, "local-machine", &unavailable));
++  EXPECT_TRUE(unavailable.foreign_profile);
++  EXPECT_TRUE(unavailable.incomplete);
++  EXPECT_EQ(2u, unavailable.favorite_ids.size());
++}
++
++TEST(ArcSidebarSnapshotTest, ConflictingSpaceIdsCannotHideForeignExclusions) {
++  auto root = ParseFixture();
++  ASSERT_TRUE(root);
++  SetFixtureMachine(*root, "local-machine");
++  auto* spaces = FixtureSidebarData(*root).FindList("spaces");
++  auto repeated_id = (*spaces)[0].Clone();
++  auto repeated = (*spaces)[1].Clone();
++  // Byte-equivalent repeated records are still one saved Space.
++  spaces->Append(repeated_id.Clone());
++  spaces->Append(repeated.Clone());
++  auto local = ParseArcSidebarSnapshot(*root, kProfile, "local-machine");
++  ASSERT_TRUE(local);
++  EXPECT_EQ(2u, local->spaces.size());
++  // Same ID, different identity cannot be subtracted from excluded totals as
++  // though the local profile made the foreign record available.
++  repeated.GetDict().Set("profile", CustomIdentity("foreign-machine"));
++  spaces->Append(std::move(repeated_id));
++  spaces->Append(std::move(repeated));
++  ArcSidebarUnavailable unavailable;
++  EXPECT_FALSE(
++      ParseArcSidebarSnapshot(*root, kProfile, "local-machine", &unavailable));
++  EXPECT_FALSE(unavailable.foreign_profile);
++}
++
+ }  // namespace
+ }  // namespace arcium
+Index: src/components/helium_onboarding/helium_onboarding_strings.grdp
+===================================================================
+--- src.orig/components/helium_onboarding/helium_onboarding_strings.grdp
++++ src/components/helium_onboarding/helium_onboarding_strings.grdp
+@@ -308,8 +308,29 @@
+ <message name="IDS_HELIUM_ONBOARDING_SPACES_CHECK_AGAIN" desc="Button that reads Arc's Spaces again. After an import, Spaces imported earlier become selectable so they can be refreshed.">
+   Check again
+ </message>
++  <message name="IDS_HELIUM_ONBOARDING_SPACES_NOT_INCLUDED" desc="Explanation of saved Arc records excluded from import, shown beside selection or results.">
++    Not included
++  </message>
++  <message name="IDS_HELIUM_ONBOARDING_SPACES_FOREIGN_SPACES_ONE" desc="Explanation of saved Arc records excluded from import, shown beside selection or results.">
++    1 Space is saved under an Arc profile from another Mac and isn't included in this import.
++  </message>
++  <message name="IDS_HELIUM_ONBOARDING_SPACES_FOREIGN_SPACES_MANY" desc="Explanation of saved Arc records excluded from import, shown beside selection or results.">
++    <ph name="COUNT">$1<ex>2</ex></ph> Spaces are saved under Arc profiles from another Mac and aren't included in this import.
++  </message>
++  <message name="IDS_HELIUM_ONBOARDING_SPACES_FOREIGN_FAVORITES_ONE" desc="Explanation of saved Arc records excluded from import, shown beside selection or results.">
++    1 Favorite is saved under an Arc profile from another Mac and isn't included in this import.
++  </message>
++  <message name="IDS_HELIUM_ONBOARDING_SPACES_FOREIGN_FAVORITES_MANY" desc="Explanation of saved Arc records excluded from import, shown beside selection or results.">
++    <ph name="COUNT">$1<ex>4</ex></ph> Favorites are saved under Arc profiles from another Mac and aren't included in this import.
++  </message>
++  <message name="IDS_HELIUM_ONBOARDING_SPACES_UNREADABLE_ONE" desc="Explanation of saved Arc records excluded from import, shown beside selection or results.">
++    Arcium couldn't verify the saved sidebar for 1 Arc profile. Its Spaces and Favorites aren't included.
++  </message>
++  <message name="IDS_HELIUM_ONBOARDING_SPACES_UNREADABLE_MANY" desc="Explanation of saved Arc records excluded from import, shown beside selection or results.">
++    Arcium couldn't verify the saved sidebar for <ph name="COUNT">$1<ex>2</ex></ph> Arc profiles. Their Spaces and Favorites aren't included.
++  </message>
+ <message name="IDS_HELIUM_ONBOARDING_SPACES_PARTIAL_READ" desc="Note when Arc discovery omitted unavailable or unreadable data. Kept through imports until a completed clean inventory.">
+-  Some Arc data isn’t available for import on this Mac. Only the Spaces shown here are included.
++  Arcium couldn't read part of Arc's saved sidebar. Some saved items may not be included.
+ </message>
+ <message name="IDS_HELIUM_ONBOARDING_SPACES_IMPORT" desc="Primary button that imports the selection when it contains Favorites but no Space.">
+   Import
+Index: src/components/helium_onboarding/src/components/ImportAvailability.svelte
+===================================================================
+--- /dev/null
++++ src/components/helium_onboarding/src/components/ImportAvailability.svelte
+@@ -0,0 +1,41 @@
++<!-- Copyright 2026 The Arcium Authors. SPDX-License-Identifier: GPL-3.0-only -->
++<script lang="ts">
++    import { s } from "../lib/strings";
++    import { availabilityNotes, type Spaces } from "../lib/arc";
++
++    let { model }: { model: Spaces.Model } = $props();
++    const notes = $derived(availabilityNotes(model));
++</script>
++
++{#if notes.length}
++    <aside class="availability" role="status" aria-label={s.spaces.notIncluded}>
++        <h3>{s.spaces.notIncluded}</h3>
++        {#each notes as note}
++            <p>{note}</p>
++        {/each}
++    </aside>
++{/if}
++
++<style>
++    .availability {
++        width: 100%;
++        box-sizing: border-box;
++        padding: 16px 20px;
++        margin: 12px 0;
++        border-radius: 20px;
++        background: color-mix(in srgb, currentColor 5%, transparent);
++        text-align: left;
++        font-size: 14px;
++        line-height: 1.5;
++    }
++    h3 {
++        font-size: inherit;
++        font-weight: 600;
++        margin: 0 0 4px;
++    }
++    p {
++        margin: 0;
++        opacity: 0.75;
++    }
++    p + p { margin-top: 8px; }
++</style>
+Index: src/components/helium_onboarding/src/lib/arc/index.ts
+===================================================================
+--- src.orig/components/helium_onboarding/src/lib/arc/index.ts
++++ src/components/helium_onboarding/src/lib/arc/index.ts
+@@ -25,6 +25,23 @@ export const pinsLabel = (n: number) =>
+ export const favoritesLabel = (n: number) =>
+     plural(n, s.spaces.favoritesOne, s.spaces.favoritesMany);
+ 
++/** Details only for actual exclusions. Never infer missing Spaces from a profile. */
++export const availabilityNotes = (model: Spaces.Model): string[] => {
++    if (!Spaces.inventoryIncomplete(model)) return [];
++    const detail = model.availability;
++    const notes: string[] = [];
++    if (detail?.foreignSpaces) {
++        notes.push(plural(detail.foreignSpaces, s.spaces.foreignSpacesOne, s.spaces.foreignSpacesMany));
++    }
++    if (detail?.foreignFavorites) {
++        notes.push(plural(detail.foreignFavorites, s.spaces.foreignFavoritesOne, s.spaces.foreignFavoritesMany));
++    }
++    if (detail?.unreadableSources) {
++        notes.push(plural(detail.unreadableSources, s.spaces.unreadableOne, s.spaces.unreadableMany));
++    }
++    return notes.length ? notes : [s.spaces.partialRead];
++};
++
+ export const failureLabel = (failure: string | undefined) => {
+     switch (failure) {
+     case 'busy': return s.spaces.failureBusy;
+Index: src/components/helium_onboarding/src/lib/arc/spaces.ts
+===================================================================
+--- src.orig/components/helium_onboarding/src/lib/arc/spaces.ts
++++ src/components/helium_onboarding/src/lib/arc/spaces.ts
+@@ -6,6 +6,7 @@
+ // History is on, and which Spaces finished in an earlier batch.
+ 
+ import type {
++    ArcAvailability,
+     ArcJob,
+     ArcJobState,
+     ArcPhase,
+@@ -75,6 +76,7 @@ export type Model = {
+     partialData: ReadonlySet<SpaceKey>;
+     /** Inventory omissions persist through jobs and unsuccessful rereads. */
+     inventoryIncomplete: boolean;
++    availability: ArcAvailability | null;
+     /** Imported earlier in this page, unlocked by an explicit refresh. */
+     again: ReadonlySet<SpaceKey>;
+     refresh: Refresh;
+@@ -101,6 +103,7 @@ export const initialModel = (): Model =>
+     results: new Map(),
+     partialData: new Set(),
+     inventoryIncomplete: false,
++    availability: null,
+     again: new Set(),
+     refresh: 'auto',
+     batch: null,
+@@ -174,6 +177,21 @@ const parseJob = (value: unknown): ArcJo
+     };
+ };
+ 
++const parseAvailability = (value: unknown): ArcAvailability | undefined => {
++    if (!isRecord(value)) return undefined;
++    const keys = ['foreignSpaces', 'foreignFavorites', 'unreadableSources'] as const;
++    if (keys.some(key => !Number.isSafeInteger(value[key]) || (value[key] as number) < 0)) {
++        return undefined;
++    }
++    return {
++        foreignSpaces: value.foreignSpaces as number,
++        foreignFavorites: value.foreignFavorites as number,
++        unreadableSources: value.unreadableSources as number,
++    };
++};
++const hasUnavailable = (value: ArcAvailability | undefined) =>
++    !!value && (value.foreignSpaces > 0 || value.foreignFavorites > 0 || value.unreadableSources > 0);
++
+ const unique = (values: string[]) => new Set(values).size === values.length;
+ 
+ /**
+@@ -201,6 +219,7 @@ export const parseState = (raw: unknown)
+         batchId: raw.batchId,
+         phase: raw.phase as ArcPhase,
+         failure: code(raw.failure),
++        availability: parseAvailability(raw.availability),
+         spaces: valid,
+         jobs: jobs as ArcJob[],
+         canOpen: raw.canOpen === true,
+@@ -422,10 +441,10 @@ export const applySnapshot = (model: Mod
+     // Only a completed inventory can remove an earlier inventory warning.
+     // Start clears the handler's failure field, so job snapshots cannot prove
+     // that sources omitted during discovery have become available.
+-    if (snapshot.generation > 0 && snapshot.phase === 'ready') {
+-        next.inventoryIncomplete = !!snapshot.failure;
+-    } else if (snapshot.phase === 'failed' && snapshot.failure === 'sidebar_unreadable') {
+-        next.inventoryIncomplete = true;
++    if (snapshot.generation > 0 && (snapshot.phase === 'ready' ||
++        (snapshot.phase === 'failed' && snapshot.failure === 'sidebar_unreadable'))) {
++        next.availability = snapshot.availability ?? null;
++        next.inventoryIncomplete = hasUnavailable(snapshot.availability) || !!snapshot.failure;
+     }
+ 
+     // A new inventory. Failures belonged to old tokens and History is opted
+Index: src/components/helium_onboarding/src/lib/cr/arc_space_import_proxy.ts
+===================================================================
+--- src.orig/components/helium_onboarding/src/lib/cr/arc_space_import_proxy.ts
++++ src/components/helium_onboarding/src/lib/cr/arc_space_import_proxy.ts
+@@ -53,11 +53,19 @@ export interface ArcJob {
+     counts: ArcJobCounts;
+ }
+ 
++export interface ArcAvailability {
++    foreignSpaces: number;
++    foreignFavorites: number;
++    unreadableSources: number;
++}
++
+ export interface ArcState {
+     generation: number;
+     batchId: number;
+     phase: ArcPhase;
+     failure: string;
++    /** Optional for older handlers; record counts, never profile guesses. */
++    availability?: ArcAvailability;
+     spaces: ArcSpace[];
+     /** Session ledger, old attempts first; the latest job wins for a token. */
+     jobs: ArcJob[];
+Index: src/components/helium_onboarding/src/pages/ArcSpaces.svelte
+===================================================================
+--- src.orig/components/helium_onboarding/src/pages/ArcSpaces.svelte
++++ src/components/helium_onboarding/src/pages/ArcSpaces.svelte
+@@ -4,6 +4,7 @@
+     import { currentPage } from "../lib/onboarding-flow";
+     import { arcImport, Spaces, spacesStatus } from "../lib/arc";
+ 
++    import ImportAvailability from "../components/ImportAvailability.svelte";
+     import PageHeader from "../components/PageHeader.svelte";
+     import SpaceTile from "../components/SpaceTile.svelte";
+ 
+@@ -24,7 +25,6 @@
+     const openFailureOutsideGrid = $derived(
+         $arc.notice === "open_failed" && (load !== "ready" || !all.length)
+     );
+-    const partialRead = $derived(Spaces.inventoryIncomplete($arc));
+ 
+     $effect(() => {
+         if (visible) {
+@@ -112,9 +112,7 @@
+             {#if openFailureOutsideGrid}
+                 <p class="note" role="alert">{s.spaces.openFailed}</p>
+             {/if}
+-            {#if partialRead}
+-                <p class="note" role="status">{s.spaces.partialRead}</p>
+-            {/if}
++            <ImportAvailability model={$arc} />
+             {#if partialData}
+                 <p class="note" role="status">{s.spaces.partialData}</p>
+             {/if}
+Index: src/components/helium_onboarding/src/pages/Welcome.svelte
+===================================================================
+--- src.orig/components/helium_onboarding/src/pages/Welcome.svelte
++++ src/components/helium_onboarding/src/pages/Welcome.svelte
+@@ -16,6 +16,7 @@
+     import { arcImport, oneClickStatus, Spaces } from "../lib/arc";
+ 
+     import SpaceRow from "../components/SpaceRow.svelte";
++    import ImportAvailability from "../components/ImportAvailability.svelte";
+     import AppearanceAction from "../components/AppearanceAction.svelte";
+ 
+     const arc = arcImport.state;
+@@ -41,7 +42,6 @@
+     const rows = $derived(sent ? Spaces.entries($arc) : []);
+     const shown = $derived(Spaces.outcomes($arc));
+     const partialData = $derived(Spaces.summarize($arc).partial);
+-    const partialRead = $derived(Spaces.inventoryIncomplete($arc));
+ 
+     // Reading Arc's sidebar is not importing it. The inventory loads with the
+     // page so the click is quick; only the button starts an import. Leaving
+@@ -237,8 +237,8 @@
+             {#if partialData}
+                 <p class="note" role="status">{s.spaces.partialData}</p>
+             {/if}
+-            {#if partialRead}
+-                <p class="note">{s.spaces.partialRead}</p>
++            {#if sent || view.kind === "failed"}
++                <ImportAvailability model={$arc} />
+             {/if}
+             <p class="scope">{s.welcome.arcScope}</p>
+             {/if}
+Index: src/components/helium_onboarding/tests/arc-inventory-warning.test.mjs
+===================================================================
+--- src.orig/components/helium_onboarding/tests/arc-inventory-warning.test.mjs
++++ src/components/helium_onboarding/tests/arc-inventory-warning.test.mjs
+@@ -91,3 +91,54 @@ test('empty valid source has no warning;
+     assert.equal(warning(apply(S.initialModel(), snapshot({spaces: []}))), false);
+     assert.equal(warning(apply(S.initialModel(), snapshot({phase: 'failed', spaces: [], failure: 'sidebar_unreadable'}))), true);
+ });
++
++const favoritesElsewhere = {foreignSpaces: 0, foreignFavorites: 4, unreadableSources: 0};
++
++test('foreign Favorites do not imply missing Spaces or a read failure', () => {
++    const model = apply(S.initialModel(), snapshot({availability: favoritesElsewhere}));
++    assert.equal(model.snapshot.failure, '');
++    assert.equal(warning(model), true);
++    assert.deepEqual(model.availability, favoritesElsewhere);
++    assert.equal(model.availability.foreignSpaces, 0);
++});
++
++test('empty foreign cache has no notice and does not block a valid empty inventory', () => {
++    const model = apply(S.initialModel(), snapshot({spaces: [], availability: {
++        foreignSpaces: 0, foreignFavorites: 0, unreadableSources: 0,
++    }}));
++    assert.equal(warning(model), false);
++    assert.equal(S.load(model), 'ready');
++});
++
++test('actual exclusion details survive import and loading, and clean discovery clears them', () => {
++    let model = apply(S.initialModel(), snapshot({availability: favoritesElsewhere}));
++    model = apply(model, snapshot({batchId: 1, phase: 'running'}));
++    model = apply(model, snapshot({batchId: 1, phase: 'finished'}));
++    assert.deepEqual(model.availability, favoritesElsewhere);
++    model = apply(model, snapshot({generation: 2, phase: 'loading', spaces: []}));
++    assert.deepEqual(model.availability, favoritesElsewhere);
++    model = S.markUnreachable(model);
++    assert.deepEqual(model.availability, favoritesElsewhere);
++    model = apply(model, snapshot({generation: 2}));
++    assert.equal(warning(model), false);
++    assert.equal(model.availability, null);
++});
++
++test('completed discovery replaces counts instead of accumulating, and late replies cannot clear them', () => {
++    let model = apply(S.initialModel(), snapshot({availability: favoritesElsewhere}));
++    const changed = {foreignSpaces: 1, foreignFavorites: 0, unreadableSources: 2};
++    model = apply(model, snapshot({generation: 2, availability: changed}));
++    assert.deepEqual(model.availability, changed);
++    model = apply(model, snapshot());
++    assert.deepEqual(model.availability, changed);
++});
++
++test('optional malformed counters never fabricate exclusion totals or reject valid imports', () => {
++    for (const bad of [-1, 0.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1, '4', null]) {
++        const model = apply(S.initialModel(), snapshot({failure: 'sidebar_unreadable',
++            availability: {...favoritesElsewhere, foreignFavorites: bad}}));
++        assert.equal(model.availability, null);
++        assert.equal(warning(model), true);
++        assert.equal(S.entries(model).length, 1);
++    }
++});
