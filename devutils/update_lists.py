@@ -40,8 +40,6 @@ _ENCODING = 'UTF-8'
 PRUNING_INCLUDE_PATTERNS = [
     'components/domain_reliability/baked_in_configs/*',
     # Removals for patches/core/ungoogled-chromium/remove-unused-preferences-fields.patch
-    'components/safe_browsing/core/common/safe_browsing_prefs.cc',
-    'components/safe_browsing/core/common/safe_browsing_prefs.h',
     'components/signin/public/base/signin_pref_names.cc',
     'components/signin/public/base/signin_pref_names.h',
 ]
