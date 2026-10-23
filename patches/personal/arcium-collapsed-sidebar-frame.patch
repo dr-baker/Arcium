@@ -370,7 +370,7 @@
  #include "chrome/browser/ui/views/helium/frame_corner_radius.h"
  #include "chrome/browser/ui/views/helium/peek_controller.h"
  #include "chrome/browser/ui/views/indigo/indigo_toolbar.h"
-@@ -363,25 +364,30 @@ void ContentsContainerView::UpdateBorder
+@@ -363,25 +364,31 @@ void ContentsContainerView::UpdateBorder
      return;
    }
  
@@ -406,16 +406,18 @@
    const gfx::RoundedCornersF container_rounded_corners(
        upper_left_radius, upper_right_radius, lower_right_radius,
        lower_left_radius);
-   const int inner_padding = is_in_split_ ? kSplitViewContentPadding : 0;
+-  const int inner_padding = is_in_split_ ? kSplitViewContentPadding : 0;
 -  const gfx::RoundedCornersF inner_rounded_corners(
 -      upper_left_radius - inner_padding, upper_right_radius - inner_padding,
 -      lower_right_radius - inner_padding, lower_left_radius - inner_padding);
++  // Match GetContentsBounds(): the split inset includes both its padding and
++  // outline thickness. Subtracting only padding moves the clipping arc's center.
 +  const auto inner_rounded_corners =
-+      InsetFrameRadii(container_rounded_corners, gfx::InsetsF(inner_padding));
++      InsetFrameRadii(container_rounded_corners, gfx::InsetsF(GetInsets()));
  
    container_outline_->SetCornerRadii(container_rounded_corners);
    if (capture_contents_border_view_) {
-@@ -400,6 +406,8 @@ void ContentsContainerView::ChildVisibil
+@@ -400,6 +407,8 @@ void ContentsContainerView::ChildVisibil
  void ContentsContainerView::Layout(PassKey pass_key) {
    LayoutSuperclass<views::View>(this);
  
@@ -653,7 +655,7 @@
  
    UpdateContentsBorderAndOverlay();
  }
-@@ -465,8 +472,9 @@ void MultiContentsView::MaybeUpdateBorde
+@@ -465,19 +472,19 @@ void MultiContentsView::MaybeUpdateBorde
    }
  }
  
@@ -665,7 +667,22 @@
  }
  
  MultiContentsView::AttachedChromeEdges
-@@ -562,14 +570,15 @@ views::ProposedLayout MultiContentsView:
+ MultiContentsView::GetAttachedChromeEdges() const {
+-  const bool split_view = IsInSplitView();
+   AttachedChromeEdges edges;
+   edges.top = IsTopChromeAttachedForBorder();
+-  edges.leading = contents_separators_.leading_side_chrome_attached ||
+-                  (split_view && split_view_insets_.left() == 0);
+-  edges.trailing = contents_separators_.trailing_side_chrome_attached ||
+-                   (split_view && split_view_insets_.right() == 0);
++  // Zero spacing can also mean a bare window edge with a zero-width frame.
++  // Layout provides explicit attachment state for sidebars and side panels.
++  edges.leading = contents_separators_.leading_side_chrome_attached;
++  edges.trailing = contents_separators_.trailing_side_chrome_attached;
+   return edges;
+ }
+ 
+@@ -562,14 +569,15 @@ views::ProposedLayout MultiContentsView:
    if (IsInSplitView()) {
      available_space.Inset(split_view_insets_);
    } else if (should_use_rounded_frame) {
@@ -685,7 +702,7 @@
      available_space.Inset(single_insets);
    }
    ViewSizes sizes = GetViewSizes(available_space);
-@@ -720,7 +729,11 @@ gfx::Rect MultiContentsView::CalculateDr
+@@ -720,7 +728,11 @@ gfx::Rect MultiContentsView::CalculateDr
    if (!is_drop_target_on_bottom) {
      int top_margin = 0;
      if (IsInSplitView() || should_use_rounded_frame || zen_mode) {
@@ -698,7 +715,7 @@
      } else if (contents_separators_.should_show_top) {
        top_margin =
            contents_separators_.top_separator->GetPreferredSize().height();
-@@ -923,8 +936,12 @@ void MultiContentsView::UpdateContentsBo
+@@ -923,8 +935,12 @@ void MultiContentsView::UpdateContentsBo
          is_in_split, should_round_contents, is_active,
          is_active && active_contents_view_highlighted_,
          use_system_top_left_radius && is_first_view,
@@ -713,7 +730,7 @@
          use_system_bottom_right_radius && is_last_view);
    }
  }
-@@ -970,6 +987,12 @@ void MultiContentsView::OnRoundedFramePr
+@@ -970,6 +986,12 @@ void MultiContentsView::OnRoundedFramePr
    UpdateContentsBorderAndOverlay();
    InvalidateLayout();
    browser_view_->InvalidateLayout();
@@ -747,7 +764,13 @@
    static constexpr int kMinWebContentsSize = 200;
 --- a/chrome/browser/ui/views/frame/multi_contents_view_browsertest.cc
 +++ b/chrome/browser/ui/views/frame/multi_contents_view_browsertest.cc
-@@ -19,6 +19,8 @@
+@@ -15,10 +15,14 @@
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+ #include "chrome/browser/ui/tabs/tab_model.h"
+ #include "chrome/browser/ui/ui_features.h"
++#include "chrome/browser/ui/views/frame/contents_container_view.h"
++#include "chrome/browser/ui/views/frame/contents_web_view.h"
+ #include "chrome/browser/ui/views/frame/custom_floating_corner.h"
  #include "chrome/browser/ui/views/frame/multi_contents_drop_target_view.h"
  #include "chrome/browser/ui/views/frame/multi_contents_view_delegate.h"
  #include "chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller.h"
@@ -756,10 +779,67 @@
  #include "chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h"
  #include "chrome/browser/ui/views/test/split_view_browser_test_mixin.h"
  #include "chrome/common/pref_names.h"
-@@ -93,6 +95,82 @@ class MultiContentsViewBrowserTest
+@@ -93,6 +97,139 @@ class MultiContentsViewBrowserTest
      : public SplitViewBrowserTestMixin<InProcessBrowserTest> {};
  
  IN_PROC_BROWSER_TEST_F(MultiContentsViewBrowserTest,
++                       SplitContentCornersShareOutlineCenter) {
++  MultiContentsView* view = multi_contents_view();
++  PrefService* prefs = browser()->profile()->GetPrefs();
++  prefs->SetBoolean(prefs::kHeliumRoundedFrame, true);
++  prefs->SetInteger(arcium::kChromeUIScalePref, 100);
++  prefs->SetInteger(arcium::kChromeFrameBorderWidthPref, 3);
++  RunScheduledLayouts();
++
++  auto* tab_strip_model = browser()->tab_strip_model();
++  const int active_index = tab_strip_model->active_index();
++  chrome::NewSplitTab(browser(), split_tabs::SplitTabLayout::kSideBySide,
++                      split_tabs::SplitTabCreatedSource::kToolbarButton);
++  ASSERT_TRUE(content::WaitForLoadStop(
++      tab_strip_model->GetWebContentsAt(active_index + 1)));
++  RunScheduledLayouts();
++  ASSERT_TRUE(view->IsInSplitView());
++  ASSERT_EQ(2u, view->contents_container_views().size());
++
++  // Compare actual layout positions and applied clipping radii, rather than
++  // repeating the radius helper. The split outline is centered on its stroke,
++  // while the content is inset by both the outline and the content padding.
++  for (int scale : {100, 125}) {
++    SCOPED_TRACE(scale);
++    prefs->SetInteger(arcium::kChromeUIScalePref, scale);
++    for (int border_width : {0, 3}) {
++      SCOPED_TRACE(border_width);
++      prefs->SetInteger(arcium::kChromeFrameBorderWidthPref, border_width);
++      RunScheduledLayouts();
++      auto* container = view->contents_container_views().back();
++      auto* contents = container->contents_view();
++      const float outer_radius =
++          GetFrameRadiiForView(container,
++                               arcium::GetChromeFrameBorderWidth(container))
++              .lower_right();
++      const float inner_radius = contents->GetBackgroundRadii().lower_right();
++      ASSERT_GT(outer_radius, container->GetInsets().right());
++      ASSERT_GT(outer_radius, container->GetInsets().bottom());
++      EXPECT_FLOAT_EQ(container->width() - outer_radius,
++                      contents->bounds().right() - inner_radius);
++      EXPECT_FLOAT_EQ(container->height() - outer_radius,
++                      contents->bounds().bottom() - inner_radius);
++
++      // The corner beside the split divider remains an interior corner.
++      auto* first_container = view->contents_container_views().front();
++      auto* first_contents = first_container->contents_view();
++      const float seam_outer_radius = GetGenericFrameRadius();
++      const float seam_inner_radius =
++          first_contents->GetBackgroundRadii().lower_right();
++      EXPECT_FLOAT_EQ(first_container->width() - seam_outer_radius,
++                      first_contents->bounds().right() - seam_inner_radius);
++      EXPECT_FLOAT_EQ(first_container->height() - seam_outer_radius,
++                      first_contents->bounds().bottom() - seam_inner_radius);
++    }
++  }
++}
++
++IN_PROC_BROWSER_TEST_F(MultiContentsViewBrowserTest,
 +                       RoundedFrameBorderWidthLayout) {
 +  MultiContentsView* view = multi_contents_view();
 +  PrefService* prefs = browser()->profile()->GetPrefs();
@@ -1030,8 +1110,8 @@
 +int GetFrameRadiusForContentInset(int content_inset);
  int GetPaddedFrameRadius();
  
-+// Inset each corner against its two adjacent edges. Both dimensions must
-+// remain concentric; a corner far from either window edge is an interior one.
++// Insets each corner by its larger adjacent gap. Equal gaps preserve the
++// circular corner center; unequal gaps use a limiting radius policy.
 +gfx::RoundedCornersF InsetFrameRadii(const gfx::RoundedCornersF& radii,
 +                                     const gfx::InsetsF& insets);
 +gfx::RoundedCornersF GetFrameRadiiForView(const views::View* view,
