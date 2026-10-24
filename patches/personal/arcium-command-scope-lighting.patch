@@ -1,0 +1,409 @@
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
+@@ -369,6 +369,51 @@ void PaintFooterControl(gfx::Canvas* can
+                          gfx::Rect(width - chip + 5, 0, chip - 10, height));
+ }
+ 
++// A cheap area-light approximation shared by connected and detached scopes.
++// The blurred footprint grows with the emitter. Dividing its emitted power by
++// that footprint keeps total light proportional to source area, so small peeks
++// naturally cast less light without turning into narrow, fixed-depth beams.
++void PaintScopeLight(gfx::Canvas* canvas,
++                     const CommandScopeDescriptor& scope,
++                     const gfx::RectF& source,
++                     float scale,
++                     float strength,
++                     const SkPath& contour) {
++  if (source.IsEmpty() || strength <= 0) return;
++  const float softness = 20 * scale;
++  const float radius_x = source.width() / 2 + softness;
++  const float radius_y = source.height() / 2 + softness;
++  const float power = source.width() * source.height();
++  const float radiance = .24f * strength * power / (radius_x * radius_y);
++  const auto lobe = [&](SkColor tint, float center_x, float share) {
++    if (tint == SK_ColorTRANSPARENT) return;
++    auto matrix = SkMatrix::Scale(radius_x, radius_y);
++    matrix.postTranslate(center_x, source.CenterPoint().y());
++    const auto color = [&](float falloff) {
++      return SkColor4f::FromColor(Alpha(tint, std::clamp(
++          base::ClampRound(255 * radiance * share * falloff), 0, 255)));
++    };
++    // Sampled inverse-square falloff, smoothly reaching zero at the footprint.
++    const SkColor4f stops[] = {color(1), color(.52f), color(.18f),
++                              color(.05f), SkColors::kTransparent};
++    const SkScalar positions[] = {0, .25f, .5f, .75f, 1};
++    cc::PaintFlags flags;
++    flags.setShader(cc::PaintShader::MakeRadialGradient(
++        {0, 0}, 1, stops, positions, 5, SkTileMode::kClamp,
++        SkGradient::Interpolation{}, 0, &matrix));
++    canvas->DrawPath(contour, flags);
++  };
++  const float center = source.CenterPoint().x();
++  if (scope.id == kOmniScope) {
++    // One emitter's energy, shared across its three colors.
++    lobe(SkColorSetRGB(174, 112, 245), center - source.width() * .24f, .4f);
++    lobe(SkColorSetRGB(100, 159, 255), center + source.width() * .24f, .4f);
++    lobe(SkColorSetRGB(89, 206, 157), center, .2f);
++  } else {
++    lobe(scope.tint, center, 1.f);
++  }
++}
++
+ }  // namespace
+ 
+ CommandPanelAppearance ReadCommandPanelAppearance(PrefService* prefs) {
+@@ -425,6 +470,17 @@ CommandPanelAppearance ReadCommandPanelA
+ class CommandTextfield : public views::Textfield {
+   METADATA_HEADER(CommandTextfield, views::Textfield)
+  public:
++  void SetFocusChangedCallback(base::RepeatingCallback<void(bool)> callback) {
++    focus_changed_ = std::move(callback);
++  }
++  void OnFocus() override {
++    Textfield::OnFocus();
++    if (focus_changed_) focus_changed_.Run(true);
++  }
++  void OnBlur() override {
++    Textfield::OnBlur();
++    if (focus_changed_) focus_changed_.Run(false);
++  }
+   bool SkipDefaultKeyEventProcessing(const ui::KeyEvent& event) override {
+     if (event.key_code() == ui::VKEY_TAB && !event.IsCommandDown() &&
+         !event.IsControlDown() && !event.IsAltDown()) {
+@@ -432,6 +488,8 @@ class CommandTextfield : public views::T
+     }
+     return Textfield::SkipDefaultKeyEventProcessing(event);
+   }
++ private:
++  base::RepeatingCallback<void(bool)> focus_changed_;
+ };
+ 
+ class CommandPanelView::ResultsView : public views::View {
+@@ -660,7 +718,14 @@ CommandPanelView::CommandPanelView(std::
+   CHECK(session_);
+   GetViewAccessibility().SetRole(ax::mojom::Role::kDialog);
+   GetViewAccessibility().SetName(u"Arcium command bar");
+-  input_ = AddChildView(std::make_unique<CommandTextfield>());
++  auto input = std::make_unique<CommandTextfield>();
++  input->SetFocusChangedCallback(base::BindRepeating(
++      [](base::WeakPtr<CommandPanelView> view, bool focused) {
++        if (!view) return;
++        view->input_focused_ = focused;
++        view->UpdateScopeGlowFocus();
++      }, weak_ptr_factory_.GetWeakPtr()));
++  input_ = AddChildView(std::move(input));
+   input_->set_controller(this);
+   input_->SetBorder(views::CreateEmptyBorder(0));
+   input_->SetBackgroundColor(SK_ColorTRANSPARENT);
+@@ -687,6 +752,9 @@ CommandPanelView::CommandPanelView(std::
+   scope_icon_animation_.SetSlideDuration(base::Milliseconds(110));
+   scope_selection_animation_.SetSlideDuration(base::Milliseconds(80));
+   content_animation_.SetSlideDuration(base::Milliseconds(160));
++  scope_focus_animation_.SetSlideDuration(base::Milliseconds(80));
++  scope_focus_animation_.SetTweenType(gfx::Tween::LINEAR_OUT_SLOW_IN);
++  scope_focus_animation_.Reset(0);
+   for (auto* animation : {&selection_animation_, &scope_animation_,
+                           &scope_label_animation_, &scope_icon_animation_,
+                           &scope_selection_animation_, &content_animation_}) {
+@@ -729,6 +797,7 @@ void CommandPanelView::SetInvocation(boo
+   scope_animation_.Reset(0);
+   scope_label_animation_.Reset(0);
+   scope_icon_animation_.Reset(0);
++  scope_focus_animation_.Reset(0);
+   previous_scope_weights_.assign(scopes_.size(), 0);
+   if (!scopes_.empty()) {
+     previous_scope_weights_[ScopeIndex(scope_)] = 1;
+@@ -1579,55 +1648,15 @@ SkPath CommandPanelView::GetContourPath(
+ }
+ void CommandPanelView::PaintConnectedScopeGlow(gfx::Canvas* canvas) {
+   if (!appearance_.connected || !appearance_.scope_tints ||
+-      appearance_.glow_strength <= 0.0 || actions_visible_) {
+-    return;
+-  }
++      appearance_.glow_strength <= 0.0 || actions_visible_) return;
+   gfx::ScopedCanvas restore(canvas);
+   const auto contour = GetContourPath();
+   canvas->ClipPath(contour, true);
+-  // Each scope casts its own color from its upper edge into the glass.
+-  // Keep the profile accent for selection chrome, not website identity.
+-  const auto glow = [&](SkColor tint, float x, float y, float spread,
+-                        float alpha) {
+-    if (tint == SK_ColorTRANSPARENT || spread <= 0) {
+-      return;
+-    }
+-    gfx::ScopedCanvas layer(canvas);
+-    canvas->ClipRect(gfx::Rect(0, base::ClampFloor(y), width(), height()));
+-    auto matrix = SkMatrix::Scale(spread, 130 * ui_scale_);
+-    matrix.postTranslate(x, y);
+-    const auto color = [&](float strength) {
+-      return SkColor4f::FromColor(Alpha(
+-          tint, std::clamp(base::ClampRound(
+-                    255 * alpha * strength),
+-                0, 255)));
+-    };
+-    const SkColor4f stops[] = {color(1), color(.58f), color(.16f),
+-                              SkColors::kTransparent};
+-    const SkScalar positions[] = {0, .25f, .65f, 1};
+-    cc::PaintFlags flags;
+-    flags.setShader(cc::PaintShader::MakeRadialGradient(
+-        {0, 0}, 1, stops, positions, 4, SkTileMode::kClamp,
+-        SkGradient::Interpolation{}, 0, &matrix));
+-    canvas->DrawPath(contour, flags);
+-  };
+   for (size_t i = 0; i < scopes_.size(); ++i) {
+     const auto* button = scope_buttons_[i].get();
+-    if (!button->GetVisible()) {
+-      continue;
+-    }
+-    const float x = button->x() + button->width() / 2.f;
+-    const float y = button->y();
+-    const float reach = button->width() * 1.05f;
+-    const float alpha = .28f * ScopeGlowStrength(i);
+-    if (scopes_[i].id == kOmniScope) {
+-      glow(SkColorSetRGB(174, 112, 245), x - button->width() * .24f,
+-           y, reach * .72f, alpha);
+-      glow(SkColorSetRGB(100, 159, 255), x + button->width() * .24f,
+-           y, reach * .72f, alpha);
+-      glow(SkColorSetRGB(89, 206, 157), x, y, reach, alpha * .45f);
+-    } else {
+-      glow(scopes_[i].tint, x, y, reach, alpha);
++    if (button->GetVisible()) {
++      PaintScopeLight(canvas, scopes_[i], gfx::RectF(button->bounds()),
++                      ui_scale_, ScopeGlowStrength(i), contour);
+     }
+   }
+ }
+@@ -1870,7 +1899,9 @@ void CommandPanelView::PaintRow(gfx::Can
+   }
+ }
+ float CommandPanelView::ScopeGlowStrength(size_t index) const {
+-  return appearance_.glow_strength * (.66f + .34f * ScopeWeight(index));
++  const float row_focus = .66f + .34f * scope_focus_animation_.GetCurrentValue();
++  const float selected = 1.f + .30f * ScopeWeight(index);
++  return appearance_.glow_strength * row_focus * selected;
+ }
+ void CommandPanelView::PaintScope(gfx::Canvas* canvas,
+                                   size_t index,
+@@ -1889,37 +1920,11 @@ void CommandPanelView::PaintScope(gfx::C
+   }
+   if (appearance_.scope_tints && !appearance_.connected &&
+       appearance_.glow_strength > 0.0) {
+-    cc::PaintFlags glow;
+-    if (scope.id == kOmniScope) {
+-      constexpr std::array<float, 3> centers = {.5f, .88f, .12f};
+-      constexpr std::array<SkColor, 3> tints = {
+-          SkColorSetRGB(174, 112, 245), SkColorSetRGB(100, 159, 255),
+-          SkColorSetRGB(89, 206, 157)};
+-      for (size_t i = 0; i < centers.size(); ++i) {
+-        const float fade = i == 0 ? .9f : .85f;
+-        auto matrix = SkMatrix::Scale(width * (i == 0 ? .6f : .65f) * fade,
+-                                      height * fade);
+-        matrix.postTranslate(width * centers[i], 0);
+-        const SkColor4f stops[] = {
+-            SkColor4f::FromColor(Alpha(tints[i], base::ClampRound(71 * ScopeGlowStrength(index)))),
+-            SkColors::kTransparent};
+-        glow.setShader(cc::PaintShader::MakeRadialGradient(
+-            {0, 0}, 1, stops, nullptr, 2, SkTileMode::kClamp,
+-            SkGradient::Interpolation{}, 0, &matrix));
+-        canvas->DrawRect(gfx::Rect(0, 0, width, height), glow);
+-      }
+-    } else {
+-      const auto tint = scope.tint;
+-      const SkPoint points[] = {{0, 0}, {0, static_cast<float>(height)}};
+-      const SkScalar positions[] = {0, .7f, 1};
+-      const SkColor4f colors[] = {
+-          SkColor4f::FromColor(Alpha(tint, base::ClampRound(65 * ScopeGlowStrength(index)))),
+-          SkColor4f::FromColor(Alpha(tint, base::ClampRound(33 * ScopeGlowStrength(index)))),
+-          SkColors::kTransparent};
+-      glow.setShader(cc::PaintShader::MakeLinearGradient(
+-          points, colors, positions, 3, SkTileMode::kClamp));
+-      canvas->DrawRect(gfx::Rect(0, 0, width, height), glow);
+-    }
++    const auto contour = TopRoundedRectPath(gfx::RectF(0, 0, width, height), 13);
++    gfx::ScopedCanvas restore(canvas);
++    canvas->ClipPath(contour, true);
++    PaintScopeLight(canvas, scope, gfx::RectF(0, 0, width, height), 1.f,
++                    ScopeGlowStrength(index), contour);
+   }
+   const auto geometry = GeometryForReveal(appearance_.reveal);
+   const float progress = scope_animation_.GetCurrentValue();
+@@ -2063,7 +2068,19 @@ float CommandPanelView::ScopeWeight(size
+ float CommandPanelView::ScopeLabelProgress() const {
+   return scope_label_animation_.GetCurrentValue();
+ }
++void CommandPanelView::UpdateScopeGlowFocus() {
++  const bool focused = scope_browsing_ && input_focused_ && !actions_visible_;
++  if (!gfx::Animation::ShouldRenderRichAnimation()) {
++    scope_focus_animation_.Reset(focused ? 1 : 0);
++  } else if (focused) {
++    scope_focus_animation_.Show();
++  } else {
++    scope_focus_animation_.Hide();
++  }
++  AnimationProgressed(&scope_focus_animation_);
++}
+ void CommandPanelView::UpdateScopeReveal() {
++  UpdateScopeGlowFocus();
+   const bool show = !actions_visible_ && (scope_browsing_ || scope_hovered_);
+   if (!gfx::Animation::ShouldRenderRichAnimation()) {
+     scope_animation_.Reset(show ? 1 : 0);
+@@ -2426,6 +2443,11 @@ void CommandPanelView::OnScrollEvent(ui:
+   event->StopPropagation();
+ }
+ void CommandPanelView::AnimationProgressed(const gfx::Animation* animation) {
++  if (animation == &scope_focus_animation_) {
++    for (const auto& button : scope_buttons_) button->SchedulePaint();
++    SchedulePaint();
++    return;
++  }
+   const bool scope_geometry = animation == &scope_animation_ ||
+                               animation == &scope_label_animation_ ||
+                               animation == &scope_selection_animation_;
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
+@@ -865,25 +865,106 @@ TEST_F(ArciumNativePanelTest, PreviewSea
+   EXPECT_GT(state_->cancels, cancels);
+ }
+ 
+-TEST_F(ArciumNativePanelTest, InactiveScopeGlowIs66PercentAcrossSelectionTransitions) {
++TEST_F(ArciumNativePanelTest, ScopeAreaControlsEmittedLightWithoutDeepInputColumns) {
+   auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
+-      gfx::Animation::RichAnimationRenderMode::FORCE_ENABLED);
++      gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
++  Open();
++  for (float scale : {.8f, 1.f, 1.25f}) {
++    panel()->SetUIScale(scale);
++    const auto energy = [&](CommandPanelAppearance::Width width) {
++      CommandPanelAppearance appearance;
++      appearance.reveal = CommandPanelAppearance::Reveal::kTabs;
++      appearance.scope_width = width;
++      appearance.glow_strength = 0;
++      panel()->SetAppearance(appearance);
++      const auto unlit = PaintPanel();
++      appearance.glow_strength = 1;
++      panel()->SetAppearance(appearance);
++      const auto lit = PaintPanel();
++      EXPECT_EQ(unlit.width(), lit.width());
++      EXPECT_EQ(unlit.height(), lit.height());
++      uint64_t energy = 0;
++      for (int y = 0; y < lit.height(); ++y) {
++        for (int x = 0; x < lit.width(); ++x) {
++          const auto before = unlit.getColor(x, y);
++          const auto after = lit.getColor(x, y);
++          energy += std::abs(int(SkColorGetR(after)) - int(SkColorGetR(before))) +
++                    std::abs(int(SkColorGetG(after)) - int(SkColorGetG(before))) +
++                    std::abs(int(SkColorGetB(after)) - int(SkColorGetB(before)));
++        }
++      }
++      const auto body = panel()->body_bounds_for_testing();
++      bool below_input_changed = false;
++      for (int y = body.y() + base::ClampRound(52 * scale);
++           y < body.y() + base::ClampRound(60 * scale); ++y) {
++        for (int x = body.x(); x < body.right(); ++x) {
++          below_input_changed |= lit.getColor(x, y) != unlit.getColor(x, y);
++        }
++      }
++      EXPECT_FALSE(below_input_changed);
++      return energy;
++    };
++    const auto narrow = energy(CommandPanelAppearance::Width::kIconWidth);
++    const auto wide = energy(CommandPanelAppearance::Width::kFlush);
++    EXPECT_GT(narrow, 0u);
++    EXPECT_GT(wide, narrow);
++  }
++}
++
++TEST_F(ArciumNativePanelTest, ScopeRowFocusDimsAllLightsAndSelectionAddsThirtyPercent) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
++  Open();
++  panel()->input_for_testing()->OnFocus();
++  const auto strength = [&](size_t scope) { return panel()->scope_glow_strength_for_testing(scope); };
++  EXPECT_NEAR(.75f * .66f * 1.3f, strength(0), .0001f);
++  EXPECT_NEAR(.75f * .66f, strength(1), .0001f);
++  Key(ui::VKEY_UP);
++  EXPECT_TRUE(panel()->scopes_focused_for_testing());
++  EXPECT_NEAR(.75f * 1.3f, strength(0), .0001f);
++  EXPECT_NEAR(.75f, strength(1), .0001f);
++  panel()->input_for_testing()->OnBlur();
++  EXPECT_TRUE(panel()->scopes_focused_for_testing());
++  EXPECT_NEAR(.75f * .66f * 1.3f, strength(0), .0001f);
++  EXPECT_NEAR(.75f * .66f, strength(1), .0001f);
++  panel()->input_for_testing()->OnFocus();
++  EXPECT_NEAR(.75f, strength(1), .0001f);
++  Key(ui::VKEY_DOWN);
++  EXPECT_FALSE(panel()->scopes_focused_for_testing());
++  EXPECT_NEAR(.75f * .66f, strength(1), .0001f);
++}
++
++TEST_F(ArciumNativePanelTest, ReopeningResetsScopeRowLightEvenWhenInputKeepsFocus) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
+   Open();
+-  EXPECT_NEAR(.75f, panel()->scope_glow_strength_for_testing(0), .0001f);
++  panel()->input_for_testing()->OnFocus();
++  Key(ui::VKEY_UP);
++  ASSERT_TRUE(panel()->scopes_focused_for_testing());
++  EXPECT_NEAR(.75f, panel()->scope_glow_strength_for_testing(1), .0001f);
++  panel()->SetInvocation(true);
++  EXPECT_FALSE(panel()->scopes_focused_for_testing());
+   EXPECT_NEAR(.75f * .66f, panel()->scope_glow_strength_for_testing(1), .0001f);
++}
++
++TEST_F(ArciumNativePanelTest, SelectedScopeLightCrossfadesWithoutChangingTheRowFactor) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_ENABLED);
++  Open();
++  panel()->input_for_testing()->OnFocus();
+   Key(ui::VKEY_RIGHT);
+   auto* selection = panel()->scope_selection_animation_for_testing();
+   selection->Reset(.5);
+   EXPECT_NEAR(panel()->scope_glow_strength_for_testing(0),
+               panel()->scope_glow_strength_for_testing(1), .0001f);
+   selection->Reset(1);
+-  EXPECT_NEAR(.75f * .66f, panel()->scope_glow_strength_for_testing(0), .0001f);
+-  EXPECT_NEAR(.75f, panel()->scope_glow_strength_for_testing(1), .0001f);
++  EXPECT_NEAR(panel()->scope_glow_strength_for_testing(0) * 1.3f,
++              panel()->scope_glow_strength_for_testing(1), .0001f);
+   CommandPanelAppearance appearance;
+   appearance.glow_strength = 1.25;
+   panel()->SetAppearance(appearance);
+-  EXPECT_NEAR(1.25f * .66f, panel()->scope_glow_strength_for_testing(0), .0001f);
+-  EXPECT_NEAR(1.25f, panel()->scope_glow_strength_for_testing(1), .0001f);
++  EXPECT_NEAR(panel()->scope_glow_strength_for_testing(0) * 1.3f,
++              panel()->scope_glow_strength_for_testing(1), .0001f);
+ }
+ TEST_F(ArciumNativePanelTest, HiddenPresenterOwnsInputAndPaintsItsContents) {
+   Open();
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel.h
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
+@@ -179,6 +179,7 @@ class CommandPanelView : public views::V
+   void BrowseScopes(bool enabled);
+   void HoverScopes(bool enabled);
+   void UpdateScopeReveal();
++  void UpdateScopeGlowFocus();
+   bool HandleScopeScroll(float vertical_delta);
+   bool HandleScopeScroll(const ui::ScrollEvent&);
+   float ScopeWeight(size_t index) const;
+@@ -253,6 +254,7 @@ class CommandPanelView : public views::V
+   bool invocation_prefill_pending_ = false;
+   bool actions_visible_ = false;
+   bool scope_browsing_ = false;
++  bool input_focused_ = false;
+   bool scope_hovered_ = false;
+   std::vector<float> previous_scope_weights_;
+   int content_direction_ = 1;
+@@ -265,6 +267,7 @@ class CommandPanelView : public views::V
+   gfx::SlideAnimation scope_label_animation_{this};
+   gfx::SlideAnimation scope_icon_animation_{this};
+   gfx::SlideAnimation scope_selection_animation_{this};
++  gfx::SlideAnimation scope_focus_animation_{this};
+   gfx::SlideAnimation content_animation_{this};
+   base::WeakPtrFactory<CommandPanelView> weak_ptr_factory_{this};
+ };
