@@ -1,0 +1,766 @@
+Index: src/chrome/browser/importer/arcium_arc_import.cc
+===================================================================
+--- src.orig/chrome/browser/importer/arcium_arc_import.cc
++++ src/chrome/browser/importer/arcium_arc_import.cc
+@@ -72,6 +72,7 @@ struct ImportedNode {
+ struct ImportedSpace {
+   std::string id;
+   std::string name;
++  std::string icon;
+   std::vector<ImportedNode> nodes;
+ };
+ 
+@@ -214,6 +215,10 @@ std::optional<Snapshot> ParseSnapshot(st
+       return std::nullopt;
+     }
+     ImportedSpace imported_space{.id = *id, .name = *name};
++    if (const auto* icon = space->FindString("icon");
++        icon && icon->size() <= 128) {
++      imported_space.icon = *icon;
++    }
+     if (!ParseNodes(*pins, &imported_space.nodes)) {
+       return std::nullopt;
+     }
+@@ -461,6 +466,7 @@ bool ImportArcSidebarSnapshot(Profile* p
+           .name = base::UTF8ToUTF16(imported.name),
+           .pins = ToPersistentNodes(imported.nodes, snapshot->source_profile,
+                                     imported.id),
++          .icon = imported.icon,
+       });
+     }
+     if (imported_spaces.empty() && !snapshot->favorites.empty() &&
+Index: src/chrome/browser/importer/arcium_arc_import_browsertest.cc
+===================================================================
+--- src.orig/chrome/browser/importer/arcium_arc_import_browsertest.cc
++++ src/chrome/browser/importer/arcium_arc_import_browsertest.cc
+@@ -815,6 +815,46 @@ helium::PersistentNode Folder(std::strin
+ }
+ 
+ IN_PROC_BROWSER_TEST_F(ArciumArcImportBrowserTest,
++                       ImportsSpaceIconsAndPreservesArciumEdits) {
++  constexpr char snapshot[] = R"json({
++    "version":1,"source_profile":"arc-icons","favorites":[],"spaces":[
++      {"id":"emoji","name":"Desktop","source_profile":"arc-icons",
++       "icon":"🖥️","pins":[]},
++      {"id":"symbol","name":"Calendar","source_profile":"arc-icons",
++       "icon":"ph:calendar","pins":[]},
++      {"id":"legacy","name":"No icon","source_profile":"arc-icons","pins":[]}
++    ]})json";
++  Profile* profile = browser()->profile();
++  auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(profile);
++  ASSERT_TRUE(ImportArcSidebarSnapshot(profile, snapshot,
++                                       ArcSidebarDestination::kPins));
++  ASSERT_TRUE(service->GetSpaceById("emoji"));
++  ASSERT_TRUE(service->GetSpaceById("symbol"));
++  ASSERT_TRUE(service->GetSpaceById("legacy"));
++  EXPECT_EQ("🖥️", service->GetSpaceById("emoji")->icon());
++  EXPECT_EQ("ph:calendar", service->GetSpaceById("symbol")->icon());
++  EXPECT_TRUE(service->GetSpaceById("legacy")->icon().empty());
++  service->SetSpaceIcon("emoji", "📚");
++  service->SetSpaceIcon("symbol", "");
++  ASSERT_TRUE(ImportArcSidebarSnapshot(profile, snapshot,
++                                       ArcSidebarDestination::kPins));
++  EXPECT_EQ("📚", service->GetSpaceById("emoji")->icon());
++  EXPECT_TRUE(service->GetSpaceById("symbol")->icon().empty());
++  const auto& records = profile->GetPrefs()->GetList("helium.spaces");
++  for (const auto& value : records) {
++    const auto& record = value.GetDict();
++    const auto* id = record.FindString("id");
++    if (id && *id == "emoji") {
++      ASSERT_TRUE(record.FindString("icon"));
++      EXPECT_EQ("📚", *record.FindString("icon"));
++    } else if (id && *id == "symbol") {
++      ASSERT_TRUE(record.FindString("icon"));
++      EXPECT_TRUE(record.FindString("icon")->empty());
++    }
++  }
++}
++
++IN_PROC_BROWSER_TEST_F(ArciumArcImportBrowserTest,
+                        ImportsNestedFoldersAsDormantPins) {
+   helium::HeliumSpaceService* service =
+       helium::HeliumSpaceServiceFactory::GetForProfile(browser()->profile());
+Index: src/chrome/browser/importer/arcium_arc_spaces_import.cc
+===================================================================
+--- src.orig/chrome/browser/importer/arcium_arc_spaces_import.cc
++++ src/chrome/browser/importer/arcium_arc_spaces_import.cc
+@@ -313,6 +313,7 @@ ArcSpacesImport::Inventory ArcSpacesImpo
+     for (const auto& space : snapshot->spaces) {
+       Entry entry = make_entry();
+       entry.name = space.name;
++      entry.icon = space.icon;
+       entry.space_id = space.id;
+       entry.identity = Digest(identity + "\nspace\n" + space.id);
+       Count(space.pins, entry.pins, entry.folders);
+@@ -844,6 +845,7 @@ base::DictValue ArcSpacesImport::Snapsho
+                        .Set("identity", entry.identity)
+                        .Set("profileToken", entry.profile_token)
+                        .Set("name", entry.name)
++                       .Set("icon", entry.icon)
+                        .Set("profileLabel", entry.profile_label)
+                        .Set("pins", entry.pins)
+                        .Set("folders", entry.folders)
+Index: src/chrome/browser/importer/arcium_arc_spaces_import.h
+===================================================================
+--- src.orig/chrome/browser/importer/arcium_arc_spaces_import.h
++++ src/chrome/browser/importer/arcium_arc_spaces_import.h
+@@ -28,7 +28,7 @@ class ArcSpacesImport {
+  public:
+   struct Entry {
+     std::string token, identity, profile_token, name, profile_label, source_key,
+-        space_id;
++        space_id, icon;
+     user_data_importer::SourceProfile source;
+     base::FilePath sidebar_path;
+     std::string fingerprint;
+Index: src/chrome/browser/importer/arcium_arc_spaces_import_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/importer/arcium_arc_spaces_import_unittest.cc
++++ src/chrome/browser/importer/arcium_arc_spaces_import_unittest.cc
+@@ -330,11 +330,29 @@ TEST_F(ArcSpacesImportLifecycleTest,
+   ASSERT_TRUE(base::WriteFile(entry_.sidebar_path, changed));
+   EXPECT_TRUE(ArcSpacesImport::SourcesUnchangedForTesting(*groups));
+   (*containers)[3].GetDict().FindList("spaces")->back().GetDict().Set(
+-      "title", "Changed saved Space");
++      "customInfo", base::DictValue().Set(
++                        "iconType", base::DictValue().Set("emoji_v2", "🖥️")));
+   ASSERT_TRUE(base::JSONWriter::Write(*root, &changed));
+   ASSERT_TRUE(base::WriteFile(entry_.sidebar_path, changed));
+   EXPECT_FALSE(ArcSpacesImport::SourcesUnchangedForTesting(*groups));
+ }
++TEST_F(ArcSpacesImportLifecycleTest, InventoryIncludesOriginalSpaceIcon) {
++  const char* fixture = R"json({"sidebar":{"containers":[{"global":{}},{
++    "items":["pins",{"childrenIds":[],"data":{"itemContainer":{}}}],
++    "spaces":["space-a",{"title":"Saved Space","profile":{"default":true},
++      "customInfo":{"iconType":{"emoji_v2":"🖥️","emoji":128218}},
++      "containerIDs":["pinned","pins"]}],"topAppsContainerIDs":[]
++  }]}})json";
++  ASSERT_TRUE(base::WriteFile(entry_.sidebar_path, fixture));
++  ArcSpacesImport importer(base::DoNothing());
++  ArcSpacesImportTestPeer::ReadFixture(importer, {entry_.source});
++  auto snapshot = importer.Snapshot();
++  const auto* spaces = snapshot.FindList("spaces");
++  ASSERT_TRUE(spaces);
++  ASSERT_EQ(1u, spaces->size());
++  EXPECT_EQ("🖥️", *spaces->front().GetDict().FindString("icon"));
++}
++
+ TEST_F(ArcSpacesImportLifecycleTest,
+        AvailabilityCountsExcludedRecordsOnceAcrossSources) {
+   const char* fixture = R"json({"sidebar":{"containers":[{"global":{}},{
+Index: src/chrome/browser/ui/helium/helium_space_service.cc
+===================================================================
+--- src.orig/chrome/browser/ui/helium/helium_space_service.cc
++++ src/chrome/browser/ui/helium/helium_space_service.cc
+@@ -27,6 +27,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_collection.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+ #include "chrome/browser/ui/helium/arcium_space_directory.h"
++#include "chrome/browser/ui/helium/arcium_space_icon.h"
+ #include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
+ #include "chrome/browser/ui/helium/helium_space.h"
+ #include "chrome/browser/ui/helium/helium_space_service_factory.h"
+@@ -1190,6 +1191,12 @@ void HeliumSpaceService::ReconcileImport
+         kept != presentation.end()) {
+       record = std::move(kept->second);
+     }
++    // Keep Arcium edits, including an explicitly cleared icon. Older imports
++    // without the field can pick up their original Arc icon on refresh.
++    if (!record.contains("icon") && !imported.icon.empty() &&
++        imported.icon.size() <= 128) {
++      record.Set("icon", NormalizeSpaceIcon(imported.icon));
++    }
+     record.Set("id", imported.id);
+     record.Set("name", base::UTF16ToUTF8(imported.name));
+     record.Set("source_profile", source_profile);
+Index: src/chrome/browser/ui/helium/helium_space_service.h
+===================================================================
+--- src.orig/chrome/browser/ui/helium/helium_space_service.h
++++ src/chrome/browser/ui/helium/helium_space_service.h
+@@ -75,6 +75,7 @@ struct ImportedPersistentSpace {
+   std::string id;
+   std::u16string name;
+   PersistentNodes pins;
++  std::string icon;
+ };
+ 
+ enum class PinToTabConversionPhaseForTesting {
+Index: src/chrome/utility/importer/arc_sidebar_snapshot.cc
+===================================================================
+--- src.orig/chrome/utility/importer/arc_sidebar_snapshot.cc
++++ src/chrome/utility/importer/arc_sidebar_snapshot.cc
+@@ -13,6 +13,8 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversion_utils.h"
+ #include "base/values.h"
+ #include "url/gurl.h"
+ 
+@@ -399,6 +401,34 @@ void ParseFavorites(const base::DictValu
+   }
+ }
+ 
++std::string ParseSpaceIcon(const base::DictValue& space) {
++  const auto* type = space.FindDictByDottedPath("customInfo.iconType");
++  if (!type) {
++    return {};
++  }
++  // Arc's newer field preserves variation selectors and joined emoji. The
++  // legacy scalar can disagree with it, so use it only as a fallback.
++  if (const auto* emoji = type->FindString("emoji_v2");
++      emoji && !emoji->empty() && emoji->size() <= 128 &&
++      base::IsStringUTF8(*emoji) && !base::StartsWith(*emoji, "ph:")) {
++    return *emoji;
++  }
++  if (const auto emoji = type->FindInt("emoji");
++      emoji && *emoji > 0 && *emoji <= 0x10ffff &&
++      !(*emoji >= 0xd800 && *emoji <= 0xdfff)) {
++    std::string result;
++    base::WriteUnicodeCharacter(*emoji, &result);
++    return result;
++  }
++  // Known Arc symbol names map to bundled artwork. Unknown representations
++  // use the neutral Space icon; they are not paths or remote image requests.
++  if (const auto* symbol = type->FindString("icon");
++      symbol && *symbol == "calendar") {
++    return "ph:calendar";
++  }
++  return {};
++}
++
+ void ParseSpaces(const base::DictValue& sidebar_data,
+                  const ProfileIdentity& source_profile,
+                  const std::map<std::string, RawItem>& items,
+@@ -421,6 +451,7 @@ void ParseSpaces(const base::DictValue&
+ 
+     ArcSidebarSpace space{
+         .id = *space_id,
++        .icon = ParseSpaceIcon(*space_value),
+         .source_profile = source_profile.directory,
+     };
+     if (const std::string* name = space_value->FindString("title")) {
+@@ -466,6 +497,7 @@ base::DictValue ArcSidebarSpace::ToDict(
+   base::DictValue value;
+   value.Set("id", id);
+   value.Set("name", name);
++  value.Set("icon", icon);
+   value.Set("source_profile", source_profile);
+   value.Set("pins", NodesToList(pins));
+   return value;
+Index: src/chrome/utility/importer/arc_sidebar_snapshot.h
+===================================================================
+--- src.orig/chrome/utility/importer/arc_sidebar_snapshot.h
++++ src/chrome/utility/importer/arc_sidebar_snapshot.h
+@@ -37,6 +37,8 @@ struct ArcSidebarNode {
+ struct ArcSidebarSpace {
+   std::string id;
+   std::string name;
++  // Emoji sequence or a supported local symbol (ph:<name>); never a URL.
++  std::string icon;
+   std::string source_profile;
+   std::vector<ArcSidebarNode> pins;
+ 
+Index: src/chrome/utility/importer/arc_sidebar_snapshot_unittest.cc
+===================================================================
+--- src.orig/chrome/utility/importer/arc_sidebar_snapshot_unittest.cc
++++ src/chrome/utility/importer/arc_sidebar_snapshot_unittest.cc
+@@ -817,5 +817,34 @@ TEST(ArcSidebarSnapshotTest, Conflicting
+   EXPECT_FALSE(unavailable.foreign_profile);
+ }
+ 
++TEST(ArcSidebarSnapshotTest, PreservesSpaceEmojiAndKnownSymbols) {
++  auto root = ParseFixture();
++  ASSERT_TRUE(root);
++  auto& space = (*FixtureSidebarData(*root).FindList("spaces"))[1].GetDict();
++  const auto check = [&](base::DictValue type, std::string_view expected) {
++    space.Set("customInfo", base::DictValue().Set("iconType", std::move(type)));
++    auto snapshot = ParseArcSidebarSnapshot(*root, kProfile);
++    ASSERT_TRUE(snapshot);
++    ASSERT_FALSE(snapshot->spaces.empty());
++    EXPECT_EQ(expected, snapshot->spaces.front().icon);
++    auto serialized = snapshot->spaces.front().ToDict();
++    ASSERT_TRUE(serialized.FindString("icon"));
++    EXPECT_EQ(expected, *serialized.FindString("icon"));
++  };
++  check(base::DictValue().Set("emoji_v2", "🖥️").Set("emoji", 0x1f4da), "🖥️");
++  check(base::DictValue().Set("emoji_v2", "👩🏽‍💻"), "👩🏽‍💻");
++  check(base::DictValue().Set("emoji", 0x1f4da), "📚");
++  check(base::DictValue().Set("emoji_v2", "").Set("emoji", 0x1f4da), "📚");
++  check(base::DictValue().Set("icon", "calendar"), "ph:calendar");
++  check(base::DictValue().Set("icon", "https://example.test/icon.svg"), "");
++  check(base::DictValue().Set("emoji", 0xd800), "");
++  check(base::DictValue().Set("emoji", 0x110000), "");
++  check(base::DictValue().Set("emoji", -1), "");
++  check(base::DictValue().Set("emoji_v2", std::string(129, 'x')), "");
++  check(base::DictValue().Set("emoji_v2", "ph:calendar"), "");
++  check(base::DictValue().Set("emoji_v2", true), "");
++  check(base::DictValue(), "");
++}
++
+ }  // namespace
+ }  // namespace arcium
+Index: src/components/helium_onboarding/src/components/SpaceIcon.svelte
+===================================================================
+--- /dev/null
++++ src/components/helium_onboarding/src/components/SpaceIcon.svelte
+@@ -0,0 +1,44 @@
++<script lang="ts">
++    import IconStar from "../icons/tabler/IconStar.svelte";
++    import IconStack2 from "../icons/tabler/IconStack2.svelte";
++
++    const { icon = "", favorites = false }: { icon?: string; favorites?: boolean } = $props();
++    // Match the native Space icon: one whole grapheme, never a cropped ZWJ
++    // sequence. Symbol artwork is local; imported values are never markup.
++    const emoji = $derived(!icon.startsWith("ph:") && icon.length <= 128
++        ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
++            .segment(icon.trim())[Symbol.iterator]().next().value?.segment ?? ""
++        : "");
++</script>
++
++<span class="space-icon" class:favorites aria-hidden="true">
++    {#if favorites}
++        <IconStar />
++    {:else if icon === "ph:calendar"}
++        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
++            <rect x="3" y="5" width="18" height="16" rx="2" />
++            <path d="M7 3v4m10-4v4M3 11h18" />
++        </svg>
++    {:else if emoji}
++        {emoji}
++    {:else}
++        <IconStack2 />
++    {/if}
++</span>
++
++<style>
++    .space-icon {
++        display: grid;
++        place-items: center;
++        width: 100%;
++        aspect-ratio: 1;
++        border-radius: 10px;
++        background: var(--helium-elevated-5);
++        color: var(--secondary);
++        font-family: "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
++        font-size: 22px;
++        line-height: 1;
++    }
++    .space-icon :global(svg) { width: 20px; height: 20px; }
++    .favorites { color: var(--helium-blue); }
++</style>
+Index: src/components/helium_onboarding/src/components/SpaceRow.svelte
+===================================================================
+--- src.orig/components/helium_onboarding/src/components/SpaceRow.svelte
++++ src/components/helium_onboarding/src/components/SpaceRow.svelte
+@@ -2,10 +2,9 @@
+     import { IconCheck, Spinner } from "@imput/helium-prism";
+     import { s } from "../lib/strings";
+     import { failureLabel, favoritesLabel, pinsLabel } from "../lib/arc";
+-    import { glyphHue, monogram } from "../lib/arc/glyph";
+     import type { Entry, TileOutcome } from "../lib/arc/spaces";
+ 
+-    import IconStar from "../icons/tabler/IconStar.svelte";
++    import SpaceIcon from "./SpaceIcon.svelte";
+ 
+     type Props = {
+         entry: Entry;
+@@ -42,15 +41,8 @@
+     class:done
+     class:working={status === "running" || status === "queued"}
+     class:failed={status === "failed"}
+-    style:--hue={glyphHue(name)}
+ >
+-    <span class="glyph" class:favorites={space.favoritesOnly} aria-hidden="true">
+-        {#if space.favoritesOnly}
+-            <IconStar />
+-        {:else}
+-            {monogram(name)}
+-        {/if}
+-    </span>
++    <SpaceIcon icon={space.icon} favorites={space.favoritesOnly} />
+     <span class="name">{name}</span>
+     <span class="meta">
+         {meta}
+@@ -82,28 +74,6 @@
+         text-align: left;
+     }
+ 
+-    .glyph {
+-        display: grid;
+-        place-items: center;
+-        width: 28px;
+-        height: 28px;
+-        border-radius: 9px;
+-        font-size: 14px;
+-        font-weight: 600;
+-        line-height: 1;
+-        color: hsl(var(--hue) 45% 34%);
+-        background-color: hsl(var(--hue) 62% 52% / 0.16);
+-
+-        &.favorites {
+-            color: var(--helium-blue);
+-            background-color: color-mix(in srgb, var(--helium-blue) 14%, transparent);
+-        }
+-
+-        & :global(svg) {
+-            width: 16px;
+-            height: 16px;
+-        }
+-    }
+ 
+     .name {
+         overflow: hidden;
+@@ -175,13 +145,6 @@
+         white-space: nowrap;
+     }
+ 
+-    @media (prefers-color-scheme: dark) {
+-        .glyph {
+-            color: hsl(var(--hue) 70% 80%);
+-            background-color: hsl(var(--hue) 50% 60% / 0.18);
+-        }
+-    }
+-
+     @media (prefers-reduced-motion: reduce) {
+         .done .mark {
+             animation: none;
+Index: src/components/helium_onboarding/src/components/SpaceTile.svelte
+===================================================================
+--- src.orig/components/helium_onboarding/src/components/SpaceTile.svelte
++++ src/components/helium_onboarding/src/components/SpaceTile.svelte
+@@ -2,10 +2,9 @@
+     import { IconCheck, Spinner } from "@imput/helium-prism";
+     import { s } from "../lib/strings";
+     import { failureLabel, favoritesLabel, pinsLabel } from "../lib/arc";
+-    import { glyphHue, monogram } from "../lib/arc/glyph";
+     import type { Entry, TileOutcome } from "../lib/arc/spaces";
+ 
+-    import IconStar from "../icons/tabler/IconStar.svelte";
++    import SpaceIcon from "./SpaceIcon.svelte";
+ 
+     type Props = {
+         entry: Entry;
+@@ -13,7 +12,7 @@
+         /** Imported earlier in this page; picking it again replaces its sidebar. */
+         again: boolean;
+         outcome?: TileOutcome;
+-        /** True while a batch runs; the tile keeps focus but ignores input. */
++        /** True while a batch runs; the row keeps focus but ignores input. */
+         busy: boolean;
+         /** Name the Arc profile only when Spaces come from more than one. */
+         showSource: boolean;
+@@ -47,7 +46,7 @@
+ <button
+     type="button"
+     role="checkbox"
+-    class="space-tile"
++    class="space-choice"
+     class:selected={selected || done}
+     class:done
+     class:working
+@@ -56,23 +55,16 @@
+     aria-checked={selected || done}
+     aria-disabled={locked}
+     aria-busy={working}
+-    style:--hue={glyphHue(name)}
+     onclick={() => !locked && ontoggle(entry.key)}
+ >
+-    <span class="glyph" class:favorites={space.favoritesOnly} aria-hidden="true">
+-        {#if space.favoritesOnly}
+-            <IconStar />
+-        {:else}
+-            {monogram(name)}
+-        {/if}
+-    </span>
++    <SpaceIcon icon={space.icon} favorites={space.favoritesOnly} />
+     <span class="text">
+         <span class="name">{name}</span>
+         {#if showSource && space.profileLabel}
+             <span class="source">{space.profileLabel}</span>
+         {/if}
+-        <span class="meta">{meta}</span>
+     </span>
++    <span class="meta">{meta}</span>
+     <span class="mark" aria-hidden="true">
+         {#if status === "running"}
+             <Spinner size={14} />
+@@ -85,35 +77,24 @@
+ </button>
+ 
+ <style>
+-    .space-tile {
++    .space-choice {
+         --accent: var(--helium-blue);
+ 
+         position: relative;
+-        display: flex;
+-        flex-direction: column;
+-        align-items: flex-start;
+-        justify-content: space-between;
+-        gap: 16px;
++        display: grid;
++        grid-template-columns: 32px minmax(0, 1fr) auto 22px;
++        align-items: center;
++        gap: 12px;
+         width: 100%;
+-        min-height: 116px;
+-        padding: 14px;
+-        border-radius: 16px;
++        min-height: 56px;
++        padding: 8px 12px;
++        box-shadow: none;
++        border-radius: 12px;
+         text-align: left;
+-        background-color: var(--helium-elevated-5);
++        background-color: transparent;
+         transition: background-color 0.15s, transform 0.12s;
+         will-change: auto;
+ 
+-        &::after {
+-            content: "";
+-            position: absolute;
+-            inset: 0;
+-            border-radius: inherit;
+-            box-shadow: inset 0 0 0 1.5px var(--accent);
+-            opacity: 0;
+-            transition: opacity 0.15s;
+-            pointer-events: none;
+-        }
+-
+         &:active:not(.locked) {
+             transform: scale(0.98);
+         }
+@@ -124,51 +105,19 @@
+     }
+ 
+     @media (hover: hover) {
+-        .space-tile:hover:not(.locked):not(.selected) {
++        .space-choice:hover:not(.locked):not(.selected) {
+             background-color: var(--helium-elevated-10);
+         }
+     }
+ 
+-    .space-tile.selected {
+-        background-color: color-mix(in srgb, var(--accent) 9%, var(--bg-surface));
+-
+-        &::after {
+-            opacity: 1;
+-        }
+-    }
+-
+-    .space-tile.done::after {
+-        opacity: 0;
++    .space-choice.selected {
++        background-color: color-mix(in srgb, var(--accent) 4%, transparent);
+     }
+ 
+-    .space-tile.failed::after {
++    .space-choice.failed {
+         box-shadow: inset 0 0 0 1.5px var(--red, #d33);
+-        opacity: 1;
+     }
+ 
+-    /* Placeholder identity: a letter on a quiet hue from the name. */
+-    .glyph {
+-        display: grid;
+-        place-items: center;
+-        width: 38px;
+-        height: 38px;
+-        border-radius: 12px;
+-        font-size: 18px;
+-        font-weight: 600;
+-        line-height: 1;
+-        color: hsl(var(--hue) 42% 36%);
+-        background-color: hsl(var(--hue) 60% 50% / 0.13);
+-
+-        &.favorites {
+-            color: var(--accent);
+-            background-color: color-mix(in srgb, var(--accent) 13%, transparent);
+-        }
+-
+-        & :global(svg) {
+-            width: 20px;
+-            height: 20px;
+-        }
+-    }
+ 
+     .text {
+         display: flex;
+@@ -200,14 +149,17 @@
+         color: var(--secondary);
+     }
+ 
++    @media (max-width: 440px) {
++        .space-choice { grid-template-columns: 28px minmax(0, 1fr) 22px; gap: 10px; }
++        .meta { grid-column: 2; grid-row: 2; margin-top: -6px; }
++        .mark { grid-column: 3; grid-row: 1 / 3; }
++    }
++
+     .failed .meta {
+         color: var(--red, #d33);
+     }
+ 
+     .mark {
+-        position: absolute;
+-        top: 12px;
+-        right: 12px;
+         display: grid;
+         place-items: center;
+         width: 22px;
+@@ -255,21 +207,13 @@
+         line-height: 1;
+     }
+ 
+-    @media (prefers-color-scheme: dark) {
+-        .glyph {
+-            color: hsl(var(--hue) 70% 78%);
+-            background-color: hsl(var(--hue) 50% 60% / 0.16);
+-        }
+-    }
+-
+     @media (prefers-reduced-motion: reduce) {
+-        .space-tile,
+-        .space-tile::after,
++        .space-choice,
+         .mark {
+             transition: none;
+         }
+ 
+-        .space-tile:active:not(.locked) {
++        .space-choice:active:not(.locked) {
+             transform: none;
+         }
+     }
+Index: src/components/helium_onboarding/src/lib/arc/spaces.ts
+===================================================================
+--- src.orig/components/helium_onboarding/src/lib/arc/spaces.ts
++++ src/components/helium_onboarding/src/lib/arc/spaces.ts
+@@ -144,6 +144,7 @@ const parseSpace = (value: unknown): Arc
+         identity: value.identity,
+         profileToken: value.profileToken,
+         name: text(value.name, 120),
++        icon: typeof value.icon === 'string' && value.icon.length <= 128 ? value.icon : '',
+         profileLabel: text(value.profileLabel, 80),
+         pins: count(value.pins),
+         folders: count(value.folders),
+Index: src/components/helium_onboarding/src/lib/cr/arc_space_import_proxy.ts
+===================================================================
+--- src.orig/components/helium_onboarding/src/lib/cr/arc_space_import_proxy.ts
++++ src/components/helium_onboarding/src/lib/cr/arc_space_import_proxy.ts
+@@ -23,6 +23,8 @@ export interface ArcSpace {
+     /** Opaque source-profile key. Favorites count once per profile. */
+     profileToken: string;
+     name: string;
++    /** Optional for older handlers. Emoji or a bundled ph: symbol. */
++    icon?: string;
+     /** Explanatory only, never a selection key. */
+     profileLabel: string;
+     pins: number;
+Index: src/components/helium_onboarding/src/lib/dev/arc-fixture.ts
+===================================================================
+--- src.orig/components/helium_onboarding/src/lib/dev/arc-fixture.ts
++++ src/components/helium_onboarding/src/lib/dev/arc-fixture.ts
+@@ -5,14 +5,14 @@
+ import * as cr from '../cr';
+ import type { ArcJob, ArcSpace, ArcState } from '../cr/arc_space_import_proxy';
+ 
+-type Source = { label: string; favorites: number; spaces: [string, number, number][] };
++type Source = { label: string; favorites: number; spaces: [string, number, number, string][] };
+ 
+ const SOURCES: Source[] = [
+     { label: 'Personal', favorites: 8, spaces: [
+-        ['Personal', 18, 3], ['Research', 1, 0], ['Reading list', 9, 1],
++        ['Personal', 18, 3, '🖥️'], ['Research', 1, 0, '🔬'], ['Reading list', 9, 1, '📚'],
+     ] },
+     { label: 'Work', favorites: 4, spaces: [
+-        ['Work', 31, 6], ['Side project with a long name', 0, 0], ['Travel', 6, 2],
++        ['Work', 31, 6, 'ph:calendar'], ['Side project with a long name', 0, 0, ''], ['Travel', 6, 2, '✈️'],
+     ] },
+     { label: 'School', favorites: 5, spaces: [] },
+ ];
+@@ -43,14 +43,14 @@ const discover = (mode: string) => {
+         } else {
+             const spaces: ArcSpace[] = [];
+             for (const source of mode === 'none' ? [] : SOURCES) {
+-                const add = (name: string, pins: number, folders: number, favoritesOnly: boolean) => {
++                const add = (name: string, pins: number, folders: number, favoritesOnly: boolean, icon = '') => {
+                     const token = `demo${state.generation}-${spaces.length}`;
+                     sourceOf.set(token, source.label);
+                     spaces.push({ token, identity: `${source.label}/${favoritesOnly ? 'f' : name}`,
+-                        profileToken: source.label, name, profileLabel: source.label, pins, folders,
++                        profileToken: source.label, name, icon, profileLabel: source.label, pins, folders,
+                         favorites: source.favorites, favoritesOnly });
+                 };
+-                source.spaces.forEach(([name, pins, folders]) => add(name, pins, folders, false));
++                source.spaces.forEach(([name, pins, folders, icon]) => add(name, pins, folders, false, icon));
+                 if (!source.spaces.length) {
+                     add('Favorites', 0, 0, true);
+                 }
+Index: src/components/helium_onboarding/src/pages/ArcSpaces.svelte
+===================================================================
+--- src.orig/components/helium_onboarding/src/pages/ArcSpaces.svelte
++++ src/components/helium_onboarding/src/pages/ArcSpaces.svelte
+@@ -64,7 +64,7 @@
+                     </div>
+                 </div>
+ 
+-                <div class="space-grid" role="group" aria-label={s.spaces.title}>
++                <div class="space-list" role="group" aria-label={s.spaces.title}>
+                     {#each all as entry (entry.key)}
+                         <SpaceTile
+                             {entry}
+@@ -105,7 +105,7 @@
+                 <Button onclick={() => arcImport.reload()}>{s.spaces.tryAgain}</Button>
+             {:else}
+                 <p class="notice" role="status">{s.spaces.loading}</p>
+-                <div class="space-grid placeholder" aria-hidden="true">
++                <div class="space-list placeholder" aria-hidden="true">
+                     <span></span><span></span><span></span>
+                 </div>
+             {/if}
+@@ -157,16 +157,19 @@
+         color: var(--red, #d33);
+     }
+ 
+-    .space-grid {
++    .space-list {
+         display: grid;
+-        grid-template-columns: repeat(auto-fill, minmax(176px, 1fr));
+-        gap: var(--gap-2);
++        grid-template-columns: minmax(0, 1fr);
++        gap: 2px;
++        padding: 6px;
++        border-radius: 20px;
++        background-color: var(--helium-elevated-5);
+         width: 100%;
+     }
+ 
+     /* Static placeholders: nothing animates while Arc is read. */
+     .placeholder span {
+-        height: 116px;
++        height: 56px;
+         border-radius: 16px;
+         background-color: var(--helium-elevated-5);
+     }
+Index: src/components/helium_onboarding/tests/arc-spaces.test.mjs
+===================================================================
+--- src.orig/components/helium_onboarding/tests/arc-spaces.test.mjs
++++ src/components/helium_onboarding/tests/arc-spaces.test.mjs
+@@ -1234,3 +1234,15 @@ test('one-click copy states its scope wi
+     f.chooseRoute('fresh');
+     assert.equal(walk(f, 2), 'PasswordManager');
+  });
++
++
++test('Space icons survive snapshots without truncating emoji sequences', () => {
++    for (const icon of ['🖥️', '👩🏽‍💻', 'ph:calendar', '']) {
++        const parsed = S.parseState(snap({spaces: [space('icon', 'P', 'Desktop', {icon})]}));
++        assert.equal(parsed.spaces[0].icon, icon);
++    }
++    for (const icon of [undefined, null, {}, 'x'.repeat(129)]) {
++        const parsed = S.parseState(snap({spaces: [space('icon', 'P', 'Desktop', {icon})]}));
++        assert.equal(parsed.spaces[0].icon, '');
++    }
++});
