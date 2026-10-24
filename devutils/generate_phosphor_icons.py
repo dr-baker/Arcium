@@ -49,6 +49,7 @@ def _keywords(name, body, enums):
 
 
 def main():
+    """Write the native icon catalogue and its license from a Phosphor package."""
     if len(sys.argv) != 3:
         sys.exit(__doc__)
     package, output = Path(sys.argv[1]), Path(sys.argv[2])
