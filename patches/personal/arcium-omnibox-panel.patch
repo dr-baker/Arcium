@@ -568,7 +568,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
-@@ -0,0 +1,2350 @@
+@@ -0,0 +1,2406 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -632,23 +632,22 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  float resting_height;
 +  int resting_padding;
 +  bool icons_hidden;
-+  bool flush;
 +  float detent_height;
 +};
 +ScopeGeometry GeometryForReveal(CommandPanelAppearance::Reveal reveal) {
 +  switch (reveal) {
 +    case CommandPanelAppearance::Reveal::kTabs:
-+      return {32, 32, 42, 8, false, false, 0};
++      return {32, 32, 42, 8, false, 0};
 +    case CommandPanelAppearance::Reveal::kIcons:
-+      return {20, 32, 32, 2, false, false, 0};
++      return {20, 32, 32, 2, false, 0};
 +    case CommandPanelAppearance::Reveal::kEdge:
-+      return {12, 32, 12, 0, true, false, 0};
++      return {12, 32, 12, 0, true, 0};
 +    case CommandPanelAppearance::Reveal::kHidden:
-+      return {0, 32, 0, 0, true, false, 0};
-+    case CommandPanelAppearance::Reveal::kFlush:
-+      return {0, 16, 0, 0, true, true, 0};
++      return {0, 32, 0, 0, true, 0};
++    case CommandPanelAppearance::Reveal::kFlat:
++      return {0, 16, 0, 0, true, 0};
 +    case CommandPanelAppearance::Reveal::kDivot:
-+      return {2, 18, 2, 0, true, true, -3};
++      return {2, 18, 2, 0, true, -3};
 +  }
 +  NOTREACHED();
 +}
@@ -962,7 +961,19 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    result.reveal = static_cast<CommandPanelAppearance::Reveal>(reveal);
 +  }
 +  result.connected = value.FindBool("connected").value_or(true);
-+  result.full_width = value.FindBool("full_width").value_or(true);
++  if (value.contains("scope_width")) {
++    const int width = value.FindInt("scope_width").value_or(-1);
++    if (width >= 0 && width <= 2) {
++      result.scope_width = static_cast<CommandPanelAppearance::Width>(width);
++    }
++  } else if (!value.FindBool("full_width").value_or(true)) {
++    result.scope_width = CommandPanelAppearance::Width::kIconWidth;
++  } else if (result.reveal != CommandPanelAppearance::Reveal::kFlat &&
++             result.reveal != CommandPanelAppearance::Reveal::kDivot) {
++    // Preserve legacy layouts on first read. New payloads store width
++    // independently, so subsequent reveal changes cannot move the rail.
++    result.scope_width = CommandPanelAppearance::Width::kOffset;
++  }
 +  result.scope_tints = value.FindBool("scope_tints").value_or(true);
 +  const double strength = value.FindDouble("glow_strength").value_or(0.75);
 +  if (std::isfinite(strength) && strength >= 0.0 && strength <= 2.0) {
@@ -1886,7 +1897,8 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    total_labels += label_spaces[i];
 +  }
 +  const auto geometry = GeometryForReveal(appearance_.reveal);
-+  const float inset = geometry.flush ? 0 : 24;
++  const bool flush = appearance_.scope_width == CommandPanelAppearance::Width::kFlush;
++  const float inset = flush ? 0 : 24;
 +  const float count = std::max<size_t>(1, scopes_.size());
 +  const float scope_gap = std::min(
 +      8.f, std::max(0.f, (body.width() / ui_scale_ - 2 * inset) / count / 3));
@@ -1901,10 +1913,55 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    }
 +    total_labels = label_budget;
 +  }
-+  const float item =
-+      appearance_.full_width
-+          ? std::max(1.f, (span - total_labels) / count)
-+          : std::min(38.f, std::max(1.f, (span - total_labels) / count));
++  const float minimum = std::min(24.f, span / count);
++  const float item = appearance_.scope_width == CommandPanelAppearance::Width::kIconWidth
++                         ? std::min(38.f, span / count)
++                         : span / count;
++  std::vector<float> widths(scopes_.size(), item);
++  const float donor_capacity =
++      std::max(0.f, count - 1) * std::max(0.f, item - minimum);
++  const float free_space = std::max(0.f, span - item * count);
++  if (total_labels > donor_capacity + free_space && total_labels > 0) {
++    const float factor = (donor_capacity + free_space) / total_labels;
++    for (auto& label : label_spaces) {
++      label *= factor;
++    }
++    total_labels = donor_capacity + free_space;
++  }
++  const float growth = std::max(0.f, total_labels - donor_capacity);
++  for (size_t i = 0; i < widths.size(); ++i) {
++    widths[i] += label_spaces[i];
++  }
++  for (size_t i = 0; i < widths.size(); ++i) {
++    const float label = label_spaces[i];
++    if (label <= 0) {
++      continue;
++    }
++    float needed = label - (total_labels > 0 ? growth * label / total_labels : 0);
++    // Let the selected tab open into its nearest neighbors. Farther tabs
++    // stay anchored until those neighbors reach their icon-sized minimum.
++    // The existing 80ms label animation drives this allocation continuously,
++    // including reversals; there is no delayed layout or queued animation.
++    for (size_t distance = 1; needed > .001f && distance < widths.size(); ++distance) {
++      const auto capacity = [&](size_t index) {
++        return std::max(0.f, widths[index] - minimum - label_spaces[index]);
++      };
++      const float left = distance <= i ? capacity(i - distance) : 0;
++      const float right = i + distance < widths.size() ? capacity(i + distance) : 0;
++      const float available = left + right;
++      if (available <= 0) {
++        continue;
++      }
++      const float take = std::min(needed, available);
++      if (left > 0) {
++        widths[i - distance] -= take * left / available;
++      }
++      if (right > 0) {
++        widths[i + distance] -= take * right / available;
++      }
++      needed -= take;
++    }
++  }
 +  float x = body.x() / ui_scale_ + inset;
 +  const int top = body.y() - base::ClampRound(ScopeRise() * ui_scale_);
 +  const int scope_height =
@@ -1913,10 +1970,10 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +                                        scope_animation_.GetCurrentValue()));
 +  for (size_t i = 0; i < scope_buttons_.size(); ++i) {
 +    const int button_x = base::ClampRound(x * ui_scale_);
-+    const float end = x + item + label_spaces[i];
++    const float end = x + widths[i];
 +    const int button_width = base::ClampRound(end * ui_scale_) - button_x;
 +    scope_buttons_[i]->SetVisible(!actions_visible_ &&
-+                                  (scope_height > 0 || geometry.flush));
++                                  (scope_height > 0 || flush));
 +    scope_buttons_[i]->SetBounds(button_x, top, button_width, scope_height);
 +    scope_buttons_[i]->GetViewAccessibility().SetIsSelected(scopes_[i].id ==
 +                                                            scope_);
@@ -1936,7 +1993,8 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  const float top = b.y() + .5f, bottom = b.bottom() - .5f;
 +  SkPathBuilder path;
 +  const auto geometry = GeometryForReveal(appearance_.reveal);
-+  if (geometry.flush && appearance_.connected && appearance_.full_width &&
++  if (appearance_.scope_width == CommandPanelAppearance::Width::kFlush &&
++      appearance_.connected &&
 +      !actions_visible_ && !scope_buttons_.empty()) {
 +    const float crest = scope_buttons_.front()->y();
 +    // The trough stays at its resting height while the whole rail rises.
@@ -2509,9 +2567,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +         ((scopes_[index].id == scope_ ? 1 : 0) - previous) * progress;
 +}
 +float CommandPanelView::ScopeLabelProgress() const {
-+  return appearance_.reveal == CommandPanelAppearance::Reveal::kTabs
-+             ? 1
-+             : scope_label_animation_.GetCurrentValue();
++  return scope_label_animation_.GetCurrentValue();
 +}
 +void CommandPanelView::UpdateScopeReveal() {
 +  const bool show = !actions_visible_ && (scope_browsing_ || scope_hovered_);
@@ -2923,7 +2979,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,254 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -2961,12 +3017,13 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 +  enum class Labels { kPill, kText, kJoined };
 +  enum class Icons { kActions, kArrows, kGoSwitch, kReturn };
 +  // Values are stored in the profile's command-panel layout dictionary.
-+  enum class Reveal { kTabs, kIcons, kEdge, kHidden, kFlush, kDivot };
++  enum class Reveal { kTabs, kIcons, kEdge, kHidden, kFlat, kDivot };
 +  Labels labels = Labels::kText;
 +  Icons icons = Icons::kGoSwitch;
 +  Reveal reveal = Reveal::kDivot;
 +  bool connected = true;
-+  bool full_width = true;
++  enum class Width { kFlush, kIconWidth, kOffset };
++  Width scope_width = Width::kFlush;
 +  bool scope_tints = true;
 +  double glow_strength = 0.75;
 +  bool activity_dots = true;
@@ -3356,7 +3413,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
-@@ -0,0 +1,2221 @@
+@@ -0,0 +1,2367 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +#include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
@@ -3997,7 +4054,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  EXPECT_EQ(CommandPanelAppearance::Reveal::kDivot,
 +            ReadCommandPanelAppearance(&prefs).reveal);
 +  for (const auto reveal : {CommandPanelAppearance::Reveal::kHidden,
-+                            CommandPanelAppearance::Reveal::kFlush,
++                            CommandPanelAppearance::Reveal::kFlat,
 +                            CommandPanelAppearance::Reveal::kDivot}) {
 +    base::DictValue layout;
 +    layout.Set("scope_reveal", static_cast<int>(reveal));
@@ -4012,6 +4069,34 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +            ReadCommandPanelAppearance(&prefs).reveal);
 +}
 +
++TEST(CommandPanelAppearanceTest, ReadsIndependentWidthsAndMigratesLegacyLayouts) {
++  TestingPrefServiceSimple prefs;
++  prefs.registry()->RegisterDictionaryPref(kCommandPanelLayoutPref);
++  using Width = CommandPanelAppearance::Width;
++  EXPECT_EQ(Width::kFlush, ReadCommandPanelAppearance(&prefs).scope_width);
++  for (int reveal = 0; reveal <= 5; ++reveal) {
++    for (int width = 0; width <= 2; ++width) {
++      base::DictValue layout;
++      layout.Set("scope_reveal", reveal);
++      layout.Set("scope_width", width);
++      layout.Set("full_width", false);
++      prefs.SetDict(kCommandPanelLayoutPref, std::move(layout));
++      EXPECT_EQ(static_cast<Width>(width), ReadCommandPanelAppearance(&prefs).scope_width);
++    }
++    base::DictValue legacy;
++    legacy.Set("scope_reveal", reveal);
++    legacy.Set("full_width", true);
++    prefs.SetDict(kCommandPanelLayoutPref, legacy.Clone());
++    EXPECT_EQ(reveal >= 4 ? Width::kFlush : Width::kOffset,
++              ReadCommandPanelAppearance(&prefs).scope_width);
++    legacy.Set("full_width", false);
++    prefs.SetDict(kCommandPanelLayoutPref, legacy.Clone());
++    EXPECT_EQ(Width::kIconWidth, ReadCommandPanelAppearance(&prefs).scope_width);
++    legacy.Set("scope_width", 9);
++    prefs.SetDict(kCommandPanelLayoutPref, std::move(legacy));
++    EXPECT_EQ(Width::kFlush, ReadCommandPanelAppearance(&prefs).scope_width);
++  }
++}
 +TEST(CommandPanelAppearanceTest, ReadsGlowStrengthAndRejectsInvalidValues) {
 +  TestingPrefServiceSimple prefs;
 +  prefs.registry()->RegisterDictionaryPref(kCommandPanelLayoutPref);
@@ -5158,7 +5243,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  };
 +  for (const float scale : {1.f, 1.15f}) {
 +    for (const auto preset :
-+         {Preset{CommandPanelAppearance::Reveal::kFlush, 0, 16},
++         {Preset{CommandPanelAppearance::Reveal::kFlat, 0, 16},
 +          Preset{CommandPanelAppearance::Reveal::kDivot, 2, 18}}) {
 +      panel()->SetInvocation(true);
 +      panel()->SetUIScale(scale);
@@ -5237,7 +5322,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +      gfx::ScopedAnimationDurationScaleMode::NORMAL_DURATION);
 +  Open();
 +  CommandPanelAppearance appearance;
-+  appearance.reveal = CommandPanelAppearance::Reveal::kFlush;
++  appearance.reveal = CommandPanelAppearance::Reveal::kFlat;
 +  panel()->SetAppearance(appearance);
 +  Key(ui::VKEY_UP);
 +  gfx::AnimationTestApi reveal(panel()->scope_animation_for_testing());
@@ -5263,7 +5348,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  state_->scopes[0].label = u"Independent label";
 +  Open();
 +  CommandPanelAppearance appearance;
-+  appearance.reveal = CommandPanelAppearance::Reveal::kFlush;
++  appearance.reveal = CommandPanelAppearance::Reveal::kFlat;
 +  appearance.scope_tints = false;
 +  panel()->SetAppearance(appearance);
 +  Key(ui::VKEY_UP);
@@ -5341,7 +5426,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  state_->scopes[3].tint = SK_ColorBLUE;
 +  Open();
 +  CommandPanelAppearance appearance;
-+  appearance.reveal = CommandPanelAppearance::Reveal::kFlush;
++  appearance.reveal = CommandPanelAppearance::Reveal::kFlat;
 +  appearance.scope_tints = false;
 +  panel()->SetAppearance(appearance);
 +  Key(ui::VKEY_UP);
@@ -5375,6 +5460,117 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  EXPECT_FALSE(PaintPanel().empty());
 +  EXPECT_FALSE(widget_->IsVisible());
 +}
++TEST_F(ArciumNativePanelTest, EveryRevealUsesTheIndependentWidthMode) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_ENABLED);
++  Open();
++  for (const auto width : {CommandPanelAppearance::Width::kFlush,
++                           CommandPanelAppearance::Width::kIconWidth,
++                           CommandPanelAppearance::Width::kOffset}) {
++    for (const double progress : {0., .5, 1.}) {
++      std::vector<gfx::Rect> reference;
++      for (int reveal = 0; reveal <= 5; ++reveal) {
++        CommandPanelAppearance appearance;
++        appearance.scope_width = width;
++        appearance.reveal = static_cast<CommandPanelAppearance::Reveal>(reveal);
++        panel()->SetAppearance(appearance);
++        panel()->scope_animation_for_testing()->Reset(progress);
++        panel()->scope_label_animation_for_testing()->Reset(progress);
++        panel()->AnimationProgressed(panel()->scope_animation_for_testing());
++        views::test::RunScheduledLayout(widget_.get());
++        for (size_t i = 0; i < panel()->scope_count_for_testing(); ++i) {
++          const auto bounds = panel()->scope_button_for_testing(i)->bounds();
++          if (reveal == 0) {
++            reference.push_back(bounds);
++          } else {
++            EXPECT_EQ(reference[i].x(), bounds.x());
++            EXPECT_EQ(reference[i].width(), bounds.width());
++          }
++        }
++      }
++    }
++  }
++}
++TEST_F(ArciumNativePanelTest, InterruptedCompactSelectionPreservesGeometryAndBounds) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_ENABLED);
++  Open();
++  CommandPanelAppearance appearance;
++  appearance.scope_width = CommandPanelAppearance::Width::kIconWidth;
++  panel()->SetAppearance(appearance);
++  Key(ui::VKEY_UP);
++  panel()->scope_label_animation_for_testing()->Reset(1);
++  Key(ui::VKEY_RIGHT);
++  panel()->scope_selection_animation_for_testing()->Reset(.5);
++  panel()->AnimationProgressed(panel()->scope_selection_animation_for_testing());
++  std::vector<gfx::Rect> before;
++  for (size_t i = 0; i < panel()->scope_count_for_testing(); ++i) {
++    before.push_back(panel()->scope_button_for_testing(i)->bounds());
++  }
++  Key(ui::VKEY_RIGHT);
++  views::test::RunScheduledLayout(widget_.get());
++  for (size_t i = 0; i < before.size(); ++i) {
++    const auto bounds = panel()->scope_button_for_testing(i)->bounds();
++    EXPECT_EQ(before[i].x(), bounds.x());
++    EXPECT_EQ(before[i].width(), bounds.width());
++  }
++  panel()->scope_selection_animation_for_testing()->Reset(.5);
++  panel()->AnimationProgressed(panel()->scope_selection_animation_for_testing());
++  const auto body = panel()->body_bounds_for_testing();
++  int right = body.x();
++  for (size_t i = 0; i < panel()->scope_count_for_testing(); ++i) {
++    const auto bounds = panel()->scope_button_for_testing(i)->bounds();
++    EXPECT_GE(bounds.width(), 24);
++    EXPECT_GE(bounds.x(), right);
++    EXPECT_LE(bounds.right(), body.right() - 24);
++    right = bounds.right();
++  }
++  EXPECT_FALSE(PaintPanel().empty());
++}
++TEST_F(ArciumNativePanelTest, ScopeExpansionBorrowsFromAdjacentTabsFirst) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_ENABLED);
++  Open();
++  auto* animation = panel()->scope_label_animation_for_testing();
++  animation->Reset(0);
++  panel()->AnimationProgressed(animation);
++  std::vector<gfx::Rect> before;
++  for (size_t i = 0; i < panel()->scope_count_for_testing(); ++i) {
++    before.push_back(panel()->scope_button_for_testing(i)->bounds());
++  }
++  animation->Reset(.5);
++  panel()->AnimationProgressed(animation);
++  EXPECT_GT(panel()->scope_button_for_testing(0)->width(), before[0].width());
++  EXPECT_LT(panel()->scope_button_for_testing(1)->width(), before[1].width());
++  for (size_t i = 2; i < before.size(); ++i) {
++    EXPECT_NEAR(before[i].x(), panel()->scope_button_for_testing(i)->x(), 1);
++    EXPECT_NEAR(before[i].width(), panel()->scope_button_for_testing(i)->width(), 1);
++  }
++  animation->Reset(0);
++  panel()->AnimationProgressed(animation);
++  for (size_t i = 0; i < before.size(); ++i) {
++    EXPECT_EQ(before[i], panel()->scope_button_for_testing(i)->bounds());
++  }
++}
++TEST_F(ArciumNativePanelTest, LongScopeExpansionPropagatesBeyondTheNearestTab) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_ENABLED);
++  Open();
++  auto publication = Update();
++  publication->scopes[0].label = std::u16string(1000, u'x');
++  Publish(publication);
++  auto* animation = panel()->scope_label_animation_for_testing();
++  animation->Reset(0);
++  panel()->AnimationProgressed(animation);
++  const int far_right = panel()->scope_button_for_testing(5)->bounds().right();
++  const int base_width = panel()->scope_button_for_testing(2)->width();
++  animation->Reset(1);
++  panel()->AnimationProgressed(animation);
++  EXPECT_NEAR(24, panel()->scope_button_for_testing(1)->width(), 1);
++  EXPECT_LT(panel()->scope_button_for_testing(2)->width(), base_width);
++  EXPECT_NEAR(far_right, panel()->scope_button_for_testing(5)->bounds().right(), 1);
++  EXPECT_FALSE(PaintPanel().empty());
++}
 +TEST_F(ArciumNativePanelTest, DivotKeepsConnectionAndWidthChoicesIndependent) {
 +  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
 +      gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
@@ -5383,18 +5579,21 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  appearance.reveal = CommandPanelAppearance::Reveal::kDivot;
 +  Key(ui::VKEY_UP);
 +  for (const bool connected : {false, true}) {
-+    for (const bool full_width : {false, true}) {
++    for (const auto width : {CommandPanelAppearance::Width::kFlush,
++                             CommandPanelAppearance::Width::kIconWidth,
++                             CommandPanelAppearance::Width::kOffset}) {
 +      appearance.connected = connected;
-+      appearance.full_width = full_width;
++      appearance.scope_width = width;
 +      panel()->SetAppearance(appearance);
 +      views::test::RunScheduledLayout(widget_.get());
 +      const auto body = panel()->body_bounds_for_testing();
 +      const auto* first = panel()->scope_button_for_testing(0);
 +      const auto* second = panel()->scope_button_for_testing(1);
 +      const float middle = (first->bounds().right() + second->x()) / 2.f;
-+      EXPECT_EQ(!(connected && full_width),
++      EXPECT_EQ(!(connected && width == CommandPanelAppearance::Width::kFlush),
 +                panel()->GetContourPath().contains(middle, body.y() + 1));
-+      EXPECT_EQ(body.x(), first->x());
++      EXPECT_EQ(body.x() + (width == CommandPanelAppearance::Width::kFlush ? 0 : 24),
++                first->x());
 +      EXPECT_FALSE(PaintPanel().empty());
 +    }
 +  }
@@ -5403,7 +5602,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
 +      gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
 +  Open();
-+  for (const auto reveal : {CommandPanelAppearance::Reveal::kFlush,
++  for (const auto reveal : {CommandPanelAppearance::Reveal::kFlat,
 +                            CommandPanelAppearance::Reveal::kDivot}) {
 +    panel()->SetInvocation(true);
 +    CommandPanelAppearance appearance;
@@ -5437,12 +5636,14 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  Publish(publication);
 +  panel()->SetUIScale(1.15f);
 +  Key(ui::VKEY_UP);
-+  for (const auto reveal : {CommandPanelAppearance::Reveal::kFlush,
++  for (const auto reveal : {CommandPanelAppearance::Reveal::kFlat,
 +                            CommandPanelAppearance::Reveal::kDivot}) {
-+    for (const bool full_width : {false, true}) {
++    for (const auto width : {CommandPanelAppearance::Width::kFlush,
++                             CommandPanelAppearance::Width::kIconWidth,
++                             CommandPanelAppearance::Width::kOffset}) {
 +      CommandPanelAppearance appearance;
 +      appearance.reveal = reveal;
-+      appearance.full_width = full_width;
++      appearance.scope_width = width;
 +      panel()->SetAppearance(appearance);
 +      views::test::RunScheduledLayout(widget_.get());
 +      for (size_t i = 0; i < panel()->scope_count_for_testing(); ++i) {
@@ -5467,9 +5668,11 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  extra.label = u"Extra";
 +  publication->scopes.push_back(extra);
 +  Publish(publication);
-+  for (bool full : {false, true}) {
++  for (const auto width : {CommandPanelAppearance::Width::kFlush,
++                           CommandPanelAppearance::Width::kIconWidth,
++                           CommandPanelAppearance::Width::kOffset}) {
 +    CommandPanelAppearance appearance;
-+    appearance.full_width = full;
++    appearance.scope_width = width;
 +    panel()->SetAppearance(appearance);
 +    panel()->SetUIScale(1.15f);
 +    views::test::RunScheduledLayout(widget_.get());
