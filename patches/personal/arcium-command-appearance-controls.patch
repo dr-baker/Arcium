@@ -1,0 +1,507 @@
+Index: src/chrome/browser/ui/helium/arcium_settings_model.cc
+===================================================================
+--- src.orig/chrome/browser/ui/helium/arcium_settings_model.cc
++++ src/chrome/browser/ui/helium/arcium_settings_model.cc
+@@ -542,7 +542,7 @@ bool ArciumSettingsModel::SetCommandPane
+   if (shutting_down_ || !prefs_ ||
+       !HasPreference(arcium::kCommandPanelLayoutPref) ||
+       !prefs_->IsUserModifiablePreference(arcium::kCommandPanelLayoutPref) ||
+-      layout.size() != 8) {
++      (layout.size() != 8 && layout.size() != 9)) {
+     return false;
+   }
+   constexpr struct {
+@@ -566,7 +566,14 @@ bool ArciumSettingsModel::SetCommandPane
+       *strength > 2.0) {
+     return false;
+   }
+-  prefs_->SetDict(arcium::kCommandPanelLayoutPref, layout.Clone());
++  const auto count = layout.FindInt("result_count");
++  if ((layout.contains("result_count") && (!count || *count < 1 || *count > 20)) ||
++      (layout.size() == 9 && !count)) return false;
++  auto normalized = layout.Clone();
++  if (!*layout.FindBool("connected") && *layout.FindInt("scope_width") == 0) {
++    normalized.Set("scope_width", 2);
++  }
++  prefs_->SetDict(arcium::kCommandPanelLayoutPref, std::move(normalized));
+   return true;
+ }
+ 
+Index: src/chrome/browser/ui/omnibox/arcium_command_example_session.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/omnibox/arcium_command_example_session.h
+@@ -0,0 +1,113 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by the GPL-3.0 license.
++#ifndef CHROME_BROWSER_UI_OMNIBOX_ARCIUM_COMMAND_EXAMPLE_SESSION_H_
++#define CHROME_BROWSER_UI_OMNIBOX_ARCIUM_COMMAND_EXAMPLE_SESSION_H_
++
++#include <algorithm>
++#include <utility>
++#include "base/strings/string_util.h"
++#include "base/strings/string_number_conversions.h"
++#include "chrome/browser/ui/omnibox/arcium_command_session.h"
++
++namespace arcium {
++
++// Deterministic Settings examples. No profile targets, network requests or
++// executable intents are retained, even when an example action menu is open.
++class CommandExampleSession final : public CommandSession {
++ public:
++  explicit CommandExampleSession(std::vector<CommandScopeDescriptor> scopes)
++      : scopes_(std::move(scopes)) {}
++  void SetInvocation(CommandInvocationMode) override {}
++  void SetResultLimit(size_t limit) override { limit_ = std::clamp(limit, size_t{1}, kMaxRows); }
++  std::vector<CommandScopeDescriptor> GetScopes() const override { return scopes_; }
++  void Search(CommandScopeId scope, std::u16string query,
++              CommandPublishCallback publish) override {
++    auto result = std::make_shared<CommandPublication>();
++    result->query_epoch = ++epoch_;
++    result->revision = base::UnguessableToken::Create();
++    result->scope_id = scope;
++    result->query = query;
++    result->scopes = scopes_;
++    const auto descriptor = std::ranges::find(scopes_, scope, &CommandScopeDescriptor::id);
++    const auto label = descriptor == scopes_.end() ? u"Search" : descriptor->label;
++    struct Example {
++      const char16_t* title;
++      const char16_t* detail;
++      const char16_t* category;
++      CommandPrimaryIcon icon;
++      CommandActivity activity;
++    };
++    const Example examples[] = {
++        {u"Project notes", u"Open tab · Work", u"Tab", CommandPrimaryIcon::kSwitch, CommandActivity::kDot},
++        {u"Design reference", u"Pinned page · Design", u"Pin", CommandPrimaryIcon::kGo, CommandActivity::kNone},
++        {u"Daily reading", u"Favorite · Personal", u"Favorite", CommandPrimaryIcon::kSwitch, CommandActivity::kCircle},
++        {u"Research collection", u"Folder · Work", u"Folder", CommandPrimaryIcon::kAction, CommandActivity::kCircleDot},
++        {u"Example website", u"example.com", u"History", CommandPrimaryIcon::kGo, CommandActivity::kNone},
++        {u"Team discussion", u"Open tab · Work", u"Tab", CommandPrimaryIcon::kSwitch, CommandActivity::kDot},
++        {u"Search ideas", u"Search this scope", u"Search", CommandPrimaryIcon::kGo, CommandActivity::kNone},
++        {u"Organize this page", u"Preview actions", u"Action", CommandPrimaryIcon::kAction, CommandActivity::kNone}};
++    const auto needle = base::ToLowerASCII(query.substr(0, kMaxQueryLength));
++    for (size_t i = 0; i < kMaxRows && result->rows.size() < limit_; ++i) {
++      const auto& example = examples[i % std::size(examples)];
++      CommandRow row;
++      row.provider_id = "settings-example";
++      row.selection_key = scope + ":example:" + std::to_string(i);
++      row.target = CommandProviderTarget{row.provider_id, row.selection_key};
++      row.title = scope == kOmniScope || scope == kSavedScope
++                      ? std::u16string(example.title)
++                      : label + u": " + example.title;
++      if (i >= std::size(examples)) row.title += u" " + base::NumberToString16(i + 1);
++      row.detail = example.detail;
++      row.category = example.category;
++      row.primary_icon = example.icon;
++      row.primary_verb = example.icon == CommandPrimaryIcon::kSwitch ? u"Switch"
++                         : example.icon == CommandPrimaryIcon::kAction ? u"Open" : u"Go";
++      row.activity = example.activity;
++      row.has_actions = true;
++      if (descriptor != scopes_.end()) { row.icon = descriptor->icon; row.tint = descriptor->tint; }
++      if (needle.empty() || base::ToLowerASCII(row.title + u" " + row.detail + u" " + row.category).find(needle) != std::u16string::npos) {
++        row.is_default = result->rows.empty();
++        result->rows.push_back(std::move(row));
++      }
++    }
++    if (!query.empty()) {
++      if (result->rows.size() >= limit_) result->rows.pop_back();
++      CommandRow search;
++      search.kind = CommandRowKind::kTypedSearch;
++      search.provider_id = "settings-example";
++      search.selection_key = scope + ":search";
++      search.target = CommandProviderTarget{search.provider_id, search.selection_key};
++      search.title = u"Search " + label + u" for “" + query.substr(0, kMaxQueryLength) + u"”";
++      search.detail = u"Example only";
++      search.category = u"Search";
++      search.primary_verb = u"Go";
++      search.is_default = result->rows.empty();
++      if (descriptor != scopes_.end()) { search.icon = descriptor->icon; search.tint = descriptor->tint; }
++      result->rows.push_back(std::move(search));
++    }
++    publish.Run(std::move(result));
++  }
++  void Cancel() override {}
++  CommandMenu ResolveActions(const CommandTarget&, std::string_view,
++                            std::u16string_view) override {
++    CommandMenu menu;
++    menu.title = u"Example actions";
++    for (const auto* label : {u"Open in a new tab", u"Move to another Space", u"Copy link"}) {
++      CommandMenuEntry entry;
++      entry.id = std::to_string(menu.entries.size());
++      entry.label = label;
++      entry.detail = u"Example only";
++      menu.entries.push_back(std::move(entry));
++    }
++    return menu;
++  }
++  CommandExecutionResult Execute(const CommandIntent&) override {
++    return {false, false, u"Example only"};
++  }
++ private:
++  std::vector<CommandScopeDescriptor> scopes_;
++  size_t limit_ = kMaxResults;
++  uint64_t epoch_ = 0;
++};
++}  // namespace arcium
++#endif  // CHROME_BROWSER_UI_OMNIBOX_ARCIUM_COMMAND_EXAMPLE_SESSION_H_
+Index: src/chrome/browser/ui/omnibox/arcium_command_native_result.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_native_result.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_native_result.cc
+@@ -100,7 +100,7 @@ std::vector<NativeCommandRow> ProjectSup
+     base::UnguessableToken revision,
+     size_t limit) {
+   return ProjectNativeCommandRows(result, revision,
+-                                  std::min(limit, CommandSession::kMaxResults),
++                                  std::min(limit, CommandSession::kMaxRows),
+                                   &IsCommandNativeMatchSupported);
+ }
+ 
+Index: src/chrome/browser/ui/omnibox/arcium_command_preview_session.h
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_preview_session.h
++++ src/chrome/browser/ui/omnibox/arcium_command_preview_session.h
+@@ -18,6 +18,7 @@ class CommandPreviewSession final : publ
+  public:
+   explicit CommandPreviewSession(std::unique_ptr<CommandSession> session)
+       : session_(std::move(session)) {}
++  void SetResultLimit(size_t limit) override { session_->SetResultLimit(limit); }
+   void SetInvocation(CommandInvocationMode mode) override {
+     session_->SetInvocation(mode);
+   }
+Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_providers.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_providers.cc
+@@ -711,7 +711,7 @@ class NativeQueryProvider final : public
+         query_.text.empty()
+             ? std::optional<uint32_t>()
+             : GetUnprojectedNativeDefaultOrdinal(native, native_rows);
+-    if (typed_ordinal && native_rows.size() >= CommandSession::kMaxRows) {
++    if (typed_ordinal && !native_rows.empty() && native_rows.size() >= query_.limit) {
+       native_rows.pop_back();
+     }
+     results.rows.reserve(native_rows.size() + 1);
+Index: src/chrome/browser/ui/omnibox/arcium_command_session.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_session.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_session.cc
+@@ -25,6 +25,10 @@ class ProviderCommandSession final : pub
+   }
+   ~ProviderCommandSession() override { Cancel(); }
+ 
++  void SetResultLimit(size_t limit) override {
++    result_limit_ = std::clamp(limit, size_t{1}, kMaxRows);
++  }
++
+   void SetInvocation(CommandInvocationMode mode) override {
+     Cancel();
+     registry_->ResetRetainedTargets();
+@@ -43,6 +47,7 @@ class ProviderCommandSession final : pub
+               CommandPublishCallback publish) override {
+     Cancel(std::string_view(scope_id));
+     registry_->ResetRetainedTargets();
++    query_limit_ = result_limit_;
+     scope_id_ = std::move(scope_id);
+     query_ = std::move(query);
+     publish_ = std::move(publish);
+@@ -63,7 +68,7 @@ class ProviderCommandSession final : pub
+         return;
+       }
+       selected[slot]->Start(
+-          {epoch, scope_id_, query_, invocation_.invocation, kMaxResults},
++          {epoch, scope_id_, query_, invocation_.invocation, query_limit_},
+           base::BindRepeating(&ProviderCommandSession::OnProviderResults,
+                               weak_factory_.GetWeakPtr(), epoch, slot));
+     }
+@@ -128,8 +133,8 @@ class ProviderCommandSession final : pub
+     if (epoch != epoch_ || slot >= active_.size()) {
+       return;
+     }
+-    if (results.rows.size() > kMaxRows) {
+-      results.rows.resize(kMaxRows);
++    if (results.rows.size() > query_limit_) {
++      results.rows.resize(query_limit_);
+     }
+     active_[slot].rows = std::move(results.rows);
+     active_[slot].done = results.done;
+@@ -148,7 +153,7 @@ class ProviderCommandSession final : pub
+     publication->invocation_text = invocation_.text;
+     publication->scopes = registry_->GetScopes();
+     publication->current_tab = invocation_.current_tab;
+-    publication->rows.reserve(kMaxRows);
++    publication->rows.reserve(query_limit_);
+     bool typed_search = false;
+     // Preserve owner order/default. Nonempty Omni/Web have one native owner;
+     // empty Omni uses the compact local suggestions.
+@@ -169,7 +174,7 @@ class ProviderCommandSession final : pub
+             continue;
+           }
+         }
+-        if (publication->rows.size() >= kMaxRows) {
++        if (publication->rows.size() >= query_limit_) {
+           continue;
+         }
+         if (row.kind == CommandRowKind::kTypedSearch) {
+@@ -191,6 +196,8 @@ class ProviderCommandSession final : pub
+   CommandInvocationSnapshot invocation_;
+   CommandScopeId scope_id_;
+   std::u16string query_;
++  size_t result_limit_ = kMaxResults;
++  size_t query_limit_ = kMaxResults;
+   uint64_t epoch_ = 0;
+   CommandPublishCallback publish_;
+   std::vector<ActiveProvider> active_;
+Index: src/chrome/browser/ui/omnibox/arcium_command_session.h
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_session.h
++++ src/chrome/browser/ui/omnibox/arcium_command_session.h
+@@ -188,11 +188,12 @@ using CommandPublishCallback =
+ class CommandSession {
+  public:
+   static constexpr size_t kMaxResults = 8;
+-  static constexpr size_t kMaxRows = kMaxResults;
++  static constexpr size_t kMaxRows = 20;
+   static constexpr size_t kMaxMenuEntries = 32;
+   static constexpr size_t kMaxQueryLength = 2048;
+   virtual ~CommandSession() = default;
+   virtual void SetInvocation(CommandInvocationMode mode) = 0;
++  virtual void SetResultLimit(size_t limit) {}
+   virtual std::vector<CommandScopeDescriptor> GetScopes() const = 0;
+   virtual void Search(CommandScopeId scope_id,
+                       std::u16string query,
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
+@@ -404,6 +404,11 @@ CommandPanelAppearance ReadCommandPanelA
+     // independently, so subsequent reveal changes cannot move the rail.
+     result.scope_width = CommandPanelAppearance::Width::kOffset;
+   }
++  if (!result.connected && result.scope_width == CommandPanelAppearance::Width::kFlush) {
++    result.scope_width = CommandPanelAppearance::Width::kOffset;
++  }
++  const int count = value.FindInt("result_count").value_or(8);
++  if (count >= 1 && count <= 20) result.result_count = count;
+   result.scope_tints = value.FindBool("scope_tints").value_or(true);
+   const double strength = value.FindDouble("glow_strength").value_or(0.75);
+   if (std::isfinite(strength) && strength >= 0.0 && strength <= 2.0) {
+@@ -743,11 +748,18 @@ void CommandPanelView::SetInvocation(boo
+   FocusInput();
+ }
+ void CommandPanelView::SetAppearance(CommandPanelAppearance appearance) {
++  if (!appearance.connected && appearance.scope_width == CommandPanelAppearance::Width::kFlush) {
++    appearance.scope_width = CommandPanelAppearance::Width::kOffset;
++  }
++  appearance.result_count = std::clamp(appearance.result_count, 1, 20);
+   if (appearance_ == appearance) {
+     return;
+   }
++  const bool count_changed = appearance_.result_count != appearance.result_count;
+   appearance_ = appearance;
++  session_->SetResultLimit(appearance.result_count);
+   UpdateScopeReveal();
++  if (count_changed) RebuildResults();
+   RebuildViews();
+ }
+ void CommandPanelView::SetUIScale(float scale) {
+@@ -1091,7 +1103,7 @@ void CommandPanelView::RebuildPublicatio
+       rows_.push_back({std::move(current), std::nullopt});
+     }
+     for (const auto& data : publication_->rows) {
+-      if (rows_.size() >= CommandSession::kMaxRows) {
++      if (rows_.size() >= static_cast<size_t>(appearance_.result_count)) {
+         break;
+       }
+       if (show_current &&
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel.h
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
+@@ -46,6 +46,7 @@ struct CommandPanelAppearance {
+   bool scope_tints = true;
+   double glow_strength = 0.75;
+   bool activity_dots = true;
++  int result_count = 8;
+   friend bool operator==(const CommandPanelAppearance&,
+                          const CommandPanelAppearance&) = default;
+ };
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "base/functional/bind.h"
+ #include "chrome/browser/ui/omnibox/arcium_command_preview_session.h"
++#include "chrome/browser/ui/omnibox/arcium_command_example_session.h"
+ #include "base/i18n/case_conversion.h"
+ #include "base/numerics/safe_conversions.h"
+ #include "base/run_loop.h"
+@@ -775,6 +776,71 @@ TEST_F(ArciumNativePanelTest, EmbeddedPa
+   EXPECT_EQ(gfx::Range(1, 4), input->GetSelectedRange());
+ }
+ 
++TEST_F(ArciumNativePanelTest, ResultCountUpdatesWithoutReplacingInput) {
++  Open();
++  Query(u"interface");
++  auto* input = panel()->input_for_testing();
++  input->SetSelectedRange(gfx::Range(1, 4));
++  CommandPanelAppearance appearance;
++  appearance.result_count = 2;
++  panel()->SetAppearance(appearance);
++  EXPECT_EQ(2u, panel()->row_count_for_testing());
++  EXPECT_EQ(input, panel()->input_for_testing());
++  EXPECT_EQ(u"interface", input->GetText());
++  EXPECT_EQ(gfx::Range(1, 4), input->GetSelectedRange());
++  appearance.result_count = 8;
++  panel()->SetAppearance(appearance);
++  EXPECT_GT(panel()->row_count_for_testing(), 2u);
++}
++
++TEST(CommandPanelAppearanceTest, DetachedFlushUsesTabsAndCountIsBounded) {
++  TestingPrefServiceSimple prefs;
++  prefs.registry()->RegisterDictionaryPref(kCommandPanelLayoutPref);
++  prefs.registry()->RegisterDictionaryPref(helium::kArciumChromeAppearancePref);
++  for (int count : {0, 1, 8, 20, 21}) {
++    prefs.SetDict(kCommandPanelLayoutPref, base::DictValue()
++        .Set("connected", false).Set("scope_width", 0).Set("result_count", count));
++    const auto appearance = ReadCommandPanelAppearance(&prefs);
++    EXPECT_EQ(CommandPanelAppearance::Width::kOffset, appearance.scope_width);
++    EXPECT_EQ(count >= 1 && count <= 20 ? count : 8, appearance.result_count);
++  }
++}
++
++TEST_F(ArciumNativePanelTest, ExamplesCoverEveryScopeActivityAndDestinationWithoutAuthority) {
++  CommandExampleSession session(TestScopes());
++  for (const auto& scope : session.GetScopes()) {
++    std::shared_ptr<const CommandPublication> result;
++    session.Search(scope.id, u"", base::BindLambdaForTesting(
++        [&](std::shared_ptr<const CommandPublication> value) { result = std::move(value); }));
++    ASSERT_TRUE(result);
++    ASSERT_EQ(8u, result->rows.size());
++    EXPECT_EQ(scope.id, result->scope_id);
++    for (const auto activity : {CommandActivity::kNone, CommandActivity::kDot,
++                                CommandActivity::kCircle, CommandActivity::kCircleDot}) {
++      EXPECT_TRUE(std::ranges::any_of(result->rows, [&](const auto& row) { return row.activity == activity; }));
++    }
++    for (const auto icon : {CommandPrimaryIcon::kGo, CommandPrimaryIcon::kSwitch, CommandPrimaryIcon::kAction}) {
++      EXPECT_TRUE(std::ranges::any_of(result->rows, [&](const auto& row) { return row.primary_icon == icon; }));
++    }
++    CommandIntent intent;
++    intent.target = result->rows.front().target;
++    EXPECT_FALSE(session.Execute(intent).success);
++    EXPECT_FALSE(session.Execute(intent).dismiss);
++    const auto menu = session.ResolveActions(intent.target, "", u"");
++    ASSERT_FALSE(menu.entries.empty());
++    for (const auto& entry : menu.entries) EXPECT_FALSE(entry.intent.has_value());
++    session.SetResultLimit(20);
++    session.Search(scope.id, u"", base::BindLambdaForTesting(
++        [&](std::shared_ptr<const CommandPublication> value) { result = std::move(value); }));
++    EXPECT_EQ(20u, result->rows.size());
++    session.SetResultLimit(8);
++    session.Search(scope.id, u"no-matching-example", base::BindLambdaForTesting(
++        [&](std::shared_ptr<const CommandPublication> value) { result = std::move(value); }));
++    ASSERT_EQ(1u, result->rows.size());
++    EXPECT_EQ(CommandRowKind::kTypedSearch, result->rows.front().kind);
++  }
++}
++
+ TEST_F(ArciumNativePanelTest, PreviewSearchesButCannotExecuteOrResolveActions) {
+   CommandPreviewSession preview(std::make_unique<FakeSession>(state_));
+   preview.SetInvocation(CommandInvocationMode::kNewTab);
+@@ -1039,7 +1105,7 @@ TEST_F(ArciumNativePanelTest, TestOwned2
+                      record.row.activity == CommandActivity::kCircleDot;
+             }));
+   Query(u"reference");
+-  EXPECT_EQ(CommandSession::kMaxRows, panel()->row_count_for_testing());
++  EXPECT_EQ(CommandSession::kMaxResults, panel()->row_count_for_testing());
+   EXPECT_EQ(0u, panel()->action_resolutions_for_testing());
+ }
+ TEST_F(ArciumNativePanelTest, CurrentInvocationUsesCapturedRealTabAndUrl) {
+@@ -2380,7 +2446,7 @@ TEST_F(ArciumNativePanelTest, DivotKeeps
+       const float middle = (first->bounds().right() + second->x()) / 2.f;
+       EXPECT_EQ(!(connected && width == CommandPanelAppearance::Width::kFlush),
+                 panel()->GetContourPath().contains(middle, body.y() + 1));
+-      EXPECT_EQ(body.x() + (width == CommandPanelAppearance::Width::kFlush ? 0 : 24),
++      EXPECT_EQ(body.x() + (connected && width == CommandPanelAppearance::Width::kFlush ? 0 : 24),
+                 first->x());
+       EXPECT_FALSE(PaintPanel().empty());
+     }
+Index: src/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
+@@ -508,6 +508,33 @@ TEST_F(ArciumCommandSessionTest, Browser
+   EXPECT_EQ(2u, actions_->resolved_targets.size());
+ }
+ 
++TEST_F(ArciumCommandSessionTest, ConfiguredLimitsAreCapturedPerQueryAndStaleCallbacksStayRejected) {
++  auto provider = AddProvider("first", {"scope"});
++  for (size_t i = 0; i < 25; ++i) {
++    provider->initial_results.rows.push_back(MakeRow("first", std::to_string(i)));
++  }
++  Search("scope");
++  EXPECT_EQ(8u, provider->queries.back().limit);
++  ASSERT_EQ(8u, publications_.back()->rows.size());
++  const auto pending = provider->callbacks.back();
++  session_->SetResultLimit(20);
++  pending.Run(provider->initial_results);
++  ASSERT_EQ(8u, publications_.back()->rows.size());
++  Search("scope");
++  EXPECT_EQ(20u, provider->queries.back().limit);
++  ASSERT_EQ(20u, publications_.back()->rows.size());
++  const auto before_stale = publications_.size();
++  pending.Run(provider->initial_results);
++  EXPECT_EQ(before_stale, publications_.size());
++  for (size_t requested : {size_t{1}, size_t{0}, size_t{100}}) {
++    session_->SetResultLimit(requested);
++    Search("scope");
++    const size_t expected = requested > 20 ? 20 : 1;
++    EXPECT_EQ(expected, provider->queries.back().limit);
++    ASSERT_EQ(expected, publications_.back()->rows.size());
++  }
++}
++
+ TEST_F(ArciumCommandSessionTest, PublicationBoundsAcrossMultipleProviders) {
+   auto first = AddProvider("first", {"scope"});
+   auto second = AddProvider("second", {"second-scope"});
+@@ -527,8 +554,8 @@ TEST_F(ArciumCommandSessionTest, Publica
+ 
+   ASSERT_EQ(2u, publications_.size());
+   for (const auto& publication : publications_) {
+-    EXPECT_EQ(8u, CommandSession::kMaxRows);
+-    ASSERT_EQ(CommandSession::kMaxRows, publication->rows.size());
++    EXPECT_EQ(8u, CommandSession::kMaxResults);
++    ASSERT_EQ(CommandSession::kMaxResults, publication->rows.size());
+     const auto typed_count =
+         std::count_if(publication->rows.begin(), publication->rows.end(),
+                       [](const CommandRow& row) {
+@@ -972,6 +999,17 @@ TEST(ArciumCommandNativeMatchTest,
+   EXPECT_TRUE(IsCommandNativeMatchSupported(match));
+ }
+ 
++TEST(ArciumCommandNativeMatchTest, SupportedProjectionHonorsExpandedLimitAndHardCeiling) {
++  ACMatches matches;
++  for (int i = 0; i < 30; ++i) matches.push_back(MakeNativeMatch("https://result.test/", 1500 - i));
++  AutocompleteResult result;
++  result.AppendMatches(matches);
++  const auto revision = base::UnguessableToken::Create();
++  EXPECT_EQ(8u, ProjectSupportedNativeCommandRows(result, revision).size());
++  EXPECT_EQ(12u, ProjectSupportedNativeCommandRows(result, revision, 12).size());
++  EXPECT_EQ(20u, ProjectSupportedNativeCommandRows(result, revision, 100).size());
++}
++
+ TEST(ArciumCommandNativeMatchTest,
+      SupportedProjectionPreservesOriginalOrdinalsOrderDefaultAndCap) {
+   ACMatches matches;
+@@ -991,7 +1029,7 @@ TEST(ArciumCommandNativeMatchTest,
+   result.AppendMatches(matches);
+   ASSERT_EQ(result.match_at(0), result.default_match());
+   const auto revision = base::UnguessableToken::Create();
+-  const auto rows = ProjectSupportedNativeCommandRows(result, revision, 100);
++  const auto rows = ProjectSupportedNativeCommandRows(result, revision, CommandSession::kMaxResults);
+   const std::vector<uint32_t> expected_ordinals = {0, 2, 4, 5, 6, 7, 8, 9};
+   ASSERT_EQ(expected_ordinals.size(), rows.size());
+   EXPECT_EQ(CommandSession::kMaxResults, rows.size());
