@@ -483,16 +483,46 @@ def _retrieve_local_files(file_iter, source_dir):
     return files
 
 
+def _locate_hunk(hunk, file_lines, expected, minimum):
+    """Locate full old-side context without accepting fuzz or ambiguous offsets."""
+    original = [line.value.rstrip('\n') for line in hunk if line.is_context or line.is_removed]
+    end = len(file_lines) - int(bool(file_lines) and file_lines[-1] == '')
+    if not original:
+        # A pure insertion has no source text that could justify relocation.
+        if not minimum <= expected <= end:
+            raise _PatchValidationError('Unanchored insertion is outside the source range')
+        return expected
+
+    def matches(position):
+        return (minimum <= position <= end - len(original)
+                and file_lines[position:position + len(original)] == original)
+
+    if matches(expected):
+        return expected
+    candidate = None
+    for position in range(minimum, end - len(original) + 1):
+        if matches(position):
+            if candidate is not None:
+                raise _PatchValidationError('Hunk has ambiguous exact-context matches')
+            candidate = position
+    if candidate is None:
+        raise _PatchValidationError('Hunk has no exact-context match; fuzz is not allowed')
+    return candidate
+
+
 def _modify_file_lines(patched_file, file_lines):
     """Helper for _apply_file_unidiff"""
     # Cursor for keeping track of the current line during hunk application
     # NOTE: The cursor is based on the line list index, not the line number!
-    line_cursor = None
+    line_cursor = 0
+    offset = 0
     for hunk in patched_file:
         # Validate hunk will match
         if not hunk.is_valid():
             raise _PatchValidationError(f'Hunk is not valid: {repr(hunk)}')
-        line_cursor = hunk.target_start - 1
+        declared = hunk.target_start - (1 if hunk.target_length else 0)
+        line_cursor = _locate_hunk(hunk, file_lines, declared + offset, line_cursor)
+        offset = line_cursor - declared
         for line in hunk:
             normalized_line = line.value.rstrip('\n')
             if line.is_added:
@@ -524,7 +554,10 @@ def _apply_file_unidiff(patched_file, files_under_test):
         assert len(patched_file) == 1 # Should be only one hunk
         assert patched_file[0].removed == 0
         assert patched_file[0].target_start == 1
-        files_under_test[patched_file_path] = [x.value.rstrip('\n') for x in patched_file[0]]
+        content = ''.join(line.value for line in patched_file[0] if line.is_added)
+        if patched_file[0][-1].line_type == LINE_TYPE_NO_NEWLINE:
+            content = content.removesuffix('\n')
+        files_under_test[patched_file_path] = content.split('\n')
     elif patched_file.is_removed_file:
         # Remove lines to see if file to be removed matches patch
         _modify_file_lines(patched_file, files_under_test[patched_file_path])
@@ -562,7 +595,7 @@ def _test_patches(series_iter, patch_cache, files_under_test):
             if get_logger().isEnabledFor(logging.DEBUG):
                 orig_file_content = files_under_test.get(Path(patched_file.path))
                 if orig_file_content:
-                    orig_file_content = ' '.join(orig_file_content)
+                    orig_file_content = '\n'.join(orig_file_content)
             try:
                 _apply_file_unidiff(patched_file, files_under_test)
             except _PatchValidationError as exc:
