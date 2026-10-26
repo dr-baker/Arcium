@@ -1,0 +1,221 @@
+Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
++++ src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
+@@ -50,6 +50,14 @@
+ #include "chrome/browser/ui/views/location_bar/location_bar_view.h"
+ #include "components/prefs/pref_service.h"
+ #include "ui/views/widget/widget.h"
++#include "chrome/browser/ui/views/infobars/confirm_infobar.h"
++#include "chrome/browser/ui/views/infobars/infobar_container_view.h"
++#include "components/infobars/content/content_infobar_manager.h"
++#include "components/infobars/core/confirm_infobar_delegate.h"
++#include "ui/base/hit_test.h"
++#include "ui/views/controls/button/md_text_button.h"
++#include "ui/views/controls/label.h"
++#include "ui/views/view_class_properties.h"
+ 
+ class ArciumBrowserChromeTest : public TestWithBrowserView {
+  protected:
+@@ -103,6 +111,96 @@ class ArciumBrowserChromeTest : public T
+   void Layout() { browser_view()->GetWidget()->LayoutRootViewIfNecessary(); }
+ };
+ 
++namespace {
++int ChromeHitTest(BrowserView* browser_view, views::View* view,
++                  gfx::Point point) {
++  views::View::ConvertPointToTarget(view, browser_view->parent(), &point);
++  return browser_view->NonClientHitTest(point);
++}
++
++class DragTestInfoBarDelegate : public ConfirmInfoBarDelegate {
++ public:
++  InfoBarIdentifier GetIdentifier() const override { return TEST_INFOBAR; }
++  std::u16string GetMessageText() const override { return u"Automation notice"; }
++};
++}
++
++TEST_F(ArciumBrowserChromeTest, HiddenToolbarTopFrameDragsWithoutClaimingPage) {
++  prefs()->SetBoolean(arcium::kShowToolbarPref, false);
++  auto* view = browser_view()->multi_contents_view();
++  for (int scale : {75, 100, 150}) {
++    prefs()->SetInteger(arcium::kChromeUIScalePref, scale);
++    for (int border : {1, 6, 12}) {
++      prefs()->SetInteger(arcium::kChromeFrameBorderWidthPref, border);
++      Layout();
++      const auto bounds = view->GetActiveContentsContainerView()->bounds();
++      ASSERT_GT(bounds.y(), 0);
++      EXPECT_EQ(HTCAPTION, ChromeHitTest(browser_view(), view,
++          gfx::Point(bounds.CenterPoint().x(), bounds.y() - 1)));
++      EXPECT_EQ(HTCLIENT, ChromeHitTest(browser_view(), view,
++          gfx::Point(bounds.CenterPoint().x(), bounds.y() + 2)));
++      EXPECT_EQ(HTCLIENT, ChromeHitTest(browser_view(), view,
++          gfx::Point(view->width() - 1, bounds.CenterPoint().y())));
++    }
++  }
++}
++
++TEST_F(ArciumBrowserChromeTest, StackedSplitTopPageNeverBecomesWindowCaption) {
++  AddTab(browser(), GURL("https://second.test/"));
++  auto* model = browser()->tab_strip_model();
++  model->AddToNewSplit({1 - model->active_index()},
++      split_tabs::SplitTabVisualData(split_tabs::SplitTabLayout::kStacked),
++      split_tabs::SplitTabCreatedSource::kToolbarButton);
++  prefs()->SetBoolean(arcium::kShowToolbarPref, false);
++  auto* view = browser_view()->multi_contents_view();
++  for (int index : {0, 1}) {
++    model->ActivateTabAt(index);
++    Layout();
++    for (auto* container : view->contents_container_views()) {
++      ASSERT_TRUE(container->GetVisible());
++      EXPECT_EQ(HTCLIENT, ChromeHitTest(browser_view(), view,
++                                      container->bounds().CenterPoint()));
++    }
++    EXPECT_EQ(HTCAPTION, ChromeHitTest(browser_view(), view,
++                                      gfx::Point(view->width() / 2, 2)));
++  }
++}
++
++TEST_F(ArciumBrowserChromeTest, InfobarPaddingDragsAndControlsRemainClient) {
++  gfx::ScopedAnimationDurationScaleMode animations(
++      gfx::ScopedAnimationDurationScaleMode::ZERO_DURATION);
++  auto infobar = ConfirmInfoBar::Create(std::make_unique<DragTestInfoBarDelegate>());
++  auto* bar = infobar.get();
++  auto* manager = infobars::ContentInfoBarManager::FromWebContents(
++      browser()->tab_strip_model()->GetActiveWebContents());
++  ASSERT_TRUE(manager);
++  manager->AddInfoBar(std::move(infobar));
++  bar->Show(false);
++  ASSERT_TRUE(base::test::RunUntil([&] {
++    Layout();
++    return bar->IsDrawn();
++  }));
++  ASSERT_GT(bar->width(), 100);
++  EXPECT_EQ(HTCAPTION, ChromeHitTest(browser_view(), bar,
++                                    gfx::Point(2, bar->height() / 2)));
++  auto client = [&](views::View* control) {
++    ASSERT_TRUE(control);
++    EXPECT_EQ(HTCLIENT, ChromeHitTest(browser_view(), control,
++                                     control->GetLocalBounds().CenterPoint()));
++  };
++  client(bar->label_for_testing());
++  client(bar->ok_button_for_testing());
++  client(bar->cancel_button_for_testing());
++  views::View* dismiss = nullptr;
++  for (views::View* child : bar->children()) {
++    for (views::View* nested : child->children()) {
++      if (nested->GetProperty(views::kElementIdentifierKey) ==
++          InfoBarView::kDismissButtonElementId) dismiss = nested;
++    }
++  }
++  client(dismiss);
++  manager->RemoveInfoBar(bar);
++}
+ TEST_F(ArciumBrowserChromeTest, HiddenToolbarHasEvenUnattachedFrameEdges) {
+   ASSERT_TRUE(browser_view()->ShouldDrawVerticalTabStrip());
+   ASSERT_TRUE(chrome::IsCommandEnabled(browser(), IDC_ARCIUM_TOGGLE_TOOLBAR));
+Index: src/chrome/browser/ui/views/frame/browser_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_view.cc
++++ src/chrome/browser/ui/views/frame/browser_view.cc
+@@ -6565,6 +6565,22 @@ int BrowserView::NonClientHitTest(const
+     }
+   }
+ 
++  if (browser_->is_type_normal() && !IsFullscreen()) {
++    gfx::Point widget_point(point);
++    views::View::ConvertPointToWidget(parent(), &widget_point);
++    if (infobar_container_ && infobar_container_->IsDrawn()) {
++      const int component =
++          views::GetHitTestComponent(infobar_container_, widget_point);
++      if (component != HTNOWHERE) return component;
++    }
++    gfx::Point contents_point(point);
++    if (multi_contents_view_->IsDrawn() &&
++        ConvertedHitTest(parent(), multi_contents_view_, &contents_point) &&
++        multi_contents_view_->IsPositionInWindowCaption(contents_point)) {
++      return HTCAPTION;
++    }
++  }
++
+   // If the point's y coordinate is below the top of the topmost view and
+   // otherwise within the bounds of this view, the point is considered to be
+   // within the client area.
+Index: src/chrome/browser/ui/views/frame/multi_contents_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/multi_contents_view.cc
++++ src/chrome/browser/ui/views/frame/multi_contents_view.cc
+@@ -213,6 +213,22 @@ MultiContentsView::MultiContentsView(
+   UpdateContentsBorderAndOverlay();
+ }
+ 
++bool MultiContentsView::IsPositionInWindowCaption(const gfx::Point& point) {
++  if (!GetLocalBounds().Contains(point)) return false;
++  int contents_top = height();
++  bool has_contents = false;
++  for (const auto* container : contents_container_views_) {
++    if (container->GetVisible() && !container->bounds().IsEmpty()) {
++      contents_top = std::min(contents_top, container->y());
++      has_contents = true;
++    }
++  }
++  if (!has_contents || point.y() >= contents_top) return false;
++  const auto* target = GetEventHandlerForPoint(point);
++  return target == this || target == background_view_ ||
++         target == contents_separators_.top_separator.get();
++}
++
+ MultiContentsView::~MultiContentsView() {
+   // Clear the map before `RemoveAllChildViews()` to avoid having dangling
+   // pointers.
+Index: src/chrome/browser/ui/views/frame/multi_contents_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/multi_contents_view.h
++++ src/chrome/browser/ui/views/frame/multi_contents_view.h
+@@ -180,6 +180,8 @@ class MultiContentsView
+ 
+   MultiContentsViewDropTargetController& drop_target_controller() const;
+ 
++  bool IsPositionInWindowCaption(const gfx::Point& point);
++
+   bool IsDragAndDropEnabled() const;
+   bool ShouldUseRoundedFrame() const;
+   void OnDragAndDropPrefStateChange();
+Index: src/chrome/browser/ui/views/infobars/infobar_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/infobars/infobar_view.cc
++++ src/chrome/browser/ui/views/infobars/infobar_view.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/views/infobars/infobar_view.h"
++#include "ui/base/hit_test.h"
++#include "ui/views/window/hit_test_utils.h"
+ 
+ #include <algorithm>
+ #include <memory>
+@@ -104,6 +106,8 @@ DEFINE_CLASS_ELEMENT_IDENTIFIER_VALUE(In
+ InfoBarView::InfoBarView(std::unique_ptr<infobars::InfoBarDelegate> delegate)
+     : infobars::InfoBar(std::move(delegate)),
+       views::ExternalFocusTracker(this, nullptr) {
++  views::SetHitTestComponent(this, HTCAPTION);
++
+   // Make Infobar animation aligned to the Compositor.
+   SetNotifier(std::make_unique<
+               gfx::AnimationDelegateNotifier<views::AnimationDelegateViews>>(
+@@ -175,6 +179,7 @@ InfoBarView::InfoBarView(std::unique_ptr
+ 
+   // Create the content container for flex layout.
+   content_container_ = AddChildView(std::make_unique<views::View>());
++  views::SetHitTestComponent(content_container_, HTCLIENT);
+   content_container_->SetLayoutManager(std::make_unique<views::FlexLayout>());
+   content_container_->SetProperty(
+       views::kFlexBehaviorKey,
+@@ -190,6 +195,7 @@ InfoBarView::InfoBarView(std::unique_ptr
+ 
+   // Create the container for right-aligned elements.
+   right_side_container_ = AddChildView(std::make_unique<views::View>());
++  views::SetHitTestComponent(right_side_container_, HTCLIENT);
+   auto* right_layout = right_side_container_->SetLayoutManager(
+       std::make_unique<views::FlexLayout>());
+   right_layout->SetOrientation(views::LayoutOrientation::kHorizontal)
