@@ -1,0 +1,169 @@
+Description: Embed the command panel in Settings without window resizing or execution authority.
+
+Index: src/chrome/browser/ui/omnibox/arcium_command_preview_session.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/omnibox/arcium_command_preview_session.h
+@@ -0,0 +1,52 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by the GPL-3.0 license.
++#ifndef CHROME_BROWSER_UI_OMNIBOX_ARCIUM_COMMAND_PREVIEW_SESSION_H_
++#define CHROME_BROWSER_UI_OMNIBOX_ARCIUM_COMMAND_PREVIEW_SESSION_H_
++
++#include <memory>
++#include <utility>
++
++#include "base/functional/bind.h"
++
++#include "chrome/browser/ui/omnibox/arcium_command_session.h"
++
++namespace arcium {
++
++// The actual search and scope providers, with no execution authority. Settings
++// previews can exercise the real presenter without navigating or changing tabs.
++class CommandPreviewSession final : public CommandSession {
++ public:
++  explicit CommandPreviewSession(std::unique_ptr<CommandSession> session)
++      : session_(std::move(session)) {}
++  void SetInvocation(CommandInvocationMode mode) override {
++    session_->SetInvocation(mode);
++  }
++  std::vector<CommandScopeDescriptor> GetScopes() const override {
++    return session_->GetScopes();
++  }
++  void Search(CommandScopeId scope, std::u16string query,
++              CommandPublishCallback publish) override {
++    session_->Search(std::move(scope), std::move(query), base::BindRepeating(
++        [](CommandPublishCallback publish,
++           std::shared_ptr<const CommandPublication> publication) {
++          auto preview = std::make_shared<CommandPublication>(*publication);
++          const auto strip_actions = [](CommandRow& row) {
++            row.has_actions = false;
++            row.primary_submenu_id.clear();
++          };
++          for (auto& row : preview->rows) strip_actions(row);
++          if (preview->current_tab) strip_actions(*preview->current_tab);
++          publish.Run(std::move(preview));
++        }, std::move(publish)));
++  }
++  void Cancel() override { session_->Cancel(); }
++  CommandMenu ResolveActions(const CommandTarget&, std::string_view,
++                            std::u16string_view) override { return {}; }
++  CommandExecutionResult Execute(const CommandIntent&) override { return {}; }
++
++ private:
++  std::unique_ptr<CommandSession> session_;
++};
++
++}  // namespace arcium
++#endif  // CHROME_BROWSER_UI_OMNIBOX_ARCIUM_COMMAND_PREVIEW_SESSION_H_
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
+@@ -756,7 +756,7 @@ void CommandPanelView::SetUIScale(float
+     return;
+   }
+   ui_scale_ = scale;
+-  if (GetWidget()) {
++  if (GetWidget() && !embedded_) {
+     auto bounds = GetWidget()->GetWindowBoundsInScreen();
+     const int available_width = available_width_provider_
+                                     ? available_width_provider_.Run() : 10000;
+@@ -1273,11 +1273,11 @@ void CommandPanelView::UpdateGeometry()
+     return;
+   }
+   const int desired = GetPreferredSize().height();
+-  if (!height_resize_) {
++  if (!height_resize_ && !embedded_) {
+     auto bounds = GetWidget()->GetWindowBoundsInScreen();
+     bounds.set_height(desired);
+     GetWidget()->SetBounds(bounds);
+-  } else if (requested_height_ != desired) {
++  } else if (height_resize_ && requested_height_ != desired) {
+     requested_height_ = desired;
+     const int current = height_resize_.Run(std::nullopt, base::TimeDelta());
+     if (desired == current) {
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel.h
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
+@@ -66,6 +66,8 @@ class CommandPanelView : public views::V
+   void FocusInput();
+   void SetAppearance(CommandPanelAppearance appearance);
+   void SetUIScale(float scale);
++  // Embedded presenters let their host lay out the pane, never the window.
++  void SetEmbedded(bool embedded) { embedded_ = embedded; }
+   void BindPreferences(PrefService* prefs,
+                        base::RepeatingCallback<float()> scale_provider,
+                        base::RepeatingCallback<int()> available_width_provider);
+@@ -131,6 +133,7 @@ class CommandPanelView : public views::V
+   void OnScrollEvent(ui::ScrollEvent*) override;
+ 
+  private:
++  bool embedded_ = false;
+   class Row;
+   class ResultsView;
+   class ResultsScrollView;
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
+@@ -8,6 +8,7 @@
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
++#include "chrome/browser/ui/omnibox/arcium_command_preview_session.h"
+ #include "base/i18n/case_conversion.h"
+ #include "base/numerics/safe_conversions.h"
+ #include "base/run_loop.h"
+@@ -755,6 +756,49 @@ TEST(CommandPanelAppearanceTest, ReadsGl
+   }
+ }
+ 
++TEST_F(ArciumNativePanelTest, EmbeddedPanelNeverResizesItsEditorWindow) {
++  Open();
++  panel()->SetEmbedded(true);
++  const gfx::Rect editor_bounds(20, 30, 1180, 700);
++  widget_->SetBounds(editor_bounds);
++  auto* input = panel()->input_for_testing();
++  Query(u"interface");
++  input->SetSelectedRange(gfx::Range(1, 4));
++  panel()->SetUIScale(1.25f);
++  CommandPanelAppearance appearance;
++  appearance.reveal = CommandPanelAppearance::Reveal::kTabs;
++  panel()->SetAppearance(appearance);
++  Key(ui::VKEY_UP);
++  EXPECT_EQ(editor_bounds, widget_->GetWindowBoundsInScreen());
++  EXPECT_EQ(input, panel()->input_for_testing());
++  EXPECT_EQ(u"interface", input->GetText());
++  EXPECT_EQ(gfx::Range(1, 4), input->GetSelectedRange());
++}
++
++TEST_F(ArciumNativePanelTest, PreviewSearchesButCannotExecuteOrResolveActions) {
++  CommandPreviewSession preview(std::make_unique<FakeSession>(state_));
++  preview.SetInvocation(CommandInvocationMode::kNewTab);
++  EXPECT_FALSE(preview.GetScopes().empty());
++  std::shared_ptr<const CommandPublication> result;
++  preview.Search(kOmniScope, u"interface", base::BindLambdaForTesting(
++      [&](std::shared_ptr<const CommandPublication> publication) {
++        result = std::move(publication);
++      }));
++  ASSERT_TRUE(result);
++  ASSERT_FALSE(result->rows.empty());
++  CommandIntent intent;
++  intent.target = result->rows.front().target;
++  const auto execution = preview.Execute(intent);
++  EXPECT_FALSE(execution.success);
++  EXPECT_FALSE(execution.dismiss);
++  EXPECT_TRUE(state_->executed.empty());
++  EXPECT_TRUE(preview.ResolveActions(intent.target, "", u"").entries.empty());
++  EXPECT_TRUE(state_->menu_requests.empty());
++  const auto cancels = state_->cancels;
++  preview.Cancel();
++  EXPECT_GT(state_->cancels, cancels);
++}
++
+ TEST_F(ArciumNativePanelTest, InactiveScopeGlowIs66PercentAcrossSelectionTransitions) {
+   auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
+       gfx::Animation::RichAnimationRenderMode::FORCE_ENABLED);

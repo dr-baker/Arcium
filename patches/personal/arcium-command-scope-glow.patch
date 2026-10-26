@@ -2,7 +2,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
-@@ -1432,39 +1432,49 @@ void CommandPanelView::PaintConnectedSco
+@@ -1573,39 +1573,49 @@ void CommandPanelView::PaintConnectedSco
    gfx::ScopedCanvas restore(canvas);
    const auto contour = GetContourPath();
    canvas->ClipPath(contour, true);
@@ -36,7 +36,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    const auto color = [&](float strength) {
 +      return SkColor4f::FromColor(Alpha(
 +          tint, std::clamp(base::ClampRound(
-+                    255 * alpha * strength * appearance_.glow_strength),
++                    255 * alpha * strength),
 +                0, 255)));
 +    };
 +    const SkColor4f stops[] = {color(1), color(.58f), color(.16f),
@@ -58,7 +58,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 -    const float alpha = .14f + .08f * ScopeWeight(i);
 +    const float y = button->y();
 +    const float reach = button->width() * 1.05f;
-+    const float alpha = .20f + .08f * ScopeWeight(i);
++    const float alpha = .28f * ScopeGlowStrength(i);
      if (scopes_[i].id == kOmniScope) {
 -      glow(accent_color_, x - button->width() * .24f,
 -           reach * .8f, alpha);
@@ -76,7 +76,17 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
      }
    }
  }
-@@ -1726,13 +1736,16 @@ void CommandPanelView::PaintScope(gfx::C
+@@ -1847,6 +1857,9 @@ void CommandPanelView::PaintRow(gfx::Can
+             cue_color);
+   }
+ }
++float CommandPanelView::ScopeGlowStrength(size_t index) const {
++  return appearance_.glow_strength * (.66f + .34f * ScopeWeight(index));
++}
+ void CommandPanelView::PaintScope(gfx::Canvas* canvas,
+                                   size_t index,
+                                   int width,
+@@ -1867,13 +1880,16 @@ void CommandPanelView::PaintScope(gfx::C
      cc::PaintFlags glow;
      if (scope.id == kOmniScope) {
        constexpr std::array<float, 3> centers = {.5f, .88f, .12f};
@@ -90,11 +100,11 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
          matrix.postTranslate(width * centers[i], 0);
          const SkColor4f stops[] = {
 -            SkColor4f::FromColor(Alpha(accent_color_, base::ClampRound((46 + 25 * weight) * appearance_.glow_strength))),
-+            SkColor4f::FromColor(Alpha(tints[i], base::ClampRound((46 + 25 * weight) * appearance_.glow_strength))),
++            SkColor4f::FromColor(Alpha(tints[i], base::ClampRound(71 * ScopeGlowStrength(index)))),
              SkColors::kTransparent};
          glow.setShader(cc::PaintShader::MakeRadialGradient(
              {0, 0}, 1, stops, nullptr, 2, SkTileMode::kClamp,
-@@ -1740,7 +1753,7 @@ void CommandPanelView::PaintScope(gfx::C
+@@ -1881,12 +1897,12 @@ void CommandPanelView::PaintScope(gfx::C
          canvas->DrawRect(gfx::Rect(0, 0, width, height), glow);
        }
      } else {
@@ -103,12 +113,41 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
        const SkPoint points[] = {{0, 0}, {0, static_cast<float>(height)}};
        const SkScalar positions[] = {0, .7f, 1};
        const SkColor4f colors[] = {
+-          SkColor4f::FromColor(Alpha(tint, base::ClampRound((40 + 25 * weight) * appearance_.glow_strength))),
+-          SkColor4f::FromColor(Alpha(tint, base::ClampRound((20 + 13 * weight) * appearance_.glow_strength))),
++          SkColor4f::FromColor(Alpha(tint, base::ClampRound(65 * ScopeGlowStrength(index)))),
++          SkColor4f::FromColor(Alpha(tint, base::ClampRound(33 * ScopeGlowStrength(index)))),
+           SkColors::kTransparent};
+       glow.setShader(cc::PaintShader::MakeLinearGradient(
+           points, colors, positions, 3, SkTileMode::kClamp));
 Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
-@@ -535,6 +535,9 @@ TEST(CommandPanelAppearanceTest, ReadsGl
+@@ -754,8 +754,31 @@ TEST(CommandPanelAppearanceTest, ReadsGl
+   }
+ }
  
++TEST_F(ArciumNativePanelTest, InactiveScopeGlowIs66PercentAcrossSelectionTransitions) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_ENABLED);
++  Open();
++  EXPECT_NEAR(.75f, panel()->scope_glow_strength_for_testing(0), .0001f);
++  EXPECT_NEAR(.75f * .66f, panel()->scope_glow_strength_for_testing(1), .0001f);
++  Key(ui::VKEY_RIGHT);
++  auto* selection = panel()->scope_selection_animation_for_testing();
++  selection->Reset(.5);
++  EXPECT_NEAR(panel()->scope_glow_strength_for_testing(0),
++              panel()->scope_glow_strength_for_testing(1), .0001f);
++  selection->Reset(1);
++  EXPECT_NEAR(.75f * .66f, panel()->scope_glow_strength_for_testing(0), .0001f);
++  EXPECT_NEAR(.75f, panel()->scope_glow_strength_for_testing(1), .0001f);
++  CommandPanelAppearance appearance;
++  appearance.glow_strength = 1.25;
++  panel()->SetAppearance(appearance);
++  EXPECT_NEAR(1.25f * .66f, panel()->scope_glow_strength_for_testing(0), .0001f);
++  EXPECT_NEAR(1.25f, panel()->scope_glow_strength_for_testing(1), .0001f);
++}
  TEST_F(ArciumNativePanelTest, HiddenPresenterOwnsInputAndPaintsItsContents) {
    Open();
 +  CommandPanelAppearance appearance;
@@ -117,7 +156,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
    EXPECT_EQ(panel()->GetWidget(), panel()->input_for_testing()->GetWidget());
    EXPECT_EQ(7u, panel()->row_count_for_testing());
    EXPECT_EQ(0u, panel()->action_resolutions_for_testing());
-@@ -585,6 +588,8 @@ TEST_F(ArciumNativePanelTest, ThemeAccen
+@@ -806,6 +829,8 @@ TEST_F(ArciumNativePanelTest, ThemeAccen
  TEST_F(ArciumNativePanelTest, SemanticColorsUpdateLiveWithoutReplacingInput) {
    TestingPrefServiceSimple prefs;
    prefs.registry()->RegisterDictionaryPref(kCommandPanelLayoutPref);
@@ -126,3 +165,25 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
    prefs.registry()->RegisterIntegerPref(kChromeUIScalePref, kChromeUIScaleDefault);
    prefs.registry()->RegisterStringPref(helium::kArciumSurfaceSetPref,
                                         helium::kSurfaceSetCustom);
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel.h
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
+@@ -81,6 +81,9 @@ class CommandPanelView : public views::V
+   views::Textfield* input_for_testing() const { return input_; }
+   views::ScrollView* scroll_for_testing() const { return scroll_; }
+   views::View* scope_button_for_testing(size_t index) const;
++  float scope_glow_strength_for_testing(size_t index) const {
++    return ScopeGlowStrength(index);
++  }
+   views::View* back_button_for_testing() const { return back_button_; }
+   size_t row_count_for_testing() const { return rows_.size(); }
+   size_t action_resolutions_for_testing() const { return action_resolutions_; }
+@@ -188,6 +191,7 @@ class CommandPanelView : public views::V
+   SkColor SelectionColor() const;
+   SkColor AccentColor(SkColor background) const;
+   void PaintRow(gfx::Canvas*, size_t index, int width, int height);
++  float ScopeGlowStrength(size_t index) const;
+   void PaintScope(gfx::Canvas*, size_t index, int width, int height);
+   void PaintConnectedScopeGlow(gfx::Canvas*);
+   void PaintFooter(gfx::Canvas*, int width, int height);

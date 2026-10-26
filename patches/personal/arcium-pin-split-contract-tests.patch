@@ -1,0 +1,351 @@
+Index: src/chrome/browser/ui/omnibox/arcium_command_split_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_split_unittest.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_split_unittest.cc
+@@ -13,6 +13,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/run_loop.h"
+ #include "base/supports_user_data.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
+ #include "chrome/browser/ui/browser.h"
+@@ -213,6 +214,11 @@ class SavedSourceSplitTest
+   }
+ 
+   void ExpectSavedSource(const SavedSourceState& state) {
++    ExpectSavedSource(state, state.link);
++  }
++
++  void ExpectSavedSource(const SavedSourceState& state,
++                         const PersistentLink& expected_link) {
+     tabs::TabInterface* source = state.handle.Get();
+     ASSERT_TRUE(source);
+     EXPECT_EQ(state.contents, source->GetContents());
+@@ -237,7 +243,7 @@ class SavedSourceSplitTest
+                                                       : space_->pins(),
+         state.link.id);
+     ASSERT_TRUE(link);
+-    EXPECT_EQ(state.link, *link);
++    EXPECT_EQ(expected_link, *link);
+     GURL home_url;
+     std::u16string home_title;
+     ASSERT_TRUE(
+@@ -260,6 +266,64 @@ class SavedSourceSplitTest
+               strip()->IsPinTab(source));
+   }
+ 
++  PersistentLink ExpectedSplitLink(const SavedSourceState& state,
++                                   const GURL& companion_home,
++                                   const std::u16string& companion_title,
++                                   bool source_second = false,
++                                   int active_pane = 0) {
++    auto expected = state.link;
++    EXPECT_FALSE(expected.split);
++    if (state.kind == PersistentRecordKind::kFavorite) return expected;
++    expected.split = PersistentSplit{
++        .second_url = source_second ? state.link.url : companion_home,
++        .second_title = source_second ? state.link.title : companion_title,
++        .stacked = false, .ratio = 0.5, .active_pane = active_pane};
++    if (source_second) {
++      expected.url = companion_home;
++      expected.title = companion_title;
++    }
++    return expected;
++  }
++
++  void ExpectSavedCollections(const SavedSourceState& state,
++                              const PersistentLink& expected_link,
++                              const PersistentNodes& pins,
++                              const PersistentNodes& favorites) {
++    auto expected_pins = pins;
++    if (state.kind == PersistentRecordKind::kPin) {
++      auto* link = PersistentItemCodec::FindLink(expected_pins, state.link.id);
++      ASSERT_TRUE(link);
++      *link = expected_link;
++    }
++    EXPECT_EQ(expected_pins, space_->pins());
++    EXPECT_EQ(favorites, service_->GetFavoritesForBrowser(browser()));
++  }
++
++  void ExpectSplitCompanion(const SavedSourceState& state,
++                            tabs::TabInterface* companion,
++                            const GURL& home, const std::u16string& title) {
++    ASSERT_TRUE(companion);
++    auto* helper = TabUIHelper::From(companion);
++    ASSERT_TRUE(helper);
++    if (state.kind == PersistentRecordKind::kFavorite) {
++      EXPECT_FALSE(service_->IsPersistentItemTab(companion));
++      EXPECT_FALSE(helper->HasAnchoredPinnedTabHome());
++      return;
++    }
++    EXPECT_EQ(PersistentRecordKind::kPin, service_->GetPersistentItemKind(companion));
++    EXPECT_EQ(state.link.id, service_->GetPersistentItemId(companion));
++    EXPECT_TRUE(service_->AreTabsInSamePersistentItem(state.handle.Get(), companion));
++    GURL actual_home;
++    std::u16string actual_title;
++    ASSERT_TRUE(service_->GetPersistentItemHome(companion, &actual_home, &actual_title));
++    EXPECT_EQ(home, actual_home);
++    EXPECT_EQ(title, actual_title);
++    EXPECT_TRUE(helper->HasAnchoredPinnedTabHome());
++    EXPECT_EQ(home, helper->anchored_pinned_tab_home_url());
++    EXPECT_EQ(title.empty() ? base::UTF8ToUTF16(home.host()) : title,
++              helper->anchored_pinned_tab_home_title());
++  }
++
+   split_tabs::SplitTabId SplitWithCopy(tabs::TabInterface* source,
+                                        tabs::TabInterface** companion) {
+     *companion = AddOrdinaryTab("https://destination.test/copy");
+@@ -290,20 +354,21 @@ TEST_P(SavedSourceSplitTest, SavedParent
+   const int initial_count = model()->count();
+   const auto id = SplitWithCopy(source, &companion);
+   ASSERT_TRUE(model()->ContainsSplit(id));
++  const auto companion_home = companion->GetContents()->GetLastCommittedURL();
++  const auto companion_title = companion->GetContents()->GetTitle();
++  const auto expected_link = ExpectedSplitLink(state, companion_home, companion_title, false, 0);
+   base::RunLoop().RunUntilIdle();
+   ASSERT_TRUE(model()->ContainsSplit(id));
+   EXPECT_EQ(initial_count + 1, model()->count());
+   EXPECT_EQ(id, source->GetSplit());
+   EXPECT_EQ(id, companion->GetSplit());
+-  EXPECT_FALSE(service_->IsPersistentItemTab(companion));
+-  EXPECT_FALSE(TabUIHelper::From(companion)->HasAnchoredPinnedTabHome());
+-  EXPECT_EQ(pins, space_->pins());
+-  EXPECT_EQ(favorites, service_->GetFavoritesForBrowser(browser()));
+-  ExpectSavedSource(state);
++  ExpectSplitCompanion(state, companion, companion_home, companion_title);
++  ExpectSavedCollections(state, expected_link, pins, favorites);
++  ExpectSavedSource(state, expected_link);
+ }
+ 
+ TEST_P(SavedSourceSplitTest,
+-       NonadjacentSavedSiblingsKeepInterveningTabAndAssociations) {
++       NonadjacentIndependentSavedItemsAreRejectedAtomically) {
+   auto* source = AddSavedSource();
+   const auto source_state = CaptureSavedSource(source);
+   std::string folder_id;
+@@ -355,32 +420,23 @@ TEST_P(SavedSourceSplitTest,
+   const auto favorites = service_->GetFavoritesForBrowser(browser());
+   const int count = model()->count();
+   model()->ActivateTabAt(model()->GetIndexOfTab(source));
++  EXPECT_FALSE(model()->IsContextMenuCommandEnabled(
++      model()->GetIndexOfTab(target), TabStripModel::CommandAddToSplit));
+   const auto id = model()->AddToNewSplit(
+       {model()->GetIndexOfTab(target)}, split_tabs::SplitTabVisualData(),
+       split_tabs::SplitTabCreatedSource::kToolbarButton);
+   base::RunLoop().RunUntilIdle();
+ 
+-  ASSERT_TRUE(model()->ContainsSplit(id));
+-  EXPECT_EQ((std::vector<tabs::TabInterface*>{source, target}),
+-            model()->GetSplitData(id)->ListTabs());
+-  EXPECT_EQ(parent, source->GetParentCollection()->GetParentCollection());
+-  EXPECT_FALSE(intervening->IsSplit());
+-  EXPECT_EQ(parent, intervening->GetParentCollection());
++  EXPECT_FALSE(model()->ContainsSplit(id));
+   EXPECT_EQ(count, model()->count());
++  EXPECT_EQ(source, model()->GetActiveTab());
+   EXPECT_EQ(pins, space_->pins());
+   EXPECT_EQ(favorites, service_->GetFavoritesForBrowser(browser()));
+-  ExpectSavedSource(source_state);
+-  ExpectSavedSource(target_state);
+-  ExpectSavedSource(intervening_state);
+-
+-  model()->RemoveSplit(id);
+-  base::RunLoop().RunUntilIdle();
+-  EXPECT_EQ(count, model()->count());
+-  EXPECT_FALSE(source->IsSplit());
+-  EXPECT_FALSE(target->IsSplit());
+-  EXPECT_FALSE(intervening->IsSplit());
+-  EXPECT_EQ(pins, space_->pins());
+-  EXPECT_EQ(favorites, service_->GetFavoritesForBrowser(browser()));
++  for (size_t i = 0; i < siblings.size(); ++i) {
++    EXPECT_FALSE(siblings[i]->IsSplit());
++    EXPECT_EQ(parent, siblings[i]->GetParentCollection());
++    EXPECT_EQ(i, parent->GetIndexOfTab(siblings[i]));
++  }
+   ExpectSavedSource(source_state);
+   ExpectSavedSource(target_state);
+   ExpectSavedSource(intervening_state);
+@@ -417,6 +473,9 @@ TEST_P(SavedSourceSplitTest,
+   auto old_companion = companion->GetHandle();
+   auto* copy = AddOrdinaryTab("https://replacement.test/");
+   auto* copy_contents = copy->GetContents();
++  const auto companion_home = copy->GetContents()->GetLastCommittedURL();
++  const auto companion_title = copy->GetContents()->GetTitle();
++  const auto expected_link = ExpectedSplitLink(state, companion_home, companion_title, true, 1);
+   model()->ActivateTabAt(model()->GetIndexOfTab(source));
+   model()->UpdateTabInSplit(companion, model()->GetIndexOfTab(copy),
+                             TabStripModel::SplitUpdateType::kReplace);
+@@ -427,8 +486,8 @@ TEST_P(SavedSourceSplitTest,
+             model()->GetSplitData(id)->ListTabs());
+   EXPECT_EQ(source, model()->GetActiveTab());
+   EXPECT_EQ(copy_contents, copy->GetContents());
+-  EXPECT_FALSE(service_->IsPersistentItemTab(copy));
+-  ExpectSavedSource(state);
++  ExpectSplitCompanion(state, copy, companion_home, companion_title);
++  ExpectSavedSource(state, expected_link);
+ }
+ 
+ TEST_P(SavedSourceSplitTest,
+@@ -489,6 +548,9 @@ TEST_P(SavedSourceSplitTest,
+   const auto id = SplitWithCopy(source, &companion);
+   ASSERT_TRUE(model()->ContainsSplit(id));
+   auto* copy = AddOrdinaryTab("https://replacement.test/");
++  const auto companion_home = copy->GetContents()->GetLastCommittedURL();
++  const auto companion_title = copy->GetContents()->GetTitle();
++  const auto expected_link = ExpectedSplitLink(state, companion_home, companion_title, false, 1);
+   model()->ActivateTabAt(model()->GetIndexOfTab(companion));
+   ActiveSelectionObserver observer(model());
+   model()->UpdateTabInSplit(companion, model()->GetIndexOfTab(copy),
+@@ -499,7 +561,8 @@ TEST_P(SavedSourceSplitTest,
+             std::ranges::find(observer.active_tabs, copy->GetHandle()));
+   EXPECT_EQ(id, source->GetSplit());
+   EXPECT_EQ(id, copy->GetSplit());
+-  ExpectSavedSource(state);
++  ExpectSplitCompanion(state, copy, companion_home, companion_title);
++  ExpectSavedSource(state, expected_link);
+ }
+ 
+ TEST_P(SavedSourceSplitTest, ClosingCompanionPreservesSavedSource) {
+@@ -521,6 +584,9 @@ TEST_P(SavedSourceSplitTest, LastGrouped
+   const auto state = CaptureSavedSource(source);
+   auto* incoming = AddOrdinaryTab("https://incoming.test/");
+   auto* incoming_contents = incoming->GetContents();
++  const auto companion_home = incoming->GetContents()->GetLastCommittedURL();
++  const auto companion_title = incoming->GetContents()->GetTitle();
++  const auto expected_link = ExpectedSplitLink(state, companion_home, companion_title, false, 0);
+   const auto pins = space_->pins();
+   const auto favorites = service_->GetFavoritesForBrowser(browser());
+   const int count = model()->count();
+@@ -539,11 +605,9 @@ TEST_P(SavedSourceSplitTest, LastGrouped
+   EXPECT_EQ(GURL("https://incoming.test/"),
+             incoming->GetContents()->GetLastCommittedURL());
+   EXPECT_EQ(count, model()->count());
+-  EXPECT_FALSE(service_->IsPersistentItemTab(incoming));
+-  EXPECT_FALSE(TabUIHelper::From(incoming)->HasAnchoredPinnedTabHome());
+-  EXPECT_EQ(pins, space_->pins());
+-  EXPECT_EQ(favorites, service_->GetFavoritesForBrowser(browser()));
+-  ExpectSavedSource(state);
++  ExpectSplitCompanion(state, incoming, companion_home, companion_title);
++  ExpectSavedCollections(state, expected_link, pins, favorites);
++  ExpectSavedSource(state, expected_link);
+ }
+ 
+ TEST_P(SavedSourceSplitTest, NativePinnedIncomingBeforeSourceKeepsPaneOrder) {
+@@ -585,6 +649,9 @@ TEST_P(SavedSourceSplitTest, SwappingCom
+   auto* companion_contents = companion->GetContents();
+   auto* incoming = AddOrdinaryTab("https://incoming.test/");
+   auto* incoming_contents = incoming->GetContents();
++  const auto companion_home = incoming->GetContents()->GetLastCommittedURL();
++  const auto companion_title = incoming->GetContents()->GetTitle();
++  const auto expected_link = ExpectedSplitLink(state, companion_home, companion_title, false, 0);
+   model()->ActivateTabAt(model()->GetIndexOfTab(source));
+   model()->UpdateTabInSplit(companion, model()->GetIndexOfTab(incoming),
+                             TabStripModel::SplitUpdateType::kSwap);
+@@ -595,7 +662,8 @@ TEST_P(SavedSourceSplitTest, SwappingCom
+   EXPECT_EQ(companion_contents, companion->GetContents());
+   EXPECT_EQ(incoming_contents, incoming->GetContents());
+   ExpectOrdinary(companion);
+-  ExpectSavedSource(state);
++  ExpectSplitCompanion(state, incoming, companion_home, companion_title);
++  ExpectSavedSource(state, expected_link);
+ }
+ 
+ TEST_P(SavedSourceSplitTest, SwappingSavedPaneLeavesItsOriginalTabAtHome) {
+@@ -645,6 +713,9 @@ TEST_P(SavedSourceSplitTest, QueuedClean
+   tabs::TabInterface* companion;
+   const auto first_id = SplitWithCopy(source, &companion);
+   ASSERT_TRUE(model()->ContainsSplit(first_id));
++  const auto companion_home = companion->GetContents()->GetLastCommittedURL();
++  const auto companion_title = companion->GetContents()->GetTitle();
++  const auto expected_link = ExpectedSplitLink(state, companion_home, companion_title);
+   model()->RemoveSplit(first_id);
+   model()->ActivateTabAt(model()->GetIndexOfTab(source));
+   const auto second_id = model()->AddToNewSplit(
+@@ -652,13 +723,14 @@ TEST_P(SavedSourceSplitTest, QueuedClean
+       split_tabs::SplitTabCreatedSource::kToolbarButton);
+   base::RunLoop().RunUntilIdle();
+   EXPECT_EQ(second_id, companion->GetSplit());
+-  ExpectSavedSource(state);
++  ExpectSplitCompanion(state, companion, companion_home, companion_title);
++  ExpectSavedSource(state, expected_link);
+   model()->RemoveSplit(second_id);
+   auto handle = companion->GetHandle();
+   model()->DetachAndDeleteWebContentsAt(model()->GetIndexOfTab(companion));
+   base::RunLoop().RunUntilIdle();
+   EXPECT_FALSE(handle.Get());
+-  ExpectSavedSource(state);
++  ExpectSavedSource(state, expected_link);
+ }
+ 
+ TEST_P(SavedSourceSplitTest, QueuedCleanupKeepsNewlySavedCompanion) {
+@@ -750,6 +822,15 @@ TEST_P(SavedSourceSplitTest, DifferentSa
+   tabs::TabInterface* companion;
+   const auto id = SplitWithCopy(source, &companion);
+   ASSERT_TRUE(model()->ContainsSplit(id));
++  const auto companion_home = companion->GetContents()->GetLastCommittedURL();
++  const auto companion_title = companion->GetContents()->GetTitle();
++  const auto expected_link = ExpectedSplitLink(source_state, companion_home, companion_title);
++  base::RunLoop().RunUntilIdle();
++  ExpectSavedSource(source_state, expected_link);
++  ExpectSplitCompanion(source_state, companion, companion_home, companion_title);
++  const auto split_pins = space_->pins();
++  const auto split_favorites = service_->GetFavoritesForBrowser(browser());
++  const auto split_tabs = model()->GetSplitData(id)->ListTabs();
+   const int split_count = model()->count();
+   model()->UpdateTabInSplit(companion, model()->GetIndexOfTab(target),
+                             TabStripModel::SplitUpdateType::kReplace);
+@@ -758,7 +839,11 @@ TEST_P(SavedSourceSplitTest, DifferentSa
+   EXPECT_EQ(id, source->GetSplit());
+   EXPECT_EQ(id, companion->GetSplit());
+   EXPECT_FALSE(target->IsSplit());
+-  ExpectSavedSource(source_state);
++  EXPECT_EQ(split_pins, space_->pins());
++  EXPECT_EQ(split_favorites, service_->GetFavoritesForBrowser(browser()));
++  EXPECT_EQ(split_tabs, model()->GetSplitData(id)->ListTabs());
++  EXPECT_EQ(source, model()->GetActiveTab());
++  ExpectSavedSource(source_state, expected_link);
+   ExpectSavedSource(target_state);
+ }
+ 
+@@ -775,6 +860,21 @@ TEST_P(SavedSourceSplitTest,
+       {model()->GetIndexOfTab(other_a)}, split_tabs::SplitTabVisualData(),
+       split_tabs::SplitTabCreatedSource::kToolbarButton);
+   ASSERT_EQ(other_id, other_b->GetSplit());
++  const auto companion_home = companion->GetContents()->GetLastCommittedURL();
++  const auto companion_title = companion->GetContents()->GetTitle();
++  const auto expected_link = ExpectedSplitLink(state, companion_home, companion_title);
++  base::RunLoop().RunUntilIdle();
++  ExpectSavedSource(state, expected_link);
++  ExpectSplitCompanion(state, companion, companion_home, companion_title);
++  const auto split_pins = space_->pins();
++  const auto split_favorites = service_->GetFavoritesForBrowser(browser());
++  const auto source_tabs = model()->GetSplitData(id)->ListTabs();
++  const auto other_tabs = model()->GetSplitData(other_id)->ListTabs();
++  auto* other_a_contents = other_a->GetContents();
++  auto* other_b_contents = other_b->GetContents();
++  const auto other_a_url = other_a_contents->GetLastCommittedURL();
++  const auto other_b_url = other_b_contents->GetLastCommittedURL();
++  const int count = model()->count();
+   model()->ActivateTabAt(model()->GetIndexOfTab(source));
+   model()->UpdateTabInSplit(companion, model()->GetIndexOfTab(other_a),
+                             TabStripModel::SplitUpdateType::kReplace);
+@@ -783,7 +883,17 @@ TEST_P(SavedSourceSplitTest,
+   EXPECT_EQ(id, companion->GetSplit());
+   EXPECT_EQ(other_id, other_a->GetSplit());
+   EXPECT_EQ(other_id, other_b->GetSplit());
+-  ExpectSavedSource(state);
++  EXPECT_EQ(count, model()->count());
++  EXPECT_EQ(source, model()->GetActiveTab());
++  EXPECT_EQ(split_pins, space_->pins());
++  EXPECT_EQ(split_favorites, service_->GetFavoritesForBrowser(browser()));
++  EXPECT_EQ(source_tabs, model()->GetSplitData(id)->ListTabs());
++  EXPECT_EQ(other_tabs, model()->GetSplitData(other_id)->ListTabs());
++  EXPECT_EQ(other_a_contents, other_a->GetContents());
++  EXPECT_EQ(other_b_contents, other_b->GetContents());
++  EXPECT_EQ(other_a_url, other_a_contents->GetLastCommittedURL());
++  EXPECT_EQ(other_b_url, other_b_contents->GetLastCommittedURL());
++  ExpectSavedSource(state, expected_link);
+ }
+ 
+ INSTANTIATE_TEST_SUITE_P(

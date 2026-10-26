@@ -568,7 +568,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
-@@ -0,0 +1,2234 @@
+@@ -0,0 +1,2406 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -632,23 +632,22 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  float resting_height;
 +  int resting_padding;
 +  bool icons_hidden;
-+  bool flush;
 +  float detent_height;
 +};
 +ScopeGeometry GeometryForReveal(CommandPanelAppearance::Reveal reveal) {
 +  switch (reveal) {
 +    case CommandPanelAppearance::Reveal::kTabs:
-+      return {32, 32, 42, 8, false, false, 0};
++      return {32, 32, 42, 8, false, 0};
 +    case CommandPanelAppearance::Reveal::kIcons:
-+      return {20, 32, 32, 2, false, false, 0};
++      return {20, 32, 32, 2, false, 0};
 +    case CommandPanelAppearance::Reveal::kEdge:
-+      return {12, 32, 12, 0, true, false, 0};
++      return {12, 32, 12, 0, true, 0};
 +    case CommandPanelAppearance::Reveal::kHidden:
-+      return {0, 32, 0, 0, true, false, 0};
-+    case CommandPanelAppearance::Reveal::kFlush:
-+      return {0, 16, 0, 0, true, true, 0};
++      return {0, 32, 0, 0, true, 0};
++    case CommandPanelAppearance::Reveal::kFlat:
++      return {0, 16, 0, 0, true, 0};
 +    case CommandPanelAppearance::Reveal::kDivot:
-+      return {2, 18, 2, 0, true, true, -3};
++      return {2, 18, 2, 0, true, -3};
 +  }
 +  NOTREACHED();
 +}
@@ -962,7 +961,19 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    result.reveal = static_cast<CommandPanelAppearance::Reveal>(reveal);
 +  }
 +  result.connected = value.FindBool("connected").value_or(true);
-+  result.full_width = value.FindBool("full_width").value_or(true);
++  if (value.contains("scope_width")) {
++    const int width = value.FindInt("scope_width").value_or(-1);
++    if (width >= 0 && width <= 2) {
++      result.scope_width = static_cast<CommandPanelAppearance::Width>(width);
++    }
++  } else if (!value.FindBool("full_width").value_or(true)) {
++    result.scope_width = CommandPanelAppearance::Width::kIconWidth;
++  } else if (result.reveal != CommandPanelAppearance::Reveal::kFlat &&
++             result.reveal != CommandPanelAppearance::Reveal::kDivot) {
++    // Preserve legacy layouts on first read. New payloads store width
++    // independently, so subsequent reveal changes cannot move the rail.
++    result.scope_width = CommandPanelAppearance::Width::kOffset;
++  }
 +  result.scope_tints = value.FindBool("scope_tints").value_or(true);
 +  const double strength = value.FindDouble("glow_strength").value_or(0.75);
 +  if (std::isfinite(strength) && strength >= 0.0 && strength <= 2.0) {
@@ -1253,6 +1264,8 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  input_->RequestFocus();
 +}
 +void CommandPanelView::SetInvocation(bool new_tab) {
++  height_resize_timer_.Stop();
++  requested_height_.reset();
 +  ++request_generation_;
 +  session_->Cancel();
 +  session_->SetInvocation(new_tab ? CommandInvocationMode::kNewTab
@@ -1416,14 +1429,19 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  return row ? row->data.selection_key : std::string();
 +}
 +const CommandPanelView::DisplayRow* CommandPanelView::SelectedRow() const {
-+  if (selected_ < 0 || selected_ >= static_cast<int>(rows_.size())) {
++  if ((!actions_visible_ && !publication_) || selected_ < 0 ||
++      selected_ >= static_cast<int>(rows_.size())) {
 +    return nullptr;
 +  }
 +  const auto& row = rows_[selected_];
 +  return row.menu_entry.has_value() == actions_visible_ ? &row : nullptr;
 +}
 +CommandPanelView::Row* CommandPanelView::SelectedRowView() const {
-+  return SelectedRow() && selected_ < static_cast<int>(row_views_.size())
++  // A pending query retains its visual selection while action and AX
++  // authority are blocked separately by SelectedRow(), Select() and Activate().
++  return selected_ >= 0 && selected_ < static_cast<int>(row_views_.size()) &&
++                 selected_ < static_cast<int>(rows_.size()) &&
++                 rows_[selected_].menu_entry.has_value() == actions_visible_
 +             ? row_views_[selected_].get()
 +             : nullptr;
 +}
@@ -1503,8 +1521,13 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  requested_query_ = current_context_ ? std::u16string() : query;
 +  if (publication_ && (publication_->scope_id != scope_ ||
 +                       publication_->query != requested_query_)) {
++    const bool same_scope = publication_->scope_id == scope_;
 +    publication_.reset();
-+    rows_.clear();
++    // Keep the last presentation while this scope searches again. It has no
++    // executable authority until the current request supplies replacement rows.
++    if (!same_scope) {
++      rows_.clear();
++    }
 +    RebuildViews();
 +  }
 +  const uint64_t request = ++request_generation_;
@@ -1542,9 +1565,8 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    return;
 +  }
 +  const bool preserve_selection = publication_ != nullptr;
-+  publication_ = std::move(publication);
-+  SyncScopes(publication_->scopes);
-+  if (scopes_.empty() || publication_->scope_id != scope_) {
++  SyncScopes(publication->scopes);
++  if (scopes_.empty() || publication->scope_id != scope_) {
 +    publication_.reset();
 +    rows_.clear();
 +    selection_explicit_ = false;
@@ -1556,6 +1578,18 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    }
 +    return;
 +  }
++  const bool has_current_row = current_context_ && scope_ == kOmniScope &&
++                               publication->current_tab.has_value();
++  if (!actions_visible_ && !rows_.empty() && publication->rows.empty() &&
++      !has_current_row && !publication->done) {
++    if (selection_explicit_ && pending_selection_key_.empty()) {
++      pending_selection_key_ = SelectedKey();
++    }
++    publication_.reset();
++    RebuildViews(true);
++    return;
++  }
++  publication_ = std::move(publication);
 +  if (current_context_ && invocation_prefill_pending_) {
 +    const base::AutoReset<bool> update_guard(&updating_, true);
 +    input_->SetText(publication_->invocation_text);
@@ -1672,27 +1706,43 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  RebuildViews(preserve_selection);
 +}
 +void CommandPanelView::RebuildViews(bool preserve_selection) {
-+  input_->GetViewAccessibility().ClearActiveDescendant();
-+  row_views_.clear();
-+  hovered_ = -1;
-+  if (back_button_) {
++  if (!preserve_selection || hovered_ >= static_cast<int>(rows_.size())) {
++    hovered_ = -1;
++  }
++  if (!actions_visible_ && back_button_) {
 +    RemoveChildViewT(back_button_.get());
 +    back_button_ = nullptr;
 +  }
-+  results_view_->RemoveAllChildViews();
-+  if (actions_visible_) {
++  if (actions_visible_ && !back_button_) {
 +    back_button_ = AddChildView(std::make_unique<BackButton>(this));
++  }
++  if (back_button_) {
 +    back_button_->GetViewAccessibility().SetName(
 +        menu_stack_.size() > 1 ? u"Back to actions" : u"Back to results");
 +  }
++  // Reuse row slots as Chromium's popup does. Async text/icon updates must not
++  // tear down every button and its accessibility node between painted frames.
++  if (row_views_.size() > rows_.size()) {
++    input_->GetViewAccessibility().ClearActiveDescendant();
++  }
++  while (row_views_.size() > rows_.size()) {
++    auto* row = row_views_.back().get();
++    row_views_.pop_back();
++    results_view_->RemoveChildViewT(row);
++  }
++  while (row_views_.size() < rows_.size()) {
++    row_views_.push_back(results_view_->AddChildView(
++        std::make_unique<Row>(this, row_views_.size())));
++  }
 +  for (size_t i = 0; i < rows_.size(); ++i) {
-+    auto* row = results_view_->AddChildView(std::make_unique<Row>(this, i));
++    auto* row = row_views_[i].get();
 +    const auto& data = rows_[i].data;
 +    row->GetViewAccessibility().SetName(data.title + u", " + data.category +
 +                                        u", " + data.detail + u", " +
 +                                        Verb(rows_[i]));
-+    row->SetEnabled(!rows_[i].menu_entry || rows_[i].menu_entry->enabled);
-+    row_views_.push_back(row);
++    row->SetEnabled(actions_visible_ ? rows_[i].menu_entry &&
++                                          rows_[i].menu_entry->enabled
++                                    : publication_ != nullptr);
 +  }
 +  if (!preserve_selection) {
 +    selection_initialized_ = false;
@@ -1737,13 +1787,57 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +                   width() - S(ui_scale_, 2 * kShadowInset),
 +                   height() - S(ui_scale_, kRailReserve + kShadowInset));
 +}
++void CommandPanelView::SetHeightResizeCallback(HeightResizeCallback callback) {
++  height_resize_timer_.Stop();
++  requested_height_.reset();
++  if (height_resize_) {
++    height_resize_.Run(std::nullopt, base::TimeDelta());
++  }
++  height_resize_ = std::move(callback);
++}
 +void CommandPanelView::UpdateGeometry() {
-+  if (!GetWidget()) {
++  if (!GetWidget() || GetWidget()->IsClosed()) {
 +    return;
 +  }
-+  auto bounds = GetWidget()->GetWindowBoundsInScreen();
-+  bounds.set_height(GetPreferredSize().height());
-+  GetWidget()->SetBounds(bounds);
++  const int desired = GetPreferredSize().height();
++  if (!height_resize_) {
++    auto bounds = GetWidget()->GetWindowBoundsInScreen();
++    bounds.set_height(desired);
++    GetWidget()->SetBounds(bounds);
++  } else if (requested_height_ != desired) {
++    requested_height_ = desired;
++    const int current = height_resize_.Run(std::nullopt, base::TimeDelta());
++    if (desired == current) {
++      height_resize_timer_.Stop();
++    } else {
++      // Both directions wait for a stable target. Identical publications do
++      // not restart the debounce; growth snaps and contraction uses a spring.
++      height_resize_timer_.Start(
++          FROM_HERE, base::Milliseconds(40),
++          base::BindOnce(&CommandPanelView::ApplyPendingHeight,
++                         weak_ptr_factory_.GetWeakPtr()));
++    }
++  }
++  // Rows, selection and input update immediately inside the retained frame.
++  LayoutAndNotifyGeometry();
++}
++void CommandPanelView::ApplyPendingHeight() {
++  if (!GetWidget() || GetWidget()->IsClosed() || !height_resize_ ||
++      !requested_height_) {
++    return;
++  }
++  const int current = height_resize_.Run(std::nullopt, base::TimeDelta());
++  if (*requested_height_ != current) {
++    const auto duration =
++        *requested_height_ < current &&
++                gfx::Animation::ShouldRenderRichAnimation()
++            ? base::Milliseconds(60)
++            : base::TimeDelta();
++    height_resize_.Run(requested_height_, duration);
++  }
++  LayoutAndNotifyGeometry();
++}
++void CommandPanelView::LayoutAndNotifyGeometry() {
 +  GetWidget()->GetRootView()->DeprecatedLayoutImmediately();
 +  if (geometry_changed_) {
 +    geometry_changed_.Run();
@@ -1803,7 +1897,8 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    total_labels += label_spaces[i];
 +  }
 +  const auto geometry = GeometryForReveal(appearance_.reveal);
-+  const float inset = geometry.flush ? 0 : 24;
++  const bool flush = appearance_.scope_width == CommandPanelAppearance::Width::kFlush;
++  const float inset = flush ? 0 : 24;
 +  const float count = std::max<size_t>(1, scopes_.size());
 +  const float scope_gap = std::min(
 +      8.f, std::max(0.f, (body.width() / ui_scale_ - 2 * inset) / count / 3));
@@ -1818,10 +1913,55 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +    }
 +    total_labels = label_budget;
 +  }
-+  const float item =
-+      appearance_.full_width
-+          ? std::max(1.f, (span - total_labels) / count)
-+          : std::min(38.f, std::max(1.f, (span - total_labels) / count));
++  const float minimum = std::min(24.f, span / count);
++  const float item = appearance_.scope_width == CommandPanelAppearance::Width::kIconWidth
++                         ? std::min(38.f, span / count)
++                         : span / count;
++  std::vector<float> widths(scopes_.size(), item);
++  const float donor_capacity =
++      std::max(0.f, count - 1) * std::max(0.f, item - minimum);
++  const float free_space = std::max(0.f, span - item * count);
++  if (total_labels > donor_capacity + free_space && total_labels > 0) {
++    const float factor = (donor_capacity + free_space) / total_labels;
++    for (auto& label : label_spaces) {
++      label *= factor;
++    }
++    total_labels = donor_capacity + free_space;
++  }
++  const float growth = std::max(0.f, total_labels - donor_capacity);
++  for (size_t i = 0; i < widths.size(); ++i) {
++    widths[i] += label_spaces[i];
++  }
++  for (size_t i = 0; i < widths.size(); ++i) {
++    const float label = label_spaces[i];
++    if (label <= 0) {
++      continue;
++    }
++    float needed = label - (total_labels > 0 ? growth * label / total_labels : 0);
++    // Let the selected tab open into its nearest neighbors. Farther tabs
++    // stay anchored until those neighbors reach their icon-sized minimum.
++    // The existing 80ms label animation drives this allocation continuously,
++    // including reversals; there is no delayed layout or queued animation.
++    for (size_t distance = 1; needed > .001f && distance < widths.size(); ++distance) {
++      const auto capacity = [&](size_t index) {
++        return std::max(0.f, widths[index] - minimum - label_spaces[index]);
++      };
++      const float left = distance <= i ? capacity(i - distance) : 0;
++      const float right = i + distance < widths.size() ? capacity(i + distance) : 0;
++      const float available = left + right;
++      if (available <= 0) {
++        continue;
++      }
++      const float take = std::min(needed, available);
++      if (left > 0) {
++        widths[i - distance] -= take * left / available;
++      }
++      if (right > 0) {
++        widths[i + distance] -= take * right / available;
++      }
++      needed -= take;
++    }
++  }
 +  float x = body.x() / ui_scale_ + inset;
 +  const int top = body.y() - base::ClampRound(ScopeRise() * ui_scale_);
 +  const int scope_height =
@@ -1830,10 +1970,10 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +                                        scope_animation_.GetCurrentValue()));
 +  for (size_t i = 0; i < scope_buttons_.size(); ++i) {
 +    const int button_x = base::ClampRound(x * ui_scale_);
-+    const float end = x + item + label_spaces[i];
++    const float end = x + widths[i];
 +    const int button_width = base::ClampRound(end * ui_scale_) - button_x;
 +    scope_buttons_[i]->SetVisible(!actions_visible_ &&
-+                                  (scope_height > 0 || geometry.flush));
++                                  (scope_height > 0 || flush));
 +    scope_buttons_[i]->SetBounds(button_x, top, button_width, scope_height);
 +    scope_buttons_[i]->GetViewAccessibility().SetIsSelected(scopes_[i].id ==
 +                                                            scope_);
@@ -1853,7 +1993,8 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  const float top = b.y() + .5f, bottom = b.bottom() - .5f;
 +  SkPathBuilder path;
 +  const auto geometry = GeometryForReveal(appearance_.reveal);
-+  if (geometry.flush && appearance_.connected && appearance_.full_width &&
++  if (appearance_.scope_width == CommandPanelAppearance::Width::kFlush &&
++      appearance_.connected &&
 +      !actions_visible_ && !scope_buttons_.empty()) {
 +    const float crest = scope_buttons_.front()->y();
 +    // The trough stays at its resting height while the whole rail rises.
@@ -2343,6 +2484,28 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +void CommandPanelView::Select(int index,
 +                              bool animate,
 +                              bool preserve_animation) {
++  if (!actions_visible_ && !publication_) {
++    // Retained rows are presentation only. Keep paint aligned with the new
++    // default slot, without granting selection or action authority to old data.
++    if (auto* row = SelectedRowView(); row && row->y() != selection_y_) {
++      previous_selection_y_ = selection_y_ = row->y();
++      selection_animation_.Reset(1);
++    }
++    for (const auto& row : row_views_) {
++      row->GetViewAccessibility().SetIsSelected(false);
++      row->SchedulePaint();
++    }
++    if (scope_browsing_ && !scope_buttons_.empty()) {
++      input_->GetViewAccessibility().SetActiveDescendant(
++          *scope_buttons_[ScopeIndex(scope_)]);
++    } else {
++      input_->GetViewAccessibility().ClearActiveDescendant();
++    }
++    results_view_->SchedulePaint();
++    footer_button_->SchedulePaint();
++    SchedulePaint();
++    return;
++  }
 +  if (animate && !rows_.empty()) {
 +    selection_explicit_ = true;
 +  }
@@ -2373,7 +2536,8 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  }
 +  for (size_t i = 0; i < row_views_.size(); ++i) {
 +    row_views_[i]->GetViewAccessibility().SetIsSelected(
-+        static_cast<int>(i) == selected_ && !scope_browsing_);
++        static_cast<int>(i) == selected_ && !scope_browsing_ &&
++        (actions_visible_ || publication_));
 +    row_views_[i]->SchedulePaint();
 +  }
 +  if (scope_browsing_ && !scope_buttons_.empty()) {
@@ -2403,9 +2567,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +         ((scopes_[index].id == scope_ ? 1 : 0) - previous) * progress;
 +}
 +float CommandPanelView::ScopeLabelProgress() const {
-+  return appearance_.reveal == CommandPanelAppearance::Reveal::kTabs
-+             ? 1
-+             : scope_label_animation_.GetCurrentValue();
++  return scope_label_animation_.GetCurrentValue();
 +}
 +void CommandPanelView::UpdateScopeReveal() {
 +  const bool show = !actions_visible_ && (scope_browsing_ || scope_hovered_);
@@ -2452,7 +2614,13 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  for (size_t i = 0; i < scopes_.size(); ++i) {
 +    previous_scope_weights_[i] = ScopeWeight(i);
 +  }
++  const bool changed_scope = scope_ != scope;
 +  scope_ = scope;
++  if (changed_scope) {
++    publication_.reset();
++    rows_.clear();
++    RebuildViews();
++  }
 +  scope_selection_animation_.Reset(
 +      gfx::Animation::ShouldRenderRichAnimation() ? 0 : 1);
 +  if (gfx::Animation::ShouldRenderRichAnimation()) {
@@ -2616,7 +2784,8 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  FocusInput();
 +}
 +void CommandPanelView::Activate(int index, int event_flags) {
-+  if (index < 0 || index >= static_cast<int>(rows_.size())) {
++  if ((!actions_visible_ && !publication_) || index < 0 ||
++      index >= static_cast<int>(rows_.size())) {
 +    return;
 +  }
 +  if (scope_browsing_) {
@@ -2724,6 +2893,9 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +      return true;
 +    }
 +  }
++  if (!actions_visible_ && !publication_ && code == ui::VKEY_DOWN) {
++    return true;
++  }
 +  if (code == ui::VKEY_UP && selected_ <= 0 && !actions_visible_) {
 +    BrowseScopes(true);
 +    return true;
@@ -2807,7 +2979,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,254 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -2824,6 +2996,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 +#include "base/memory/raw_ptr.h"
 +#include "base/memory/weak_ptr.h"
 +#include "base/timer/timer.h"
++#include "base/time/time.h"
 +#include "chrome/browser/ui/omnibox/arcium_command_session.h"
 +#include "components/prefs/pref_change_registrar.h"
 +#include "third_party/skia/include/core/SkPath.h"
@@ -2844,12 +3017,13 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 +  enum class Labels { kPill, kText, kJoined };
 +  enum class Icons { kActions, kArrows, kGoSwitch, kReturn };
 +  // Values are stored in the profile's command-panel layout dictionary.
-+  enum class Reveal { kTabs, kIcons, kEdge, kHidden, kFlush, kDivot };
++  enum class Reveal { kTabs, kIcons, kEdge, kHidden, kFlat, kDivot };
 +  Labels labels = Labels::kText;
 +  Icons icons = Icons::kGoSwitch;
 +  Reveal reveal = Reveal::kDivot;
 +  bool connected = true;
-+  bool full_width = true;
++  enum class Width { kFlush, kIconWidth, kOffset };
++  Width scope_width = Width::kFlush;
 +  bool scope_tints = true;
 +  double glow_strength = 0.75;
 +  bool activity_dots = true;
@@ -2878,6 +3052,11 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 +                       base::RepeatingCallback<int()> available_width_provider);
 +  void SetNativeMaterial(bool enabled);
 +  void SetGeometryChangedCallback(base::RepeatingClosure callback);
++  // nullopt freezes any native resize at its current presentation height.
++  // The executor returns that height so reversals never start at an old target.
++  using HeightResizeCallback = base::RepeatingCallback<
++      int(std::optional<int>, base::TimeDelta)>;
++  void SetHeightResizeCallback(HeightResizeCallback callback);
 +  SkPath GetContourPath() const;
 +
 +  views::Textfield* input_for_testing() const { return input_; }
@@ -2984,6 +3163,8 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 +  void BackMenu();
 +  void Activate(int index, int event_flags = 0);
 +  void UpdateGeometry();
++  void ApplyPendingHeight();
++  void LayoutAndNotifyGeometry();
 +  void PaintRow(gfx::Canvas*, size_t index, int width, int height);
 +  void PaintScope(gfx::Canvas*, size_t index, int width, int height);
 +  void PaintConnectedScopeGlow(gfx::Canvas*);
@@ -3009,6 +3190,9 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 +  base::RepeatingClosure dismiss_;
 +  base::RepeatingCallback<void(bool)> reopen_;
 +  base::RepeatingClosure geometry_changed_;
++  HeightResizeCallback height_resize_;
++  base::OneShotTimer height_resize_timer_;
++  std::optional<int> requested_height_;
 +  base::RepeatingCallback<int()> available_width_provider_;
 +  CommandPanelAppearance appearance_;
 +  float ui_scale_ = 1.0f;
@@ -3054,7 +3238,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,170 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -3194,6 +3378,15 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
 +      weak_ptr_factory_.GetWeakPtr()));
 +  arcium_command_bar_material_->Refresh();
 +  arcium_command_bar_widget_->Show();
++  arcium_native_command_panel_->SetHeightResizeCallback(base::BindRepeating(
++      [](base::WeakPtr<BrowserView> view, std::optional<int> height,
++         base::TimeDelta duration) {
++        return view && view->arcium_command_bar_material_
++                   ? view->arcium_command_bar_material_->ResizeHeight(height,
++                                                                     duration)
++                   : 0;
++      },
++      weak_ptr_factory_.GetWeakPtr()));
 +  arcium_native_command_panel_->FocusInput();
 +  LOCAL_HISTOGRAM_TIMES("Arcium.CommandBar.OpenSetup", open_timer.Elapsed());
 +  if (auto* compositor = arcium_command_bar_widget_->GetCompositor()) {
@@ -3220,7 +3413,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
-@@ -0,0 +1,1878 @@
+@@ -0,0 +1,2373 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +#include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
@@ -3237,6 +3430,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +#include "base/strings/string_number_conversions.h"
 +#include "base/test/bind.h"
 +#include "base/test/scoped_feature_list.h"
++#include "base/test/task_environment.h"
 +#include "build/build_config.h"
 +#include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
 +#include "components/prefs/pref_registry_simple.h"
@@ -3249,6 +3443,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +#include "ui/events/event.h"
 +#include "ui/gfx/animation/animation_test_api.h"
 +#include "ui/gfx/font_list.h"
++#include "ui/gfx/image/image_skia_rep.h"
 +#include "ui/gfx/scoped_animation_duration_scale_mode.h"
 +#include "ui/gfx/text_utils.h"
 +#include "ui/views/accessibility/view_accessibility.h"
@@ -3570,6 +3765,10 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +
 +class ArciumNativePanelTest : public views::ViewsTestBase {
 + protected:
++  explicit ArciumNativePanelTest(
++      base::test::TaskEnvironment::TimeSource time_source =
++          base::test::TaskEnvironment::TimeSource::SYSTEM_TIME)
++      : views::ViewsTestBase(time_source) {}
 +  void SetUp() override {
 +    // Hidden RootView bitmap painting does not composite child layers. Use
 +    // synchronous View scrolling so both row pixels and offsets are observable.
@@ -3663,13 +3862,199 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  int dismissals_ = 0;
 +};
 +
++class ArciumPanelHeightTest : public ArciumNativePanelTest {
++ protected:
++  ArciumPanelHeightTest()
++      : ArciumNativePanelTest(
++            base::test::TaskEnvironment::TimeSource::MOCK_TIME) {}
++
++  void Rows(size_t count) {
++    auto update = Update();
++    update->rows.clear();
++    update->current_tab.reset();
++    for (size_t i = 0; i < count; ++i) {
++      const auto key = "height-" + base::NumberToString(i);
++      update->rows.push_back(Result(
++          key, u"Height row", CommandUrlTarget{GURL("https://height.test/" + key)}));
++    }
++    Publish(std::move(update));
++  }
++  void Stabilize() {
++    panel()->SetHeightResizeCallback(base::BindLambdaForTesting(
++        [this](std::optional<int> height, base::TimeDelta duration) {
++          auto bounds = widget_->GetWindowBoundsInScreen();
++          if (!height && presentation_height_) {
++            bounds.set_height(*presentation_height_);
++            presentation_height_.reset();
++            widget_->SetBounds(bounds);
++          }
++          if (height) {
++            requests_.push_back({*height, duration});
++            bounds.set_height(*height);
++            widget_->SetBounds(bounds);
++          }
++          return widget_->GetWindowBoundsInScreen().height();
++        }));
++  }
++  int Height() { return widget_->GetWindowBoundsInScreen().height(); }
++  void Advance(int milliseconds) {
++    task_environment()->FastForwardBy(base::Milliseconds(milliseconds));
++  }
++  struct Request {
++    int height;
++    base::TimeDelta duration;
++  };
++  std::vector<Request> requests_;
++  std::optional<int> presentation_height_;
++};
++
++TEST_F(ArciumPanelHeightTest, GrowthWaitsForFortyMillisecondsOfStableHeight) {
++  Open();
++  Rows(1);
++  const int initial = Height();
++  const auto origin = widget_->GetWindowBoundsInScreen().origin();
++  Stabilize();
++  Rows(6);
++  Advance(20);
++  Rows(8);
++  Advance(39);
++  EXPECT_EQ(initial, Height());
++  EXPECT_TRUE(requests_.empty());
++  Advance(1);
++  ASSERT_EQ(1u, requests_.size());
++  EXPECT_EQ(panel()->GetPreferredSize().height(), Height());
++  EXPECT_EQ(base::TimeDelta(), requests_.back().duration);
++  EXPECT_EQ(origin, widget_->GetWindowBoundsInScreen().origin());
++}
++
++TEST_F(ArciumPanelHeightTest, ShorterResultsLeaveSpaceUntilFortyMilliseconds) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_ENABLED);
++  Open();
++  Rows(8);
++  const int initial = Height();
++  Stabilize();
++  Rows(2);
++  EXPECT_EQ(2u, panel()->row_count_for_testing());
++  EXPECT_LT(panel()->GetPreferredSize().height(), initial);
++  EXPECT_FALSE(PaintPanel().empty());
++  Advance(39);
++  EXPECT_EQ(initial, Height());
++  EXPECT_TRUE(requests_.empty());
++  Advance(1);
++  ASSERT_EQ(1u, requests_.size());
++  EXPECT_EQ(base::Milliseconds(60), requests_.back().duration);
++  EXPECT_EQ(panel()->GetPreferredSize().height(), requests_.back().height);
++}
++
++TEST_F(ArciumPanelHeightTest, ANewSmallerTargetRestartsTheShrinkDelay) {
++  Open();
++  Rows(8);
++  const int initial = Height();
++  Stabilize();
++  Rows(1);
++  Advance(20);
++  Rows(3);
++  Advance(39);
++  EXPECT_EQ(initial, Height());
++  EXPECT_TRUE(requests_.empty());
++  Advance(1);
++  ASSERT_EQ(1u, requests_.size());
++  EXPECT_EQ(panel()->GetPreferredSize().height(), requests_.back().height);
++}
++
++TEST_F(ArciumPanelHeightTest, IdenticalPublicationsDoNotPostponeContraction) {
++  Open();
++  Rows(8);
++  Stabilize();
++  Rows(2);
++  Advance(20);
++  Rows(2);
++  Advance(19);
++  EXPECT_TRUE(requests_.empty());
++  Advance(1);
++  ASSERT_EQ(1u, requests_.size());
++}
++
++TEST_F(ArciumPanelHeightTest, GrowthCancelsPendingContractionAndKeepsTopFixed) {
++  Open();
++  Rows(4);
++  const auto initial = widget_->GetWindowBoundsInScreen();
++  Stabilize();
++  Rows(2);
++  Advance(20);
++  Rows(10);
++  Advance(39);
++  EXPECT_EQ(initial, widget_->GetWindowBoundsInScreen());
++  Advance(1);
++  ASSERT_EQ(1u, requests_.size());
++  EXPECT_GT(Height(), initial.height());
++  EXPECT_EQ(initial.origin(), widget_->GetWindowBoundsInScreen().origin());
++  Advance(200);
++  EXPECT_EQ(1u, requests_.size());
++}
++
++TEST_F(ArciumPanelHeightTest, ReturningToCurrentHeightCancelsPendingResize) {
++  Open();
++  Rows(8);
++  const int initial = Height();
++  Stabilize();
++  Rows(2);
++  Advance(30);
++  Rows(8);
++  Advance(200);
++  EXPECT_EQ(initial, Height());
++  EXPECT_TRUE(requests_.empty());
++}
++
++TEST_F(ArciumPanelHeightTest, RetargetingUsesPresentedHeightInsteadOfOldTarget) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_ENABLED);
++  Open();
++  Rows(8);
++  const int initial = Height();
++  Stabilize();
++  Rows(1);
++  Advance(40);
++  ASSERT_EQ(1u, requests_.size());
++  presentation_height_ = (initial + Height()) / 2;
++  Rows(3);
++  Advance(39);
++  EXPECT_EQ(1u, requests_.size());
++  Advance(1);
++  ASSERT_EQ(2u, requests_.size());
++  EXPECT_EQ(base::Milliseconds(60), requests_.back().duration);
++}
++
++TEST_F(ArciumPanelHeightTest, ReduceMotionContractsWithoutAnimation) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
++  Open();
++  Rows(8);
++  Stabilize();
++  Rows(2);
++  Advance(40);
++  ASSERT_EQ(1u, requests_.size());
++  EXPECT_EQ(base::TimeDelta(), requests_.back().duration);
++}
++
++TEST_F(ArciumPanelHeightTest, ClosingCancelsDelayedHeightChanges) {
++  Open();
++  Rows(8);
++  Stabilize();
++  Rows(2);
++  Close();
++  Advance(200);
++  EXPECT_TRUE(requests_.empty());
++}
++
 +TEST(CommandPanelAppearanceTest, PreservesHiddenAndBothSavedPeekPresets) {
 +  TestingPrefServiceSimple prefs;
 +  prefs.registry()->RegisterDictionaryPref(kCommandPanelLayoutPref);
 +  EXPECT_EQ(CommandPanelAppearance::Reveal::kDivot,
 +            ReadCommandPanelAppearance(&prefs).reveal);
 +  for (const auto reveal : {CommandPanelAppearance::Reveal::kHidden,
-+                            CommandPanelAppearance::Reveal::kFlush,
++                            CommandPanelAppearance::Reveal::kFlat,
 +                            CommandPanelAppearance::Reveal::kDivot}) {
 +    base::DictValue layout;
 +    layout.Set("scope_reveal", static_cast<int>(reveal));
@@ -3684,6 +4069,34 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +            ReadCommandPanelAppearance(&prefs).reveal);
 +}
 +
++TEST(CommandPanelAppearanceTest, ReadsIndependentWidthsAndMigratesLegacyLayouts) {
++  TestingPrefServiceSimple prefs;
++  prefs.registry()->RegisterDictionaryPref(kCommandPanelLayoutPref);
++  using Width = CommandPanelAppearance::Width;
++  EXPECT_EQ(Width::kFlush, ReadCommandPanelAppearance(&prefs).scope_width);
++  for (int reveal = 0; reveal <= 5; ++reveal) {
++    for (int width = 0; width <= 2; ++width) {
++      base::DictValue layout;
++      layout.Set("scope_reveal", reveal);
++      layout.Set("scope_width", width);
++      layout.Set("full_width", false);
++      prefs.SetDict(kCommandPanelLayoutPref, std::move(layout));
++      EXPECT_EQ(static_cast<Width>(width), ReadCommandPanelAppearance(&prefs).scope_width);
++    }
++    base::DictValue legacy;
++    legacy.Set("scope_reveal", reveal);
++    legacy.Set("full_width", true);
++    prefs.SetDict(kCommandPanelLayoutPref, legacy.Clone());
++    EXPECT_EQ(reveal >= 4 ? Width::kFlush : Width::kOffset,
++              ReadCommandPanelAppearance(&prefs).scope_width);
++    legacy.Set("full_width", false);
++    prefs.SetDict(kCommandPanelLayoutPref, legacy.Clone());
++    EXPECT_EQ(Width::kIconWidth, ReadCommandPanelAppearance(&prefs).scope_width);
++    legacy.Set("scope_width", 9);
++    prefs.SetDict(kCommandPanelLayoutPref, std::move(legacy));
++    EXPECT_EQ(Width::kFlush, ReadCommandPanelAppearance(&prefs).scope_width);
++  }
++}
 +TEST(CommandPanelAppearanceTest, ReadsGlowStrengthAndRejectsInvalidValues) {
 +  TestingPrefServiceSimple prefs;
 +  prefs.registry()->RegisterDictionaryPref(kCommandPanelLayoutPref);
@@ -4139,6 +4552,157 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  EXPECT_EQ(u"reference", panel()->input_for_testing()->GetText());
 +  EXPECT_EQ(u"reference", panel()->row_for_testing(0).title);
 +}
++TEST_F(ArciumNativePanelTest, DeferredQueryKeepsRowsWithoutStaleActions) {
++  Open();
++  Query(u"interface");
++  Key(ui::VKEY_DOWN);
++  ASSERT_TRUE(panel()->row_for_testing(1).has_actions);
++  const auto count = panel()->row_count_for_testing();
++  auto* list = panel()->scroll_for_testing()->contents();
++  views::ViewTracker first(list->children()[0]);
++  state_->defer_search = true;
++  Query(u"interfacex");
++  auto old_callback = state_->publish;
++  auto old_publication = state_->last_publication;
++  Query(u"interfacey");
++  old_callback.Run(old_publication);
++  EXPECT_EQ(count, panel()->row_count_for_testing());
++  ASSERT_TRUE(first.view());
++  EXPECT_EQ(first.view(), list->children()[0]);
++  for (views::View* row : list->children()) {
++    EXPECT_FALSE(row->GetEnabled());
++  }
++  EXPECT_FALSE(PaintPanel().empty());
++  Key(ui::VKEY_DOWN);
++  EXPECT_EQ(0, panel()->selected_for_testing());
++  Key(ui::VKEY_K, kActionModifier);
++  EXPECT_FALSE(panel()->actions_visible_for_testing());
++  Key(ui::VKEY_RETURN);
++  EXPECT_TRUE(state_->executed.empty());
++  ui::AXNodeData pending_input;
++  panel()->input_for_testing()->GetViewAccessibility().GetAccessibleNodeData(
++      &pending_input);
++  EXPECT_FALSE(pending_input.HasIntAttribute(
++      ax::mojom::IntAttribute::kActivedescendantId));
++  Publish(Update());
++  ASSERT_TRUE(first.view());
++  EXPECT_TRUE(first.view()->GetEnabled());
++  EXPECT_EQ(u"interfacey", panel()->row_for_testing(0).title);
++  Key(ui::VKEY_RETURN);
++  ASSERT_EQ(1u, state_->executed.size());
++  EXPECT_EQ(u"interfacey", state_->executed.back().query);
++}
++
++TEST_F(ArciumNativePanelTest, PendingQueryKeepsThePaintedSelectionBackground) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
++  Open();
++  Query(u"reference");
++  auto* list = panel()->scroll_for_testing()->contents();
++  ASSERT_GT(list->children().size(), 1u);
++  const int row_height = list->children()[0]->height();
++  gfx::Point probe(list->width() / 2, row_height - 5);
++  views::View::ConvertPointToTarget(list, widget_->GetRootView(), &probe);
++  const auto before = PaintPanel();
++  const auto selected = before.getColor(probe.x(), probe.y());
++  ASSERT_NE(selected, before.getColor(probe.x(), probe.y() + row_height));
++  state_->defer_search = true;
++  Query(u"reference pending");
++  const auto pending = PaintPanel();
++  EXPECT_EQ(selected, pending.getColor(probe.x(), probe.y()));
++  EXPECT_FALSE(list->children()[0]->GetEnabled());
++  Key(ui::VKEY_RETURN);
++  EXPECT_TRUE(state_->executed.empty());
++}
++
++TEST_F(ArciumNativePanelTest, EmptyPartialResultsDoNotBlankThePreviousList) {
++  Open();
++  Query(u"reference");
++  const auto count = panel()->row_count_for_testing();
++  ASSERT_GT(count, 1u);
++  views::ViewTracker first(
++      panel()->scroll_for_testing()->contents()->children()[0]);
++  state_->defer_search = true;
++  Query(u"no matches yet");
++  auto empty = Update();
++  empty->rows.clear();
++  empty->done = false;
++  Publish(empty);
++  EXPECT_EQ(count, panel()->row_count_for_testing());
++  ASSERT_TRUE(first.view());
++  EXPECT_FALSE(first.view()->GetEnabled());
++  Key(ui::VKEY_RETURN);
++  EXPECT_TRUE(state_->executed.empty());
++  auto completed = Update();
++  completed->done = true;
++  Publish(completed);
++  EXPECT_EQ(0u, panel()->row_count_for_testing());
++  EXPECT_FALSE(first.view());
++}
++
++TEST_F(ArciumNativePanelTest, PublicationsReuseRowViewsAndUpdateTheirContents) {
++  Open();
++  auto* list = panel()->scroll_for_testing()->contents();
++  views::ViewTracker first(list->children()[0]);
++  views::ViewTracker last(list->children().back());
++  auto update = Update();
++  update->rows[0].title = u"Updated browser search";
++  update->rows[0].icon = TestIcon(SK_ColorBLUE);
++  Publish(update);
++  ASSERT_TRUE(first.view());
++  EXPECT_EQ(first.view(), list->children()[0]);
++  EXPECT_TRUE(last.view());
++  ui::AXNodeData data;
++  first.view()->GetViewAccessibility().GetAccessibleNodeData(&data);
++  EXPECT_EQ(0u, data.GetString16Attribute(ax::mojom::StringAttribute::kName)
++                    .find(u"Updated browser search"));
++  EXPECT_EQ(SK_ColorBLUE,
++            panel()->row_for_testing(0).icon.GetRepresentation(1.f)
++                .GetBitmap().getColor(0, 0));
++  auto shorter = Update();
++  shorter->rows.resize(2);
++  Publish(shorter);
++  EXPECT_TRUE(first.view());
++  EXPECT_FALSE(last.view());
++  EXPECT_EQ(2u, list->children().size());
++}
++
++TEST_F(ArciumNativePanelTest, PendingScopeChangeClearsThePreviousScopeRows) {
++  Open();
++  state_->defer_search = true;
++  Query(u"pending");
++  ASSERT_GT(panel()->row_count_for_testing(), 0u);
++  views::ViewTracker first(
++      panel()->scroll_for_testing()->contents()->children()[0]);
++  auto old_callback = state_->publish;
++  auto old_publication = state_->last_publication;
++  Key(ui::VKEY_RIGHT);
++  EXPECT_EQ(kWebScope, panel()->scope_for_testing());
++  EXPECT_EQ(0u, panel()->row_count_for_testing());
++  EXPECT_FALSE(first.view());
++  old_callback.Run(old_publication);
++  EXPECT_EQ(0u, panel()->row_count_for_testing());
++}
++
++TEST_F(ArciumNativePanelTest, EmptyPartialKeepsAnExplicitSelectionForItsReturn) {
++  Open();
++  Query(u"interface");
++  Key(ui::VKEY_DOWN);
++  ASSERT_EQ("interface", panel()->row_for_testing(1).selection_key);
++  auto returning = Update();
++  auto empty = Update();
++  empty->rows.clear();
++  empty->done = false;
++  Publish(empty);
++  EXPECT_EQ("interface", panel()->pending_selection_key_for_testing());
++  Key(ui::VKEY_RETURN);
++  EXPECT_TRUE(state_->executed.empty());
++  Publish(returning);
++  EXPECT_EQ("interface",
++            panel()->row_for_testing(panel()->selected_for_testing())
++                .selection_key);
++}
++
 +TEST_F(ArciumNativePanelTest, AsyncInvocationClearsPreviousResultViews) {
 +  Open();
 +  ASSERT_EQ(7u, panel()->row_count_for_testing());
@@ -4679,7 +5243,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  };
 +  for (const float scale : {1.f, 1.15f}) {
 +    for (const auto preset :
-+         {Preset{CommandPanelAppearance::Reveal::kFlush, 0, 16},
++         {Preset{CommandPanelAppearance::Reveal::kFlat, 0, 16},
 +          Preset{CommandPanelAppearance::Reveal::kDivot, 2, 18}}) {
 +      panel()->SetInvocation(true);
 +      panel()->SetUIScale(scale);
@@ -4758,7 +5322,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +      gfx::ScopedAnimationDurationScaleMode::NORMAL_DURATION);
 +  Open();
 +  CommandPanelAppearance appearance;
-+  appearance.reveal = CommandPanelAppearance::Reveal::kFlush;
++  appearance.reveal = CommandPanelAppearance::Reveal::kFlat;
 +  panel()->SetAppearance(appearance);
 +  Key(ui::VKEY_UP);
 +  gfx::AnimationTestApi reveal(panel()->scope_animation_for_testing());
@@ -4784,7 +5348,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  state_->scopes[0].label = u"Independent label";
 +  Open();
 +  CommandPanelAppearance appearance;
-+  appearance.reveal = CommandPanelAppearance::Reveal::kFlush;
++  appearance.reveal = CommandPanelAppearance::Reveal::kFlat;
 +  appearance.scope_tints = false;
 +  panel()->SetAppearance(appearance);
 +  Key(ui::VKEY_UP);
@@ -4862,7 +5426,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  state_->scopes[3].tint = SK_ColorBLUE;
 +  Open();
 +  CommandPanelAppearance appearance;
-+  appearance.reveal = CommandPanelAppearance::Reveal::kFlush;
++  appearance.reveal = CommandPanelAppearance::Reveal::kFlat;
 +  appearance.scope_tints = false;
 +  panel()->SetAppearance(appearance);
 +  Key(ui::VKEY_UP);
@@ -4889,12 +5453,129 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  EXPECT_GT(SkColorGetR(during), SkColorGetR(untinted));
 +  EXPECT_GT(SkColorGetB(during), SkColorGetB(untinted));
 +  reveal.Step(start + base::Milliseconds(140));
-+  EXPECT_EQ(during, PaintPanel().getColor(x, y));
++  const SkColor settled = PaintPanel().getColor(x, y);
++  // The glow keeps its height while its origin follows the reveal. Bound
++  // the sampled raster variation to one channel step during that movement.
++  EXPECT_EQ(SkColorGetA(during), SkColorGetA(settled));
++  EXPECT_NEAR(SkColorGetR(during), SkColorGetR(settled), 1);
++  EXPECT_NEAR(SkColorGetG(during), SkColorGetG(settled), 1);
++  EXPECT_NEAR(SkColorGetB(during), SkColorGetB(settled), 1);
 +  const auto contour = panel()->GetContourPath();
 +  panel()->SetNativeMaterial(true);
 +  EXPECT_EQ(contour, panel()->GetContourPath());
 +  EXPECT_FALSE(PaintPanel().empty());
 +  EXPECT_FALSE(widget_->IsVisible());
++}
++TEST_F(ArciumNativePanelTest, EveryRevealUsesTheIndependentWidthMode) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_ENABLED);
++  Open();
++  for (const auto width : {CommandPanelAppearance::Width::kFlush,
++                           CommandPanelAppearance::Width::kIconWidth,
++                           CommandPanelAppearance::Width::kOffset}) {
++    for (const double progress : {0., .5, 1.}) {
++      std::vector<gfx::Rect> reference;
++      for (int reveal = 0; reveal <= 5; ++reveal) {
++        CommandPanelAppearance appearance;
++        appearance.scope_width = width;
++        appearance.reveal = static_cast<CommandPanelAppearance::Reveal>(reveal);
++        panel()->SetAppearance(appearance);
++        panel()->scope_animation_for_testing()->Reset(progress);
++        panel()->scope_label_animation_for_testing()->Reset(progress);
++        panel()->AnimationProgressed(panel()->scope_animation_for_testing());
++        views::test::RunScheduledLayout(widget_.get());
++        for (size_t i = 0; i < panel()->scope_count_for_testing(); ++i) {
++          const auto bounds = panel()->scope_button_for_testing(i)->bounds();
++          if (reveal == 0) {
++            reference.push_back(bounds);
++          } else {
++            EXPECT_EQ(reference[i].x(), bounds.x());
++            EXPECT_EQ(reference[i].width(), bounds.width());
++          }
++        }
++      }
++    }
++  }
++}
++TEST_F(ArciumNativePanelTest, InterruptedCompactSelectionPreservesGeometryAndBounds) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_ENABLED);
++  Open();
++  CommandPanelAppearance appearance;
++  appearance.scope_width = CommandPanelAppearance::Width::kIconWidth;
++  panel()->SetAppearance(appearance);
++  Key(ui::VKEY_UP);
++  panel()->scope_label_animation_for_testing()->Reset(1);
++  Key(ui::VKEY_RIGHT);
++  panel()->scope_selection_animation_for_testing()->Reset(.5);
++  panel()->AnimationProgressed(panel()->scope_selection_animation_for_testing());
++  std::vector<gfx::Rect> before;
++  for (size_t i = 0; i < panel()->scope_count_for_testing(); ++i) {
++    before.push_back(panel()->scope_button_for_testing(i)->bounds());
++  }
++  Key(ui::VKEY_RIGHT);
++  views::test::RunScheduledLayout(widget_.get());
++  for (size_t i = 0; i < before.size(); ++i) {
++    const auto bounds = panel()->scope_button_for_testing(i)->bounds();
++    EXPECT_EQ(before[i].x(), bounds.x());
++    EXPECT_EQ(before[i].width(), bounds.width());
++  }
++  panel()->scope_selection_animation_for_testing()->Reset(.5);
++  panel()->AnimationProgressed(panel()->scope_selection_animation_for_testing());
++  const auto body = panel()->body_bounds_for_testing();
++  int right = body.x();
++  for (size_t i = 0; i < panel()->scope_count_for_testing(); ++i) {
++    const auto bounds = panel()->scope_button_for_testing(i)->bounds();
++    EXPECT_GE(bounds.width(), 24);
++    EXPECT_GE(bounds.x(), right);
++    EXPECT_LE(bounds.right(), body.right() - 24);
++    right = bounds.right();
++  }
++  EXPECT_FALSE(PaintPanel().empty());
++}
++TEST_F(ArciumNativePanelTest, ScopeExpansionBorrowsFromAdjacentTabsFirst) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_ENABLED);
++  Open();
++  auto* animation = panel()->scope_label_animation_for_testing();
++  animation->Reset(0);
++  panel()->AnimationProgressed(animation);
++  std::vector<gfx::Rect> before;
++  for (size_t i = 0; i < panel()->scope_count_for_testing(); ++i) {
++    before.push_back(panel()->scope_button_for_testing(i)->bounds());
++  }
++  animation->Reset(.5);
++  panel()->AnimationProgressed(animation);
++  EXPECT_GT(panel()->scope_button_for_testing(0)->width(), before[0].width());
++  EXPECT_LT(panel()->scope_button_for_testing(1)->width(), before[1].width());
++  for (size_t i = 2; i < before.size(); ++i) {
++    EXPECT_NEAR(before[i].x(), panel()->scope_button_for_testing(i)->x(), 1);
++    EXPECT_NEAR(before[i].width(), panel()->scope_button_for_testing(i)->width(), 1);
++  }
++  animation->Reset(0);
++  panel()->AnimationProgressed(animation);
++  for (size_t i = 0; i < before.size(); ++i) {
++    EXPECT_EQ(before[i], panel()->scope_button_for_testing(i)->bounds());
++  }
++}
++TEST_F(ArciumNativePanelTest, LongScopeExpansionPropagatesBeyondTheNearestTab) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_ENABLED);
++  Open();
++  auto publication = Update();
++  publication->scopes[0].label = std::u16string(1000, u'x');
++  Publish(publication);
++  auto* animation = panel()->scope_label_animation_for_testing();
++  animation->Reset(0);
++  panel()->AnimationProgressed(animation);
++  const int far_right = panel()->scope_button_for_testing(5)->bounds().right();
++  const int base_width = panel()->scope_button_for_testing(2)->width();
++  animation->Reset(1);
++  panel()->AnimationProgressed(animation);
++  EXPECT_NEAR(24, panel()->scope_button_for_testing(1)->width(), 1);
++  EXPECT_LT(panel()->scope_button_for_testing(2)->width(), base_width);
++  EXPECT_NEAR(far_right, panel()->scope_button_for_testing(5)->bounds().right(), 1);
++  EXPECT_FALSE(PaintPanel().empty());
 +}
 +TEST_F(ArciumNativePanelTest, DivotKeepsConnectionAndWidthChoicesIndependent) {
 +  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
@@ -4904,18 +5585,21 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  appearance.reveal = CommandPanelAppearance::Reveal::kDivot;
 +  Key(ui::VKEY_UP);
 +  for (const bool connected : {false, true}) {
-+    for (const bool full_width : {false, true}) {
++    for (const auto width : {CommandPanelAppearance::Width::kFlush,
++                             CommandPanelAppearance::Width::kIconWidth,
++                             CommandPanelAppearance::Width::kOffset}) {
 +      appearance.connected = connected;
-+      appearance.full_width = full_width;
++      appearance.scope_width = width;
 +      panel()->SetAppearance(appearance);
 +      views::test::RunScheduledLayout(widget_.get());
 +      const auto body = panel()->body_bounds_for_testing();
 +      const auto* first = panel()->scope_button_for_testing(0);
 +      const auto* second = panel()->scope_button_for_testing(1);
 +      const float middle = (first->bounds().right() + second->x()) / 2.f;
-+      EXPECT_EQ(!(connected && full_width),
++      EXPECT_EQ(!(connected && width == CommandPanelAppearance::Width::kFlush),
 +                panel()->GetContourPath().contains(middle, body.y() + 1));
-+      EXPECT_EQ(body.x(), first->x());
++      EXPECT_EQ(body.x() + (width == CommandPanelAppearance::Width::kFlush ? 0 : 24),
++                first->x());
 +      EXPECT_FALSE(PaintPanel().empty());
 +    }
 +  }
@@ -4924,7 +5608,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
 +      gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
 +  Open();
-+  for (const auto reveal : {CommandPanelAppearance::Reveal::kFlush,
++  for (const auto reveal : {CommandPanelAppearance::Reveal::kFlat,
 +                            CommandPanelAppearance::Reveal::kDivot}) {
 +    panel()->SetInvocation(true);
 +    CommandPanelAppearance appearance;
@@ -4958,12 +5642,14 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  Publish(publication);
 +  panel()->SetUIScale(1.15f);
 +  Key(ui::VKEY_UP);
-+  for (const auto reveal : {CommandPanelAppearance::Reveal::kFlush,
++  for (const auto reveal : {CommandPanelAppearance::Reveal::kFlat,
 +                            CommandPanelAppearance::Reveal::kDivot}) {
-+    for (const bool full_width : {false, true}) {
++    for (const auto width : {CommandPanelAppearance::Width::kFlush,
++                             CommandPanelAppearance::Width::kIconWidth,
++                             CommandPanelAppearance::Width::kOffset}) {
 +      CommandPanelAppearance appearance;
 +      appearance.reveal = reveal;
-+      appearance.full_width = full_width;
++      appearance.scope_width = width;
 +      panel()->SetAppearance(appearance);
 +      views::test::RunScheduledLayout(widget_.get());
 +      for (size_t i = 0; i < panel()->scope_count_for_testing(); ++i) {
@@ -4988,9 +5674,11 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  extra.label = u"Extra";
 +  publication->scopes.push_back(extra);
 +  Publish(publication);
-+  for (bool full : {false, true}) {
++  for (const auto width : {CommandPanelAppearance::Width::kFlush,
++                           CommandPanelAppearance::Width::kIconWidth,
++                           CommandPanelAppearance::Width::kOffset}) {
 +    CommandPanelAppearance appearance;
-+    appearance.full_width = full;
++    appearance.scope_width = width;
 +    panel()->SetAppearance(appearance);
 +    panel()->SetUIScale(1.15f);
 +    views::test::RunScheduledLayout(widget_.get());
@@ -6081,7 +6769,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
                    auto* browser = context->browser();
                    return browser ? browser->tab_strip_model()
                                         ->GetActiveWebContents()
-@@ -271,14 +309,14 @@ class CachedAutocompleteClient final : p
+@@ -271,15 +309,18 @@ class CachedAutocompleteClient final : p
    }
  
   private:
@@ -6094,20 +6782,58 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
                                    public TemplateURLServiceObserver {
   public:
 -  explicit NativeQueryProvider(std::shared_ptr<ProductionContext> context)
-+  explicit NativeQueryProvider(std::shared_ptr<CommandSessionContext> context)
++  NativeQueryProvider(
++      std::shared_ptr<CommandSessionContext> context,
++      CommandNativeControllerFactoryForTesting controller_factory)
        : context_(std::move(context)),
++        controller_factory_(std::move(controller_factory)),
          engines_(TemplateURLServiceFactory::GetForProfile(
              context_->browser()->profile())) {
-@@ -713,7 +751,7 @@ class NativeQueryProvider final : public
+     if (engines_) {
+@@ -336,12 +377,15 @@ class NativeQueryProvider final : public
+     const AutocompleteInput input = CreateInput();
+     controller_->Start(input);
+   }
+-  void Cancel() override {
++  void Cancel(std::optional<std::string_view> next_scope = std::nullopt) override {
++    const bool continuation = next_scope && !publish_.is_null() &&
++                              *next_scope == query_.scope_id;
+     ++query_generation_;
+     publish_.Reset();
+     context_->icons.Cancel();
+     if (controller_) {
+-      controller_->Stop(AutocompleteStopReason::kClobbered);
++      controller_->Stop(continuation ? AutocompleteStopReason::kInteraction
++                                     : AutocompleteStopReason::kClobbered);
+     }
+     lease_.InvalidateCurrent();
+   }
+@@ -411,8 +455,12 @@ class NativeQueryProvider final : public
+     }
+     AutocompleteControllerConfig config{.provider_types = types};
+     config.unscoped_open_tab_suggestions = !web;
+-    controller_ = std::make_shared<AutocompleteController>(
+-        std::make_unique<CachedAutocompleteClient>(context_), config);
++    controller_ = controller_factory_.is_null()
++                      ? std::make_shared<AutocompleteController>(
++                            std::make_unique<CachedAutocompleteClient>(context_),
++                            config)
++                      : controller_factory_.Run(web);
++    CHECK(controller_);
+     controller_is_web_ = web;
+     controller_->AddObserver(this);
+   }
+@@ -713,7 +761,8 @@ class NativeQueryProvider final : public
              lease_.revision(), std::move(callback), std::move(results)));
    }
  
 -  std::shared_ptr<ProductionContext> context_;
 +  std::shared_ptr<CommandSessionContext> context_;
++  CommandNativeControllerFactoryForTesting controller_factory_;
    raw_ptr<TemplateURLService> engines_;
    base::ScopedObservation<TemplateURLService, TemplateURLServiceObserver>
        engine_observation_{this};
-@@ -733,11 +771,12 @@ class NativeQueryProvider final : public
+@@ -733,11 +782,12 @@ class NativeQueryProvider final : public
  
  class LocalQueryProvider final : public CommandQueryProvider {
   public:
@@ -6121,15 +6847,19 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
    std::string_view id() const override { return kBuiltinCommandProvider; }
    bool SupportsScope(std::string_view scope_id) const override {
      return scope_id == kOmniScope ||
-@@ -761,6 +800,7 @@ class LocalQueryProvider final : public
+@@ -761,9 +811,10 @@ class LocalQueryProvider final : public
               CommandProviderPublishCallback publish) override {
      query_ = std::move(query);
      publish_ = std::move(publish);
 +    context_->corpus.SetActive(true);
      Publish();
    }
-   void Cancel() override {
-@@ -779,6 +819,12 @@ class LocalQueryProvider final : public
+-  void Cancel() override {
++  void Cancel(std::optional<std::string_view> = std::nullopt) override {
+     ++generation_;
+     publish_.Reset();
+     context_->icons.Cancel();
+@@ -779,6 +830,12 @@ class LocalQueryProvider final : public
        return;
      }
      const auto& index = context_->corpus.index();
@@ -6142,7 +6872,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
      if (query_.scope_id == kOmniScope && !query_.text.empty()) {
        // Native autocomplete owns nonempty Omni order and default selection.
        PostResults({}, index.revision());
-@@ -864,6 +910,7 @@ class LocalQueryProvider final : public
+@@ -864,6 +921,7 @@ class LocalQueryProvider final : public
                 CommandProviderResults results) {
                if (!owner || generation != owner->generation_ ||
                    epoch != owner->query_.epoch || owner->publish_.is_null() ||
@@ -6150,7 +6880,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
                    corpus_revision !=
                        owner->context_->corpus.index().revision()) {
                  return;
-@@ -873,7 +920,7 @@ class LocalQueryProvider final : public
+@@ -873,7 +931,7 @@ class LocalQueryProvider final : public
              weak_factory_.GetWeakPtr(), generation_, query_.epoch,
              corpus_revision, std::move(callback), std::move(results)));
    }
@@ -6159,7 +6889,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
    base::CallbackListSubscription corpus_subscription_;
    CommandQuery query_;
    CommandProviderPublishCallback publish_;
-@@ -904,8 +951,18 @@ class RouterActionDelegate final : publi
+@@ -904,10 +962,23 @@ class RouterActionDelegate final : publi
  }  // namespace
  
  std::unique_ptr<CommandSession> CreateCommandSession(Browser* browser) {
@@ -6168,7 +6898,9 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
 +}
 +
 +std::unique_ptr<CommandSession> CreateCommandSession(
-+    Browser* browser, std::shared_ptr<CommandSessionContext>& context) {
++    Browser* browser,
++    std::shared_ptr<CommandSessionContext>& context,
++    CommandNativeControllerFactoryForTesting controller_factory) {
 +  base::ElapsedTimer timer;
    CHECK(browser);
 -  auto context = std::make_shared<ProductionContext>(browser);
@@ -6177,9 +6909,13 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
 +  }
 +  CHECK_EQ(context->browser(), browser);
    auto registry = std::make_unique<CommandProviderRegistry>();
-   auto native = std::make_unique<NativeQueryProvider>(context);
+-  auto native = std::make_unique<NativeQueryProvider>(context);
++  auto native = std::make_unique<NativeQueryProvider>(
++      context, std::move(controller_factory));
    const auto weak_native = native->GetWeakPtr();
-@@ -936,15 +993,17 @@ std::unique_ptr<CommandSession> CreateCo
+   CommandNativeActionCallbacks callbacks{
+       base::BindRepeating(
+@@ -936,15 +1007,17 @@ std::unique_ptr<CommandSession> CreateCo
    // rows, cancellation, and any lazy actions they add to their opaque targets.
    CHECK(registry->Register(std::move(native)));
    CHECK(registry->Register(std::make_unique<LocalQueryProvider>(context)));
@@ -6203,7 +6939,42 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.h
 ===================================================================
 --- src.orig/chrome/browser/ui/omnibox/arcium_command_providers.h
 +++ src/chrome/browser/ui/omnibox/arcium_command_providers.h
-@@ -94,7 +94,12 @@ std::unique_ptr<CommandSession> CreateCo
+@@ -5,11 +5,13 @@
+ #define CHROME_BROWSER_UI_OMNIBOX_ARCIUM_COMMAND_PROVIDERS_H_
+ 
+ #include <memory>
++#include <optional>
+ #include <string_view>
+ #include <vector>
+ 
+ #include "chrome/browser/ui/omnibox/arcium_command_session.h"
+ 
++class AutocompleteController;
+ class Browser;
+ 
+ namespace arcium {
+@@ -39,7 +41,10 @@ class CommandQueryProvider {
+   virtual bool SupportsScope(std::string_view scope_id) const;
+   virtual void Start(CommandQuery query,
+                      CommandProviderPublishCallback publish) = 0;
+-  virtual void Cancel() = 0;
++  // An immediate query restart may retain suggestions for this same scope.
++  // This hint never carries execution authority across query generations.
++  virtual void Cancel(
++      std::optional<std::string_view> next_scope = std::nullopt) = 0;
+   // Cancel preserves a selected menu target; a new invocation/query clears it.
+   virtual void ResetRetainedTarget();
+   virtual CommandMenu ResolveActions(const CommandProviderTarget& target,
+@@ -61,7 +66,7 @@ class CommandProviderRegistry {
+   std::vector<CommandQueryProvider*> ProvidersForScope(
+       std::string_view scope_id) const;
+   std::vector<CommandScopeDescriptor> GetScopes() const;
+-  void Cancel();
++  void Cancel(std::optional<std::string_view> next_scope = std::nullopt);
+   void ResetRetainedTargets();
+ 
+  private:
+@@ -94,7 +99,16 @@ std::unique_ptr<CommandSession> CreateCo
  
  // This browser-owned factory contains the Profile/controller/URL integration.
  // Presenters receive only CommandSession and its immutable value publications.
@@ -6211,8 +6982,12 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_providers.h
  std::unique_ptr<CommandSession> CreateCommandSession(Browser* browser);
 +// Retain only browser data/cache between presentations. Each session still owns
 +// fresh query generations, action authority, selection, and subscriptions.
++using CommandNativeControllerFactoryForTesting = base::RepeatingCallback<
++    std::shared_ptr<AutocompleteController>(bool web)>;
 +std::unique_ptr<CommandSession> CreateCommandSession(
-+    Browser* browser, std::shared_ptr<CommandSessionContext>& context);
++    Browser* browser,
++    std::shared_ptr<CommandSessionContext>& context,
++    CommandNativeControllerFactoryForTesting controller_factory = {});
  
  }  // namespace arcium
  
@@ -6260,12 +7035,21 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
  #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
  #include "chrome/browser/profiles/profile.h"
  #include "chrome/browser/ui/browser.h"
-@@ -29,8 +43,12 @@
+@@ -29,8 +43,21 @@
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
  #include "chrome/common/pref_names.h"
  #include "chrome/test/base/browser_with_test_window_test.h"
 +#include "chrome/test/base/testing_profile.h"
  #include "components/content_settings/core/browser/host_content_settings_map.h"
++#include "components/omnibox/browser/autocomplete_controller.h"
++#include "components/omnibox/browser/autocomplete_controller_config.h"
++#include "components/omnibox/browser/autocomplete_input.h"
++#include "components/omnibox/browser/autocomplete_match.h"
++#include "components/omnibox/browser/autocomplete_match_type.h"
++#include "components/omnibox/browser/autocomplete_result.h"
++#include "components/omnibox/browser/fake_autocomplete_provider_client.h"
++#include "components/omnibox/browser/omnibox_prefs.h"
++#include "components/prefs/pref_registry_simple.h"
  #include "components/prefs/pref_service.h"
 +#include "components/history/core/browser/history_service.h"
 +#include "components/favicon_base/favicon_types.h"
@@ -6273,7 +7057,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
  #include "components/sessions/content/session_tab_helper.h"
  #include "components/split_tabs/split_tab_visual_data.h"
  #include "components/tabs/public/split_tab_data.h"
-@@ -39,8 +57,10 @@
+@@ -39,8 +66,10 @@
  #include "content/public/browser/navigation_entry.h"
  #include "content/public/browser/web_contents.h"
  #include "testing/gtest/include/gtest/gtest.h"
@@ -6284,10 +7068,44 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
  
  namespace arcium {
  namespace {
-@@ -110,8 +130,76 @@ CommandIntent Intent(CommandTarget targe
+@@ -110,8 +139,110 @@ CommandIntent Intent(CommandTarget targe
            .target = std::move(target)};
  }
  
++class NativeContinuityObserver : public AutocompleteController::Observer {
++ public:
++  ~NativeContinuityObserver() override {
++    for (const auto& controller : controllers) {
++      controller->RemoveObserver(this);
++    }
++  }
++  std::shared_ptr<AutocompleteController> Create(bool /*web*/) {
++    auto client = std::make_unique<FakeAutocompleteProviderClient>();
++    omnibox::RegisterProfilePrefs(static_cast<PrefRegistrySimple*>(
++        client->GetPrefs()->DeprecatedGetPrefRegistry()));
++    auto controller = std::make_shared<AutocompleteController>(
++        std::move(client), AutocompleteControllerConfig{.provider_types = 0});
++    controller->AddObserver(this);
++    controllers.push_back(controller);
++    return controller;
++  }
++  void OnStart(AutocompleteController* controller,
++               const AutocompleteInput& input) override {
++    Start start;
++    start.query = input.text();
++    for (const auto& match : controller->result()) {
++      start.urls.push_back(match.destination_url);
++    }
++    starts.push_back(std::move(start));
++  }
++  struct Start {
++    std::u16string query;
++    std::vector<GURL> urls;
++  };
++  std::vector<std::shared_ptr<AutocompleteController>> controllers;
++  std::vector<Start> starts;
++};
++
 +class RecordingCommandBrowserWindow : public TestBrowserWindow {
 + public:
 +  bool ShowArciumCommandBar(bool new_tab) override {
@@ -6361,7 +7179,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
    void SetUp() override {
      features_.InitAndEnableFeature(helium::kHeliumFavoritesAndPins);
      BrowserWithTestWindowTest::SetUp();
-@@ -334,6 +422,132 @@ class ArciumCommandActionRouterTest : pu
+@@ -334,6 +465,132 @@ class ArciumCommandActionRouterTest : pu
    raw_ptr<content::WebContents> accepted_source_ = nullptr;
  };
  
@@ -6494,7 +7312,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
  TEST_F(ArciumCommandActionRouterTest, NativeCurrentAcceptUsesCapturedTab) {
    auto* captured = AddOrdinaryTab("https://captured.test/");
    Capture(captured);
-@@ -454,6 +668,115 @@ TEST_F(ArciumCommandActionRouterTest, Sc
+@@ -454,6 +711,166 @@ TEST_F(ArciumCommandActionRouterTest, Sc
    EXPECT_EQ(1, browser()->tab_strip_model()->count());
  }
  
@@ -6527,6 +7345,57 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
 +  EXPECT_GT(corpus.index().revision(), revision);
 +  EXPECT_TRUE(corpus.index().Search(u"initial", kSavedScope).empty());
 +  EXPECT_EQ(1u, corpus.index().Search(u"replacement", kSavedScope).size());
++}
++
++TEST_F(ArciumCommandActionRouterTest,
++       TypingReusesNativeMatchesButCancellationRevokesThem) {
++  AddOrdinaryTab("https://source.test/");
++  NativeContinuityObserver native;
++  std::shared_ptr<CommandSessionContext> context;
++  auto session = CreateCommandSession(
++      browser(), context,
++      base::BindRepeating(&NativeContinuityObserver::Create,
++                          base::Unretained(&native)));
++  session->SetInvocation(CommandInvocationMode::kNewTab);
++  auto publish = base::BindLambdaForTesting(
++      [](std::shared_ptr<const CommandPublication>) {});
++  const GURL seed_url("https://retained-suggestion.test/");
++  auto seed = [&] {
++    // Settle startup corpus/engine refreshes before installing the match that
++    // the next explicit query restart must preserve.
++    base::RunLoop().RunUntilIdle();
++    AutocompleteMatch match(nullptr, 1000, false,
++                            AutocompleteMatchType::HISTORY_URL);
++    match.destination_url = seed_url;
++    match.contents = u"Retained suggestion";
++    match.fill_into_edit = u"https://retained-suggestion.test/";
++    native.controllers.back()->InjectAdHocMatch(match);
++  };
++  session->Search(kOmniScope, u"first", publish);
++  ASSERT_EQ(1u, native.controllers.size());
++  seed();
++  ASSERT_FALSE(native.controllers.back()->result().empty());
++  session->Search(kOmniScope, u"second", publish);
++  ASSERT_FALSE(native.starts.empty());
++  EXPECT_EQ(u"second", native.starts.back().query);
++  EXPECT_EQ(std::vector<GURL>{seed_url}, native.starts.back().urls);
++
++  seed();
++  session->Cancel();
++  EXPECT_TRUE(native.controllers.back()->result().empty());
++  session->Search(kOmniScope, u"third", publish);
++  seed();
++  session->SetInvocation(CommandInvocationMode::kNewTab);
++  EXPECT_TRUE(native.controllers.back()->result().empty());
++
++  session->Search(kOmniScope, u"fourth", publish);
++  seed();
++  const auto omni = native.controllers.back();
++  session->Search(kWebScope, u"fifth", publish);
++  EXPECT_TRUE(omni->result().empty());
++  EXPECT_EQ(2u, native.controllers.size());
++  EXPECT_EQ(u"fifth", native.starts.back().query);
++  EXPECT_TRUE(native.starts.back().urls.empty());
 +}
 +
 +TEST_F(ArciumCommandActionRouterTest, DeferredSessionCapturesSavedHomeBeforeIndexing) {
@@ -6695,7 +7564,56 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
  #include "url/gurl.h"
  
  namespace arcium {
-@@ -1841,6 +1843,98 @@ TEST_F(ArciumCommandIconCacheTest,
+@@ -80,6 +82,7 @@ struct FakeProviderState {
+   bool require_retained_target = false;
+   size_t menu_entry_count = 1;
+   size_t cancel_count = 0;
++  std::vector<std::optional<std::string>> next_scopes;
+   size_t reset_count = 0;
+   size_t destroy_count = 0;
+   std::optional<CommandProviderTarget> retained_target;
+@@ -118,7 +121,9 @@ class FakeCommandProvider final : public
+       state_->Publish(state_->callbacks.size() - 1, state_->initial_results);
+     }
+   }
+-  void Cancel() override {
++  void Cancel(std::optional<std::string_view> next_scope) override {
++    state_->next_scopes.push_back(next_scope ? std::optional<std::string>(*next_scope)
++                                           : std::nullopt);
+     ++state_->cancel_count;
+     if (state_->publish_on_cancel && !state_->callbacks.empty()) {
+       state_->Publish(state_->callbacks.size() - 1,
+@@ -265,6 +270,29 @@ class ArciumCommandSessionTest : public
+   std::unique_ptr<CommandSession> session_;
+ };
+ 
++TEST_F(ArciumCommandSessionTest, QueryRestartHintsPreserveCancellationAuthority) {
++  auto provider = AddProvider("native", {"web", "omni"});
++  provider->initial_results = {{MakeRow("native", "current")}, true};
++  provider->publish_on_cancel = true;
++  Search("web", u"first");
++  auto old = provider->callbacks.back();
++  Search("web", u"second");
++  ASSERT_TRUE(provider->next_scopes.back());
++  EXPECT_EQ("web", *provider->next_scopes.back());
++  const auto count = publications_.size();
++  old.Run({{MakeRow("native", "stale")}, true});
++  EXPECT_EQ(count, publications_.size());
++  ASSERT_FALSE(publications_.empty());
++  EXPECT_EQ(u"second", publications_.back()->query);
++  Search("omni", u"third");
++  ASSERT_TRUE(provider->next_scopes.back());
++  EXPECT_EQ("omni", *provider->next_scopes.back());
++  session_->Cancel();
++  EXPECT_FALSE(provider->next_scopes.back());
++  session_->SetInvocation(CommandInvocationMode::kCurrentTab);
++  EXPECT_FALSE(provider->next_scopes.back());
++}
++
+ TEST_F(ArciumCommandSessionTest, SynchronousStartPublishesInitializedEpoch) {
+   auto first = AddProvider("first", {"scope"});
+   auto second = AddProvider("second", {"second-scope"});
+@@ -1841,6 +1869,98 @@ TEST_F(ArciumCommandIconCacheTest,
  }
  
  TEST_F(ArciumCommandIconCacheTest,
@@ -6794,3 +7712,128 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
         OversizedValidUrlsNeverFetchOrEnterTheCache) {
    const std::string prefix = "https://visible.test/";
    const GURL oversized(
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_bar_material.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_bar_material.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_bar_material.cc
+@@ -60,6 +60,24 @@ CommandBarMaterial::~CommandBarMaterial(
+   native_background_.reset();
+ }
+ 
++int CommandBarMaterial::ResizeHeight(std::optional<int> height,
++                                     base::TimeDelta duration) {
++  if (!widget_ || widget_->IsClosed()) {
++    return 0;
++  }
++  if (native_background_) {
++    if (const auto actual = native_background_->ResizeHeight(height, duration)) {
++      return *actual;
++    }
++  }
++  auto bounds = widget_->GetWindowBoundsInScreen();
++  if (height) {
++    bounds.set_height(*height);
++    widget_->SetBounds(bounds);
++  }
++  return bounds.height();
++}
++
+ void CommandBarMaterial::Refresh() {
+   if (!widget_) {
+     return;
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_bar_material.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_bar_material.h
++++ src/chrome/browser/ui/views/omnibox/arcium_command_bar_material.h
+@@ -6,10 +6,12 @@
+ #define CHROME_BROWSER_UI_VIEWS_OMNIBOX_ARCIUM_COMMAND_BAR_MATERIAL_H_
+ 
+ #include <memory>
++#include <optional>
+ 
+ #include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
+ #include "chrome/browser/ui/views/helium/glass_surface_configuration.h"
+ #include "components/prefs/pref_change_registrar.h"
+ #include "third_party/skia/include/core/SkPath.h"
+@@ -32,6 +34,12 @@ class CommandBarNativeBackground {
+  public:
+   virtual ~CommandBarNativeBackground() = default;
+   virtual void SetContour(const SkPath& contour) {}
++  // nullopt stops at the current presentation height. Unsupported hosts use
++  // ordinary Widget bounds; native hosts can animate a height-only change.
++  virtual std::optional<int> ResizeHeight(std::optional<int> height,
++                                          base::TimeDelta duration) {
++    return std::nullopt;
++  }
+   virtual bool Update(bool requested,
+                       const helium::GlassSurfaceConfiguration& configuration,
+                       const gfx::Rect& bounds,
+@@ -67,6 +75,7 @@ class CommandBarMaterial : public views:
+   // Clips are read from the actual Views painting geometry. The results
+   // clip excludes the location-bar cutout, avoiding a second native blur.
+   void Refresh();
++  int ResizeHeight(std::optional<int> height, base::TimeDelta duration);
+   // True when the shared native profile decoration is installed. A configured
+   // solid material can also need transparent Views for its color and grain.
+   bool uses_native_material() const { return uses_native_material_; }
+Index: src/chrome/browser/ui/omnibox/arcium_command_session.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_session.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_session.cc
+@@ -41,7 +41,7 @@ class ProviderCommandSession final : pub
+   void Search(CommandScopeId scope_id,
+               std::u16string query,
+               CommandPublishCallback publish) override {
+-    Cancel();
++    Cancel(std::string_view(scope_id));
+     registry_->ResetRetainedTargets();
+     scope_id_ = std::move(scope_id);
+     query_ = std::move(query);
+@@ -69,14 +69,7 @@ class ProviderCommandSession final : pub
+     }
+   }
+ 
+-  void Cancel() override {
+-    // Invalidate first: Cancel itself may cause a provider's final callback.
+-    ++epoch_;
+-    weak_factory_.InvalidateWeakPtrs();
+-    publish_.Reset();
+-    active_.clear();
+-    registry_->Cancel();
+-  }
++  void Cancel() override { Cancel(std::nullopt); }
+ 
+   CommandMenu ResolveActions(const CommandTarget& target,
+                              std::string_view menu_id,
+@@ -114,6 +107,15 @@ class ProviderCommandSession final : pub
+   }
+ 
+  private:
++  void Cancel(std::optional<std::string_view> next_scope) {
++    // Invalidate first: Cancel itself may cause a provider's final callback.
++    ++epoch_;
++    weak_factory_.InvalidateWeakPtrs();
++    publish_.Reset();
++    active_.clear();
++    registry_->Cancel(next_scope);
++  }
++
+   struct ActiveProvider {
+     CommandQueryProvider* provider;
+     std::vector<CommandRow> rows;
+@@ -270,9 +272,10 @@ std::vector<CommandScopeDescriptor> Comm
+   }
+   return scopes;
+ }
+-void CommandProviderRegistry::Cancel() {
++void CommandProviderRegistry::Cancel(
++    std::optional<std::string_view> next_scope) {
+   for (const auto& provider : providers_) {
+-    provider->Cancel();
++    provider->Cancel(next_scope);
+   }
+ }
+ 
