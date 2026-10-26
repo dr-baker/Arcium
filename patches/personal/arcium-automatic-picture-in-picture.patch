@@ -15,12 +15,57 @@
        </message>
 --- a/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_helper.cc
 +++ b/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_helper.cc
-@@ -720,9 +720,11 @@ bool AutoPictureInPictureTabHelper::IsEl
+@@ -20,9 +20,11 @@
+ #include "chrome/browser/picture_in_picture/picture_in_picture_window_manager.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/recently_audible_helper.h"
++#include "chrome/common/pref_names.h"
+ #include "components/content_settings/browser/page_specific_content_settings.h"
+ #include "components/content_settings/core/browser/host_content_settings_map.h"
+ #include "components/permissions/permission_decision_auto_blocker.h"
++#include "components/prefs/pref_service.h"
+ #include "content/public/browser/media_session.h"
+ #include "content/public/browser/media_session_service.h"
+ #include "media/base/media_switches.h"
+@@ -650,6 +652,15 @@ void AutoPictureInPictureTabHelper::Mayb
+ 
+ bool AutoPictureInPictureTabHelper::IsEligibleForAutoPictureInPicture(
+     bool should_record_blocking_metrics) {
++  const bool browser_initiated_auto_pip = base::FeatureList::IsEnabled(
++      blink::features::kBrowserInitiatedAutomaticPictureInPicture);
++  if (browser_initiated_auto_pip &&
++      !Profile::FromBrowserContext(web_contents()->GetBrowserContext())
++           ->GetPrefs()
++           ->GetBoolean(prefs::kArciumAutoPictureInPictureEnabled)) {
++    return false;
++  }
++
+   // Don't try to autopip if picture-in-picture is currently disabled.
+   if (PictureInPictureWindowManager::GetInstance()
+           ->IsPictureInPictureDisabled()) {
+@@ -669,9 +680,9 @@ bool AutoPictureInPictureTabHelper::IsEl
+ 
+   // Browser-initiated auto-PiP can select the active video directly. Keep the
+   // registration requirement for the website-driven path.
+-  if (!base::FeatureList::IsEnabled(
+-          blink::features::kBrowserInitiatedAutomaticPictureInPicture) &&
+-      !is_enter_auto_picture_in_picture_available_) {
++  if (!is_enter_auto_picture_in_picture_available_ &&
++      !(browser_initiated_auto_pip &&
++        CanEnterBrowserInitiatedAutoPictureInPicture())) {
+     return false;
+   }
+ 
+@@ -718,11 +729,13 @@ bool AutoPictureInPictureTabHelper::IsEl
+ }
+ 
  bool AutoPictureInPictureTabHelper::MeetsVideoPlaybackConditions() const {
-   const bool browser_initiated_auto_pip = base::FeatureList::IsEnabled(
-       blink::features::kBrowserInitiatedAutomaticPictureInPicture);
-+  if (browser_initiated_auto_pip) {
-+    return has_safe_url_ && CanEnterBrowserInitiatedAutoPictureInPicture();
+-  const bool browser_initiated_auto_pip = base::FeatureList::IsEnabled(
+-      blink::features::kBrowserInitiatedAutomaticPictureInPicture);
++  if (base::FeatureList::IsEnabled(
++          blink::features::kBrowserInitiatedAutomaticPictureInPicture) &&
++      has_safe_url_ && CanEnterBrowserInitiatedAutoPictureInPicture()) {
++    return true;
 +  }
    return has_audio_focus_ && is_playing_ && WasRecentlyAudible() &&
 -         has_safe_url_ &&
@@ -29,7 +74,7 @@
  }
  
  bool AutoPictureInPictureTabHelper::IsUsingCameraOrMicrophone() const {
-@@ -862,17 +864,16 @@ AutoPictureInPictureTabHelper::GetPrimar
+@@ -862,17 +875,16 @@ AutoPictureInPictureTabHelper::GetPrimar
  
    auto* rfh = media_session->GetRoutedFrame();
  
@@ -57,7 +102,7 @@
      rfh = web_contents()->GetPrimaryMainFrame();
    }
  
-@@ -901,12 +902,8 @@ AutoPictureInPictureTabHelper::GetAutoPi
+@@ -901,12 +913,8 @@ AutoPictureInPictureTabHelper::GetAutoPi
      return media::PictureInPictureEventsInfo::AutoPipReason::kVideoConferencing;
    }
  
@@ -72,7 +117,7 @@
    if (CanEnterBrowserInitiatedAutoPictureInPicture()) {
      return media::PictureInPictureEventsInfo::AutoPipReason::kBrowserInitiated;
    }
-@@ -971,6 +968,18 @@ AutoPictureInPictureTabHelper::CreateOve
+@@ -971,6 +979,18 @@ AutoPictureInPictureTabHelper::CreateOve
      return nullptr;
    }
  
@@ -131,7 +176,7 @@
  #include "components/ukm/test_ukm_recorder.h"
  #include "components/zoom/zoom_controller.h"
  #include "content/public/browser/media_session.h"
-@@ -1180,6 +1184,34 @@ class BrowserInitiatedAutoPictureInPictu
+@@ -1180,6 +1184,53 @@ class BrowserInitiatedAutoPictureInPictu
    }
  };
  
@@ -151,6 +196,25 @@
 +    EXPECT_FALSE(contents->HasPictureInPictureDocument());
 +  }
 +
++  void PrepareRegisteredDocumentPipInLocalIframe() {
++    LoadAutoDocumentPipPage(browser());
++    auto* contents = browser()->tab_strip_model()->GetActiveWebContents();
++    ASSERT_TRUE(ExecJs(contents, R"(
++      const iframe = document.createElement("iframe");
++      iframe.style.width = "100%";
++      iframe.style.height = "100%";
++      iframe.style.position = "absolute";
++      document.body.appendChild(iframe);
++      iframe.contentDocument.body.appendChild(video);
++    )"));
++    PlayVideo(contents);
++    WaitForAudioFocusGained();
++    WaitForMediaSessionPlaying(contents);
++    WaitForWasRecentlyAudible(contents);
++    SetExpectedHasHighEngagement(true);
++    SetContentSetting(contents, CONTENT_SETTING_ASK);
++  }
++
 +  void PrepareVideo() {
 +    LoadNotRegisteredPage(browser());
 +    auto* contents = browser()->tab_strip_model()->GetActiveWebContents();
@@ -166,7 +230,7 @@
  }  // namespace
  
  IN_PROC_BROWSER_TEST_F(AutoPictureInPictureWithVideoPlaybackBrowserTest,
-@@ -3288,7 +3320,7 @@ IN_PROC_BROWSER_TEST_F(BrowserInitiatedA
+@@ -3288,7 +3339,7 @@ IN_PROC_BROWSER_TEST_F(BrowserInitiatedA
  }
  
  IN_PROC_BROWSER_TEST_F(BrowserInitiatedAutoPictureInPictureBrowserTest,
@@ -175,7 +239,7 @@
    // Load a page that does not register for autopip and start video playback.
    LoadNotRegisteredPage(browser());
    auto* web_contents = browser()->tab_strip_model()->GetActiveWebContents();
-@@ -3303,7 +3335,13 @@ IN_PROC_BROWSER_TEST_F(BrowserInitiatedA
+@@ -3303,7 +3354,13 @@ IN_PROC_BROWSER_TEST_F(BrowserInitiatedA
    MuteVideo(web_contents);
    WaitForWasRecentlyAudible(web_contents, /*expected_recently_audible=*/false);
  
@@ -190,7 +254,7 @@
  }
  
  IN_PROC_BROWSER_TEST_F(BrowserInitiatedAutoPictureInPictureBrowserTest,
-@@ -3416,45 +3454,186 @@ IN_PROC_BROWSER_TEST_F(BrowserInitiatedA
+@@ -3416,45 +3473,210 @@ IN_PROC_BROWSER_TEST_F(BrowserInitiatedA
                                          /*should_document_pip=*/false);
  }
  
@@ -203,6 +267,16 @@
 -                   .Append(kNotRegisteredPage)
 -                   .MaybeAsASCII());
 -  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), test_page_url));
+-
+-  auto* web_contents = browser()->tab_strip_model()->GetActiveWebContents();
+-  PlayVideo(web_contents);
+-  WaitForAudioFocusGained();
+-  WaitForMediaSessionPlaying(web_contents);
+-  WaitForWasRecentlyAudible(web_contents);
+-  SetExpectedHasHighEngagement(true);
+-
+-  // Set content setting to CONTENT_SETTING_ASK to show the prompt.
+-  SetContentSetting(web_contents, CONTENT_SETTING_ASK);
 +IN_PROC_BROWSER_TEST_F(ArciumAutomaticPictureInPictureBrowserTest,
 +                       DefaultEnabledLowEngagementNeedsNoPermissionOverlay) {
 +  EXPECT_TRUE(base::FeatureList::IsEnabled(
@@ -213,37 +287,60 @@
 +  PrepareVideo();
 +  auto* contents = browser()->tab_strip_model()->GetActiveWebContents();
  
--  auto* web_contents = browser()->tab_strip_model()->GetActiveWebContents();
--  PlayVideo(web_contents);
--  WaitForAudioFocusGained();
--  WaitForMediaSessionPlaying(web_contents);
--  WaitForWasRecentlyAudible(web_contents);
--  SetExpectedHasHighEngagement(true);
-+  base::HistogramTester histograms;
-+  SwitchToNewTabAndWaitForAutoPip();
+   base::HistogramTester histograms;
+   SwitchToNewTabAndWaitForAutoPip();
+-  EXPECT_TRUE(web_contents->HasPictureInPictureVideo());
 +  EXPECT_TRUE(contents->HasPictureInPictureVideo());
 +  EXPECT_EQ(nullptr, GetOverlayViewFromVideoPipWindow());
 +  EXPECT_FALSE(EvalJs(contents, "video.paused").ExtractBool());
 +  histograms.ExpectTotalCount(kBrowserInitiatedHistogram, 0);
  
--  // Set content setting to CONTENT_SETTING_ASK to show the prompt.
--  SetContentSetting(web_contents, CONTENT_SETTING_ASK);
+-  auto* const overlay_view = GetOverlayViewFromVideoPipWindow();
+-  ASSERT_TRUE(overlay_view);
+-  overlay_view->get_view_for_testing()->simulate_button_press_for_testing(
 +  SwitchBackToOpenerAndWaitForPipToClose();
 +  EXPECT_FALSE(EvalJs(contents, "video.paused").ExtractBool());
 +}
++
++IN_PROC_BROWSER_TEST_F(ArciumAutomaticPictureInPictureBrowserTest,
++                       RegisteredDocumentPipFallbackPreservesAskOverlay) {
++  PrepareRegisteredDocumentPipInLocalIframe();
++  auto* contents = browser()->tab_strip_model()->GetActiveWebContents();
++  SwitchToNewTabAndWaitForAutoPip();
++  EXPECT_TRUE(contents->HasPictureInPictureDocument());
++  EXPECT_FALSE(contents->HasPictureInPictureVideo());
++  auto* overlay = GetOverlayViewFromDocumentPipWindow();
++  ASSERT_TRUE(overlay);
++  overlay->get_view_for_testing()->simulate_button_press_for_testing(
+       AutoPipSettingView::UiResult::kAllowOnce);
++  SwitchBackToOpenerAndWaitForPipToClose();
++}
  
--  base::HistogramTester histograms;
+-  metrics::SubprocessMetricsProvider::MergeHistogramDeltasForTesting();
+-  auto samples =
+-      histograms.GetHistogramSamplesSinceCreation(kBrowserInitiatedHistogram);
++IN_PROC_BROWSER_TEST_F(ArciumAutomaticPictureInPictureBrowserTest,
++                       DisabledPreferencePreventsRegisteredDocumentFallback) {
++  PrepareRegisteredDocumentPipInLocalIframe();
++  auto* contents = browser()->tab_strip_model()->GetActiveWebContents();
++  browser()->profile()->GetPrefs()->SetBoolean(
++      prefs::kArciumAutoPictureInPictureEnabled, false);
++  SwitchToNewTabAndDontExpectAutopip();
++  ExpectNoPipAfterPendingChecks(contents);
++}
+ 
+-  // Verify metrics.
+-  EXPECT_EQ(1, samples->TotalCount());
+-  EXPECT_EQ(1, samples->GetCount(static_cast<int>(PromptResult::kAllowOnce)));
+-  CheckPromptResultUkmRecorded(web_contents->GetLastCommittedURL(),
+-                               UkmEntry::kBrowserInitiatedName,
+-                               PromptResult::kAllowOnce);
 +IN_PROC_BROWSER_TEST_F(ArciumAutomaticPictureInPictureBrowserTest,
 +                       DisabledPreferencePreservesExistingAndManualPip) {
 +  PrepareVideo();
 +  auto* contents = browser()->tab_strip_model()->GetActiveWebContents();
-   SwitchToNewTabAndWaitForAutoPip();
--  EXPECT_TRUE(web_contents->HasPictureInPictureVideo());
- 
--  auto* const overlay_view = GetOverlayViewFromVideoPipWindow();
--  ASSERT_TRUE(overlay_view);
--  overlay_view->get_view_for_testing()->simulate_button_press_for_testing(
--      AutoPipSettingView::UiResult::kAllowOnce);
++  SwitchToNewTabAndWaitForAutoPip();
++
 +  browser()->profile()->GetPrefs()->SetBoolean(
 +      prefs::kArciumAutoPictureInPictureEnabled, false);
 +  EXPECT_TRUE(contents->HasPictureInPictureVideo());
@@ -266,10 +363,7 @@
 +  ASSERT_TRUE(ExecJs(contents, "document.exitPictureInPicture()"));
 +  exited.Wait();
 +}
- 
--  metrics::SubprocessMetricsProvider::MergeHistogramDeltasForTesting();
--  auto samples =
--      histograms.GetHistogramSamplesSinceCreation(kBrowserInitiatedHistogram);
++
 +IN_PROC_BROWSER_TEST_F(ArciumAutomaticPictureInPictureBrowserTest,
 +                       MutedFromFirstPlaybackEntersAndReturnsInline) {
 +  LoadNotRegisteredPage(browser());
@@ -292,13 +386,7 @@
 +    auto info = content::MediaSession::Get(contents)->GetMediaSessionInfoSync();
 +    return info && info->can_enter_browser_initiated_autopip;
 +  }));
- 
--  // Verify metrics.
--  EXPECT_EQ(1, samples->TotalCount());
--  EXPECT_EQ(1, samples->GetCount(static_cast<int>(PromptResult::kAllowOnce)));
--  CheckPromptResultUkmRecorded(web_contents->GetLastCommittedURL(),
--                               UkmEntry::kBrowserInitiatedName,
--                               PromptResult::kAllowOnce);
++
 +  SwitchToNewTabAndWaitForAutoPip();
 +  EXPECT_TRUE(contents->HasPictureInPictureVideo());
 +  EXPECT_EQ(nullptr, GetOverlayViewFromVideoPipWindow());
@@ -1212,7 +1300,26 @@
  #include "content/browser/media/session/audio_focus_delegate.h"
  #include "content/browser/media/session/media_players_callback_aggregator.h"
  #include "content/browser/media/session/media_session_controller.h"
-@@ -2290,11 +2291,20 @@ bool MediaSessionImpl::CanEnterBrowserIn
+@@ -1343,8 +1344,16 @@ void MediaSessionImpl::ExitPictureInPict
+ void MediaSessionImpl::EnterAutoPictureInPicture() {
+   if (base::FeatureList::IsEnabled(
+           blink::features::kBrowserInitiatedAutomaticPictureInPicture)) {
+-    MaybeEnterBrowserInitiatedAutomaticPictureInPicture();
+-    return;
++    if (!GetContentClient()
++             ->browser()
++             ->IsBrowserInitiatedAutomaticPictureInPictureEnabled(
++                 *web_contents())) {
++      return;
++    }
++    if (CanEnterBrowserInitiatedAutomaticPictureInPicture()) {
++      MaybeEnterBrowserInitiatedAutomaticPictureInPicture();
++      return;
++    }
+   }
+ 
+   if (!ShouldRouteAction(
+@@ -2290,11 +2299,20 @@ bool MediaSessionImpl::CanEnterBrowserIn
      return false;
    }
  
@@ -1235,7 +1342,7 @@
      return false;
    }
  
-@@ -2324,7 +2334,11 @@ void MediaSessionImpl::RecordBrowserInit
+@@ -2324,7 +2342,11 @@ void MediaSessionImpl::RecordBrowserInit
      return;
    }
  
@@ -1248,7 +1355,7 @@
    if (source_id == ukm::kInvalidSourceId) {
      return;
    }
-@@ -2347,6 +2361,21 @@ void MediaSessionImpl::MaybeEnterBrowser
+@@ -2347,6 +2369,21 @@ void MediaSessionImpl::MaybeEnterBrowser
      return;
    }
  
@@ -1675,3 +1782,85 @@
  }
  
  int TestWebFrameClient::loads_in_progress_ = 0;
+--- a/content/browser/media/session/media_session_impl_unittest.cc
++++ b/content/browser/media/session/media_session_impl_unittest.cc
+@@ -1675,6 +1675,79 @@ TEST_F(MediaSessionImplTestWithDryRunOnl
+   mock_media_session_service().FlushForTesting();
+ }
+ 
++TEST_F(MediaSessionImplTest,
++       BrowserInitiatedAutoPipFallsBackToRegisteredHandler) {
++  StartNewPlayer();
++  mock_media_session_service().EnableAction(
++      MediaSessionAction::kEnterPictureInPicture);
++  EXPECT_CALL(mock_media_session_service().mock_client(),
++              DidReceiveAction(
++                  MediaSessionAction::kEnterPictureInPicture,
++                  EnterPictureInPictureReasonEquals(
++                      blink::mojom::MediaSessionEnterPictureInPictureReason::
++                          kContentOccluded)));
++  GetMediaSession()->EnterAutoPictureInPicture();
++  mock_media_session_service().FlushForTesting();
++  EXPECT_EQ(0, player_observer_->received_enter_picture_in_picture_calls());
++}
++
++TEST_F(MediaSessionImplTest,
++       BrowserInitiatedAutoPipRoutesRegisteredHandlerWithCamera) {
++  int player = StartNewPlayer();
++  player_observer_->SetIsPictureInPictureAvailable(player, true);
++  mock_media_session_service().EnableAction(
++      MediaSessionAction::kEnterPictureInPicture);
++  mock_media_session_service().SetCameraState(
++      media_session::mojom::CameraState::kTurnedOn);
++  FlushForTesting(GetMediaSession());
++  EXPECT_CALL(mock_media_session_service().mock_client(),
++              DidReceiveAction(
++                  MediaSessionAction::kEnterPictureInPicture,
++                  EnterPictureInPictureReasonEquals(
++                      blink::mojom::MediaSessionEnterPictureInPictureReason::
++                          kContentOccluded)));
++  GetMediaSession()->EnterAutoPictureInPicture();
++  mock_media_session_service().FlushForTesting();
++  EXPECT_EQ(0, player_observer_->received_enter_picture_in_picture_calls());
++}
++
++TEST_F(MediaSessionImplTest,
++       BrowserInitiatedAutoPipRoutesRegisteredHandlerWithMicrophone) {
++  int player = StartNewPlayer();
++  player_observer_->SetIsPictureInPictureAvailable(player, true);
++  mock_media_session_service().EnableAction(
++      MediaSessionAction::kEnterPictureInPicture);
++  mock_media_session_service().SetMicrophoneState(
++      media_session::mojom::MicrophoneState::kUnmuted);
++  FlushForTesting(GetMediaSession());
++  EXPECT_CALL(mock_media_session_service().mock_client(),
++              DidReceiveAction(
++                  MediaSessionAction::kEnterPictureInPicture,
++                  EnterPictureInPictureReasonEquals(
++                      blink::mojom::MediaSessionEnterPictureInPictureReason::
++                          kContentOccluded)));
++  GetMediaSession()->EnterAutoPictureInPicture();
++  mock_media_session_service().FlushForTesting();
++  EXPECT_EQ(0, player_observer_->received_enter_picture_in_picture_calls());
++}
++
++TEST_F(MediaSessionImplTest,
++       BrowserInitiatedAutoPipPreferenceBlocksRegisteredFallback) {
++  MockContentBrowserClient mock_client;
++  ContentBrowserClient* old_client = SetBrowserClientForTesting(&mock_client);
++  StartNewPlayer();
++  mock_media_session_service().EnableAction(
++      MediaSessionAction::kEnterPictureInPicture);
++  mock_client.browser_initiated_auto_pip_enabled = false;
++  EXPECT_CALL(mock_media_session_service().mock_client(),
++              DidReceiveAction(MediaSessionAction::kEnterPictureInPicture, _))
++      .Times(0);
++  GetMediaSession()->EnterAutoPictureInPicture();
++  mock_media_session_service().FlushForTesting();
++  EXPECT_EQ(0, player_observer_->received_enter_picture_in_picture_calls());
++  SetBrowserClientForTesting(old_client);
++}
++
+ class MediaSessionImplWithMediaSessionClientTest : public MediaSessionImplTest {
+  protected:
+   TestMediaSessionClient client_;
