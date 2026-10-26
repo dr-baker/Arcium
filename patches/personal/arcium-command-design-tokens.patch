@@ -332,7 +332,28 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
  constexpr int kEmptyHeight = 87;
  constexpr int kHeadingHeight = 55;
  constexpr int kFooterHeight = 46;
-@@ -378,14 +376,15 @@ void PaintScopeLight(gfx::Canvas* canvas
+@@ -99,7 +97,8 @@ SkColor Blend(SkColor from, SkColor to,
+   return gfx::Tween::ColorValueBetween(std::clamp(progress, 0.f, 1.f), from, to);
+ }
+ 
+-SkPath TopRoundedRectPath(const gfx::RectF& rect, float radius) {
++SkPath TopRoundedRectPath(const gfx::RectF& rect, float radius,
++                         bool close = true) {
+   radius = std::min({radius, rect.width() / 2, rect.height()});
+   SkPathBuilder path;
+   path.moveTo(rect.x(), rect.bottom())
+@@ -107,8 +106,8 @@ SkPath TopRoundedRectPath(const gfx::Rec
+       .quadTo(rect.x(), rect.y(), rect.x() + radius, rect.y())
+       .lineTo(rect.right() - radius, rect.y())
+       .quadTo(rect.right(), rect.y(), rect.right(), rect.y() + radius)
+-      .lineTo(rect.right(), rect.bottom())
+-      .close();
++      .lineTo(rect.right(), rect.bottom());
++  if (close) path.close();
+   return path.detach();
+ }
+ 
+@@ -378,25 +377,31 @@ void PaintScopeLight(gfx::Canvas* canvas
                       const gfx::RectF& source,
                       float scale,
                       float strength,
@@ -341,8 +362,9 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +                     const CommandPanelDesign& design) {
    if (source.IsEmpty() || strength <= 0) return;
 -  const float softness = 20 * scale;
+-  const float radius_x = source.width() / 2 + softness;
 +  const float softness = design.glow_softness * scale;
-   const float radius_x = source.width() / 2 + softness;
++  const float radius_x = source.width() / 2;
    const float radius_y = source.height() + softness;
    const float power = source.width() * source.height();
    // Only the downward half of the footprint receives this emitter's energy.
@@ -351,7 +373,39 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    gfx::ScopedCanvas restore(canvas);
    const auto bounds = contour.getBounds();
    canvas->sk_canvas()->clipRect(SkRect::MakeLTRB(
-@@ -427,6 +426,9 @@ CommandPanelAppearance ReadCommandPanelA
+       bounds.left(), source.y(), bounds.right(), bounds.bottom()));
++  const float center = source.CenterPoint().x();
+   const auto lobe = [&](SkColor tint, float center_x, float share) {
+     if (tint == SK_ColorTRANSPARENT) return;
+-    auto matrix = SkMatrix::Scale(radius_x, radius_y);
++    // Off-center colors use smaller, inscribed ellipses. Every color remains
++    // inside the same tab-width oval instead of widening Omni's footprint.
++    const float fraction = 1.f - std::abs(center_x - center) / radius_x;
++    auto matrix = SkMatrix::Scale(radius_x * fraction, radius_y * fraction);
+     matrix.postTranslate(center_x, source.y());
+     const auto color = [&](float falloff) {
+       return SkColor4f::FromColor(Alpha(tint, std::clamp(
+-          base::ClampRound(255 * radiance * share * falloff), 0, 255)));
++          base::ClampRound(255 * radiance * share * falloff /
++                           (fraction * fraction)), 0, 255)));
+     };
+     // Sampled inverse-square falloff, smoothly reaching zero at the footprint.
+     const SkColor4f stops[] = {color(1), color(.52f), color(.18f),
+@@ -408,11 +413,10 @@ void PaintScopeLight(gfx::Canvas* canvas
+         SkGradient::Interpolation{}, 0, &matrix));
+     canvas->DrawPath(contour, flags);
+   };
+-  const float center = source.CenterPoint().x();
+   if (scope.id == kOmniScope) {
+     // One emitter's energy, shared across its three colors.
+-    lobe(SkColorSetRGB(174, 112, 245), center - source.width() * .24f, .4f);
+-    lobe(SkColorSetRGB(100, 159, 255), center + source.width() * .24f, .4f);
++    lobe(SkColorSetRGB(174, 112, 245), center - source.width() * .16f, .4f);
++    lobe(SkColorSetRGB(100, 159, 255), center + source.width() * .16f, .4f);
+     lobe(SkColorSetRGB(89, 206, 157), center, .2f);
+   } else {
+     lobe(scope.tint, center, 1.f);
+@@ -427,6 +431,9 @@ CommandPanelAppearance ReadCommandPanelA
      return result;
    }
    const auto& value = prefs->GetDict(kCommandPanelLayoutPref);
@@ -361,7 +415,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    const int labels = value.FindInt("labels").value_or(1);
    const int icons = value.FindInt("icons").value_or(2);
    const int reveal = value.FindInt("scope_reveal").value_or(5);
-@@ -577,8 +579,8 @@ class CommandPanelView::Row : public vie
+@@ -577,8 +584,8 @@ class CommandPanelView::Row : public vie
      canvas->SaveLayerAlpha(base::ClampRound(255 * (.35f + .65f * progress)),
                             gfx::Rect(0, 0, w, h));
      if (GetState() == STATE_PRESSED) {
@@ -372,7 +426,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
      }
      panel_->PaintRow(canvas, index_, w, h);
      canvas->Restore();
-@@ -593,7 +595,7 @@ void CommandPanelView::ResultsView::OnPa
+@@ -593,7 +600,7 @@ void CommandPanelView::ResultsView::OnPa
        panel_->hovered_ < static_cast<int>(panel_->row_views_.size()) &&
        (panel_->hovered_ != panel_->selected_ || panel_->scope_browsing_)) {
      FillRoundRect(canvas, panel_->row_views_[panel_->hovered_]->bounds(),
@@ -381,7 +435,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    }
    if (!panel_->SelectedRowView() || panel_->scope_browsing_) {
      return;
-@@ -602,17 +604,17 @@ void CommandPanelView::ResultsView::OnPa
+@@ -602,17 +609,17 @@ void CommandPanelView::ResultsView::OnPa
                    (panel_->selection_y_ - panel_->previous_selection_y_) *
                        panel_->selection_animation_.GetCurrentValue();
    FillRoundRect(canvas,
@@ -404,7 +458,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    }
  }
  
-@@ -648,14 +650,14 @@ class CommandPanelView::ScopeButton : pu
+@@ -648,14 +655,14 @@ class CommandPanelView::ScopeButton : pu
        canvas->ClipPath(TopRoundedRectPath(
            gfx::RectF(0, 0, width(),
                       std::max(0, panel_->BodyBounds().y() - y())),
@@ -422,7 +476,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
      }
      panel_->PaintScope(canvas, index_,
                         base::ClampRound(width() / panel_->ui_scale_),
-@@ -696,12 +698,12 @@ class CommandPanelView::FooterButton : p
+@@ -696,12 +703,12 @@ class CommandPanelView::FooterButton : p
      if (GetState() == STATE_HOVERED || GetState() == STATE_PRESSED) {
        FillRoundRect(canvas, gfx::Rect(0, 5,
            base::ClampRound(width() / panel_->ui_scale_), 32), 5,
@@ -437,7 +491,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    }
  
   private:
-@@ -737,7 +739,7 @@ CommandPanelView::CommandPanelView(std::
+@@ -737,7 +744,7 @@ CommandPanelView::CommandPanelView(std::
    input_->SetTextColorId(ui::kColorRefNeutral99);
    input_->SetSelectionBackgroundColorId(ui::kColorSysPrimary);
    input_->SetSelectionTextColorId(ui::kColorSysOnPrimary);
@@ -446,7 +500,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    input_->GetViewAccessibility().SetRole(
        ax::mojom::Role::kTextFieldWithComboBox);
    input_->GetViewAccessibility().SetName(u"Search everything or enter URL");
-@@ -751,13 +753,7 @@ CommandPanelView::CommandPanelView(std::
+@@ -751,13 +758,7 @@ CommandPanelView::CommandPanelView(std::
    results_view_->GetViewAccessibility().SetRole(ax::mojom::Role::kListBox);
    results_view_->GetViewAccessibility().SetName(u"Suggestions");
    footer_button_ = AddChildView(std::make_unique<FooterButton>(this));
@@ -461,7 +515,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    scope_focus_animation_.SetTweenType(gfx::Tween::LINEAR_OUT_SLOW_IN);
    scope_focus_animation_.Reset(0);
    for (auto* animation : {&selection_animation_, &scope_animation_,
-@@ -821,6 +817,26 @@ void CommandPanelView::SetInvocation(boo
+@@ -821,6 +822,26 @@ void CommandPanelView::SetInvocation(boo
    RebuildResults();
    FocusInput();
  }
@@ -488,7 +542,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
  void CommandPanelView::SetAppearance(CommandPanelAppearance appearance) {
    if (!appearance.connected && appearance.scope_width == CommandPanelAppearance::Width::kFlush) {
      appearance.scope_width = CommandPanelAppearance::Width::kOffset;
-@@ -829,9 +845,61 @@ void CommandPanelView::SetAppearance(Com
+@@ -829,9 +850,61 @@ void CommandPanelView::SetAppearance(Com
    if (appearance_ == appearance) {
      return;
    }
@@ -550,7 +604,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    if (reveal_changed) {
      // A preset edit should show its resting shape, even after browsing scopes.
      scope_browsing_ = false;
-@@ -849,17 +917,8 @@ void CommandPanelView::SetUIScale(float
+@@ -849,17 +922,8 @@ void CommandPanelView::SetUIScale(float
      return;
    }
    ui_scale_ = scale;
@@ -570,7 +624,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    RebuildViews();
  }
  void CommandPanelView::BindPreferences(
-@@ -911,15 +970,17 @@ void CommandPanelView::OnThemeChanged()
+@@ -911,15 +975,17 @@ void CommandPanelView::OnThemeChanged()
    muted_color_ = colors->GetColor(kColorArciumMutedText);
    if (input_) {
      input_->SetTextColorId(kColorArciumText);
@@ -590,7 +644,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
  }
  void CommandPanelView::SetNativeMaterial(bool enabled) {
    native_material_ = enabled;
-@@ -1350,14 +1411,15 @@ void CommandPanelView::RebuildViews(bool
+@@ -1350,14 +1416,15 @@ void CommandPanelView::RebuildViews(bool
  gfx::Size CommandPanelView::CalculatePreferredSize(
      const views::SizeBounds&) const {
    const int gap =
@@ -610,7 +664,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
                                      kFooterHeight + kShadowInset));
  }
  gfx::Rect CommandPanelView::BodyBounds() const {
-@@ -1391,7 +1453,7 @@ void CommandPanelView::UpdateGeometry()
+@@ -1391,7 +1458,7 @@ void CommandPanelView::UpdateGeometry()
        // Both directions wait for a stable target. Identical publications do
        // not restart the debounce; growth snaps and contraction uses a spring.
        height_resize_timer_.Start(
@@ -619,7 +673,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
            base::BindOnce(&CommandPanelView::ApplyPendingHeight,
                           weak_ptr_factory_.GetWeakPtr()));
      }
-@@ -1409,7 +1471,7 @@ void CommandPanelView::ApplyPendingHeigh
+@@ -1409,7 +1476,7 @@ void CommandPanelView::ApplyPendingHeigh
      const auto duration =
          *requested_height_ < current &&
                  gfx::Animation::ShouldRenderRichAnimation()
@@ -628,7 +682,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
              : base::TimeDelta();
      height_resize_.Run(requested_height_, duration);
    }
-@@ -1433,27 +1495,29 @@ float CommandPanelView::ScopeRise() cons
+@@ -1433,27 +1500,29 @@ float CommandPanelView::ScopeRise() cons
  void CommandPanelView::Layout(PassKey) {
    const auto body = BodyBounds();
    const int input_inset = 50;
@@ -668,7 +722,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    }
    // Scroll bounds can be unchanged while a new menu adds overflowing rows.
    scroll_->DeprecatedLayoutImmediately();
-@@ -1476,10 +1540,11 @@ void CommandPanelView::Layout(PassKey) {
+@@ -1476,10 +1545,11 @@ void CommandPanelView::Layout(PassKey) {
    }
    const auto geometry = GeometryForReveal(appearance_.reveal);
    const bool flush = appearance_.scope_width == CommandPanelAppearance::Width::kFlush;
@@ -682,7 +736,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    const float span = std::max(0.f, body.width() / ui_scale_ - 2 * inset -
                                         std::max(0.f, count - 1) * scope_gap);
    const float label_budget =
-@@ -1566,9 +1631,10 @@ void CommandPanelView::Layout(PassKey) {
+@@ -1566,9 +1636,10 @@ void CommandPanelView::Layout(PassKey) {
  }
  SkPath CommandPanelView::GetPanelContourPath() const {
    const auto b = BodyBounds();
@@ -694,7 +748,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    SkPathBuilder path;
    const auto geometry = GeometryForReveal(appearance_.reveal);
    if (appearance_.scope_width == CommandPanelAppearance::Width::kFlush &&
-@@ -1587,7 +1653,7 @@ SkPath CommandPanelView::GetPanelContour
+@@ -1587,7 +1658,7 @@ SkPath CommandPanelView::GetPanelContour
        // Keep equal-radius arcs tangent even when a registry has many narrow
        // scopes. The six-scope presentation retains the panel's 13px radius.
        const float trough_radius = std::min(
@@ -703,7 +757,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
             (middle - left - radius) / 2, (right - radius - middle) / 2});
        if (dip < .01f || trough_radius <= 0) {
          continue;
-@@ -1632,7 +1698,7 @@ SkPath CommandPanelView::GetPanelContour
+@@ -1632,7 +1703,7 @@ SkPath CommandPanelView::GetPanelContour
        }
        const float shoulder = std::min(4 * ui_scale_, (top - y) * .3f);
        const float cap =
@@ -712,7 +766,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
                                    top - y - shoulder}));
        path.lineTo(x - shoulder, top)
            .quadTo(x, top, x, top - shoulder)
-@@ -1664,7 +1730,7 @@ SkPath CommandPanelView::GetContourPath(
+@@ -1664,7 +1735,7 @@ SkPath CommandPanelView::GetContourPath(
        if (button->GetVisible() && height > 0) {
          path.addPath(TopRoundedRectPath(
              gfx::RectF(button->x(), button->y(), button->width(), height),
@@ -721,7 +775,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
        }
      }
    }
-@@ -1683,7 +1749,7 @@ void CommandPanelView::PaintConnectedSco
+@@ -1683,7 +1754,7 @@ void CommandPanelView::PaintConnectedSco
        source.set_height(std::clamp(
            BodyBounds().y() - source.y(), 0.f, source.height()));
        PaintScopeLight(canvas, scopes_[i], source, ui_scale_,
@@ -730,7 +784,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
      }
    }
  }
-@@ -1710,17 +1776,17 @@ void CommandPanelView::OnPaint(gfx::Canv
+@@ -1710,17 +1781,17 @@ void CommandPanelView::OnPaint(gfx::Canv
    PaintConnectedScopeGlow(canvas);
  
    canvas->FillRect(gfx::Rect(body.x() + S(ui_scale_, 10),
@@ -752,7 +806,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    {
      gfx::ScopedCanvas restore(canvas);
      canvas->Translate(gfx::Vector2d(body.x() + S(ui_scale_, 19),
-@@ -1734,19 +1800,19 @@ void CommandPanelView::OnPaint(gfx::Canv
+@@ -1734,19 +1805,19 @@ void CommandPanelView::OnPaint(gfx::Canv
          canvas,
          gfx::Rect(scroll_->x() + S(ui_scale_, 10), y + S(ui_scale_, 8),
                    S(ui_scale_, 28), S(ui_scale_, 28)),
@@ -775,7 +829,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    }
    if (rows_.empty()) {
      auto empty_bounds = scroll_->bounds();
-@@ -1754,7 +1820,7 @@ void CommandPanelView::OnPaint(gfx::Canv
+@@ -1754,7 +1825,7 @@ void CommandPanelView::OnPaint(gfx::Canv
          gfx::Insets::TLBR(0, S(ui_scale_, 15), 0, S(ui_scale_, 15)));
      canvas->DrawStringRect(
          actions_visible_ ? u"No matching choices" : u"No matching results",
@@ -784,7 +838,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    }
  }
  void CommandPanelView::PaintRow(gfx::Canvas* canvas,
-@@ -1767,8 +1833,12 @@ void CommandPanelView::PaintRow(gfx::Can
+@@ -1767,8 +1838,12 @@ void CommandPanelView::PaintRow(gfx::Can
        static_cast<int>(index) == selected_ && !scope_browsing_;
    const SkColor row_background = selected ? SelectionColor() : panel_color_;
    const SkColor row_text = selected
@@ -799,7 +853,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    // Selection semantics update immediately. The cue arrives with the moving
    // highlight, so it cannot announce the destination ahead of that highlight.
    const float cue_progress = selected ? selection_animation_.GetCurrentValue() : 0;
-@@ -1779,9 +1849,9 @@ void CommandPanelView::PaintRow(gfx::Can
+@@ -1779,9 +1854,9 @@ void CommandPanelView::PaintRow(gfx::Can
      cc::PaintFlags border;
      border.setAntiAlias(true);
      border.setStyle(cc::PaintFlags::kStroke_Style);
@@ -811,7 +865,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    }
    int x = joined ? 8 : 11;
    if (!row.menu_entry) {
-@@ -1838,12 +1908,12 @@ void CommandPanelView::PaintRow(gfx::Can
+@@ -1838,12 +1913,12 @@ void CommandPanelView::PaintRow(gfx::Can
    const int available = std::max(
        1, right - x - category_width - (category_width ? category_gap : 0));
    const int title_width =
@@ -826,7 +880,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
        gfx::Rect(x, subtitle ? 2 : 0, title_width, subtitle ? 22 : height));
    if (subtitle) {
      canvas->DrawStringRect(data.detail, Font(10), row_muted,
-@@ -1884,7 +1954,7 @@ void CommandPanelView::PaintRow(gfx::Can
+@@ -1884,7 +1959,7 @@ void CommandPanelView::PaintRow(gfx::Can
    const SkColor cue_color = Blend(tint, row_text, .18f * cue_progress);
    if (!appearance_.scope_tints && !joined) {
      FillRoundRect(canvas, gfx::Rect(cue_x, (height - 23) / 2, cue_width, 23), 4,
@@ -835,7 +889,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    }
    if (row.menu_entry) {
      if (!row.menu_entry->submenu_id.empty()) {
-@@ -1926,8 +1996,9 @@ void CommandPanelView::PaintRow(gfx::Can
+@@ -1926,8 +2001,9 @@ void CommandPanelView::PaintRow(gfx::Can
    }
  }
  float CommandPanelView::ScopeGlowStrength(size_t index) const {
@@ -847,13 +901,13 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    return appearance_.glow_strength * row_focus * selected;
  }
  void CommandPanelView::PaintScope(gfx::Canvas* canvas,
-@@ -1936,25 +2007,28 @@ void CommandPanelView::PaintScope(gfx::C
+@@ -1936,25 +2012,28 @@ void CommandPanelView::PaintScope(gfx::C
                                    int height) {
    const auto& scope = scopes_[index];
    const float weight = ScopeWeight(index);
 -  if (!appearance_.connected) {
-+  // Detached borders follow the exposed tab, not the taller interaction area
-+  // below the body edge. All height/reveal modes share this boundary.
++  // Detached scopes sit behind the body. Their cap outline stays open at the
++  // body edge, where a soft occlusion shadow supplies the depth cue.
 +  const float visible_height = std::clamp(
 +      (BodyBounds().y() - scope_buttons_[index]->y()) / ui_scale_,
 +      0.f, static_cast<float>(height));
@@ -866,8 +920,8 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
      edge.setStrokeWidth(1);
      canvas->DrawPath(TopRoundedRectPath(
 -        gfx::RectF(.5f, .5f, width - 1, height - 1), 13), edge);
-+        gfx::RectF(.5f, .5f, width - 1, std::max(0.f, visible_height - 1)),
-+        appearance_.design.scope_radius), edge);
++        gfx::RectF(.5f, .5f, width - 1, std::max(0.f, visible_height - .5f)),
++        appearance_.design.scope_radius, false), edge);
    }
    if (appearance_.scope_tints && !appearance_.connected &&
        appearance_.glow_strength > 0.0) {
@@ -884,7 +938,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    }
    const auto geometry = GeometryForReveal(appearance_.reveal);
    const float progress = scope_animation_.GetCurrentValue();
-@@ -1967,7 +2041,7 @@ void CommandPanelView::PaintScope(gfx::C
+@@ -1967,7 +2046,7 @@ void CommandPanelView::PaintScope(gfx::C
                         (gfx::GetStringWidth(scope.label, Font(11, true)) + 7)));
    const int x = (width - 16 - label) / 2;
    const Glyph glyph = scope.id == kOmniScope ? Glyph::kOmni : Glyph::kGlobe;
@@ -893,7 +947,29 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    const int icon_y = base::ClampRound(
        geometry.resting_padding + (8 - geometry.resting_padding) * progress);
    if (icon_opacity > 0) {
-@@ -2005,7 +2079,7 @@ void CommandPanelView::PaintFooter(gfx::
+@@ -1982,6 +2061,21 @@ void CommandPanelView::PaintScope(gfx::C
+         Alpha(color, base::ClampRound(255 * label_progress)),
+         gfx::Rect(x + 23, icon_y, std::max(1, label - 7), 16));
+   }
++  if (!appearance_.connected && visible_height > 0) {
++    // Paint after the scope contents: the foreground omnibox shades the tab
++    // behind it. A small gradient avoids an extra blur or offscreen layer.
++    constexpr float kOverlapShadowHeight = 8;
++    const float top = visible_height - kOverlapShadowHeight;
++    const SkPoint points[] = {{0, top}, {0, visible_height}};
++    const SkColor4f colors[] = {
++        SkColors::kTransparent, SkColor4f::FromColor(SkColorSetA(SK_ColorBLACK, 64))};
++    cc::PaintFlags shadow;
++    shadow.setShader(cc::PaintShader::MakeLinearGradient(
++        points, colors, nullptr, 2, SkTileMode::kClamp));
++    canvas->DrawRect(gfx::RectF(0, std::max(0.f, top), width,
++                               std::min(visible_height, kOverlapShadowHeight)),
++                     shadow);
++  }
+ }
+ void CommandPanelView::PaintFooter(gfx::Canvas* canvas, int width, int height) {
+   std::u16string hint;
+@@ -2005,7 +2099,7 @@ void CommandPanelView::PaintFooter(gfx::
      }
    }
    canvas->DrawStringRect(
@@ -902,7 +978,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
        gfx::Rect(0, 0,
                  std::max(1, width - FooterControlWidth(actions_visible_) - 15),
                  height));
-@@ -2144,7 +2218,7 @@ void CommandPanelView::HoverScopes(bool
+@@ -2144,7 +2238,7 @@ void CommandPanelView::HoverScopes(bool
        !gfx::Animation::ShouldRenderRichAnimation()) {
      UpdateScopeReveal();
    } else {
