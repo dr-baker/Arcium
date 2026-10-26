@@ -34,13 +34,13 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_design.h
 +  int scope_radius = 13;
 +  int input_font_size = 18;
 +  int title_font_size = 14;
-+  double glow_width = 1.75;
++  double glow_width = 2.0;
 +  double glow_height = 0.8;
-+  double collapsed_glow_height = 0.25;
++  double collapsed_glow_height = 0.55;
 +  double glow_softness = 40.0;
 +  double glow_radiance = 0.48;
-+  double inactive_scope_strength = 0.66;
-+  double selected_scope_boost = 0.3;
++  double inactive_scope_strength = 0.61;
++  double selected_scope_boost = 0.51;
 +  int selection_ms = 80;
 +  int scope_reveal_ms = 140;
 +  int scope_label_ms = 80;
@@ -599,7 +599,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    }
  }
  
-@@ -427,6 +564,9 @@ CommandPanelAppearance ReadCommandPanelA
+@@ -427,9 +564,12 @@ CommandPanelAppearance ReadCommandPanelA
      return result;
    }
    const auto& value = prefs->GetDict(kCommandPanelLayoutPref);
@@ -608,7 +608,11 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  }
    const int labels = value.FindInt("labels").value_or(1);
    const int icons = value.FindInt("icons").value_or(2);
-   const int reveal = value.FindInt("scope_reveal").value_or(5);
+-  const int reveal = value.FindInt("scope_reveal").value_or(5);
++  const int reveal = value.FindInt("scope_reveal").value_or(4);
+   if (labels >= 0 && labels <= 2) {
+     result.labels = static_cast<CommandPanelAppearance::Labels>(labels);
+   }
 @@ -577,8 +717,8 @@ class CommandPanelView::Row : public vie
      canvas->SaveLayerAlpha(base::ClampRound(255 * (.35f + .65f * progress)),
                             gfx::Rect(0, 0, w, h));
@@ -1190,7 +1194,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    }
    if (row.menu_entry) {
      if (!row.menu_entry->submenu_id.empty()) {
-@@ -1926,9 +2203,22 @@ void CommandPanelView::PaintRow(gfx::Can
+@@ -1926,9 +2203,25 @@ void CommandPanelView::PaintRow(gfx::Can
    }
  }
  float CommandPanelView::ScopeGlowStrength(size_t index) const {
@@ -1203,20 +1207,23 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +  const float inactive_multiplier = appearance_.design.inactive_scope_strength;
 +  const float row_multiplier = inactive_multiplier + (1.f - inactive_multiplier) *
 +      scope_focus_animation_.GetCurrentValue();
-+  // The stored boost remains backward compatible; the editor presents the
-+  // actual selected multiplier, 1.3 by default, rather than its 0.3 increment.
++  // The editor presents the full factor; preferences store its increment.
 +  const float selected_multiplier =
 +      1.f + appearance_.design.selected_scope_boost * ScopeWeight(index);
 +  const auto state = scope_buttons_[index]->GetState();
 +  const float hover_boost = state == views::Button::STATE_HOVERED ||
 +      state == views::Button::STATE_PRESSED ? .45f : 0.f;
-+  const float light_boost = scope_buttons_[index]->light_mode() ? .5f : 0.f;
-+  return (appearance_.glow_strength + light_boost + hover_boost) *
++  const bool light = scope_buttons_[index]->light_mode();
++  const float light_boost = light ? .5f : 0.f;
++  // Scope-specific strength changes preserve the original tint and falloff.
++  const float scope_boost = scopes_[index].id == kXScope ? .1f :
++      (scopes_[index].id == kSavedScope && !light ? .2f : 0.f);
++  return (appearance_.glow_strength + light_boost + hover_boost + scope_boost) *
 +      row_multiplier * selected_multiplier;
  }
  void CommandPanelView::PaintScope(gfx::Canvas* canvas,
                                    size_t index,
-@@ -1936,25 +2226,32 @@ void CommandPanelView::PaintScope(gfx::C
+@@ -1936,25 +2229,32 @@ void CommandPanelView::PaintScope(gfx::C
                                    int height) {
    const auto& scope = scopes_[index];
    const float weight = ScopeWeight(index);
@@ -1260,7 +1267,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
    }
    const auto geometry = GeometryForReveal(appearance_.reveal);
    const float progress = scope_animation_.GetCurrentValue();
-@@ -1967,13 +2264,14 @@ void CommandPanelView::PaintScope(gfx::C
+@@ -1967,13 +2267,14 @@ void CommandPanelView::PaintScope(gfx::C
                         (gfx::GetStringWidth(scope.label, Font(11, true)) + 7)));
    const int x = (width - 16 - label) / 2;
    const Glyph glyph = scope.id == kOmniScope ? Glyph::kOmni : Glyph::kGlobe;
@@ -1277,7 +1284,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
      canvas->Restore();
    }
    if (label) {
-@@ -1982,6 +2280,21 @@ void CommandPanelView::PaintScope(gfx::C
+@@ -1982,6 +2283,21 @@ void CommandPanelView::PaintScope(gfx::C
          Alpha(color, base::ClampRound(255 * label_progress)),
          gfx::Rect(x + 23, icon_y, std::max(1, label - 7), 16));
    }
@@ -1299,7 +1306,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
  }
  void CommandPanelView::PaintFooter(gfx::Canvas* canvas, int width, int height) {
    std::u16string hint;
-@@ -2005,7 +2318,7 @@ void CommandPanelView::PaintFooter(gfx::
+@@ -2005,7 +2321,7 @@ void CommandPanelView::PaintFooter(gfx::
      }
    }
    canvas->DrawStringRect(
@@ -1308,7 +1315,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
        gfx::Rect(0, 0,
                  std::max(1, width - FooterControlWidth(actions_visible_) - 15),
                  height));
-@@ -2144,7 +2457,7 @@ void CommandPanelView::HoverScopes(bool
+@@ -2144,7 +2460,7 @@ void CommandPanelView::HoverScopes(bool
        !gfx::Animation::ShouldRenderRichAnimation()) {
      UpdateScopeReveal();
    } else {
@@ -1329,6 +1336,15 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.h
  #include "components/prefs/pref_change_registrar.h"
  #include "third_party/skia/include/core/SkColor.h"
  #include "third_party/skia/include/core/SkPath.h"
+@@ -39,7 +40,7 @@ struct CommandPanelAppearance {
+   enum class Reveal { kTabs, kIcons, kEdge, kHidden, kFlat, kDivot };
+   Labels labels = Labels::kText;
+   Icons icons = Icons::kGoSwitch;
+-  Reveal reveal = Reveal::kDivot;
++  Reveal reveal = Reveal::kFlat;
+   bool connected = true;
+   enum class Width { kFlush, kIconWidth, kOffset };
+   Width scope_width = Width::kFlush;
 @@ -47,6 +48,7 @@ struct CommandPanelAppearance {
    double glow_strength = 0.75;
    bool activity_dots = true;
@@ -1428,7 +1444,121 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
  #include "ui/events/event.h"
  #include "ui/color/color_mixer.h"
  #include "ui/color/color_provider.h"
-@@ -2778,3 +2781,159 @@ TEST_F(ArciumNativePanelTest, RepeatedIn
+@@ -676,7 +679,7 @@ TEST(CommandPanelAppearanceTest, Preserv
+   TestingPrefServiceSimple prefs;
+   prefs.registry()->RegisterDictionaryPref(kCommandPanelLayoutPref);
+   prefs.registry()->RegisterDictionaryPref(helium::kArciumChromeAppearancePref);
+-  EXPECT_EQ(CommandPanelAppearance::Reveal::kDivot,
++  EXPECT_EQ(CommandPanelAppearance::Reveal::kFlat,
+             ReadCommandPanelAppearance(&prefs).reveal);
+   for (const auto reveal : {CommandPanelAppearance::Reveal::kHidden,
+                             CommandPanelAppearance::Reveal::kFlat,
+@@ -690,7 +693,7 @@ TEST(CommandPanelAppearanceTest, Preserv
+   base::DictValue malformed;
+   malformed.Set("scope_reveal", 6);
+   prefs.SetDict(kCommandPanelLayoutPref, std::move(malformed));
+-  EXPECT_EQ(CommandPanelAppearance::Reveal::kDivot,
++  EXPECT_EQ(CommandPanelAppearance::Reveal::kFlat,
+             ReadCommandPanelAppearance(&prefs).reveal);
+ }
+ 
+@@ -980,27 +983,27 @@ TEST_F(ArciumNativePanelTest, ScopeLight
+   }
+ }
+ 
+-TEST_F(ArciumNativePanelTest, ScopeRowFocusDimsAllLightsAndSelectionAddsThirtyPercent) {
++TEST_F(ArciumNativePanelTest, ScopeRowFocusDimsAllLightsAndSelectionAddsConfiguredBoost) {
+   auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
+       gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
+   Open();
+   panel()->input_for_testing()->OnFocus();
+   const auto strength = [&](size_t scope) { return panel()->scope_glow_strength_for_testing(scope); };
+-  EXPECT_NEAR(.75f * .66f * 1.3f, strength(0), .0001f);
+-  EXPECT_NEAR(.75f * .66f, strength(1), .0001f);
++  EXPECT_NEAR(.75f * .61f * 1.51f, strength(0), .0001f);
++  EXPECT_NEAR(.75f * .61f, strength(1), .0001f);
+   Key(ui::VKEY_UP);
+   EXPECT_TRUE(panel()->scopes_focused_for_testing());
+-  EXPECT_NEAR(.75f * 1.3f, strength(0), .0001f);
++  EXPECT_NEAR(.75f * 1.51f, strength(0), .0001f);
+   EXPECT_NEAR(.75f, strength(1), .0001f);
+   panel()->input_for_testing()->OnBlur();
+   EXPECT_TRUE(panel()->scopes_focused_for_testing());
+-  EXPECT_NEAR(.75f * .66f * 1.3f, strength(0), .0001f);
+-  EXPECT_NEAR(.75f * .66f, strength(1), .0001f);
++  EXPECT_NEAR(.75f * .61f * 1.51f, strength(0), .0001f);
++  EXPECT_NEAR(.75f * .61f, strength(1), .0001f);
+   panel()->input_for_testing()->OnFocus();
+   EXPECT_NEAR(.75f, strength(1), .0001f);
+   Key(ui::VKEY_DOWN);
+   EXPECT_FALSE(panel()->scopes_focused_for_testing());
+-  EXPECT_NEAR(.75f * .66f, strength(1), .0001f);
++  EXPECT_NEAR(.75f * .61f, strength(1), .0001f);
+ }
+ 
+ TEST_F(ArciumNativePanelTest, ReopeningResetsScopeRowLightEvenWhenInputKeepsFocus) {
+@@ -1013,7 +1016,7 @@ TEST_F(ArciumNativePanelTest, ReopeningR
+   EXPECT_NEAR(.75f, panel()->scope_glow_strength_for_testing(1), .0001f);
+   panel()->SetInvocation(true);
+   EXPECT_FALSE(panel()->scopes_focused_for_testing());
+-  EXPECT_NEAR(.75f * .66f, panel()->scope_glow_strength_for_testing(1), .0001f);
++  EXPECT_NEAR(.75f * .61f, panel()->scope_glow_strength_for_testing(1), .0001f);
+ }
+ 
+ TEST_F(ArciumNativePanelTest, SelectedScopeLightCrossfadesWithoutChangingTheRowFactor) {
+@@ -1027,14 +1030,49 @@ TEST_F(ArciumNativePanelTest, SelectedSc
+   EXPECT_NEAR(panel()->scope_glow_strength_for_testing(0),
+               panel()->scope_glow_strength_for_testing(1), .0001f);
+   selection->Reset(1);
+-  EXPECT_NEAR(panel()->scope_glow_strength_for_testing(0) * 1.3f,
++  EXPECT_NEAR(panel()->scope_glow_strength_for_testing(0) * 1.51f,
+               panel()->scope_glow_strength_for_testing(1), .0001f);
+   CommandPanelAppearance appearance;
+   appearance.glow_strength = 1.25;
+   panel()->SetAppearance(appearance);
+-  EXPECT_NEAR(panel()->scope_glow_strength_for_testing(0) * 1.3f,
++  EXPECT_NEAR(panel()->scope_glow_strength_for_testing(0) * 1.51f,
+               panel()->scope_glow_strength_for_testing(1), .0001f);
+ }
++TEST_F(ArciumNativePanelTest, ScopeStrengthOffsetsKeepFocusAndZeroSemantics) {
++  auto motion = gfx::AnimationTestApi::SetRichAnimationRenderMode(
++      gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
++  Open();
++  panel()->input_for_testing()->OnFocus();
++  const auto strength = [&](size_t index) {
++    return panel()->scope_glow_strength_for_testing(index);
++  };
++  for (bool light : {false, true}) {
++    SetTestPanelColors(light ? SK_ColorWHITE : SK_ColorBLACK,
++                       light ? SK_ColorBLACK : SK_ColorWHITE);
++    CommandPanelAppearance appearance;
++    panel()->SetAppearance(appearance);
++    const float base = .75f + (light ? .5f : 0.f);
++    const float saved = base + (light ? 0.f : .2f);
++    const float neutral = base + .1f;
++    EXPECT_NEAR(base * .61f, strength(1), .0001f);
++    EXPECT_NEAR(saved * .61f, strength(2), .0001f);
++    EXPECT_NEAR(neutral * .61f, strength(4), .0001f);
++    Key(ui::VKEY_UP);
++    ASSERT_TRUE(panel()->scopes_focused_for_testing());
++    Key(ui::VKEY_RIGHT);
++    Key(ui::VKEY_RIGHT);
++    EXPECT_NEAR(saved * 1.51f, strength(2), .0001f);
++    Key(ui::VKEY_RIGHT);
++    Key(ui::VKEY_RIGHT);
++    EXPECT_NEAR(neutral * 1.51f, strength(4), .0001f);
++    appearance.glow_strength = 0;
++    panel()->SetAppearance(appearance);
++    for (size_t i = 0; i < panel()->scope_count_for_testing(); ++i)
++      EXPECT_FLOAT_EQ(0, strength(i));
++    panel()->SetInvocation(true);
++  }
++}
++
+ TEST_F(ArciumNativePanelTest, HiddenPresenterOwnsInputAndPaintsItsContents) {
+   Open();
+   CommandPanelAppearance appearance;
+@@ -2778,3 +2816,159 @@ TEST_F(ArciumNativePanelTest, RepeatedIn
      Close();
    }
  }
