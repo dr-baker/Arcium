@@ -1,0 +1,366 @@
+Index: src/chrome/browser/ui/browser_command_controller.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_command_controller.cc
++++ src/chrome/browser/ui/browser_command_controller.cc
+@@ -761,10 +761,7 @@ void BrowserCommandController::HandleCom
+       CloseWindow(browser_);
+       break;
+     case IDC_NEW_TAB: {
+-      if (BrowserWindow::FromBrowser(browser_)->ShowArciumCommandBar(true)) {
+-        break;
+-      }
+-      NewTab(browser_, NewTabTypes::kNewTabCommand);
++      NewTabWithCommandBar(browser_, NewTabTypes::kNewTabCommand);
+       break;
+     }
+     case IDC_NEW_TAB_TO_RIGHT: {
+Index: src/chrome/browser/ui/browser_commands.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_commands.cc
++++ src/chrome/browser/ui/browser_commands.cc
+@@ -1292,6 +1292,12 @@ content::WebContents& NewTab(BrowserWind
+   return *contents;
+ }
+ 
++void NewTabWithCommandBar(BrowserWindowInterface* browser, NewTabTypes context) {
++  auto& contents = NewTab(browser, context);
++  auto* target = GlobalBrowserCollection::GetInstance()->FindBrowserWithTab(&contents);
++  if (target) BrowserWindow::FromBrowser(target)->ShowArciumCommandBar(true);
++}
++
+ void NewTabToRight(BrowserWindowInterface* browser) {
+   browser->GetTabStripModel()->ExecuteContextMenuCommand(
+       browser->GetTabStripModel()->active_index(),
+Index: src/chrome/browser/ui/browser_commands.h
+===================================================================
+--- src.orig/chrome/browser/ui/browser_commands.h
++++ src/chrome/browser/ui/browser_commands.h
+@@ -115,6 +115,7 @@ void NewIncognitoWindow(Profile* profile
+ void CloseWindow(BrowserWindowInterface* browser);
+ content::WebContents& NewTab(BrowserWindowInterface* browser,
+                              NewTabTypes context);
++void NewTabWithCommandBar(BrowserWindowInterface* browser, NewTabTypes context);
+ void NewTabToRight(BrowserWindowInterface* browser);
+ void NewTabFromClipboardURL(BrowserWindowInterface* browser);
+ void CloseTab(BrowserWindowInterface* browser);
+Index: src/chrome/browser/ui/omnibox/arcium_command_action_router.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_action_router.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_action_router.cc
+@@ -458,13 +458,9 @@ CommandMenu FilterActions(CommandMenu me
+   return menu;
+ }
+ 
+-WindowOpenDisposition InvocationDisposition(const CommandInvocation& invocation,
+-                                            int event_flags) {
+-  const auto base_disposition =
+-      invocation.mode == CommandInvocationMode::kNewTab
+-          ? WindowOpenDisposition::NEW_FOREGROUND_TAB
+-          : WindowOpenDisposition::CURRENT_TAB;
+-  return ui::DispositionFromEventFlags(event_flags, base_disposition);
++WindowOpenDisposition InvocationDisposition(int event_flags) {
++  return ui::DispositionFromEventFlags(event_flags,
++                                       WindowOpenDisposition::CURRENT_TAB);
+ }
+ 
+ bool PrepareCurrentTab(base::WeakPtr<Browser> owner,
+@@ -1129,7 +1125,7 @@ CommandExecutionResult ArciumCommandActi
+     const auto accept = native_callbacks_.accept;
+     const CommandNativeTarget selection = *native;
+     const auto disposition =
+-        InvocationDisposition(invocation_, intent.event_flags);
++        InvocationDisposition(intent.event_flags);
+     const auto owner = browser_->AsWeakPtr();
+     const auto source = invocation_.source_tab;
+     if (disposition == WindowOpenDisposition::CURRENT_TAB &&
+@@ -1167,7 +1163,7 @@ CommandExecutionResult ArciumCommandActi
+                : Unavailable();
+   }
+   return ExecuteOpen(intent, target,
+-                     InvocationDisposition(invocation_, intent.event_flags),
++                     InvocationDisposition(intent.event_flags),
+                      ui::PAGE_TRANSITION_GENERATED);
+ }
+ 
+Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
+@@ -178,33 +178,47 @@ class RecordingCommandBrowserWindow : pu
+  public:
+   bool ShowArciumCommandBar(bool new_tab) override {
+     invocations.push_back(new_tab);
++    counts_at_presentation.push_back(tab_count.Run());
+     return handles_command_bar;
+   }
+   bool handles_command_bar = true;
+   std::vector<bool> invocations;
++  base::RepeatingCallback<int()> tab_count;
++  std::vector<int> counts_at_presentation;
+ };
+ 
+ class ArciumCommandEntryRoutingTest : public BrowserWithTestWindowTest {
+  protected:
++  void SetUp() override {
++    BrowserWithTestWindowTest::SetUp();
++    profile()->GetPrefs()->SetString(prefs::kNewTabPageLocationOverride,
++                                   "about:blank");
++  }
+   std::unique_ptr<BrowserWindow> CreateBrowserWindow() override {
+-    return std::make_unique<RecordingCommandBrowserWindow>();
++    auto window = std::make_unique<RecordingCommandBrowserWindow>();
++    window->tab_count = base::BindLambdaForTesting([this] {
++      return browser()->tab_strip_model()->count();
++    });
++    return window;
+   }
+   RecordingCommandBrowserWindow* recording_window() {
+     return static_cast<RecordingCommandBrowserWindow*>(window());
+   }
+ };
+ 
+-TEST_F(ArciumCommandEntryRoutingTest, NewTabCommandDefersCreation) {
++TEST_F(ArciumCommandEntryRoutingTest, NewTabCommandCreatesBeforePresentation) {
+   AddTab(browser(), GURL("https://source.test/"));
+   auto* source = browser()->tab_strip_model()->GetActiveWebContents();
+   const int count = browser()->tab_strip_model()->count();
+   ASSERT_TRUE(chrome::ExecuteCommand(browser(), IDC_NEW_TAB));
+   EXPECT_EQ((std::vector<bool>{true}), recording_window()->invocations);
+-  EXPECT_EQ(count, browser()->tab_strip_model()->count());
+-  EXPECT_EQ(source, browser()->tab_strip_model()->GetActiveWebContents());
++  EXPECT_EQ(count + 1, browser()->tab_strip_model()->count());
++  EXPECT_EQ((std::vector<int>{count + 1}),
++            recording_window()->counts_at_presentation);
++  EXPECT_NE(source, browser()->tab_strip_model()->GetActiveWebContents());
+ }
+ 
+-TEST_F(ArciumCommandEntryRoutingTest, NewTabActionDefersCreation) {
++TEST_F(ArciumCommandEntryRoutingTest, NewTabActionCreatesBeforePresentation) {
+   AddTab(browser(), GURL("https://source.test/"));
+   auto* source = browser()->tab_strip_model()->GetActiveWebContents();
+   const int count = browser()->tab_strip_model()->count();
+@@ -213,8 +227,10 @@ TEST_F(ArciumCommandEntryRoutingTest, Ne
+   ASSERT_TRUE(action);
+   action->InvokeAction();
+   EXPECT_EQ((std::vector<bool>{true}), recording_window()->invocations);
+-  EXPECT_EQ(count, browser()->tab_strip_model()->count());
+-  EXPECT_EQ(source, browser()->tab_strip_model()->GetActiveWebContents());
++  EXPECT_EQ(count + 1, browser()->tab_strip_model()->count());
++  EXPECT_EQ((std::vector<int>{count + 1}),
++            recording_window()->counts_at_presentation);
++  EXPECT_NE(source, browser()->tab_strip_model()->GetActiveWebContents());
+ }
+ 
+ TEST_F(ArciumCommandEntryRoutingTest, FocusSearchUsesCurrentTabInvocation) {
+@@ -607,13 +623,27 @@ TEST_F(ArciumCommandActionRouterTest, Na
+ }
+ 
+ TEST_F(ArciumCommandActionRouterTest,
+-       NativeNewTabAcceptPreservesInvocationMode) {
++       NativeNewTabAcceptUsesCreatedTab) {
+   auto* captured = AddOrdinaryTab("https://captured.test/");
+   Capture(captured, CommandInvocationMode::kNewTab);
+   auto* later_active = AddOrdinaryTab("https://later.test/");
+   ASSERT_TRUE(router_->Execute(Intent(Native())).success);
+-  EXPECT_EQ(WindowOpenDisposition::NEW_FOREGROUND_TAB, accepted_disposition_);
+-  EXPECT_EQ(later_active->GetContents(), accepted_source_);
++  EXPECT_EQ(WindowOpenDisposition::CURRENT_TAB, accepted_disposition_);
++  EXPECT_EQ(captured->GetContents(), accepted_source_);
++  EXPECT_NE(later_active->GetContents(), accepted_source_);
++}
++
++TEST_F(ArciumCommandActionRouterTest, ClosedNewTabRejectsNativeNavigation) {
++  auto* captured = AddOrdinaryTab("about:blank");
++  Capture(captured, CommandInvocationMode::kNewTab);
++  auto* survivor = AddOrdinaryTab("https://survivor.test/");
++  browser()->tab_strip_model()->CloseWebContentsAt(
++      browser()->tab_strip_model()->GetIndexOfTab(captured),
++      TabCloseTypes::CLOSE_NONE);
++  EXPECT_FALSE(router_->Execute(Intent(Native())).success);
++  EXPECT_EQ(0, native_accepts_);
++  EXPECT_EQ(GURL("https://survivor.test/"),
++            survivor->GetContents()->GetLastCommittedURL());
+ }
+ 
+ TEST_F(ArciumCommandActionRouterTest, NativeAcceptMayDestroyRouter) {
+@@ -895,7 +925,8 @@ TEST_F(ArciumCommandActionRouterTest,
+        ChatGPTNewTabQueryPreservesExistingConversationAndNavigatesToRoot) {
+   auto* source = AddOrdinaryTab("https://chatgpt.com/c/existing-conversation");
+   content::WebContents* original = source->GetContents();
+-  Capture(source, CommandInvocationMode::kNewTab);
++  auto* created = AddOrdinaryTab("about:blank");
++  Capture(created, CommandInvocationMode::kNewTab);
+   const auto url = BuildCommandSearchUrl(kChatGPTScope, u"a fresh question");
+   ASSERT_TRUE(url);
+   ASSERT_TRUE(router_->Execute(Intent(CommandUrlTarget{.url = *url})).success);
+@@ -903,6 +934,7 @@ TEST_F(ArciumCommandActionRouterTest,
+   ASSERT_EQ(2, browser()->tab_strip_model()->count());
+   auto* destination = browser()->tab_strip_model()->GetActiveWebContents();
+   ASSERT_NE(original, destination);
++  EXPECT_EQ(created->GetContents(), destination);
+   EXPECT_EQ(GURL("https://chatgpt.com/c/existing-conversation"),
+             original->GetLastCommittedURL());
+   EXPECT_EQ(nullptr, original->GetController().GetPendingEntry());
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
+@@ -4,7 +4,9 @@
+ #include "base/metrics/histogram_macros_local.h"
+ #include "base/time/time.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/omnibox/arcium_command_providers.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/helium/arcium_chrome_ui_scale.h"
+@@ -35,6 +37,15 @@ bool BrowserView::ShowArciumNativeComman
+       return view ? arcium::CreateCommandSession(view->browser(), view->arcium_command_context_)
+                   : nullptr;
+     }, weak_ptr_factory_.GetWeakPtr());
++    options.invoke = base::BindRepeating([](base::WeakPtr<BrowserView> view,
++                                            bool new_tab) {
++      if (!view) return;
++      if (new_tab) {
++        chrome::ExecuteCommand(view->browser(), IDC_NEW_TAB);
++      } else {
++        view->ShowArciumCommandBar(false);
++      }
++    }, weak_ptr_factory_.GetWeakPtr());
+     options.panel_changed = base::BindRepeating([](base::WeakPtr<BrowserView> view,
+                                                   arcium::CommandPanelView* panel) {
+       if (view) view->arcium_native_command_panel_ = panel;
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.cc
+@@ -100,7 +100,13 @@ bool CommandPanelPresentation::Show(bool
+   auto view = std::make_unique<CommandPanelView>(std::move(session),
+       base::BindRepeating(&CommandPanelPresentation::Close, weak_factory_.GetWeakPtr(), false),
+       base::BindRepeating([](base::WeakPtr<CommandPanelPresentation> owner, bool invocation) {
+-        if (owner) owner->Show(invocation);
++        if (!owner) return;
++        auto invoke = owner->options_.invoke;
++        if (invoke) {
++          invoke.Run(invocation);
++        } else {
++          owner->Show(invocation);
++        }
+       }, weak_factory_.GetWeakPtr()), new_tab);
+   panel_ = view.get();
+   panel_->BindPreferences(options_.prefs, options_.scale,
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.h
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.h
+@@ -41,6 +41,7 @@ class CommandPanelPresentation : public
+     base::RepeatingCallback<void(CommandPanelView*)> panel_changed;
+     base::RepeatingCallback<void(CommandPanelView*)> will_close;
+     base::RepeatingCallback<void(bool)> invocation_changed;
++    base::RepeatingCallback<void(bool)> invoke;
+     base::RepeatingCallback<void(bool accepted, bool reopening)> closed;
+     base::RepeatingCallback<void(views::Widget*, base::TimeTicks)> opened;
+   };
+Index: src/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
++++ src/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
+@@ -543,11 +543,11 @@ void BrowserTabStripController::OnDropIn
+ }
+ 
+ void BrowserTabStripController::CreateNewTab(NewTabTypes context) {
+-  if (context == NewTabTypes::kNewTabButton &&
+-      browser_view_->ShowArciumCommandBar(true)) {
+-    return;
++  if (context == NewTabTypes::kNewTabButton) {
++    chrome::NewTabWithCommandBar(browser_view_->browser(), context);
++  } else {
++    chrome::NewTab(browser_view_->browser(), context);
+   }
+-  chrome::NewTab(browser_view_->browser(), context);
+ }
+ 
+ void BrowserTabStripController::OnStartedDragging() {
+Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
++++ src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
+@@ -5,6 +5,11 @@
+ #include "chrome/browser/ui/views/frame/test_with_browser_view.h"
+ 
+ #include <memory>
++#include "chrome/browser/ui/omnibox/arcium_command_example_session.h"
++#include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
++#include "chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.h"
++#include "ui/events/keycodes/keyboard_codes.h"
++#include "ui/views/controls/textfield/textfield.h"
+ #include <cstdlib>
+ #include "base/run_loop.h"
+ #include "chrome/browser/ui/helium/helium_space_service.h"
+@@ -402,3 +407,65 @@ TEST_F(ArciumBrowserChromeTest, FooterRa
+   EXPECT_LE(std::abs(footer->spaces_scroll_for_testing()->bounds().CenterPoint().x() -
+                      footer->GetContentsBounds().CenterPoint().x()), 1);
+ }
++
++TEST_F(ArciumBrowserChromeTest, NewTabCommandRepeatsInsidePanelAndSurvivesEscape) {
++  prefs()->SetString(prefs::kNewTabPageLocationOverride, "about:blank");
++  arcium::CommandPanelPresentation::SetSessionFactoryForTesting(
++      browser_view(), base::BindRepeating([]() -> std::unique_ptr<arcium::CommandSession> {
++        return std::make_unique<arcium::CommandExampleSession>(
++            std::vector<arcium::CommandScopeDescriptor>{
++                {.id = arcium::kOmniScope, .label = u"Omni"}});
++      }));
++  auto* model = browser()->tab_strip_model();
++  const int before = model->count();
++  ASSERT_TRUE(chrome::ExecuteCommand(browser(), IDC_NEW_TAB));
++  auto* presentation = arcium::CommandPanelPresentation::Get(browser_view());
++  ASSERT_TRUE(presentation);
++  ASSERT_TRUE(base::test::RunUntil([&] { return presentation->is_open(); }));
++  EXPECT_EQ(before + 1, model->count());
++  auto* first = model->GetActiveWebContents();
++  auto* panel = presentation->panel();
++  ASSERT_TRUE(panel);
++  EXPECT_TRUE(panel->input_for_testing()->GetText().empty());
++  ui::KeyEvent new_tab(ui::EventType::kKeyPressed, ui::VKEY_T,
++#if BUILDFLAG(IS_MAC)
++                      ui::EF_COMMAND_DOWN);
++#else
++                      ui::EF_CONTROL_DOWN);
++#endif
++  EXPECT_TRUE(panel->HandleKeyEvent(panel->input_for_testing(), new_tab));
++  EXPECT_EQ(before + 2, model->count());
++  EXPECT_NE(first, model->GetActiveWebContents());
++  ASSERT_TRUE(base::test::RunUntil([&] { return presentation->is_open(); }));
++  panel = presentation->panel();
++  ASSERT_TRUE(panel);
++  EXPECT_TRUE(panel->input_for_testing()->GetText().empty());
++  ui::KeyEvent escape(ui::EventType::kKeyPressed, ui::VKEY_ESCAPE, ui::EF_NONE);
++  EXPECT_TRUE(panel->HandleKeyEvent(panel->input_for_testing(), escape));
++  ASSERT_TRUE(base::test::RunUntil([&] { return !presentation->widget(); }));
++  EXPECT_EQ(before + 2, model->count());
++}
++
++TEST_F(ArciumBrowserChromeTest, PopupNewTabOpensPanelInDestinationWindow) {
++  prefs()->SetString(prefs::kNewTabPageLocationOverride, "about:blank");
++  arcium::CommandPanelPresentation::SetSessionFactoryForTesting(
++      browser_view(), base::BindRepeating([]() -> std::unique_ptr<arcium::CommandSession> {
++        return std::make_unique<arcium::CommandExampleSession>(
++            std::vector<arcium::CommandScopeDescriptor>{
++                {.id = arcium::kOmniScope, .label = u"Omni"}});
++      }));
++  auto* popup = CreateBrowserWithBrowserView(profile(), Browser::TYPE_POPUP);
++  AddTab(popup, GURL("https://popup.test/"));
++  auto* original = popup->tab_strip_model()->GetActiveWebContents();
++  const int before = browser()->tab_strip_model()->count();
++  ASSERT_TRUE(chrome::ExecuteCommand(popup, IDC_NEW_TAB));
++  EXPECT_EQ(1, popup->tab_strip_model()->count());
++  EXPECT_EQ(original, popup->tab_strip_model()->GetActiveWebContents());
++  EXPECT_EQ(before + 1, browser()->tab_strip_model()->count());
++  auto* presentation = arcium::CommandPanelPresentation::Get(browser_view());
++  ASSERT_TRUE(presentation);
++  ASSERT_TRUE(base::test::RunUntil([&] { return presentation->is_open(); }));
++  EXPECT_TRUE(presentation->panel()->input_for_testing()->GetText().empty());
++  presentation->Close();
++  ASSERT_TRUE(base::test::RunUntil([&] { return !presentation->widget(); }));
++}
