@@ -1,0 +1,852 @@
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn
++++ src/chrome/browser/ui/BUILD.gn
+@@ -464,6 +464,7 @@ static_library("ui") {
+     "helium/helium_layout_state_controller.cc",
+     "helium/arcium_appearance_prefs.h",
+     "helium/helium_layout_state_controller.h",
++    "helium/arcium_content_frame.h",
+     "helium/helium_persistent_item_model.cc",
+     "helium/helium_persistent_item_model.h",
+     "helium/helium_sidebar_drag_transaction.cc",
+Index: src/chrome/browser/ui/browser_ui_prefs.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_ui_prefs.cc
++++ src/chrome/browser/ui/browser_ui_prefs.cc
+@@ -14,6 +14,7 @@
+ #include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/helium/arcium_chrome_ui_scale.h"
++#include "chrome/browser/ui/helium/arcium_content_frame.h"
+ #if defined(TOOLKIT_VIEWS)
+ #include "chrome/browser/ui/helium/arcium_settings_prefs.h"
+ #include "chrome/browser/ui/views/helium/glass_surface_configuration.h"
+@@ -139,6 +140,7 @@ void RegisterBrowserUserPrefs(user_prefs
+ 
+   registry->RegisterBooleanPref(prefs::kHeliumRoundedFrame, true);
+   registry->RegisterDictionaryPref(arcium::kCommandPanelLayoutPref);
++  registry->RegisterDictionaryPref(arcium::kContentFramePref);
+   registry->RegisterIntegerPref(arcium::kCommandBarAppearancePref,
+                                 arcium::kCommandBarAppearanceAutomatic);
+ 
+Index: src/chrome/browser/ui/helium/arcium_content_frame.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/helium/arcium_content_frame.h
+@@ -0,0 +1,137 @@
++// Copyright 2026 The Arcium Authors
++// SPDX-License-Identifier: GPL-3.0-only
++
++#ifndef CHROME_BROWSER_UI_HELIUM_ARCIUM_CONTENT_FRAME_H_
++#define CHROME_BROWSER_UI_HELIUM_ARCIUM_CONTENT_FRAME_H_
++
++#include <cmath>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++
++#include "base/strings/string_number_conversions.h"
++#include "base/values.h"
++#include "components/prefs/pref_service.h"
++
++namespace arcium {
++
++inline constexpr char kContentFramePref[] = "arcium.appearance.content_frame";
++
++enum class ContentShadowMode { kDefault, kNone, kCustom };
++
++struct ContentFrameStyle {
++  int border_width = 0;
++  int x = 0;
++  int y = 0;
++  int blur = 24;
++  int spread = 0;
++  int opacity = 20;
++  std::string color = "#000000";
++  ContentShadowMode shadow_mode = ContentShadowMode::kDefault;
++
++  bool operator==(const ContentFrameStyle&) const = default;
++};
++
++inline base::DictValue SerializeContentFrame(const ContentFrameStyle& style) {
++  const char* mode = "default";
++  switch (style.shadow_mode) {
++    case ContentShadowMode::kDefault:
++      break;
++    case ContentShadowMode::kNone:
++      mode = "none";
++      break;
++    case ContentShadowMode::kCustom:
++      mode = "custom";
++      break;
++  }
++  return base::DictValue()
++      .Set("borderWidth", style.border_width)
++      .Set("x", style.x)
++      .Set("y", style.y)
++      .Set("blur", style.blur)
++      .Set("spread", style.spread)
++      .Set("opacity", style.opacity)
++      .Set("color", style.color)
++      .Set("shadowMode", mode);
++}
++
++inline std::optional<int> ContentFrameNumber(const base::DictValue& value,
++                                            std::string_view key,
++                                            int min, int max) {
++  const auto* raw = value.Find(key);
++  if (!raw || (!raw->is_int() && !raw->is_double())) {
++    return std::nullopt;
++  }
++  const double number = raw->is_int() ? raw->GetInt() : raw->GetDouble();
++  if (!std::isfinite(number) || number < min || number > max ||
++      std::trunc(number) != number) {
++    return std::nullopt;
++  }
++  return static_cast<int>(number);
++}
++
++inline std::optional<ContentFrameStyle> ParseContentFrame(
++    const base::DictValue& value) {
++  ContentShadowMode mode;
++  if (value.size() == 7 && !value.Find("shadowMode")) {
++    mode = ContentShadowMode::kCustom;
++  } else {
++    const auto* saved_mode = value.FindString("shadowMode");
++    if (value.size() != 8 || !saved_mode) {
++      return std::nullopt;
++    }
++    if (*saved_mode == "default") {
++      mode = ContentShadowMode::kDefault;
++    } else if (*saved_mode == "none") {
++      mode = ContentShadowMode::kNone;
++    } else if (*saved_mode == "custom") {
++      mode = ContentShadowMode::kCustom;
++    } else {
++      return std::nullopt;
++    }
++  }
++  const auto border = ContentFrameNumber(value, "borderWidth", 0, 6);
++  const auto x = ContentFrameNumber(value, "x", -24, 24);
++  const auto y = ContentFrameNumber(value, "y", -24, 24);
++  const auto blur = ContentFrameNumber(value, "blur", 0, 48);
++  const auto spread = ContentFrameNumber(value, "spread", -12, 12);
++  const auto opacity = ContentFrameNumber(value, "opacity", 0, 100);
++  const auto* color = value.FindString("color");
++  uint32_t rgb = 0;
++  if (!border || !x || !y || !blur || !spread || !opacity ||
++      !color || color->size() != 7 || color->front() != '#' ||
++      color->find_first_not_of("0123456789abcdefABCDEF", 1) != std::string::npos ||
++      !base::HexStringToUInt(color->substr(1), &rgb)) {
++    return std::nullopt;
++  }
++  return ContentFrameStyle{*border, *x, *y, *blur, *spread, *opacity, *color, mode};
++}
++
++inline ContentFrameStyle ResolveContentFrame(ContentFrameStyle style,
++                                            bool dark,
++                                            std::string_view accent_hex) {
++  if (style.shadow_mode == ContentShadowMode::kNone) {
++    style.opacity = 0;
++  } else if (style.shadow_mode == ContentShadowMode::kDefault) {
++    style.x = 0;
++    style.y = 0;
++    style.blur = dark ? 48 : 24;
++    style.spread = dark ? 4 : 0;
++    style.opacity = dark ? 12 : 20;
++    style.color = dark ? std::string(accent_hex) : "#000000";
++  }
++  return style;
++}
++
++inline ContentFrameStyle ReadContentFrame(const PrefService* prefs) {
++  if (!prefs || !prefs->FindPreference(kContentFramePref)) {
++    return {};
++  }
++  return ParseContentFrame(prefs->GetDict(kContentFramePref))
++      .value_or(ContentFrameStyle{});
++}
++
++}  // namespace arcium
++
++#endif  // CHROME_BROWSER_UI_HELIUM_ARCIUM_CONTENT_FRAME_H_
+Index: src/chrome/browser/ui/helium/arcium_settings_model.cc
+===================================================================
+--- src.orig/chrome/browser/ui/helium/arcium_settings_model.cc
++++ src/chrome/browser/ui/helium/arcium_settings_model.cc
+@@ -3,6 +3,7 @@
+ // the terms of the GPL-3.0 license that can be found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/helium/arcium_settings_model.h"
++#include "chrome/browser/ui/helium/arcium_content_frame.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -55,7 +56,7 @@ constexpr char kSharedPaletteDarkChromeC
+ constexpr char kSharedPaletteControlColorIDKey[] = "controlColorID";
+ constexpr size_t kSharedPaletteConfigurationKeyCount = 13;
+ 
+-constexpr std::array<std::string_view, 43> kProfilePreferences = {
++constexpr std::array<std::string_view, 44> kProfilePreferences = {
+     prefs::kRestoreOnStartup,
+     prefs::kPromptForDownload,
+     prefs::kHeliumLittleArcExternalLinks,
+@@ -77,6 +78,7 @@ constexpr std::array<std::string_view, 4
+     arcium::kArcSidebarNavigationEnabledPref,
+     arcium::kSidebarExtensionsDrawerEnabledPref,
+     arcium::kChromeFrameBorderWidthPref,
++    arcium::kContentFramePref,
+     arcium::kChromeUIScalePref,
+     prefs::kHeliumVerticalRightAligned,
+     prefs::kHeliumZenMode,
+@@ -731,6 +733,22 @@ bool ArciumSettingsModel::SetSurfaceSet(
+   return true;
+ }
+ 
++base::DictValue ArciumSettingsModel::GetContentFrame() const {
++  return arcium::SerializeContentFrame(arcium::ReadContentFrame(prefs_));
++}
++
++bool ArciumSettingsModel::SetContentFrame(const base::DictValue& value) {
++  const auto parsed = arcium::ParseContentFrame(value);
++  if (!parsed || shutting_down_ || !prefs_ ||
++      !HasPreference(arcium::kContentFramePref) ||
++      !prefs_->IsUserModifiablePreference(arcium::kContentFramePref)) {
++    return false;
++  }
++  prefs_->SetDict(arcium::kContentFramePref,
++                  arcium::SerializeContentFrame(*parsed));
++  return true;
++}
++
+ base::DictValue ArciumSettingsModel::GetSurfaceTuning() const {
+   return helium::SerializeSurfaceTuning(
+       helium::ReadSurfaceInputs(prefs_).tuning);
+Index: src/chrome/browser/ui/helium/arcium_settings_model.h
+===================================================================
+--- src.orig/chrome/browser/ui/helium/arcium_settings_model.h
++++ src/chrome/browser/ui/helium/arcium_settings_model.h
+@@ -86,6 +86,8 @@ class ArciumSettingsModel final
+   std::string GetSurfaceSet() const;
+   bool SetSurfaceSet(std::string_view value);
+   // The values of the current preset, or the saved Custom values.
++  base::DictValue GetContentFrame() const;
++  bool SetContentFrame(const base::DictValue& value);
+   base::DictValue GetSurfaceTuning() const;
+   // Saves complete, validated values and selects the Custom preset.
+   bool SetSurfaceTuning(const base::DictValue& tuning);
+Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/helium/helium_space_service_unittest.cc
++++ src/chrome/browser/ui/helium/helium_space_service_unittest.cc
+@@ -26,6 +26,7 @@
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/helium/arcium_settings_model.h"
++#include "chrome/browser/ui/helium/arcium_content_frame.h"
+ #include "chrome/browser/ui/helium/helium_favorites_and_pins.h"
+ #include "chrome/browser/ui/helium/helium_space.h"
+ #include "chrome/browser/ui/helium/helium_space_service_factory.h"
+@@ -3106,4 +3107,151 @@ TEST_F(HeliumSpaceServiceTest, SystemCon
+   contents->SetColorProviderSource(nullptr);
+ }
+ 
++TEST_F(HeliumSpaceServiceTest, ContentFrameDefaultsAndBoundaryWrites) {
++  arcium_settings::ArciumSettingsModel model(
++      profile(), base::DoNothing(), base::DoNothing());
++  const auto defaults = arcium::ContentFrameStyle();
++  EXPECT_EQ(defaults.border_width, 0);
++  EXPECT_EQ(model.GetContentFrame(), arcium::SerializeContentFrame(defaults));
++  auto style = defaults;
++  style.border_width = 6;
++  style.x = -24;
++  style.y = 24;
++  style.blur = 48;
++  style.spread = -12;
++  style.opacity = 100;
++  style.color = "#8C7BFF";
++  ASSERT_TRUE(model.SetContentFrame(arcium::SerializeContentFrame(style)));
++  EXPECT_EQ(arcium::ReadContentFrame(profile()->GetPrefs()), style);
++  // Foundation sends numeric dictionary values as doubles.
++  auto bridge_payload = arcium::SerializeContentFrame(style);
++  bridge_payload.Set("borderWidth", 6.0);
++  EXPECT_TRUE(model.SetContentFrame(bridge_payload));
++  style.border_width = 0;
++  style.x = 24;
++  style.y = -24;
++  style.blur = 0;
++  style.spread = 12;
++  style.opacity = 0;
++  EXPECT_TRUE(model.SetContentFrame(arcium::SerializeContentFrame(style)));
++  EXPECT_EQ(arcium::ReadContentFrame(profile()->GetPrefs()), style);
++}
++
++TEST_F(HeliumSpaceServiceTest, ContentFrameDefaultsFollowWindowAppearance) {
++  auto saved = arcium::ContentFrameStyle();
++  saved.border_width = 6;
++  const auto light = arcium::ResolveContentFrame(saved, false, "#123456");
++  EXPECT_EQ(light.border_width, 6);
++  EXPECT_EQ(light.x, 0);
++  EXPECT_EQ(light.y, 0);
++  EXPECT_EQ(light.opacity, 20);
++  EXPECT_EQ(light.blur, 24);
++  EXPECT_EQ(light.spread, 0);
++  EXPECT_EQ(light.color, "#000000");
++  const auto dark = arcium::ResolveContentFrame(saved, true, "#123456");
++  EXPECT_EQ(dark.border_width, 6);
++  EXPECT_EQ(dark.x, 0);
++  EXPECT_EQ(dark.y, 0);
++  EXPECT_EQ(dark.opacity, 12);
++  EXPECT_EQ(dark.blur, 48);
++  EXPECT_EQ(dark.spread, 4);
++  EXPECT_EQ(dark.color, "#123456");
++  EXPECT_EQ(arcium::ResolveContentFrame(saved, true, "#ABCDEF").color,
++            "#ABCDEF");
++  saved.shadow_mode = arcium::ContentShadowMode::kCustom;
++  saved.x = -7;
++  saved.y = 3;
++  saved.opacity = 63;
++  saved.color = "#654321";
++  EXPECT_EQ(arcium::ResolveContentFrame(saved, true, "#ABCDEF"), saved);
++  const auto custom = saved;
++  saved.shadow_mode = arcium::ContentShadowMode::kNone;
++  const auto none = arcium::ResolveContentFrame(saved, false, "#ABCDEF");
++  EXPECT_EQ(none.opacity, 0);
++  EXPECT_EQ(none.border_width, 6);
++  EXPECT_EQ(none.color, custom.color);
++  EXPECT_EQ(saved.opacity, custom.opacity);
++  saved.shadow_mode = arcium::ContentShadowMode::kCustom;
++  EXPECT_EQ(saved, custom);
++}
++
++TEST_F(HeliumSpaceServiceTest, ContentFrameLegacyStylesRemainCustom) {
++  auto legacy = arcium::SerializeContentFrame(arcium::ContentFrameStyle());
++  legacy.Remove("shadowMode");
++  legacy.Set("y", 2);
++  legacy.Set("blur", 8);
++  legacy.Set("opacity", 25);
++  const auto parsed = arcium::ParseContentFrame(legacy);
++  ASSERT_TRUE(parsed);
++  EXPECT_EQ(parsed->shadow_mode, arcium::ContentShadowMode::kCustom);
++  EXPECT_EQ(parsed->y, 2);
++  EXPECT_EQ(parsed->blur, 8);
++  EXPECT_EQ(parsed->opacity, 25);
++  EXPECT_EQ(arcium::ResolveContentFrame(*parsed, true, "#ABCDEF"), *parsed);
++  const auto upgraded = arcium::SerializeContentFrame(*parsed);
++  EXPECT_EQ(*upgraded.FindString("shadowMode"), "custom");
++  EXPECT_EQ(arcium::ParseContentFrame(upgraded), parsed);
++}
++
++TEST_F(HeliumSpaceServiceTest, ContentFrameRejectsInvalidAndManagedWrites) {
++  arcium_settings::ArciumSettingsModel model(
++      profile(), base::DoNothing(), base::DoNothing());
++  const auto saved = model.GetContentFrame();
++  for (const char* mode : {"", "glow", "Default"}) {
++    auto payload = saved.Clone();
++    payload.Set("shadowMode", mode);
++    EXPECT_FALSE(model.SetContentFrame(payload));
++  }
++  auto invalid_mode = saved.Clone();
++  invalid_mode.Set("shadowMode", true);
++  EXPECT_FALSE(model.SetContentFrame(invalid_mode));
++  for (const char* field : {"borderWidth", "x", "y", "blur", "spread", "opacity"}) {
++    SCOPED_TRACE(field);
++    for (double invalid : {-1000.0, 1000.0, 0.5}) {
++      auto payload = saved.Clone();
++      payload.Set(field, invalid);
++      EXPECT_FALSE(model.SetContentFrame(payload));
++    }
++    auto payload = saved.Clone();
++    payload.Set(field, true);
++    EXPECT_FALSE(model.SetContentFrame(payload));
++    payload.Remove(field);
++    EXPECT_FALSE(model.SetContentFrame(payload));
++  }
++  for (const char* color : {"red", "#123", "#FFFFFF00", "#GGGGGG", "#0xFFFF", "#+FFFFF"}) {
++    auto payload = saved.Clone();
++    payload.Set("color", color);
++    EXPECT_FALSE(model.SetContentFrame(payload));
++  }
++  auto oversized_border = saved.Clone();
++  oversized_border.Set("borderWidth", 7);
++  EXPECT_FALSE(model.SetContentFrame(oversized_border));
++  EXPECT_EQ(model.GetContentFrame(), saved);
++  auto* prefs = profile()->GetTestingPrefService();
++  prefs->SetManagedPref(arcium::kContentFramePref, base::Value(saved.Clone()));
++  auto change = saved.Clone();
++  change.Set("borderWidth", 6);
++  EXPECT_FALSE(model.SetContentFrame(change));
++  prefs->RemoveManagedPref(arcium::kContentFramePref);
++  model.Shutdown();
++  EXPECT_FALSE(model.SetContentFrame(change));
++}
++
++TEST_F(HeliumSpaceServiceTest, ContentFrameObservesExternalChanges) {
++  int changes = 0;
++  arcium_settings::ArciumSettingsModel model(
++      profile(), base::BindLambdaForTesting([&] { ++changes; }),
++      base::DoNothing());
++  auto style = arcium::ContentFrameStyle();
++  style.border_width = 6;
++  profile()->GetPrefs()->SetDict(arcium::kContentFramePref,
++                                arcium::SerializeContentFrame(style));
++  EXPECT_GT(changes, 0);
++  EXPECT_EQ(model.GetContentFrame(), arcium::SerializeContentFrame(style));
++  const int before_shutdown = changes;
++  model.Shutdown();
++  profile()->GetPrefs()->ClearPref(arcium::kContentFramePref);
++  EXPECT_EQ(changes, before_shutdown);
++}
++
+ }  // namespace helium
+Index: src/chrome/browser/ui/views/frame/contents_container_outline.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/contents_container_outline.cc
++++ src/chrome/browser/ui/views/frame/contents_container_outline.cc
+@@ -3,6 +3,11 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/views/frame/contents_container_outline.h"
++#include "ui/gfx/shadow_value.h"
++#include "ui/gfx/skia_paint_util.h"
++
++#include <algorithm>
++#include <utility>
+ 
+ #include "base/i18n/rtl.h"
+ #include "chrome/browser/ui/ui_features.h"
+@@ -90,6 +95,13 @@ SkPath ContentsContainerOutline::GetPath
+   return path.detach();
+ }
+ 
++void ContentsContainerOutline::SetThickness(std::optional<int> thickness) {
++  if (thickness_ != thickness) {
++    thickness_ = thickness;
++    SchedulePaint();
++  }
++}
++
+ void ContentsContainerOutline::SetCornerRadii(
+     const gfx::RoundedCornersF& radii) {
+   if (corner_radii_ == radii) {
+@@ -113,22 +125,25 @@ void ContentsContainerOutline::UpdateSta
+ }
+ 
+ void ContentsContainerOutline::OnPaint(gfx::Canvas* canvas) {
+-  // Draw the bordering stroke.
++  const int thickness = thickness_.value_or(GetThickness(is_highlighted_));
++  if (thickness <= 0 || width() <= thickness || height() <= thickness) {
++    return;
++  }
+   cc::PaintFlags flags;
+-  flags.setStrokeWidth(GetThickness(is_highlighted_));
++  flags.setStrokeWidth(thickness);
+   flags.setColor(GetColorProvider()->GetColor(stroke_color_));
+   flags.setStyle(cc::PaintFlags::kStroke_Style);
+   flags.setAntiAlias(true);
+ 
+   gfx::RectF local_bounds(GetLocalBounds());
+-  const float half_thickness = GetThickness(is_highlighted_) / 2.0f;
++  const float half_thickness = thickness / 2.0f;
+   local_bounds.Inset(half_thickness);
+ 
+   const gfx::RoundedCornersF corner_radii(
+-      corner_radii_.upper_left() - half_thickness,
+-      corner_radii_.upper_right() - half_thickness,
+-      corner_radii_.lower_right() - half_thickness,
+-      corner_radii_.lower_left() - half_thickness);
++      std::max(0.f, corner_radii_.upper_left() - half_thickness),
++      std::max(0.f, corner_radii_.upper_right() - half_thickness),
++      std::max(0.f, corner_radii_.lower_right() - half_thickness),
++      std::max(0.f, corner_radii_.lower_left() - half_thickness));
+ 
+   SkPath path =
+       GetPath(local_bounds, corner_radii);
+@@ -144,5 +159,64 @@ void ContentsContainerOutline::OnViewIsD
+   view_bounds_observer_.Reset();
+ }
+ 
++ContentsFrameShadow::ContentsFrameShadow() {
++  SetPaintToLayer();
++  layer()->SetFillsBoundsOpaquely(false);
++  SetCanProcessEventsWithinSubtree(false);
++  GetViewAccessibility().SetIsInvisible(true);
++}
++
++void ContentsFrameShadow::Update(arcium::ContentFrameStyle style,
++                                std::vector<Frame> frames) {
++  if (style_ == style && frames_ == frames) {
++    return;
++  }
++  style_ = std::move(style);
++  frames_ = std::move(frames);
++  SchedulePaint();
++}
++
++void ContentsFrameShadow::OnPaint(gfx::Canvas* canvas) {
++  if (style_.opacity == 0 || frames_.empty()) {
++    return;
++  }
++  uint32_t rgb = 0;
++  base::HexStringToUInt(style_.color.substr(1), &rgb);
++  const SkColor color = SkColorSetARGB(
++      (style_.opacity * 255 + 50) / 100, (rgb >> 16) & 255,
++      (rgb >> 8) & 255, rgb & 255);
++  canvas->Save();
++  // The effect belongs to chrome, including when a page has transparency.
++  for (const auto& frame : frames_) {
++    canvas->ClipPath(
++        ContentsContainerOutline::GetPath(frame.bounds, frame.radii),
++        true, SkClipOp::kDifference);
++  }
++  for (const auto& frame : frames_) {
++    gfx::RectF bounds = frame.bounds;
++    bounds.Outset(style_.spread);
++    if (bounds.IsEmpty()) {
++      continue;
++    }
++    const auto radius = [this](float value) {
++      return std::max(0.f, value + style_.spread);
++    };
++    const gfx::RoundedCornersF radii(
++        radius(frame.radii.upper_left()), radius(frame.radii.upper_right()),
++        radius(frame.radii.lower_right()), radius(frame.radii.lower_left()));
++    cc::PaintFlags flags;
++    flags.setAntiAlias(true);
++    flags.setColor(SK_ColorTRANSPARENT);
++    flags.setLooper(gfx::CreateShadowDrawLooper({gfx::ShadowValue(
++        gfx::Vector2d(style_.x, style_.y), style_.blur, color)}));
++    // Only the blurred shadow is visible; the source shape is clipped out.
++    canvas->DrawPath(ContentsContainerOutline::GetPath(bounds, radii), flags);
++  }
++  canvas->Restore();
++}
++
++BEGIN_METADATA(ContentsFrameShadow)
++END_METADATA
++
+ BEGIN_METADATA(ContentsContainerOutline)
+ END_METADATA
+Index: src/chrome/browser/ui/views/frame/contents_container_outline.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/contents_container_outline.h
++++ src/chrome/browser/ui/views/frame/contents_container_outline.h
+@@ -5,10 +5,15 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_FRAME_CONTENTS_CONTAINER_OUTLINE_H_
+ #define CHROME_BROWSER_UI_VIEWS_FRAME_CONTENTS_CONTAINER_OUTLINE_H_
+ 
++#include <optional>
++#include <vector>
++
+ #include "base/memory/raw_ptr.h"
++#include "chrome/browser/ui/helium/arcium_content_frame.h"
+ #include "base/scoped_observation.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "ui/gfx/geometry/rounded_corners_f.h"
++#include "ui/gfx/geometry/rect_f.h"
+ #include "ui/views/view.h"
+ #include "ui/views/view_observer.h"
+ 
+@@ -37,6 +42,8 @@ class ContentsContainerOutline : public
+ 
+   bool is_highlighted() const { return is_highlighted_; }
+ 
++  const gfx::RoundedCornersF& corner_radii() const { return corner_radii_; }
++  void SetThickness(std::optional<int> thickness);
+   void SetCornerRadii(const gfx::RoundedCornersF& radii);
+   void UpdateState(bool is_active, bool is_highlighted);
+   void UpdateState(bool is_highlighted, ui::ColorId stroke_color);
+@@ -49,6 +56,7 @@ class ContentsContainerOutline : public
+   void OnViewBoundsChanged(views::View* observed_view) override;
+   void OnViewIsDeleting(views::View* observed_view) override;
+ 
++  std::optional<int> thickness_;
+   bool is_highlighted_ = false;
+   ui::ColorId stroke_color_ = kColorMultiContentsViewInactiveContentOutline;
+   gfx::RoundedCornersF corner_radii_{kCornerRadius};
+@@ -56,4 +64,21 @@ class ContentsContainerOutline : public
+       view_bounds_observer_{this};
+ };
+ 
++class ContentsFrameShadow : public views::View {
++  METADATA_HEADER(ContentsFrameShadow, views::View)
++ public:
++  struct Frame {
++    gfx::RectF bounds;
++    gfx::RoundedCornersF radii;
++    bool operator==(const Frame&) const = default;
++  };
++  ContentsFrameShadow();
++  void Update(arcium::ContentFrameStyle style, std::vector<Frame> frames);
++
++ private:
++  void OnPaint(gfx::Canvas* canvas) override;
++  arcium::ContentFrameStyle style_;
++  std::vector<Frame> frames_;
++};
++
+ #endif  // CHROME_BROWSER_UI_VIEWS_FRAME_CONTENTS_CONTAINER_OUTLINE_H_
+Index: src/chrome/browser/ui/views/frame/contents_container_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/contents_container_view.cc
++++ src/chrome/browser/ui/views/frame/contents_container_view.cc
+@@ -3,7 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/views/frame/contents_container_view.h"
++#include "chrome/browser/ui/helium/arcium_content_frame.h"
+ 
++#include <algorithm>
+ #include <memory>
+ #include <optional>
+ #include <utility>
+@@ -216,6 +218,12 @@ void ContentsContainerView::UpdateBorder
+                                                    bool round_top_right,
+                                                    bool round_bottom_left,
+                                                    bool round_bottom_right) {
++  const auto style = arcium::ReadContentFrame(
++      browser_view_->GetProfile()->GetPrefs());
++  const int split_thickness = std::max(
++      style.border_width, ContentsContainerOutline::kThickness);
++  const bool split_border_changed = is_in_split && GetInsets() != gfx::Insets(
++      kSplitViewContentPadding + split_thickness);
+   const bool split_changed = is_in_split != is_in_split_;
+   const bool rounded_contents_changed =
+       should_round_contents != should_round_contents_;
+@@ -242,22 +250,27 @@ void ContentsContainerView::UpdateBorder
+       }
+     }
+   } else {
+-    if (split_changed || rounded_contents_changed) {
++    if (split_changed || rounded_contents_changed || split_border_changed) {
+       if (is_in_split) {
+         SetBorder(views::CreateEmptyBorder(gfx::Insets(
+-            kSplitViewContentPadding + ContentsContainerOutline::kThickness)));
++            kSplitViewContentPadding + split_thickness)));
+       } else {
+         SetBorder(nullptr);
+       }
+     }
+-    if (split_changed || rounded_contents_changed || corner_state_changed) {
++    if (split_changed || rounded_contents_changed || corner_state_changed ||
++        split_border_changed) {
+       UpdateBorderRoundedCorners();
+     }
+ 
+     if (is_in_split) {
++      container_outline_->SetThickness(std::max(
++          style.border_width, ContentsContainerOutline::GetThickness(is_highlighted)));
+       container_outline_->UpdateState(is_active, is_highlighted);
+     } else if (browser_view_->GetIsNormalType()) {
++      container_outline_->SetThickness(style.border_width);
+       container_outline_->UpdateState(false, kColorToolbarContentAreaSeparator);
++      container_outline_->SetVisible(style.border_width > 0);
+     } else {
+       container_outline_->SetVisible(false);
+     }
+Index: src/chrome/browser/ui/views/frame/multi_contents_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/multi_contents_view.cc
++++ src/chrome/browser/ui/views/frame/multi_contents_view.cc
+@@ -13,6 +13,7 @@
+ #include "base/i18n/rtl.h"
+ #include "base/notreached.h"
+ #include "base/numerics/safe_conversions.h"
++#include "base/strings/stringprintf.h"
+ #include "chrome/browser/actor/ui/actor_overlay_web_view.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -22,7 +23,9 @@
+ #include "chrome/browser/ui/sad_tab_helper.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/browser_widget.h"
+ #include "chrome/browser/ui/views/frame/contents_container_view.h"
++#include "chrome/browser/ui/views/frame/contents_container_outline.h"
+ #include "chrome/browser/ui/views/frame/contents_separator.h"
+ #include "chrome/browser/ui/views/frame/contents_web_view.h"
+ #include "chrome/browser/ui/views/frame/multi_contents_background_view.h"
+@@ -41,8 +44,12 @@
+ #include "components/split_tabs/split_tab_visual_data.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/common/url_constants.h"
++#include "third_party/skia/include/core/SkColor.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/base/ozone_buildflags.h"
++#include "ui/color/color_id.h"
++#include "ui/color/color_provider.h"
++#include "ui/color/color_provider_key.h"
+ #include "ui/compositor/layer.h"
+ #include "ui/compositor/layer_type.h"
+ #include "ui/events/types/event_type.h"
+@@ -117,6 +124,7 @@ MultiContentsView::MultiContentsView(
+ 
+   background_view_ =
+       AddChildView(std::make_unique<MultiContentsBackgroundView>(browser_view));
++  content_shadow_ = AddChildView(std::make_unique<ContentsFrameShadow>());
+ 
+   contents_container_views_.push_back(
+       AddChildView(std::make_unique<ContentsContainerView>(browser_view_)));
+@@ -210,6 +218,11 @@ MultiContentsView::MultiContentsView(
+           &MultiContentsView::OnChromeFrameBorderWidthPrefStateChange,
+           base::Unretained(this)));
+ 
++  pref_change_registrar_.Add(
++      arcium::kContentFramePref,
++      base::BindRepeating(
++          &MultiContentsView::OnChromeFrameBorderWidthPrefStateChange,
++          base::Unretained(this)));
+   UpdateContentsBorderAndOverlay();
+ }
+ 
+@@ -483,6 +496,7 @@ double MultiContentsView::CalculateRatio
+ void MultiContentsView::OnThemeChanged() {
+   views::View::OnThemeChanged();
+   UpdateContentsBorderAndOverlay();
++  InvalidateLayout();
+ }
+ 
+ void MultiContentsView::OnFullscreenStateChanged() {
+@@ -580,6 +594,36 @@ void MultiContentsView::OnReadAnythingOv
+ 
+ // TODO(crbug.com/397777917): Consider using FlexSpecification weights and
+ // interior margins instead of a custom layout once this bug is resolved.
++arcium::ContentFrameStyle MultiContentsView::GetContentFrameStyle() const {
++  const auto* widget = browser_view_->browser_widget();
++  const bool dark = widget &&
++      widget->GetSpaceContentColorProviderKey().color_mode ==
++          ui::ColorProviderKey::ColorMode::kDark;
++  const auto* provider = GetColorProvider();
++  const SkColor accent = provider ? provider->GetColor(ui::kColorSysPrimary)
++                                  : SK_ColorBLACK;
++  return arcium::ResolveContentFrame(
++      arcium::ReadContentFrame(browser_view_->GetProfile()->GetPrefs()), dark,
++      base::StringPrintf("#%02X%02X%02X", SkColorGetR(accent),
++                         SkColorGetG(accent), SkColorGetB(accent)));
++}
++
++void MultiContentsView::Layout(PassKey) {
++  LayoutSuperclass<views::View>(this);
++  std::vector<ContentsFrameShadow::Frame> frames;
++  if (ShouldUseRoundedFrame() && browser_view_->GetIsNormalType()) {
++    for (const auto* container : contents_container_views_) {
++      if (container->GetVisible()) {
++        gfx::Rect bounds = container->GetMirroredBounds();
++        bounds.Offset(-content_shadow_->x(), -content_shadow_->y());
++        frames.push_back({gfx::RectF(bounds),
++                          container->contents_outline_view()->corner_radii()});
++      }
++    }
++  }
++  content_shadow_->Update(GetContentFrameStyle(), std::move(frames));
++}
++
+ views::ProposedLayout MultiContentsView::CalculateProposedLayout(
+     const views::SizeBounds& size_bounds) const {
+   views::ProposedLayout layouts;
+@@ -598,6 +642,14 @@ views::ProposedLayout MultiContentsView:
+                                should_use_rounded_frame;
+   layouts.child_layouts.emplace_back(background_view_.get(), show_background,
+                                      available_space);
++  const auto style = GetContentFrameStyle();
++  const int shadow_extent = style.blur +
++      std::max(std::abs(style.x), std::abs(style.y)) +
++      std::max(0, style.spread) + 2;
++  gfx::Rect shadow_bounds = available_space;
++  shadow_bounds.Outset(shadow_extent);
++  layouts.child_layouts.emplace_back(content_shadow_.get(), show_background,
++                                     shadow_bounds);
+ 
+   if (IsDragAndDropEnabled()) {
+     available_space = CalculateDropTargetLayout(
+Index: src/chrome/browser/ui/views/frame/multi_contents_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/multi_contents_view.h
++++ src/chrome/browser/ui/views/frame/multi_contents_view.h
+@@ -25,6 +25,11 @@
+ 
+ class BrowserView;
+ class ContentsWebView;
++namespace arcium {
++struct ContentFrameStyle;
++}
++
++class ContentsFrameShadow;
+ class MultiContentsBackgroundView;
+ class MultiContentsDropTargetView;
+ class MultiContentsResizeArea;
+@@ -171,6 +176,7 @@ class MultiContentsView
+ 
+   // views::View:
+   void OnThemeChanged() override;
++  void Layout(PassKey) override;
+ 
+   void OnFullscreenStateChanged();
+ 
+@@ -306,6 +312,9 @@ class MultiContentsView
+   raw_ptr<BrowserView> browser_view_;
+   std::unique_ptr<MultiContentsViewDelegate> delegate_;
+ 
++  arcium::ContentFrameStyle GetContentFrameStyle() const;
++
++  raw_ptr<ContentsFrameShadow> content_shadow_ = nullptr;
+   raw_ptr<MultiContentsBackgroundView> background_view_;
+   ContentsSeparators contents_separators_;
+ 
+Index: src/chrome/browser/ui/views/frame/multi_contents_view_browsertest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/multi_contents_view_browsertest.cc
++++ src/chrome/browser/ui/views/frame/multi_contents_view_browsertest.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/views/frame/multi_contents_view.h"
++#include "chrome/browser/ui/helium/arcium_content_frame.h"
++#include "chrome/browser/ui/views/frame/contents_container_outline.h"
+ 
+ #include "base/check_deref.h"
+ #include "base/files/file_path.h"
+@@ -154,6 +156,28 @@ IN_PROC_BROWSER_TEST_F(MultiContentsView
+ }
+ 
+ IN_PROC_BROWSER_TEST_F(MultiContentsViewBrowserTest,
++                       ContentBorderChangesLiveWithoutPageReflow) {
++  auto* prefs = browser()->profile()->GetPrefs();
++  prefs->SetBoolean(prefs::kHeliumRoundedFrame, true);
++  auto style = arcium::ContentFrameStyle();
++  prefs->SetDict(arcium::kContentFramePref, arcium::SerializeContentFrame(style));
++  RunScheduledLayouts();
++  auto* container = multi_contents_view()->GetActiveContentsContainerView();
++  const auto bounds = container->contents_view()->bounds();
++  EXPECT_FALSE(container->contents_outline_view()->GetVisible());
++  style.border_width = 6;
++  prefs->SetDict(arcium::kContentFramePref, arcium::SerializeContentFrame(style));
++  RunScheduledLayouts();
++  EXPECT_TRUE(container->contents_outline_view()->GetVisible());
++  EXPECT_EQ(container->contents_view()->bounds(), bounds);
++  style.border_width = 0;
++  prefs->SetDict(arcium::kContentFramePref, arcium::SerializeContentFrame(style));
++  RunScheduledLayouts();
++  EXPECT_FALSE(container->contents_outline_view()->GetVisible());
++  EXPECT_EQ(container->contents_view()->bounds(), bounds);
++}
++
++IN_PROC_BROWSER_TEST_F(MultiContentsViewBrowserTest,
+                        RoundedFrameBorderWidthLayout) {
+   MultiContentsView* view = multi_contents_view();
+   PrefService* prefs = browser()->profile()->GetPrefs();
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
+@@ -1692,7 +1692,7 @@ void CommandPanelView::OnPaint(gfx::Canv
+     shadow.setAntiAlias(true);
+     shadow.setColor(SK_ColorBLACK);
+     shadow.setLooper(gfx::CreateShadowDrawLooper({gfx::ShadowValue(
+-        gfx::Vector2d(0, S(ui_scale_, 8)), S(ui_scale_, 28),
++        gfx::Vector2d(0, S(ui_scale_, 2)), S(ui_scale_, 28),
+         SkColorSetA(SK_ColorBLACK, 0x40))}));
+     canvas->DrawPath(contour, shadow);
+   }
