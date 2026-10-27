@@ -1300,6 +1300,26 @@
  #include "content/browser/media/session/audio_focus_delegate.h"
  #include "content/browser/media/session/media_players_callback_aggregator.h"
  #include "content/browser/media/session/media_session_controller.h"
+@@ -729,9 +730,6 @@ void MediaSessionImpl::Resume(SuspendTyp
+ }
+ 
+ void MediaSessionImpl::Suspend(SuspendType suspend_type) {
+-  if (!IsActive())
+-    return;
+-
+   if (suspend_type == SuspendType::kUI) {
+     // If the site has registered an action handler for pause then we should
+     // pass it to the site and let them handle it.
+@@ -741,6 +739,9 @@ void MediaSessionImpl::Suspend(SuspendTy
+     }
+   }
+ 
++  if (!IsActive())
++    return;
++
+   OnSuspendInternal(suspend_type, State::SUSPENDED);
+ }
+ 
 @@ -1343,8 +1344,16 @@ void MediaSessionImpl::ExitPictureInPict
  void MediaSessionImpl::EnterAutoPictureInPicture() {
    if (base::FeatureList::IsEnabled(
@@ -1784,7 +1804,36 @@
  int TestWebFrameClient::loads_in_progress_ = 0;
 --- a/content/browser/media/session/media_session_impl_unittest.cc
 +++ b/content/browser/media/session/media_session_impl_unittest.cc
-@@ -1675,6 +1675,79 @@ TEST_F(MediaSessionImplTestWithDryRunOnl
+@@ -507,6 +507,28 @@ TEST_F(MediaSessionImplTest, SuspendUI_W
+   observer.WaitForExpectedActions(default_actions());
+ }
+ 
++TEST_F(MediaSessionImplTest, BrowserInitiatedAutoPipPauseWhileSessionInactive) {
++  auto owned_delegate = std::make_unique<MockAudioFocusDelegate>();
++  auto* delegate = owned_delegate.get();
++  SetDelegateForTests(GetMediaSession(), std::move(owned_delegate));
++  mock_media_session_service().EnableAction(MediaSessionAction::kPause);
++  mock_media_session_service().FlushForTesting();
++
++  ASSERT_TRUE(GetMediaSession()->ShouldRouteAction(MediaSessionAction::kPause));
++  ASSERT_EQ(MediaSessionInfo::SessionState::kInactive,
++            GetState(GetMediaSession()));
++  ASSERT_EQ(0, delegate->request_audio_focus_count());
++  EXPECT_CALL(mock_media_session_service().mock_client(),
++              DidReceiveAction(MediaSessionAction::kPause, _));
++
++  GetMediaSession()->Suspend(MediaSession::SuspendType::kUI);
++  mock_media_session_service().FlushForTesting();
++
++  EXPECT_EQ(MediaSessionInfo::SessionState::kInactive,
++            GetState(GetMediaSession()));
++  EXPECT_EQ(0, delegate->request_audio_focus_count());
++}
++
+ TEST_F(MediaSessionImplTest, ResumeUI) {
+   EXPECT_CALL(mock_media_session_service().mock_client(),
+               DidReceiveAction(MediaSessionAction::kPlay, _))
+@@ -1675,6 +1697,79 @@ TEST_F(MediaSessionImplTestWithDryRunOnl
    mock_media_session_service().FlushForTesting();
  }
  
