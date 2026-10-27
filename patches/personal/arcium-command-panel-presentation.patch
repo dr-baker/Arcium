@@ -1,0 +1,1223 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -2,6 +2,7 @@
+ # Use of this source code is governed by a BSD-style license that can be
+ # found in the LICENSE file.
+ 
++import("//chrome/browser/ui/views/omnibox/arcium_command_panel_sources.gni")
+ import("//build/config/buildflags_paint_preview.gni")
+ import("//build/config/compiler/compiler.gni")
+ import("//build/config/features.gni")
+@@ -4364,10 +4365,7 @@
+       "views/omnibox/omnibox_popup_webui_base_content.h",
+       "views/omnibox/omnibox_popup_webui_content.cc",
+       "views/omnibox/omnibox_popup_webui_content.h",
+-      "views/omnibox/arcium_command_bar_material.cc",
+-      "views/omnibox/arcium_command_bar_material.h",
+-      "views/omnibox/arcium_command_panel.h",
+-      "views/omnibox/arcium_command_panel.cc",
++    ] + arcium_command_panel_sources + arcium_space_palette_resolver_sources + [
+       "views/omnibox/arcium_command_panel_browser_view.cc",
+       "views/omnibox/omnibox_result_view.cc",
+       "views/omnibox/omnibox_result_view.h",
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -203,6 +203,7 @@
+ #include "chrome/browser/ui/views/location_bar/star_view.h"
+ #include "chrome/browser/ui/views/new_tab_footer/footer_web_view.h"
+ #include "chrome/browser/ui/views/omnibox/arcium_command_bar_material.h"
++#include "chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.h"
+ #include "chrome/browser/ui/views/omnibox/omnibox_popup_closer.h"
+ #include "chrome/browser/ui/views/omnibox/omnibox_popup_view_browser_view.h"
+ #include "chrome/browser/ui/views/omnibox/omnibox_view_views.h"
+@@ -4031,56 +4032,27 @@
+ }
+ 
+ bool BrowserView::IsArciumCommandBarNewTab() const {
+-  return arcium_command_bar_widget_ && arcium_command_bar_new_tab_;
++  const auto* presentation = arcium::CommandPanelPresentation::Get(this);
++  return presentation && presentation->is_open() && presentation->new_tab();
+ }
+ 
+ void BrowserView::CloseArciumCommandBar(bool accepted) {
+-  arcium_pending_command_invocation_.reset();
+-  if (!arcium_command_bar_widget_) {
+-    return;
+-  }
+   arcium_command_bar_accepted_ |= accepted;
+-  if (arcium_command_bar_closing_) {
+-    return;
++  if (auto* presentation = arcium::CommandPanelPresentation::Get(this)) {
++    presentation->Close(accepted);
+   }
+-  arcium_command_bar_closing_ = true;
+-  // Acceptance may activate another tab while the omnibox controller is on
+-  // the stack. Close on the next task so its controller can finish first.
+-  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+-      FROM_HERE, base::BindOnce(
+-                     [](base::WeakPtr<views::Widget> widget) {
+-                       if (widget) {
+-                         widget->Close();
+-                       }
+-                     },
+-                     arcium_command_bar_widget_->GetWeakPtr()));
+ }
+ 
+ void BrowserView::DestroyArciumCommandBar(bool reopen_pending) {
+-  const auto pending = reopen_pending ? arcium_pending_command_invocation_
+-                                      : std::nullopt;
+-  arcium_pending_command_invocation_.reset();
+-  if (!arcium_command_bar_widget_) {
+-    return;
++  // Deferred destruction and pending invocations belong to the shared owner.
++  (void)reopen_pending;
++  if (auto* presentation = arcium::CommandPanelPresentation::Get(this)) {
++    presentation->Destroy(arcium_command_bar_accepted_);
+   }
+-  arcium_command_bar_material_.reset();
+-  arcium_command_bar_widget_->RemoveObserver(this);
+-  auto widget = std::move(arcium_command_bar_widget_);
+-  auto native_delegate = std::move(arcium_native_command_delegate_);
+   arcium_native_command_panel_ = nullptr;
+   arcium_command_bar_new_tab_ = false;
+   arcium_command_bar_closing_ = false;
+-  const bool restore_focus =
+-      !pending.has_value() && !arcium_command_bar_accepted_ && GetWidget() &&
+-      GetWidget()->IsActive();
+-  widget.reset();
+-  native_delegate.reset();
+-  if (restore_focus) {
+-    RestoreFocus();
+-  }
+-  if (pending.has_value()) {
+-    ShowArciumNativeCommandPanel(*pending);
+-  }
++  arcium_pending_command_invocation_.reset();
+ }
+ 
+ void BrowserView::SetFocusToLocationBar(bool is_user_initiated) {
+@@ -5964,10 +5936,7 @@
+ 
+ void BrowserView::OnWidgetBoundsChanged(views::Widget* widget,
+                                         const gfx::Rect& new_bounds) {
+-  if (widget == arcium_command_bar_widget_.get()) {
+-    return;
+-  }
+-  CloseArciumCommandBar(false);
++  // The shared popup owner observes its parent bounds and dismisses itself.
+   TryNotifyWindowBoundsChanged(new_bounds);
+ }
+ 
+--- a/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
++++ b/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
+@@ -1,169 +1,74 @@
+-// Copyright 2026 The Helium Authors
++// Copyright 2026 The Arcium Authors
+ // Use of this source code is governed by the GPL-3.0 license.
+-
+-#include <algorithm>
+-#include <memory>
+-
+ #include "base/functional/bind.h"
+ #include "base/metrics/histogram_macros_local.h"
+ #include "base/time/time.h"
+-#include "base/timer/elapsed_timer.h"
+-#include "components/viz/common/frame_timing_details.h"
+-#include "ui/compositor/compositor.h"
+-#include "ui/views/view_tracker.h"
+-#include "base/numerics/safe_conversions.h"
+-#include "base/task/single_thread_task_runner.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/omnibox/arcium_command_providers.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/helium/arcium_chrome_ui_scale.h"
+-#include "chrome/browser/ui/views/omnibox/arcium_command_bar_material.h"
+ #include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
+-#include "ui/color/color_provider_key.h"
++#include "chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.h"
++#include "components/viz/common/frame_timing_details.h"
++#include "ui/compositor/compositor.h"
++#include "ui/views/view_tracker.h"
+ #include "ui/views/widget/widget.h"
+-#include "ui/views/widget/widget_delegate.h"
+ 
+ bool BrowserView::ShowArciumNativeCommandPanel(bool new_tab) {
+   if (!browser_->is_type_normal() || !toolbar_ || !GetWidget() ||
+-      GetWidget()->IsClosed() || !GetActiveWebContents()) {
+-    return false;
+-  }
+-  if (arcium_command_bar_widget_) {
+-    if (arcium_command_bar_closing_) {
+-      // The current widget is already closing. Keep only the latest invocation
+-      // and reopen after the owner has destroyed that widget and its delegate.
+-      arcium_pending_command_invocation_ = new_tab;
+-    } else if (arcium_native_command_panel_) {
+-      arcium_command_bar_new_tab_ = new_tab;
+-      arcium_native_command_panel_->SetInvocation(new_tab);
+-      arcium_command_bar_widget_->Activate();
+-    }
+-    return true;
+-  }
+-  base::ElapsedTimer open_timer;
+-  const auto open_started = base::TimeTicks::Now();
+-  auto panel = std::make_unique<arcium::CommandPanelView>(
+-      arcium::CreateCommandSession(browser_, arcium_command_context_),
+-      base::BindRepeating(&BrowserView::CloseArciumCommandBar,
+-                          weak_ptr_factory_.GetWeakPtr(), false),
+-      base::BindRepeating(
+-          [](base::WeakPtr<BrowserView> view, bool invocation) {
+-            if (view) {
+-              view->ShowArciumCommandBar(invocation);
+-            }
+-          },
+-          weak_ptr_factory_.GetWeakPtr()), new_tab);
+-  arcium_native_command_panel_ = panel.get();
+-  auto* profile = browser_->profile()->GetOriginalProfile();
+-  panel->BindPreferences(
+-      profile->GetPrefs(),
+-      base::BindRepeating(
+-          [](Profile* owner) {
+-            return static_cast<float>(arcium::GetChromeUIScale(owner));
+-          },
+-          base::Unretained(profile)),
+-      base::BindRepeating(
+-          [](base::WeakPtr<BrowserView> view) {
+-            return view ? view->GetBoundsInScreen().width() - 32 : 280;
+-          },
+-          weak_ptr_factory_.GetWeakPtr()));
+-  const double scale = arcium::GetChromeUIScale(profile);
+-  const auto parent = GetBoundsInScreen();
+-  const int width = std::max(
+-      280, std::min(base::ClampRound(824 * scale), parent.width() - 32));
+-  const int height = panel->GetPreferredSize().height();
+-  const auto bounds = gfx::Rect(
+-      parent.CenterPoint().x() - width / 2,
+-      parent.y() +
+-          std::max(16, base::ClampRound(parent.height() * .11 - 48 * scale)),
+-      width, height);
+-  auto delegate = std::make_unique<views::WidgetDelegate>();
+-  delegate->SetCanActivate(true);
+-  delegate->SetContentsView(std::move(panel));
+-  delegate->RegisterWindowClosingCallback(base::BindOnce(
+-      [](base::WeakPtr<BrowserView> view) {
+-        if (!view) {
+-          return;
+-        }
+-        view->arcium_command_bar_closing_ = true;
+-        base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+-            FROM_HERE,
+-            base::BindOnce(&BrowserView::DestroyArciumCommandBar, view, true));
+-      },
+-      weak_ptr_factory_.GetWeakPtr()));
+-  arcium_native_command_delegate_ = std::move(delegate);
+-  arcium_command_bar_new_tab_ = new_tab;
+-  arcium_command_bar_accepted_ = false;
+-  arcium_command_bar_closing_ = false;
+-  auto widget = std::make_unique<views::Widget>();
+-  views::Widget::InitParams params(
+-      views::Widget::InitParams::CLIENT_OWNS_WIDGET,
+-      views::Widget::InitParams::TYPE_WINDOW_FRAMELESS);
+-  params.opacity = views::Widget::InitParams::WindowOpacity::kTranslucent;
+-  params.parent = GetWidget()->GetNativeView();
+-  params.bounds = bounds;
+-  params.delegate = arcium_native_command_delegate_.get();
+-  widget->Init(std::move(params));
+-  arcium_command_bar_widget_ = std::move(widget);
+-  arcium_command_bar_widget_->AddObserver(this);
+-  arcium_command_bar_widget_->GetRootView()->DeprecatedLayoutImmediately();
+-  arcium_command_bar_material_ = std::make_unique<arcium::CommandBarMaterial>(
+-      arcium_command_bar_widget_.get(), profile->GetPrefs(),
+-      base::BindRepeating(
+-          [](base::WeakPtr<BrowserView> view) {
+-            arcium::CommandBarMaterial::Clip clip;
+-            if (view && view->arcium_native_command_panel_) {
+-              clip.contour =
+-                  view->arcium_native_command_panel_->GetContourPath();
+-            }
+-            return clip;
+-          },
+-          weak_ptr_factory_.GetWeakPtr()),
+-      base::BindRepeating(
+-          [](base::WeakPtr<BrowserView> view, bool enabled) {
+-            if (view && view->arcium_native_command_panel_) {
+-              view->arcium_native_command_panel_->SetNativeMaterial(enabled);
+-            }
+-          },
+-          weak_ptr_factory_.GetWeakPtr()));
+-  arcium_native_command_panel_->SetGeometryChangedCallback(base::BindRepeating(
+-      [](base::WeakPtr<BrowserView> view) {
+-        if (view && view->arcium_command_bar_material_) {
+-          view->arcium_command_bar_material_->Refresh();
+-        }
+-      },
+-      weak_ptr_factory_.GetWeakPtr()));
+-  arcium_command_bar_material_->Refresh();
+-  arcium_command_bar_widget_->Show();
+-  arcium_native_command_panel_->SetHeightResizeCallback(base::BindRepeating(
+-      [](base::WeakPtr<BrowserView> view, std::optional<int> height,
+-         base::TimeDelta duration) {
+-        return view && view->arcium_command_bar_material_
+-                   ? view->arcium_command_bar_material_->ResizeHeight(height,
+-                                                                     duration)
+-                   : 0;
+-      },
+-      weak_ptr_factory_.GetWeakPtr()));
+-  arcium_native_command_panel_->FocusInput();
+-  LOCAL_HISTOGRAM_TIMES("Arcium.CommandBar.OpenSetup", open_timer.Elapsed());
+-  if (auto* compositor = arcium_command_bar_widget_->GetCompositor()) {
+-    compositor->RequestSuccessfulPresentationTimeForNextFrame(base::BindOnce(
+-        [](std::unique_ptr<views::ViewTracker> panel, base::TimeTicks started,
+-           const viz::FrameTimingDetails& details) {
+-          LOCAL_HISTOGRAM_BOOLEAN("Arcium.CommandBar.ClosedBeforePresentation",
+-                                  !panel->view());
+-          if (!panel->view()) {
+-            return;
+-          }
+-          const auto presented = details.presentation_feedback.timestamp;
+-          if (!presented.is_null() && presented >= started) {
+-            LOCAL_HISTOGRAM_TIMES("Arcium.CommandBar.OpenPresentation",
+-                                  presented - started);
+-          }
+-        },
+-        std::make_unique<views::ViewTracker>(arcium_native_command_panel_),
+-        open_started));
++      GetWidget()->IsClosed() || !GetActiveWebContents()) return false;
++  auto* presentation = arcium::CommandPanelPresentation::Get(this);
++  if (!presentation) {
++    arcium::CommandPanelPresentation::Options options;
++    options.parent = GetWidget();
++    options.anchor_bounds = base::BindRepeating([](base::WeakPtr<BrowserView> view) {
++      return view ? view->GetBoundsInScreen() : gfx::Rect();
++    }, weak_ptr_factory_.GetWeakPtr());
++    auto* profile = browser_->profile()->GetOriginalProfile();
++    options.prefs = profile->GetPrefs();
++    options.scale = base::BindRepeating([](Profile* owner) {
++      return static_cast<float>(arcium::GetChromeUIScale(owner));
++    }, base::Unretained(profile));
++    options.create_session = base::BindRepeating([](base::WeakPtr<BrowserView> view)
++        -> std::unique_ptr<arcium::CommandSession> {
++      return view ? arcium::CreateCommandSession(view->browser(), view->arcium_command_context_)
++                  : nullptr;
++    }, weak_ptr_factory_.GetWeakPtr());
++    options.panel_changed = base::BindRepeating([](base::WeakPtr<BrowserView> view,
++                                                  arcium::CommandPanelView* panel) {
++      if (view) view->arcium_native_command_panel_ = panel;
++    }, weak_ptr_factory_.GetWeakPtr());
++    options.invocation_changed = base::BindRepeating([](base::WeakPtr<BrowserView> view,
++                                                       bool invocation) {
++      if (view) view->arcium_command_bar_new_tab_ = invocation;
++    }, weak_ptr_factory_.GetWeakPtr());
++    options.closed = base::BindRepeating([](base::WeakPtr<BrowserView> view,
++                                           bool accepted, bool reopening) {
++      if (!view) return;
++      view->arcium_command_bar_new_tab_ = false;
++      view->arcium_command_bar_closing_ = false;
++      view->arcium_command_bar_accepted_ = accepted;
++      if (!accepted && !reopening && view->GetWidget() && view->GetWidget()->IsActive())
++        view->RestoreFocus();
++    }, weak_ptr_factory_.GetWeakPtr());
++    options.opened = base::BindRepeating([](base::WeakPtr<BrowserView> view,
++                                           views::Widget* widget, base::TimeTicks started) {
++      if (!view) return;
++      LOCAL_HISTOGRAM_TIMES("Arcium.CommandBar.OpenSetup", base::TimeTicks::Now() - started);
++      if (auto* compositor = widget->GetCompositor()) {
++        compositor->RequestSuccessfulPresentationTimeForNextFrame(base::BindOnce(
++            [](std::unique_ptr<views::ViewTracker> panel, base::TimeTicks opened,
++               const viz::FrameTimingDetails& details) {
++              LOCAL_HISTOGRAM_BOOLEAN("Arcium.CommandBar.ClosedBeforePresentation", !panel->view());
++              if (!panel->view()) return;
++              const auto presented = details.presentation_feedback.timestamp;
++              if (!presented.is_null() && presented >= opened)
++                LOCAL_HISTOGRAM_TIMES("Arcium.CommandBar.OpenPresentation", presented - opened);
++            }, std::make_unique<views::ViewTracker>(view->arcium_native_command_panel_), started));
++      }
++    }, weak_ptr_factory_.GetWeakPtr());
++    presentation = arcium::CommandPanelPresentation::Install(this, std::move(options));
+   }
+-  return true;
++  return presentation->Show(new_tab);
+ }
+--- /dev/null
++++ b/chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.cc
+@@ -0,0 +1,251 @@
++// Copyright 2026 The Arcium Authors
++// Use of this source code is governed by the GPL-3.0 license.
++#include "chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/check.h"
++#include "base/functional/bind.h"
++#include "base/numerics/safe_conversions.h"
++#include "base/task/single_thread_task_runner.h"
++#include "chrome/browser/ui/views/omnibox/arcium_command_bar_material.h"
++#include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
++#include "ui/base/class_property.h"
++#include "ui/views/view.h"
++#include "ui/views/widget/widget.h"
++#include "ui/views/widget/widget_delegate.h"
++
++DEFINE_UI_CLASS_PROPERTY_TYPE(arcium::CommandPanelPresentation*)
++DEFINE_UI_CLASS_PROPERTY_TYPE(arcium::CommandPanelPresentation::SessionFactory*)
++namespace arcium {
++namespace {
++DEFINE_OWNED_UI_CLASS_PROPERTY_KEY(CommandPanelPresentation, kCommandPresentation)
++DEFINE_OWNED_UI_CLASS_PROPERTY_KEY(CommandPanelPresentation::SessionFactory, kTestSessionFactory)
++}
++
++CommandPanelPresentation* CommandPanelPresentation::Get(const views::View* owner) {
++  return owner ? owner->GetProperty(kCommandPresentation) : nullptr;
++}
++CommandPanelPresentation* CommandPanelPresentation::Install(views::View* owner,
++                                                           Options options) {
++  CHECK(owner);
++  CHECK(!Get(owner));
++  auto presentation = std::make_unique<CommandPanelPresentation>(std::move(options));
++  presentation->owner_ = owner;
++  return owner->SetProperty(kCommandPresentation, std::move(presentation));
++}
++void CommandPanelPresentation::SetSessionFactoryForTesting(views::View* owner,
++                                                            SessionFactory factory) {
++  CHECK(owner);
++  if (auto* presentation = Get(owner)) presentation->Destroy(true);
++  if (factory) owner->SetProperty(kTestSessionFactory, std::make_unique<SessionFactory>(std::move(factory)));
++  else owner->ClearProperty(kTestSessionFactory);
++}
++CommandPanelPresentation::CommandPanelPresentation(Options options)
++    : options_(std::move(options)), parent_(options_.parent) {
++  CHECK(parent_);
++  CHECK(options_.prefs);
++  CHECK(options_.create_session);
++  CHECK(options_.scale);
++  options_.parent = nullptr;
++  parent_->AddObserver(this);
++}
++CommandPanelPresentation::~CommandPanelPresentation() {
++  weak_factory_.InvalidateWeakPtrs();
++  if (parent_) parent_->RemoveObserver(this);
++  parent_ = nullptr;
++  owner_ = nullptr;
++  DestroyPopup(false, false);
++}
++gfx::Rect CommandPanelPresentation::AnchorBounds() const {
++  if (!parent_) return {};
++  return options_.anchor_bounds ? options_.anchor_bounds.Run()
++                                : parent_->GetWindowBoundsInScreen();
++}
++gfx::Rect CommandPanelPresentation::PopupBounds(const gfx::Rect& anchor,
++                                               float scale, int height) {
++  const int width = std::max(280, std::min(base::ClampRound(824 * scale), anchor.width() - 32));
++  return gfx::Rect(anchor.CenterPoint().x() - width / 2,
++      anchor.y() + std::max(16, base::ClampRound(anchor.height() * .11 - 48 * scale)),
++      width, height);
++}
++bool CommandPanelPresentation::is_open() const {
++  return widget_ && !closing_ && !widget_->IsClosed();
++}
++bool CommandPanelPresentation::Show(bool new_tab) {
++  if (!parent_ || parent_->IsClosed()) return false;
++  if (closing_ || destroying_) {
++    pending_invocation_ = new_tab;
++    return true;
++  }
++  const auto life = weak_factory_.GetWeakPtr();
++  new_tab_ = new_tab;
++  auto invocation_changed = options_.invocation_changed;
++  if (invocation_changed) invocation_changed.Run(new_tab);
++  if (!life) return false;
++  if (widget_) {
++    panel_->SetInvocation(new_tab);
++    if (!life || !widget_) return true;
++    widget_->Activate();
++    return true;
++  }
++  const auto started = base::TimeTicks::Now();
++  auto create_session = options_.create_session;
++  if (owner_) {
++    if (const auto* override = owner_->GetProperty(kTestSessionFactory)) create_session = *override;
++  }
++  auto session = create_session.Run();
++  if (!life || !session || !parent_) return false;
++  auto view = std::make_unique<CommandPanelView>(std::move(session),
++      base::BindRepeating(&CommandPanelPresentation::Close, weak_factory_.GetWeakPtr(), false),
++      base::BindRepeating([](base::WeakPtr<CommandPanelPresentation> owner, bool invocation) {
++        if (owner) owner->Show(invocation);
++      }, weak_factory_.GetWeakPtr()), new_tab);
++  panel_ = view.get();
++  panel_->BindPreferences(options_.prefs, options_.scale,
++      base::BindRepeating([](base::WeakPtr<CommandPanelPresentation> owner) {
++        return owner ? std::max(280, owner->AnchorBounds().width() - 32) : 280;
++      }, weak_factory_.GetWeakPtr()));
++  delegate_ = std::make_unique<views::WidgetDelegate>();
++  delegate_->SetCanActivate(true);
++  delegate_->SetContentsView(std::move(view));
++  delegate_->RegisterWindowClosingCallback(base::BindOnce(
++      &CommandPanelPresentation::WindowClosing, weak_factory_.GetWeakPtr()));
++  widget_ = std::make_unique<views::Widget>();
++  views::Widget::InitParams params(views::Widget::InitParams::CLIENT_OWNS_WIDGET,
++      views::Widget::InitParams::TYPE_WINDOW_FRAMELESS);
++  params.opacity = views::Widget::InitParams::WindowOpacity::kTranslucent;
++  params.parent = parent_->GetNativeView();
++  params.bounds = PopupBounds(AnchorBounds(), options_.scale.Run(), panel_->GetPreferredSize().height());
++  params.delegate = delegate_.get();
++  widget_->Init(std::move(params));
++  widget_->SetColorModeOverride(options_.color_mode);
++  widget_->AddObserver(this);
++  accepted_ = false;
++  widget_->GetRootView()->DeprecatedLayoutImmediately();
++  material_ = std::make_unique<CommandBarMaterial>(widget_.get(), options_.prefs,
++      base::BindRepeating([](base::WeakPtr<CommandPanelPresentation> owner) {
++        CommandBarMaterial::Clip clip;
++        if (owner && owner->panel_) clip.contour = owner->panel_->GetContourPath();
++        return clip;
++      }, weak_factory_.GetWeakPtr()),
++      base::BindRepeating([](base::WeakPtr<CommandPanelPresentation> owner, bool enabled) {
++        if (owner && owner->panel_) owner->panel_->SetNativeMaterial(enabled);
++      }, weak_factory_.GetWeakPtr()));
++  panel_->SetGeometryChangedCallback(base::BindRepeating(
++      &CommandPanelPresentation::RefreshMaterial, weak_factory_.GetWeakPtr()));
++  material_->Refresh();
++  auto panel_changed = options_.panel_changed;
++  if (panel_changed) panel_changed.Run(panel_);
++  if (!life || !widget_ || !panel_ || closing_) return true;
++  widget_->Show();
++  if (!life || !widget_ || !panel_ || closing_) return true;
++  panel_->SetHeightResizeCallback(base::BindRepeating(
++      [](base::WeakPtr<CommandPanelPresentation> owner, std::optional<int> height,
++         base::TimeDelta duration) {
++        return owner && owner->material_ ? owner->material_->ResizeHeight(height, duration) : 0;
++      }, weak_factory_.GetWeakPtr()));
++  panel_->FocusInput();
++  auto opened = options_.opened;
++  if (opened) opened.Run(widget_.get(), started);
++  return true;
++}
++void CommandPanelPresentation::RefreshMaterial() {
++  if (material_) material_->Refresh();
++}
++void CommandPanelPresentation::RefreshContext() {
++  if (!widget_ || !panel_ || closing_) return;
++  panel_->SetUIScale(options_.scale.Run());
++  widget_->SetBounds(PopupBounds(AnchorBounds(), options_.scale.Run(),
++                                widget_->GetWindowBoundsInScreen().height()));
++  widget_->ThemeChanged();
++  RefreshMaterial();
++}
++void CommandPanelPresentation::Close(bool accepted) {
++  pending_invocation_.reset();
++  accepted_ |= accepted;
++  if (!widget_ || closing_) return;
++  closing_ = true;
++  // Executing a row can navigate or activate another window. Finish its
++  // controller callback before closing the native widget.
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE,
++      base::BindOnce([](base::WeakPtr<CommandPanelPresentation> owner) {
++        if (owner && owner->widget_ && !owner->widget_->IsClosed()) owner->widget_->Close();
++      }, weak_factory_.GetWeakPtr()));
++}
++void CommandPanelPresentation::WindowClosing() {
++  if (destroying_) return;
++  closing_ = true;
++  ScheduleDestruction();
++}
++void CommandPanelPresentation::ScheduleDestruction() {
++  if (destruction_pending_ || destroying_) return;
++  destruction_pending_ = true;
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE,
++      base::BindOnce(&CommandPanelPresentation::DestroyPopup,
++                    weak_factory_.GetWeakPtr(), true, true));
++}
++void CommandPanelPresentation::Destroy(bool accepted) {
++  accepted_ |= accepted;
++  pending_invocation_.reset();
++  DestroyPopup(false, true);
++}
++void CommandPanelPresentation::DestroyPopup(bool reopen_pending, bool notify) {
++  if (destroying_) return;
++  const auto pending = reopen_pending && parent_ ? pending_invocation_ : std::nullopt;
++  pending_invocation_.reset();
++  destruction_pending_ = false;
++  if (!widget_) return;
++  destroying_ = true;
++  closing_ = true;
++  // Old Close/Destroy tasks must never operate on a later popup generation.
++  weak_factory_.InvalidateWeakPtrs();
++  const auto closing_life = weak_factory_.GetWeakPtr();
++  auto will_close = options_.will_close;
++  if (notify && panel_ && will_close) will_close.Run(panel_);
++  if (!closing_life) return;
++  if (panel_) {
++    panel_->SetGeometryChangedCallback({});
++    panel_->SetHeightResizeCallback({});
++  }
++  material_.reset();
++  widget_->RemoveObserver(this);
++  auto widget = std::move(widget_);
++  panel_ = nullptr;
++  if (!widget->IsClosed()) widget->CloseNow();
++  widget.reset();
++  delegate_.reset();
++  const bool accepted = accepted_;
++  accepted_ = false;
++  closing_ = false;
++  destroying_ = false;
++  const auto weak = weak_factory_.GetWeakPtr();
++  auto panel_changed = options_.panel_changed;
++  if (notify && panel_changed) panel_changed.Run(nullptr);
++  if (notify && !weak) return;
++  auto closed = options_.closed;
++  if (notify && closed) closed.Run(accepted, pending.has_value());
++  if (notify && !weak) return;
++  if (pending) Show(*pending);
++}
++void CommandPanelPresentation::OnWidgetActivationChanged(views::Widget* widget, bool active) {
++  if (widget == widget_.get() && !active && !closing_ && !destroying_) Close(false);
++}
++void CommandPanelPresentation::OnWidgetDestroying(views::Widget* widget) {
++  if (widget == parent_) {
++    parent_->RemoveObserver(this);
++    parent_ = nullptr;
++    Destroy(true);
++  } else if (widget == widget_.get() && !destroying_) {
++    closing_ = true;
++    ScheduleDestruction();
++  }
++}
++void CommandPanelPresentation::OnWidgetBoundsChanged(views::Widget* widget, const gfx::Rect&) {
++  if (widget == parent_) Close(false);
++}
++void CommandPanelPresentation::OnWidgetThemeChanged(views::Widget* widget) {
++  if (widget == parent_ && widget_ && !closing_) widget_->ThemeChanged();
++}
++}  // namespace arcium
+--- /dev/null
++++ b/chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.h
+@@ -0,0 +1,97 @@
++// Copyright 2026 The Arcium Authors
++// Use of this source code is governed by the GPL-3.0 license.
++#ifndef CHROME_BROWSER_UI_VIEWS_OMNIBOX_ARCIUM_COMMAND_PANEL_PRESENTATION_H_
++#define CHROME_BROWSER_UI_VIEWS_OMNIBOX_ARCIUM_COMMAND_PANEL_PRESENTATION_H_
++
++#include <memory>
++#include <optional>
++
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
++#include "ui/color/color_provider_key.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/views/widget/widget_observer.h"
++
++class PrefService;
++namespace views {
++class View;
++class Widget;
++class WidgetDelegate;
++}
++namespace arcium {
++class CommandSession;
++class CommandPanelView;
++class CommandBarMaterial;
++
++// The browser and development hosts supply data and context. This owner keeps
++// the production popup's native geometry, focus, material and teardown together.
++class CommandPanelPresentation : public views::WidgetObserver {
++ public:
++  using SessionFactory = base::RepeatingCallback<std::unique_ptr<CommandSession>()>;
++  struct Options {
++    raw_ptr<views::Widget> parent = nullptr;
++    raw_ptr<PrefService> prefs = nullptr;
++    SessionFactory create_session;
++    base::RepeatingCallback<float()> scale;
++    // Empty uses the complete parent window, as normal browser presentation does.
++    base::RepeatingCallback<gfx::Rect()> anchor_bounds;
++    std::optional<ui::ColorProviderKey::ColorMode> color_mode;
++    base::RepeatingCallback<void(CommandPanelView*)> panel_changed;
++    base::RepeatingCallback<void(CommandPanelView*)> will_close;
++    base::RepeatingCallback<void(bool)> invocation_changed;
++    base::RepeatingCallback<void(bool accepted, bool reopening)> closed;
++    base::RepeatingCallback<void(views::Widget*, base::TimeTicks)> opened;
++  };
++
++  // A View-owned property avoids adding development state or new fields to
++  // BrowserView's widely included header. The owner must outlive its callbacks.
++  static CommandPanelPresentation* Get(const views::View* owner);
++  static CommandPanelPresentation* Install(views::View* owner, Options options);
++  static void SetSessionFactoryForTesting(views::View* owner, SessionFactory factory);
++  explicit CommandPanelPresentation(Options options);
++  ~CommandPanelPresentation() override;
++  CommandPanelPresentation(const CommandPanelPresentation&) = delete;
++  CommandPanelPresentation& operator=(const CommandPanelPresentation&) = delete;
++
++  bool Show(bool new_tab);
++  void Close(bool accepted = false);
++  void Destroy(bool accepted = true);
++  void RefreshContext();
++  bool is_open() const;
++  bool is_closing() const { return closing_; }
++  bool new_tab() const { return new_tab_; }
++  views::Widget* widget() const { return widget_.get(); }
++  CommandPanelView* panel() const { return panel_; }
++  static gfx::Rect PopupBounds(const gfx::Rect& anchor, float scale, int height);
++
++  void OnWidgetActivationChanged(views::Widget* widget, bool active) override;
++  void OnWidgetDestroying(views::Widget* widget) override;
++  void OnWidgetThemeChanged(views::Widget* widget) override;
++  void OnWidgetBoundsChanged(views::Widget* widget, const gfx::Rect& bounds) override;
++
++ private:
++  gfx::Rect AnchorBounds() const;
++  void WindowClosing();
++  void ScheduleDestruction();
++  void DestroyPopup(bool reopen_pending, bool notify);
++  void RefreshMaterial();
++  Options options_;
++  raw_ptr<views::View> owner_ = nullptr;
++  raw_ptr<views::Widget> parent_ = nullptr;
++  // Reverse destruction keeps the delegate alive until the widget is gone.
++  std::unique_ptr<views::WidgetDelegate> delegate_;
++  std::unique_ptr<views::Widget> widget_;
++  std::unique_ptr<CommandBarMaterial> material_;
++  raw_ptr<CommandPanelView> panel_ = nullptr;
++  std::optional<bool> pending_invocation_;
++  bool new_tab_ = false;
++  bool accepted_ = false;
++  bool closing_ = false;
++  bool destroying_ = false;
++  bool destruction_pending_ = false;
++  base::WeakPtrFactory<CommandPanelPresentation> weak_factory_{this};
++};
++}  // namespace arcium
++#endif
+--- /dev/null
++++ b/chrome/browser/ui/views/omnibox/arcium_command_panel_sources.gni
+@@ -0,0 +1,20 @@
++# One production implementation for browser and UI development hosts.
++arcium_command_panel_sources = [
++  "//chrome/browser/ui/views/omnibox/arcium_command_panel.cc",
++  "//chrome/browser/ui/views/omnibox/arcium_command_panel.h",
++  "//chrome/browser/ui/views/omnibox/arcium_command_bar_material.cc",
++  "//chrome/browser/ui/views/omnibox/arcium_command_bar_material.h",
++  "//chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.cc",
++  "//chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.h",
++]
++
++# Consumers must be testonly. These are inert scenario providers, not browser prefs.
++arcium_command_workshop_sources = [
++  "//chrome/test/arcium_command_workshop_support.cc",
++  "//chrome/test/arcium_command_workshop_support.h",
++]
++
++# Pure palette resolution, shared without the Browser-backed Space service.
++arcium_space_palette_resolver_sources = [
++  "//chrome/browser/ui/helium/helium_space_palette_resolver.cc",
++]
+--- a/chrome/browser/ui/helium/helium_space.cc
++++ b/chrome/browser/ui/helium/helium_space.cc
+@@ -202,14 +202,7 @@
+   return dict;
+ }
+ 
+-const SpaceGlow* ResolveSpaceAccentGlow(const SpaceBackground& background,
+-                                       std::string_view id) {
+-  if (background.glows.empty()) {
+-    return nullptr;
+-  }
+-  const auto found = std::ranges::find(background.glows, id, &SpaceGlow::id);
+-  return found == background.glows.end() ? &background.glows.front() : &*found;
+-}
++
+ 
+ void SpaceTheme::NormalizePaletteSource() {
+   if (!background) {
+--- /dev/null
++++ b/chrome/test/arcium_command_workshop_support.cc
+@@ -0,0 +1,385 @@
++// Copyright 2026 The Arcium Authors
++// Use of this source code is governed by the GPL-3.0 license.
++#include "chrome/test/arcium_command_workshop_support.h"
++
++#include <algorithm>
++#include <cmath>
++#include <utility>
++#include <vector>
++
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/json/json_reader.h"
++#include "base/memory/weak_ptr.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
++#include "ui/events/event.h"
++#include "ui/views/controls/textfield/textfield.h"
++#include "chrome/browser/ui/helium/space_palette.h"
++#include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
++#include "chrome/browser/ui/views/helium/surface_style.h"
++#include "base/task/single_thread_task_runner.h"
++#include "base/time/time.h"
++#include "chrome/browser/ui/omnibox/arcium_command_example_session.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++
++namespace arcium::workshop {
++namespace {
++using CommandPublicationPtr = std::shared_ptr<const CommandPublication>;
++SkColor ContextColor(const base::DictValue* palette, const char* name, SkColor fallback) {
++  if (!palette) return fallback;
++  const auto* text = palette->FindString(name);
++  uint32_t color = 0;
++  if (!text || text->size() != 7 || (*text)[0] != '#' ||
++      !base::HexStringToUInt(std::string_view(*text).substr(1), &color)) return fallback;
++  return SkColorSetRGB((color >> 16) & 255, (color >> 8) & 255, color & 255);
++}
++struct Step {
++  int delay_ms;
++  int rows;
++  bool done;
++  bool reorder = false;
++};
++
++class ScriptedSession : public CommandSession {
++ public:
++  explicit ScriptedSession(const base::DictValue& document)
++      : examples_(ScenarioScopes()) {
++    fixture_ = *document.FindString("fixture");
++    if (const auto* steps = document.FindList("publications")) {
++      for (const auto& value : *steps) {
++        const auto& step = value.GetDict();
++        steps_.push_back({*step.FindInt("delay_ms"), *step.FindInt("rows"),
++                          *step.FindBool("done"), step.FindBool("reorder").value_or(false)});
++      }
++    } else if (fixture_ == "streaming") {
++      steps_ = {{0, 4, false}, {45, 8, false}, {120, 2, false},
++                {180, 8, false, true}, {260, 6, true}};
++    } else {
++      steps_ = {{0, fixture_ == "empty" ? 0 : 20, true}};
++    }
++  }
++  ~ScriptedSession() override { Cancel(); }
++  void SetInvocation(CommandInvocationMode mode) override { examples_.SetInvocation(mode); }
++  void SetResultLimit(size_t limit) override { limit_ = std::clamp(limit, size_t{1}, size_t{20}); }
++  std::vector<CommandScopeDescriptor> GetScopes() const override { return ScenarioScopes(); }
++  void Search(CommandScopeId scope, std::u16string query, CommandPublishCallback publish) override {
++    Cancel();
++    const uint64_t epoch = ++epoch_;
++    examples_.SetResultLimit(20);
++    CommandPublicationPtr full;
++    examples_.Search(scope, fixture_ == "streaming" ? std::u16string() : query, base::BindRepeating(
++        [](CommandPublicationPtr* result, CommandPublicationPtr publication) { *result = std::move(publication); },
++        &full));
++    if (fixture_ == "streaming") {
++      auto unfiltered = std::make_shared<CommandPublication>(*full);
++      unfiltered->query = query; full = std::move(unfiltered);
++    }
++    for (const auto& step : steps_) {
++      if (steps_.size() == 1 && step.delay_ms == 0 && fixture_ != "streaming") {
++        Publish(full, step, epoch, publish);
++        continue;
++      }
++      base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(FROM_HERE,
++          base::BindOnce(&ScriptedSession::Publish, weak_factory_.GetWeakPtr(), full,
++                        step, epoch, publish), base::Milliseconds(step.delay_ms));
++    }
++  }
++  void Cancel() override { weak_factory_.InvalidateWeakPtrs(); }
++  CommandMenu ResolveActions(const CommandTarget& target, std::string_view id,
++                             std::u16string_view query) override {
++    return examples_.ResolveActions(target, id, query);
++  }
++  CommandExecutionResult Execute(const CommandIntent&) override {
++    return {false, false, u"Example only"};
++  }
++ private:
++  void Publish(CommandPublicationPtr full, Step step, uint64_t epoch,
++               CommandPublishCallback publish) {
++    auto result = std::make_shared<CommandPublication>(*full);
++    result->query_epoch = epoch;
++    result->revision = base::UnguessableToken::Create();
++    result->done = step.done;
++    result->rows.resize(std::min({result->rows.size(), limit_, static_cast<size_t>(step.rows)}));
++    if (step.reorder && result->rows.size() > 1)
++      std::rotate(result->rows.begin(), result->rows.begin() + 1, result->rows.end());
++    if (fixture_ == "long") {
++      for (auto& row : result->rows) {
++        row.title += u" · A long title to check truncation, spacing, icons and selection across window sizes";
++        row.detail += u" · A second long line with more context for this example";
++      }
++    }
++    publish.Run(std::move(result));
++  }
++  CommandExampleSession examples_;
++  std::string fixture_;
++  std::vector<Step> steps_;
++  size_t limit_ = 8;
++  uint64_t epoch_ = 0;
++  base::WeakPtrFactory<ScriptedSession> weak_factory_{this};
++};
++}  // namespace
++
++base::DictValue DefaultScenario(std::string_view fixture) {
++  base::DictValue result;
++  result.Set("schema", "arcium-ui-workshop");
++  result.Set("version", 1);
++  result.Set("component", "command-bar");
++  result.Set("fixture", std::string(fixture));
++  result.Set("query", "");
++  result.Set("scope", "omni");
++  return result;
++}
++bool ValidateScenario(const base::DictValue& document, std::string* error) {
++  auto fail = [&](std::string message) { if (error) *error = std::move(message); return false; };
++  const auto* schema = document.FindString("schema");
++  const auto* component = document.FindString("component");
++  const auto* fixture = document.FindString("fixture");
++  if (!schema || *schema != "arcium-ui-workshop" || document.FindInt("version") != 1 ||
++      !component || *component != "command-bar") return fail("Unsupported workshop document");
++  if (!fixture || (*fixture != "mixed" && *fixture != "empty" && *fixture != "long" && *fixture != "streaming"))
++    return fail("Unknown fixture");
++  if (const auto* query = document.Find("query"); query && (!query->is_string() || query->GetString().size() > CommandSession::kMaxQueryLength))
++    return fail("Invalid example query");
++  if (const auto* scope = document.FindString("scope")) {
++    const auto scopes = ScenarioScopes();
++    if (std::ranges::find(scopes, *scope, &CommandScopeDescriptor::id) == scopes.end())
++      return fail("Unknown scope");
++  } else if (document.Find("scope")) return fail("Invalid scope");
++  if (const auto* key = document.Find("selected_key"); key && (!key->is_string() || key->GetString().size() > 1024))
++    return fail("Invalid selected row key");
++  if (const auto* context = document.FindDict("context")) {
++    if (const auto* scale = context->Find("scale")) {
++      if (!scale->is_double() && !scale->is_int()) return fail("Invalid UI scale");
++      if (!std::isfinite(scale->GetDouble()) || scale->GetDouble() < .8 || scale->GetDouble() > 1.25)
++        return fail("UI scale must be between 0.8 and 1.25");
++    }
++    if (const auto* value = context->Find("mode"); value &&
++        (!value->is_string() || (value->GetString() != "light" && value->GetString() != "dark")))
++      return fail("Unknown appearance mode");
++    for (const char* key : {"reduce_motion", "reduce_transparency"})
++      if (context->Find(key) && !context->FindBool(key)) return fail("Invalid accessibility input");
++    if (const auto* material = context->Find("command_material"); material &&
++        (!material->is_int() || material->GetInt() < 0 || material->GetInt() > 2))
++      return fail("Invalid command material");
++    if (const auto* surface = context->Find("surface_set"); surface &&
++        (!surface->is_string() || (surface->GetString() != "glass" && surface->GetString() != "solid" &&
++          surface->GetString() != "refractive" && surface->GetString() != "quiet" && surface->GetString() != "custom")))
++      return fail("Invalid surface set");
++    if (context->Find("surface_tuning") && !context->FindDict("surface_tuning")) return fail("Invalid surface tuning");
++    if (context->Find("chrome_appearance") && !context->FindDict("chrome_appearance"))
++      return fail("Invalid chrome appearance");
++    if (const auto* palette = context->FindDict("palette")) {
++      for (const char* key : {"seed", "companion"}) if (const auto* value = palette->Find(key)) {
++        uint32_t color;
++        if (!value->is_string() || value->GetString().size() != 7 || value->GetString()[0] != '#' ||
++            !base::HexStringToUInt(std::string_view(value->GetString()).substr(1), &color))
++          return fail("Palette colors must use #RRGGBB");
++      }
++      for (const char* key : {"controls_chroma", "panels_chroma"}) if (const auto* value = palette->Find(key)) {
++        if (!value->is_int() || value->GetInt() < 0 || value->GetInt() > 200)
++          return fail("Invalid palette chroma");
++      }
++    } else if (context->Find("palette")) return fail("Invalid palette");
++  } else if (document.Find("context")) return fail("Invalid context");
++  if (const auto* steps = document.FindList("publications")) {
++    if (steps->empty() || steps->size() > 24) return fail("A scenario needs 1 to 24 publications");
++    int previous = -1;
++    for (const auto& value : *steps) {
++      if (!value.is_dict()) return fail("Invalid publication");
++      const auto& step = value.GetDict();
++      auto delay = step.FindInt("delay_ms"); auto rows = step.FindInt("rows");
++      if (!delay || *delay < 0 || *delay > 5000 || *delay < previous ||
++          !rows || *rows < 0 || *rows > 20 || !step.FindBool("done"))
++        return fail("Invalid publication timing, row count or completion flag");
++      if (step.Find("reorder") && !step.FindBool("reorder")) return fail("Invalid reorder flag");
++      previous = *delay;
++    }
++  } else if (document.Find("publications")) return fail("Invalid publications");
++  return true;
++}
++std::optional<base::DictValue> LoadScenario(const base::FilePath& path, std::string* error) {
++  std::string data;
++  if (!base::ReadFileToStringWithMaxSize(path, &data, 1024 * 1024)) {
++    if (error) *error = "Could not read a scenario smaller than 1 MiB";
++    return std::nullopt;
++  }
++  return ParseScenario(data, error);
++}
++std::optional<base::DictValue> ParseScenario(std::string_view data, std::string* error) {
++  if (data.size() > 1024 * 1024) { if (error) *error = "Scenario exceeds 1 MiB"; return std::nullopt; }
++  auto result = base::JSONReader::ReadDict(data, base::JSON_PARSE_RFC);
++  if (!result || !ValidateScenario(*result, error)) return std::nullopt;
++  return result;
++}
++helium::GlassSurfaceConfiguration ContextAppearance(const base::DictValue& document) {
++  if (const auto* context = document.FindDict("context")) {
++    if (const auto* appearance = context->FindDict("chrome_appearance"))
++      return helium::ParseGlassSurfaceConfiguration(*appearance);
++  }
++  return helium::DefaultGlassSurfaceConfiguration();
++}
++helium::SpaceTheme ContextTheme(const base::DictValue& document) {
++  helium::SpaceTheme result;
++  const auto* context = document.FindDict("context");
++  const auto* palette = context ? context->FindDict("palette") : nullptr;
++  const SkColor seed = ContextColor(palette, "seed", ui::ArciumPalette().seed);
++  const SkColor companion = ContextColor(palette, "companion", seed);
++  result.background.emplace();
++  result.background->glows.push_back({.color = seed, .id = "workshop-primary"});
++  result.background->glows.push_back({.color = companion, .id = "workshop-companion"});
++  result.accent_glow_id = "workshop-primary";
++  result.color = seed;
++  result.controls_chroma = palette ? palette->FindInt("controls_chroma").value_or(100) : 100;
++  result.panels_chroma = palette ? palette->FindInt("panels_chroma").value_or(35) : 35;
++  const auto* mode = context ? context->FindString("mode") : nullptr;
++  result.mode = mode && *mode == "light" ? helium::SpaceTheme::Mode::kLight : helium::SpaceTheme::Mode::kDark;
++  return result;
++}
++ui::ArciumPalette ContextPalette(const base::DictValue& document) {
++  const auto theme = ContextTheme(document);
++  return helium::SpacePaletteKey(&theme, ContextAppearance(document));
++}
++std::vector<CommandScopeDescriptor> ScenarioScopes() {
++  struct Scope { const char* id; const char16_t* label; SkColor tint; };
++  const Scope fixtures[] = {
++      {"omni", u"Omni", SkColorSetRGB(174, 112, 245)},
++      {"web", u"Web", SkColorSetRGB(100, 159, 255)},
++      {"saved", u"Saved", SkColorSetRGB(205, 182, 112)},
++      {"youtube", u"YouTube", SkColorSetRGB(240, 75, 70)},
++      {"x", u"X", SkColorSetRGB(210, 215, 220)},
++      {"chatgpt", u"ChatGPT", SkColorSetRGB(89, 206, 157)}};
++  std::vector<CommandScopeDescriptor> result;
++  int index = 0;
++  for (const auto& fixture : fixtures) {
++    CommandScopeDescriptor scope;
++    scope.id = fixture.id; scope.label = fixture.label; scope.tint = fixture.tint;
++    scope.provider_id = "workshop";
++    scope.placeholder = u"Search " + scope.label;
++    scope.search_verb = u"Search " + scope.label;
++    if (scope.id == kOmniScope) scope.placeholder = u"Search tabs, Pins, Favorites and the web";
++    scope.accessibility_description = scope.placeholder;
++    SkBitmap bitmap; bitmap.allocN32Pixels(16, 16); bitmap.eraseColor(SK_ColorTRANSPARENT);
++    // Identical fixture pixels in both hosts, independent of SF Symbol versions.
++    for (int y = 2; y < 14; ++y) for (int x = 2; x < 14; ++x) {
++      if (x == 2 || x == 13 || y == 2 || y == 13 || (x + y + index) % 5 == 0)
++        *bitmap.getAddr32(x, y) = fixture.tint;
++    }
++    bitmap.setImmutable();
++    scope.icon = gfx::ImageSkia::CreateFrom1xBitmap(bitmap);
++    result.push_back(std::move(scope));
++    ++index;
++  }
++  return result;
++}
++base::DictValue ContextPreferences(const base::DictValue& document) {
++  const auto* context = document.FindDict("context");
++  const auto* tuning = context ? context->FindDict("surface_tuning") : nullptr;
++  const auto* set = context ? context->FindString("surface_set") : nullptr;
++  return base::DictValue().Set(kCommandBarAppearancePref, context ? context->FindInt("command_material").value_or(2) : 2)
++      .Set(helium::kArciumSurfaceSetPref, set ? *set : helium::kSurfaceSetGlass)
++      .Set(helium::kArciumSurfaceTuningPref, tuning ? tuning->Clone() : base::DictValue())
++      .Set(helium::kArciumChromeAppearancePref, helium::SerializeGlassSurfaceConfiguration(ContextAppearance(document)));
++}
++float ContextScale(const base::DictValue& document) {
++  const auto* context = document.FindDict("context");
++  return context ? context->FindDouble("scale").value_or(1.) : 1.;
++}
++void ApplyState(CommandPanelView* panel, const base::DictValue& document) {
++  if (!panel) return;
++  panel->FocusInput();
++  if (const auto* scope = document.FindString("scope")) {
++    for (size_t i = 0; i < panel->scope_count_for_testing() && panel->scope_for_testing() != *scope; ++i)
++      panel->HandleKeyEvent(nullptr, ui::KeyEvent(ui::EventType::kKeyPressed, ui::VKEY_RIGHT, 0));
++    // Leaving the row uses the real keyboard path and restores input focus.
++    if (panel->scopes_focused_for_testing())
++      panel->HandleKeyEvent(nullptr, ui::KeyEvent(ui::EventType::kKeyPressed, ui::VKEY_DOWN, 0));
++  }
++  const auto* text = document.FindString("query");
++  const auto query = text ? base::UTF8ToUTF16(*text) : std::u16string();
++  panel->input_for_testing()->SetText(query);
++  panel->ContentsChanged(panel->input_for_testing(), query);
++  if (const auto* selected = document.FindString("selected_key")) panel->RestoreSelectionKey(*selected);
++}
++void SaveState(CommandPanelView* panel, base::DictValue& document) {
++  if (!panel) return;
++  document.Set("query", base::UTF16ToUTF8(panel->input_for_testing()->GetText()));
++  document.Set("scope", panel->scope_for_testing());
++  const auto key = panel->CaptureSelectionKey();
++  if (key.empty()) document.Remove("selected_key"); else document.Set("selected_key", key);
++}
++std::vector<base::DictValue> VisualCases() {
++  std::vector<base::DictValue> result;
++  auto add = [&](std::string name, int reveal, int width, float scale, const char* mode,
++                 int material, int viewport = 1000) {
++    auto document = DefaultScenario();
++    document.Set("name", name);
++    document.Set("layout", base::DictValue().Set("labels", 1).Set("icons", 2)
++        .Set("scope_reveal", reveal).Set("connected", true).Set("scope_width", width)
++        .Set("scope_tints", true).Set("glow_strength", .75).Set("activity_dots", true).Set("result_count", 8));
++    document.Set("context", base::DictValue().Set("scale", static_cast<double>(scale))
++        .Set("mode", mode).Set("command_material", material).Set("viewport_width", viewport)
++        .Set("viewport_height", 680));
++    result.push_back(std::move(document));
++  };
++  for (int reveal = 0; reveal < 6; ++reveal) add("reveal-" + base::NumberToString(reveal), reveal, 2, 1, "dark", 0);
++  for (int width = 0; width < 3; ++width) add("width-" + base::NumberToString(width), 5, width, 1, "dark", 0);
++  for (float scale : {.8f, 1.1f, 1.25f}) add("scale-" + base::NumberToString(static_cast<int>(scale * 100)), 5, 2, scale, "dark", 0);
++  add("light", 5, 2, 1, "light", 0);
++  add("narrow", 5, 2, 1, "dark", 0, 600);
++  add("wide", 5, 2, 1, "dark", 0, 1250);
++  add("glass-dark", 5, 2, 1, "dark", 1);
++  add("glass-light", 5, 2, 1, "light", 1);
++  add("automatic", 5, 2, 1, "dark", 2);
++  auto long_case = result.front().Clone(); long_case.Set("name", "long"); long_case.Set("fixture", "long"); result.push_back(std::move(long_case));
++  auto empty = result.front().Clone(); empty.Set("name", "empty"); empty.Set("fixture", "empty"); result.push_back(std::move(empty));
++  for (const char* material : {"liquidGlass", "frosted", "solid"}) {
++    auto document = result.front().Clone(); document.Set("name", std::string("material-") + material);
++    auto* context = document.EnsureDict("context"); context->Set("command_material", 1);
++    context->Set("chrome_appearance", base::DictValue().Set("enabled", true).Set("material", material));
++    result.push_back(std::move(document));
++  }
++  auto clear = result.back().Clone(); clear.Set("name", "glass-clear");
++  clear.EnsureDict("context")->Set("chrome_appearance", base::DictValue().Set("enabled", true).Set("material", "liquidGlass").Set("glassStyle", "clear"));
++  result.push_back(std::move(clear));
++  auto palette = result.front().Clone(); palette.Set("name", "custom-palette");
++  palette.EnsureDict("context")->Set("palette", base::DictValue().Set("seed", "#D05588").Set("companion", "#4088CC").Set("controls_chroma", 75).Set("panels_chroma", 60));
++  result.push_back(std::move(palette));
++  const std::pair<const char*, helium::PanelMaterial> materials[] = {
++      {"solid", helium::PanelMaterial::kSolid}, {"fast", helium::PanelMaterial::kFast},
++      {"clear", helium::PanelMaterial::kLiquid}, {"liquid", helium::PanelMaterial::kSystemLiquid},
++      {"glassmorphic", helium::PanelMaterial::kGlassmorphic}};
++  for (const auto& [name, material] : materials) {
++    auto document = result.front().Clone(); document.Set("name", std::string("text-material-") + name);
++    auto tuning = helium::PresetSurfaceTuning(helium::SurfaceSet::kGlass); tuning.text_material = material;
++    document.EnsureDict("context")->Set("surface_set", "custom");
++    document.EnsureDict("context")->Set("surface_tuning", helium::SerializeSurfaceTuning(tuning));
++    document.EnsureDict("context")->Set("command_material", 2); result.push_back(std::move(document));
++  }
++  for (const char* surface : {"refractive", "quiet", "solid", "custom"}) {
++    auto document = result.front().Clone(); document.Set("name", std::string("surface-") + surface);
++    document.EnsureDict("context")->Set("surface_set", surface);
++    document.EnsureDict("context")->Set("command_material", 2); result.push_back(std::move(document));
++  }
++  for (const char* input : {"reduce_motion", "reduce_transparency"}) {
++    auto document = result.front().Clone(); document.Set("name", input);
++    document.EnsureDict("context")->Set("command_material", 1);
++    document.EnsureDict("context")->Set(input, true); result.push_back(std::move(document));
++  }
++  for (auto& document : result) {
++    const auto& name = *document.FindString("name");
++    const bool liquid = name == "glass-dark" || name == "glass-light" || name == "automatic" ||
++        name.starts_with("material-") || name == "glass-clear" || name == "text-material-liquid" ||
++        name == "text-material-glassmorphic" || name == "surface-refractive" || name == "surface-custom" || name == "reduce_motion";
++    document.Set("expected_backend", liquid ? "public-liquid" : name == "text-material-clear" ? "native-clear" :
++        name == "text-material-fast" ? "blur" : "solid");
++  }
++  return result;
++}
++std::unique_ptr<CommandSession> CreateSession(const base::DictValue& document) {
++  std::string error;
++  if (!ValidateScenario(document, &error)) return nullptr;
++  return std::make_unique<ScriptedSession>(document);
++}
++}  // namespace arcium::workshop
+--- /dev/null
++++ b/chrome/test/arcium_command_workshop_support.h
+@@ -0,0 +1,45 @@
++// Copyright 2026 The Arcium Authors
++// Use of this source code is governed by the GPL-3.0 license.
++#ifndef CHROME_TEST_ARCIUM_COMMAND_WORKSHOP_SUPPORT_H_
++#define CHROME_TEST_ARCIUM_COMMAND_WORKSHOP_SUPPORT_H_
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include "base/files/file_path.h"
++#include "base/functional/callback.h"
++#include "base/values.h"
++#include "chrome/browser/ui/omnibox/arcium_command_session.h"
++
++namespace views { class Widget; }
++namespace ui { struct ArciumPalette; }
++namespace helium { struct SpaceTheme; struct GlassSurfaceConfiguration; }
++
++namespace arcium { class CommandPanelView; class CommandPanelPresentation; }
++namespace arcium::workshop {
++// Tooling envelope only. The layout member is parsed by the production
++// preference bridge; scenario/context never become browser preferences.
++base::DictValue DefaultScenario(std::string_view fixture = "mixed");
++std::optional<base::DictValue> LoadScenario(const base::FilePath& path,
++                                          std::string* error);
++std::optional<base::DictValue> ParseScenario(std::string_view data, std::string* error);
++ui::ArciumPalette ContextPalette(const base::DictValue& document);
++helium::SpaceTheme ContextTheme(const base::DictValue& document);
++helium::GlassSurfaceConfiguration ContextAppearance(const base::DictValue& document);
++base::DictValue ContextPreferences(const base::DictValue& document);
++float ContextScale(const base::DictValue& document);
++void ApplyState(CommandPanelView* panel, const base::DictValue& document);
++void SaveState(CommandPanelView* panel, base::DictValue& document);
++std::vector<base::DictValue> VisualCases();
++// Same opaque native backdrop in both hosts, below the real material.
++void InstallBackdrop(views::Widget* parent);
++void ApplyAccessibilityContext(const base::DictValue& document);
++bool CapturePopup(views::Widget* popup, const base::FilePath& path);
++void RecordHeightTrace(base::RepeatingCallback<CommandPanelPresentation*()> popup,
++                       base::FilePath path, base::OnceClosure complete);
++base::DictValue DescribePanel(views::Widget* popup, CommandPanelView* panel);
++bool ValidateScenario(const base::DictValue& document, std::string* error);
++std::vector<CommandScopeDescriptor> ScenarioScopes();
++std::unique_ptr<CommandSession> CreateSession(const base::DictValue& document);
++}  // namespace arcium::workshop
++#endif
+--- /dev/null
++++ b/chrome/browser/ui/helium/helium_space_palette_resolver.cc
+@@ -0,0 +1,15 @@
++// Copyright 2026 The Arcium Authors
++// Use of this source code is governed by the GPL-3.0 license.
++#include "chrome/browser/ui/helium/helium_space.h"
++#include <algorithm>
++
++namespace helium {
++const SpaceGlow* ResolveSpaceAccentGlow(const SpaceBackground& background,
++                                       std::string_view id) {
++  if (background.glows.empty()) {
++    return nullptr;
++  }
++  const auto found = std::ranges::find(background.glows, id, &SpaceGlow::id);
++  return found == background.glows.end() ? &background.glows.front() : &*found;
++}
++}  // namespace helium
+--- a/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
++++ b/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
+@@ -1074,6 +1074,18 @@
+   selection_explicit_ = state.explicit_selection;
+   selection_missing_ = state.missing_selection;
+ }
++std::string CommandPanelView::CaptureSelectionKey() const {
++  return !pending_selection_key_.empty() ? pending_selection_key_
++                                        : publication_ ? SelectedKey() : std::string();
++}
++void CommandPanelView::RestoreSelectionKey(std::string key) {
++  if (actions_visible_ || key.empty()) return;
++  pending_selection_key_ = std::move(key);
++  selection_explicit_ = true; selection_missing_ = true; selected_ = -1;
++  // Start a request with the pending key already installed. Synchronous and
++  // streaming providers reconcile through the same publication path.
++  RebuildResults();
++}
+ void CommandPanelView::RebuildResults(bool resolve_menu) {
+   const std::u16string query(ClampInputForQuery());
+   if (actions_visible_) {
+--- a/chrome/browser/ui/views/omnibox/arcium_command_panel.h
++++ b/chrome/browser/ui/views/omnibox/arcium_command_panel.h
+@@ -64,6 +64,10 @@
+                    base::RepeatingCallback<void(bool)> reopen, bool new_tab = true);
+   ~CommandPanelView() override;
+   void SetInvocation(bool new_tab);
++  // Restore by stable identity across asynchronous publications, including rows
++  // that are absent until a later revision. A new user selection takes over.
++  void RestoreSelectionKey(std::string key);
++  std::string CaptureSelectionKey() const;
+   void FocusInput();
+   void SetAppearance(CommandPanelAppearance appearance);
+   void SetUIScale(float scale);
