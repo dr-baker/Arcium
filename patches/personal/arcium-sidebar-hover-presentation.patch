@@ -1,87 +1,17 @@
-Index: src/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
-===================================================================
---- src.orig/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
-+++ src/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
-@@ -161,6 +161,10 @@ VerticalTabStripStateController* Vertica
- 
- void VerticalTabStripStateController::SetDelegate(Delegate* delegate) {
-   delegate_ = delegate;
-+  if (!delegate_) {
-+    temporary_presentation_notification_timer_.Stop();
-+    temporary_expanded_presentation_ = false;
-+  }
-   if (delegate_) {
-     delegate_->SetCollapsedStateUpdatedCallback(
-         base::BindRepeating(&VerticalTabStripStateController::SetCollapsed,
-@@ -194,6 +198,9 @@ bool VerticalTabStripStateController::Is
- 
- VerticalTabStripCollapseState
- VerticalTabStripStateController::GetCollapseState() const {
-+  if (temporary_expanded_presentation_) {
-+    return VerticalTabStripCollapseState::kExpanded;
-+  }
-   if (IsCollapsed()) {
-     return VerticalTabStripCollapseState::kCollapsed;
-   }
-@@ -203,6 +210,25 @@ VerticalTabStripStateController::GetColl
-   return VerticalTabStripCollapseState::kExpanded;
- }
- 
-+void VerticalTabStripStateController::SetTemporaryExpandedPresentation(
-+    bool expanded) {
-+  if (temporary_expanded_presentation_ == expanded) {
-+    return;
-+  }
-+  temporary_expanded_presentation_ = expanded;
-+  // Coalesce after any in-flight collapse dispatch. A callback may itself
-+  // start hover reveal; nested notifications would leave later observers
-+  // with the stale outer collapsed state. This path never persists state.
-+  temporary_presentation_notification_timer_.Start(
-+      FROM_HERE, base::TimeDelta(),
-+      base::BindOnce(
-+          [](VerticalTabStripStateController* controller) {
-+            controller->on_collapse_changed_callback_list_.Notify(
-+                controller->GetCollapseState());
-+          },
-+          base::Unretained(this)));
-+}
-+
- void VerticalTabStripStateController::RequestCollapse(bool collapse) {
-   if (!delegate_) {
-     return;
-@@ -374,7 +400,7 @@ void VerticalTabStripStateController::Up
- 
- void VerticalTabStripStateController::UpdateCollapseActionItem() {
-   const bool is_collapsed =
--      GetCollapseState() != VerticalTabStripCollapseState::kExpanded;
-+      IsCollapsed() || (delegate_ && delegate_->IsCollapsing());
-   const bool should_flip_icon_direction =
-       base::i18n::IsRTL() != IsTabStripRightAligned();
- 
 Index: src/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
 ===================================================================
 --- src.orig/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
 +++ src/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
-@@ -95,6 +95,10 @@ class VerticalTabStripStateController :
-   bool IsCollapsed() const;
-   VerticalTabStripCollapseState GetCollapseState() const;
+@@ -68,6 +68,9 @@ class VerticalTabStripStateController {
+   virtual bool IsCollapsed() const = 0;
+   virtual VerticalTabStripCollapseState GetCollapseState() const = 0;
  
-+  // Expand only the views' presentation. Durable collapse, actions, session
-+  // restore and preferences continue to use state_.
-+  void SetTemporaryExpandedPresentation(bool expanded);
++  // Expand the visible presentation without persisting a different collapse state.
++  virtual void SetTemporaryExpandedPresentation(bool expanded) = 0;
 +
    // Request that the Delegate begin transitioning its collapse state.
    // The Delegate is then responsible for updating this class's collapse
    // state through SetCollapsed.
-@@ -176,6 +180,8 @@ class VerticalTabStripStateController :
-   // The collapsed state is true if and only if the tabstrip is fully collapsed.
-   // The uncollapsed width is only updated at the end of a resize operation.
-   VerticalTabStripState state_;
-+  bool temporary_expanded_presentation_ = false;
-+  base::OneShotTimer temporary_presentation_notification_timer_;
- 
-   base::RepeatingCallbackList<void(VerticalTabStripCollapseState)>
-       on_collapse_changed_callback_list_;
 Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
@@ -278,7 +208,7 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 +++ src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
-@@ -306,6 +306,7 @@ void VerticalTabStripRegionView::OnAnima
+@@ -333,6 +333,7 @@ void VerticalTabStripRegionView::OnAnima
        }
        break;
    }
@@ -286,7 +216,7 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
  }
  
  bool VerticalTabStripRegionView::IsPositionInWindowCaption(
-@@ -385,10 +386,13 @@ void VerticalTabStripRegionView::SetZenM
+@@ -431,11 +432,14 @@ void VerticalTabStripRegionView::SetFloa
  
    background->SetCorners(corners);
    background->SetOutline(outline);
@@ -296,29 +226,30 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
  }
  
  void VerticalTabStripRegionView::AddedToWidget() {
+   BaseTabStripRegionView::AddedToWidget();
 +  is_attached_to_widget_ = true;
 +  UpdateTemporaryExpandedPresentation();
    paint_as_active_subscription_ =
        GetWidget()->RegisterPaintAsActiveChangedCallback(base::BindRepeating(
-           [](VerticalTabStripRegionView* view) {
-@@ -403,6 +407,8 @@ void VerticalTabStripRegionView::AddedTo
+           &VerticalTabStripRegionView::UpdateExpandOnHoverState,
+@@ -446,6 +450,8 @@ void VerticalTabStripRegionView::AddedTo
  }
  
  void VerticalTabStripRegionView::RemovedFromWidget() {
 +  is_attached_to_widget_ = false;
 +  UpdateTemporaryExpandedPresentation();
-   widget_observation_.Reset();
    if (GetFocusManager()) {
      GetFocusManager()->RemoveFocusChangeListener(&focus_listener_);
-@@ -424,6 +430,7 @@ void VerticalTabStripRegionView::OnWidge
+   }
+@@ -498,6 +504,7 @@ views::ProposedLayout VerticalTabStripRe
  }
  
  void VerticalTabStripRegionView::Layout(PassKey) {
 +  UpdateTemporaryExpandedPresentation();
-   if (browser_view_->IsSidebarNavigationActive()) {
-     auto* toolbar = browser_view_->toolbar();
+   if (browser_view()->IsSidebarNavigationActive()) {
+     auto* toolbar = browser_view()->toolbar();
      const bool expanded = !state_controller_->IsCollapsed() ||
-@@ -553,6 +560,9 @@ views::View* VerticalTabStripRegionView:
+@@ -636,6 +643,9 @@ views::View* VerticalTabStripRegionView:
  
  bool VerticalTabStripRegionView::IsSidebarNavigationTemporarilyExpanded()
      const {
@@ -326,19 +257,19 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 +    return false;
 +  }
    const auto* controller =
-       BrowserAnimationController::From(browser_view_->browser());
+       BrowserAnimationController::From(browser_view()->browser());
    const bool collapsing_hover =
-@@ -1140,7 +1150,8 @@ void VerticalTabStripRegionView::OnColla
+@@ -1207,7 +1217,8 @@ void VerticalTabStripRegionView::OnColla
  }
  
  void VerticalTabStripRegionView::UpdateResizeAreaVisibility() {
--  if (zen_mode_floating_style_) {
-+  if (zen_mode_floating_style_ ||
+-  if (floating_style_ != FloatingStyle::kNone) {
++  if (floating_style_ != FloatingStyle::kNone ||
 +      IsSidebarNavigationTemporarilyExpanded()) {
      resize_area_->SetVisible(false);
      return;
    }
-@@ -1155,6 +1166,24 @@ void VerticalTabStripRegionView::UpdateR
+@@ -1222,6 +1233,24 @@ void VerticalTabStripRegionView::UpdateR
    resize_area_->SetVisible(is_fully_expanded || can_resize_collapsed_tab_strip);
  }
  
@@ -347,7 +278,7 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 +      is_attached_to_widget_ && IsSidebarNavigationTemporarilyExpanded();
 +  if (auto* background =
 +          static_cast<CustomCornersBackground*>(this->background())) {
-+    background->SetPaintWithNativeFrameMaterials(zen_mode_floating_style_ ||
++    background->SetPaintWithNativeFrameMaterials((floating_style_ != FloatingStyle::kNone) ||
 +                                                 expanded);
 +  }
 +  state_controller_->SetTemporaryExpandedPresentation(expanded);
@@ -360,11 +291,11 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 +  SchedulePaint();
 +}
 +
- void VerticalTabStripRegionView::UpdateColors() {
-   SchedulePaint();
- }
-@@ -1186,7 +1215,8 @@ void VerticalTabStripRegionView::UpdateE
-     std::optional<bool> hovered) {
+ bool VerticalTabStripRegionView::IsCollapseButtonHovered() const {
+   const auto* button = browser_view()->GetViewByID(
+       VIEW_ID_COLLAPSE_VERTICAL_TABS_BUTTON);
+@@ -1257,7 +1286,8 @@ void VerticalTabStripRegionView::UpdateE
+ 
    // If not collapsed, then we shouldn't be in or entering the expand on hover
    // state.
 -  if (!state_controller_->ShouldDisplayVerticalTabs() ||
@@ -373,7 +304,7 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
        !state_controller_->IsCollapsed()) {
      ResetExpandOnHoverTimers();
      is_expanded_on_hover_ = false;
-@@ -1388,6 +1418,7 @@ void VerticalTabStripRegionView::Animate
+@@ -1466,6 +1496,7 @@ void VerticalTabStripRegionView::Animate
        ->Start(TabStripAnimations::kVerticalTabStrip,
                expand ? TabStripAnimations::kExpandOnHover
                       : TabStripAnimations::kCollapseOnHover);
@@ -385,18 +316,18 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
 +++ src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
-@@ -224,6 +224,7 @@ class VerticalTabStripRegionView final
+@@ -237,6 +237,7 @@ class VerticalTabStripRegionView final
+       tabs::VerticalTabStripCollapseState collapse_state);
    void UpdateResizeAreaVisibility();
  
-   void UpdateColors();
 +  void UpdateTemporaryExpandedPresentation();
- 
    void OnAnimationProgressed(const BrowserAnimationController* controller,
                               BrowserAnimationUpdate status);
-@@ -307,6 +308,7 @@ class VerticalTabStripRegionView final
  
+@@ -328,6 +329,7 @@ class VerticalTabStripRegionView final
    base::OneShotTimer expand_on_hover_timer_;
    bool is_expanded_on_hover_ = false;
+   bool suppress_expand_on_hover_ = false;
 +  bool is_attached_to_widget_ = false;
    std::optional<base::TimeTicks> expand_on_hover_start_time_;
    base::RetainingOneShotTimer expand_on_hover_heuristic_timer_;
@@ -405,7 +336,7 @@ Index: src/chrome/test/BUILD.gn
 ===================================================================
 --- src.orig/chrome/test/BUILD.gn
 +++ src/chrome/test/BUILD.gn
-@@ -11512,6 +11512,7 @@ if (!is_android && toolkit_views) {
+@@ -9957,6 +9957,7 @@ if (!is_android && toolkit_views) {
        "//components/keyed_service/core",
        "//components/tabs:test_support",
        "//components/autofill/content/browser:test_support",
@@ -413,3 +344,95 @@ Index: src/chrome/test/BUILD.gn
        "//components/prefs",
        "//components/proxy_config",
        "//components/variations",
+Index: src/chrome/browser/ui/tabs/mock_vertical_tab_strip_state_controller.h
+===================================================================
+--- src.orig/chrome/browser/ui/tabs/mock_vertical_tab_strip_state_controller.h
++++ src/chrome/browser/ui/tabs/mock_vertical_tab_strip_state_controller.h
+@@ -28,6 +28,7 @@ class MockVerticalTabStripStateControlle
+               GetCollapseState,
+               (),
+               (const, override));
++  MOCK_METHOD(void, SetTemporaryExpandedPresentation, (bool), (override));
+   MOCK_METHOD(void, RequestCollapse, (bool), (override));
+   MOCK_METHOD(int, GetUncollapsedWidth, (), (const, override));
+   MOCK_METHOD(void, SetUncollapsedWidth, (int), (override));
+Index: src/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_impl.cc
+===================================================================
+--- src.orig/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_impl.cc
++++ src/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_impl.cc
+@@ -158,6 +158,10 @@ VerticalTabStripStateControllerImpl::Get
+ 
+ void VerticalTabStripStateControllerImpl::SetDelegate(Delegate* delegate) {
+   delegate_ = delegate;
++  if (!delegate_) {
++    temporary_presentation_notification_timer_.Stop();
++    temporary_expanded_presentation_ = false;
++  }
+   if (delegate_) {
+     delegate_->SetCollapsedStateUpdatedCallback(
+         base::BindRepeating(&VerticalTabStripStateControllerImpl::SetCollapsed,
+@@ -199,6 +203,9 @@ bool VerticalTabStripStateControllerImpl
+ 
+ VerticalTabStripCollapseState
+ VerticalTabStripStateControllerImpl::GetCollapseState() const {
++  if (temporary_expanded_presentation_) {
++    return VerticalTabStripCollapseState::kExpanded;
++  }
+   if (IsCollapsed()) {
+     return VerticalTabStripCollapseState::kCollapsed;
+   }
+@@ -208,6 +215,24 @@ VerticalTabStripStateControllerImpl::Get
+   return VerticalTabStripCollapseState::kExpanded;
+ }
+ 
++void VerticalTabStripStateControllerImpl::SetTemporaryExpandedPresentation(
++    bool expanded) {
++  if (temporary_expanded_presentation_ == expanded) {
++    return;
++  }
++  temporary_expanded_presentation_ = expanded;
++  // Coalesce after collapse dispatch so later observers cannot see stale state.
++  // Call the base notifier directly; the implementation also persists state.
++  temporary_presentation_notification_timer_.Start(
++      FROM_HERE, base::TimeDelta(),
++      base::BindOnce(
++          [](VerticalTabStripStateControllerImpl* controller) {
++            controller->VerticalTabStripStateController::NotifyCollapseChanged(
++                controller->GetCollapseState());
++          },
++          base::Unretained(this)));
++}
++
+ void VerticalTabStripStateControllerImpl::RequestCollapse(bool collapse) {
+   if (!delegate_) {
+     return;
+@@ -357,7 +382,7 @@ void VerticalTabStripStateControllerImpl
+ 
+ void VerticalTabStripStateControllerImpl::UpdateCollapseActionItem() {
+   const bool is_collapsed =
+-      GetCollapseState() != VerticalTabStripCollapseState::kExpanded;
++      IsCollapsed() || (delegate_ && delegate_->IsCollapsing());
+   const bool should_flip_icon_direction =
+       base::i18n::IsRTL() != IsTabStripRightAligned();
+ 
+Index: src/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_impl.h
+===================================================================
+--- src.orig/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_impl.h
++++ src/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_impl.h
+@@ -54,6 +54,7 @@ class VerticalTabStripStateControllerImp
+ 
+   bool IsCollapsed() const override;
+   VerticalTabStripCollapseState GetCollapseState() const override;
++  void SetTemporaryExpandedPresentation(bool expanded) override;
+ 
+   // Request that the Delegate begin transitioning its collapse state.
+   // The Delegate is then responsible for updating this class's collapse
+@@ -122,6 +123,8 @@ class VerticalTabStripStateControllerImp
+   // The collapsed state is true if and only if the tabstrip is fully collapsed.
+   // The uncollapsed width is only updated at the end of a resize operation.
+   VerticalTabStripState state_;
++  bool temporary_expanded_presentation_ = false;
++  base::OneShotTimer temporary_presentation_notification_timer_;
+ 
+   base::ScopedObservation<GlobalBrowserCollection, BrowserCollectionObserver>
+       browser_collection_observation_{this};

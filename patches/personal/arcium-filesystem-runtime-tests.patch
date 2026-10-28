@@ -1,16 +1,16 @@
 --- a/content/browser/file_system_access/file_system_access_file_handle_impl_unittest.cc
 +++ b/content/browser/file_system_access/file_system_access_file_handle_impl_unittest.cc
-@@ -1221,6 +1221,7 @@ class FileSystemAccessFileHandleImplMove
-                 IsFileTypeDangerous_(target_basename, origin))
+@@ -1462,6 +1462,7 @@ class FileSystemAccessFileHandleImplMove
+     EXPECT_CALL(permission_context_, IsFileTypeDangerous_(target_basename))
          .WillRepeatedly(testing::Return(!expects_safe_name));
  
 +    EXPECT_CALL(permission_context_, PerformAfterWriteChecks_).Times(0);
      if (expected_status == FileSystemAccessStatus::kOk) {
        DCHECK(!expected_sensitive_entry_result.has_value() ||
               *expected_sensitive_entry_result ==
-@@ -1244,8 +1245,8 @@ class FileSystemAccessFileHandleImplMove
+@@ -1485,8 +1486,8 @@ class FileSystemAccessFileHandleImplMove
                FileSystemAccessPermissionContext::HandleType::kFile,
-               FileSystemAccessPermissionContext::UserAction::kSave,
+               FileSystemAccessPermissionContext::AccessTrigger::kSave,
                web_contents_->GetPrimaryMainFrame()->GetGlobalId(), testing::_))
 -          .WillOnce(
 -              base::test::RunOnceCallback<5>(*expected_sensitive_entry_result));
@@ -19,7 +19,7 @@
      }
  
      if (!parent_grant) {
-@@ -1260,27 +1261,11 @@ class FileSystemAccessFileHandleImplMove
+@@ -1501,27 +1502,11 @@ class FileSystemAccessFileHandleImplMove
      }
  
      if (expected_status == FileSystemAccessStatus::kOk) {
@@ -48,7 +48,7 @@
      if (gesture_present()) {
        static_cast<TestRenderFrameHost*>(web_contents_->GetPrimaryMainFrame())
            ->SimulateUserActivation();
-@@ -1349,22 +1334,7 @@ class FileSystemAccessFileHandleImplMove
+@@ -1589,22 +1574,7 @@ class FileSystemAccessFileHandleImplMove
          .WillOnce(base::test::RunOnceCallback<5>(
              FileSystemAccessPermissionContext::SensitiveEntryResult::kAllowed));
  
@@ -72,7 +72,7 @@
      EXPECT_CALL(permission_context_,
                  NotifyEntryMoved(origin, PathInfo(source), PathInfo(target)));
  
-@@ -2174,10 +2144,7 @@ TEST_F(FileSystemAccessFileHandleImplRen
+@@ -2424,10 +2394,7 @@ TEST_F(FileSystemAccessFileHandleImplRen
            web_contents_->GetPrimaryMainFrame()->GetGlobalId(), testing::_))
        .WillOnce(base::test::RunOnceCallback<5>(
            FileSystemAccessPermissionContext::SensitiveEntryResult::kAllowed));
@@ -86,7 +86,7 @@
    // Rename should succeed even though we didn't grant parent write permission.
 --- a/content/browser/file_system_access/file_system_access_file_writer_impl_unittest.cc
 +++ b/content/browser/file_system_access/file_system_access_file_writer_impl_unittest.cc
-@@ -634,32 +634,14 @@ class FileSystemAccessFileWriterAfterWri
+@@ -666,34 +666,14 @@ class FileSystemAccessFileWriterAfterWri
            PathInfo());
  };
  
@@ -94,7 +94,7 @@
 +TEST_F(FileSystemAccessFileWriterAfterWriteChecksTest,
 +       CloseCommitsWithoutAfterWriteScan) {
    uint64_t bytes_written;
-   FileSystemAccessStatus result = WriteSync(0, "abc", &bytes_written);
+   FileSystemAccessStatus result = WriteSync(0, "abc", &bytes_written)->status;
    EXPECT_EQ(result, FileSystemAccessStatus::kOk);
    EXPECT_EQ(bytes_written, 3u);
  
@@ -114,6 +114,8 @@
 -              Field(&FileSystemAccessWriteItem::sha256_hash, Eq(expected_hash)),
 -              Field(&FileSystemAccessWriteItem::size, Eq(3)),
 -              Field(&FileSystemAccessWriteItem::frame_url, Eq(kTestURL)),
+-              Field(&FileSystemAccessWriteItem::initiating_frame_id,
+-                    Eq(kFrameId)),
 -              Field(&FileSystemAccessWriteItem::has_user_gesture, Eq(false))),
 -          kFrameId, _))
 -      .WillOnce(base::test::RunOnceCallback<2>(
@@ -122,13 +124,13 @@
    EXPECT_CALL(permission_context_, NotifyEntryModified(_, _)).Times(1);
  
    result = CloseSync();
-@@ -673,61 +655,20 @@ TEST_F(FileSystemAccessFileWriterAfterWr
+@@ -707,61 +687,20 @@ TEST_F(FileSystemAccessFileWriterAfterWr
        file_system_context_.get(), test_file_url_, 3));
  }
  
 -TEST_F(FileSystemAccessFileWriterAfterWriteChecksTest, Block) {
 -  uint64_t bytes_written;
--  FileSystemAccessStatus result = WriteSync(0, "abc", &bytes_written);
+-  FileSystemAccessStatus result = WriteSync(0, "abc", &bytes_written)->status;
 -  EXPECT_EQ(result, FileSystemAccessStatus::kOk);
 -  EXPECT_EQ(bytes_written, 3u);
 -
@@ -151,7 +153,7 @@
 -       HandleCloseDuringCheckOK) {
 +       HandleCloseCompletesWithoutAfterWriteScan) {
    uint64_t bytes_written;
-   FileSystemAccessStatus result = WriteSync(0, "abc", &bytes_written);
+   FileSystemAccessStatus result = WriteSync(0, "abc", &bytes_written)->status;
    EXPECT_EQ(result, FileSystemAccessStatus::kOk);
    EXPECT_EQ(bytes_written, 3u);
  
@@ -187,13 +189,13 @@
    task_environment_.RunUntilIdle();
    EXPECT_FALSE(storage::AsyncFileTestHelper::FileExists(
        file_system_context_.get(), test_swap_url_,
-@@ -737,47 +678,6 @@ TEST_F(FileSystemAccessFileWriterAfterWr
+@@ -771,47 +710,6 @@ TEST_F(FileSystemAccessFileWriterAfterWr
  }
  
  TEST_F(FileSystemAccessFileWriterAfterWriteChecksTest,
 -       HandleCloseDuringCheckNotOK) {
 -  uint64_t bytes_written;
--  FileSystemAccessStatus result = WriteSync(0, "abc", &bytes_written);
+-  FileSystemAccessStatus result = WriteSync(0, "abc", &bytes_written)->status;
 -  EXPECT_EQ(result, FileSystemAccessStatus::kOk);
 -  EXPECT_EQ(bytes_written, 3u);
 -
@@ -235,7 +237,7 @@
         DestructDuringMoveQuarantines) {
    // This test uses kFileSystemTypeTest to be able to intercept file system
    // operations. As such, recreate urls and handle_.
-@@ -806,25 +706,11 @@ TEST_F(FileSystemAccessFileWriterAfterWr
+@@ -840,25 +738,11 @@ TEST_F(FileSystemAccessFileWriterAfterWr
    EXPECT_EQ(result, FileSystemAccessStatus::kOk);
    EXPECT_EQ(bytes_written, 3u);
  
@@ -265,7 +267,7 @@
    // About to start the move operation. Now destroy the writer. The
 --- a/content/browser/file_system_access/file_system_access_manager_impl_unittest.cc
 +++ b/content/browser/file_system_access/file_system_access_manager_impl_unittest.cc
-@@ -834,10 +834,7 @@ TEST_F(FileSystemAccessManagerImplTest,
+@@ -1082,10 +1082,7 @@ TEST_F(FileSystemAccessManagerImplTest,
        storage::AsyncFileTestHelper::kDontCheckSize));
    writer_remote->Close(base::DoNothing());
  
@@ -277,7 +279,7 @@
  
    // Severs the mojo pipe, but the writer should not be destroyed.
    writer_remote.reset();
-@@ -926,10 +923,7 @@ TEST_F(FileSystemAccessManagerImplTest,
+@@ -1174,10 +1171,7 @@ TEST_F(FileSystemAccessManagerImplTest,
        file_system_context_.get(), test_file_url,
        storage::AsyncFileTestHelper::kDontCheckSize));
  
@@ -291,7 +293,7 @@
    // destroyed until the file is written out.
 --- a/content/browser/file_system_access/file_system_access_safe_move_helper_unittest.cc
 +++ b/content/browser/file_system_access/file_system_access_safe_move_helper_unittest.cc
-@@ -511,29 +511,11 @@ class FileSystemAccessSafeMoveHelperAfte
+@@ -511,31 +511,11 @@ class FileSystemAccessSafeMoveHelperAfte
        permission_context_;
  };
  
@@ -316,6 +318,8 @@
 -              Field(&FileSystemAccessWriteItem::sha256_hash, Eq(expected_hash)),
 -              Field(&FileSystemAccessWriteItem::size, Eq(3)),
 -              Field(&FileSystemAccessWriteItem::frame_url, Eq(kTestURL)),
+-              Field(&FileSystemAccessWriteItem::initiating_frame_id,
+-                    Eq(kFrameId)),
 -              Field(&FileSystemAccessWriteItem::has_user_gesture, Eq(false))),
 -          kFrameId, _))
 -      .WillOnce(base::test::RunOnceCallback<2>(
@@ -324,7 +328,7 @@
  
    helper_->Start(base::BindLambdaForTesting(
        [](blink::mojom::FileSystemAccessErrorPtr result) {
-@@ -548,27 +530,6 @@ TEST_F(FileSystemAccessSafeMoveHelperAft
+@@ -550,27 +530,6 @@ TEST_F(FileSystemAccessSafeMoveHelperAft
        file_system_context_.get(), test_dest_url_, 3));
  }
  
