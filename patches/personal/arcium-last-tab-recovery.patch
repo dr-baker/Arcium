@@ -1,14 +1,14 @@
 --- a/chrome/browser/ui/tabs/tab_strip_model.cc
 +++ b/chrome/browser/ui/tabs/tab_strip_model.cc
-@@ -120,6 +120,7 @@
- #include "components/web_modal/web_contents_modal_dialog_manager.h"
+@@ -121,6 +121,7 @@
  #include "components/webapps/common/web_app_id.h"
  #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/navigation_controller.h"
 +#include "content/public/browser/navigation_controller.h"
  #include "content/public/browser/reload_type.h"
  #include "content/public/browser/render_process_host.h"
  #include "content/public/browser/render_widget_host.h"
-@@ -222,6 +223,73 @@ class ReentrancyCheck {
+@@ -223,6 +224,73 @@ class ReentrancyCheck {
    const raw_ptr<bool> guard_flag_;
  };
  
@@ -82,35 +82,25 @@
  // Returns true if the specified transition is one of the types that cause the
  // opener relationships for the tab in which the transition occurred to be
  // forgotten. This is generally any navigation that isn't a link click (i.e.
-@@ -1480,11 +1548,26 @@ void TabStripModel::CloseAllTabs() {
- }
- 
- void TabStripModel::CloseAllTabsInGroup(const tab_groups::TabGroupId& group) {
--  ReentrancyCheck reentrancy_check(&reentrancy_guard_);
-   if (!group_model_) {
-     return;
+@@ -1480,6 +1548,17 @@ void TabStripModel::CloseAllTabsInGroup(
+     ExitFocusMode(TabGroupFocusExitReason::kGroupClosed);
    }
  
-+  // The group close path holds the reentrancy guard while it closes its tabs.
-+  // Add a recovery tab before entering that guarded operation because adding a
-+  // tab re-enters the model.
-+  TabGroup* const tab_group = group_model_->GetTabGroup(group);
-+  if (!tab_group) {
-+    return;
-+  }
-+  const gfx::Range tabs_in_group = tab_group->ListTabs();
++  // Prepare the ordinary-tab recovery before entering the guarded close.
++  const gfx::Range tabs_in_group = group_model_->GetTabGroup(group)->ListTabs();
 +  const std::vector<int> reversed_group_indices =
 +      gfx::Range(tabs_in_group.GetMax(), tabs_in_group.GetMin()).ToIntVector();
 +  const std::vector<content::WebContents*> closing_tabs =
 +      GetWebContentsesByIndices(reversed_group_indices);
 +  AddEmptyTabBeforeClosingLastOrdinaryTabs(this, closing_tabs, closing_all_);
++  if (!group_model_ || !group_model_->ContainsTabGroup(group)) {
++    return;
++  }
 +
-+  ReentrancyCheck reentrancy_check(&reentrancy_guard_);
-+
-   if (focused_group_ == group) {
-     SetFocusedGroup(std::nullopt);
-   }
-@@ -1494,6 +1577,18 @@ void TabStripModel::CloseAllTabsInGroup(
+   const int num_tabs_in_group = group_model_->GetTabGroup(group)->tab_count();
+   if (count() == num_tabs_in_group) {
+     // If the group about to be closed has all of the tabs in the browser, add a
+@@ -1500,6 +1579,18 @@ void TabStripModel::CloseAllTabsInGroup(
  
  void TabStripModel::CloseAllTabsInGroupImpl(
      const tab_groups::TabGroupId& group) {
@@ -129,34 +119,28 @@
    delegate_->WillCloseGroup(group);
  
    for (TabStripModelObserver& observer : observers_) {
-@@ -3505,16 +3600,19 @@ void TabStripModel::ExecuteCloseTabs(
-       std::move(get_tabs_to_close).Run();
-   if (base::CommandLine::ForCurrentProcess()->
-           GetSwitchValueASCII("close-window-with-last-tab") == "never" &&
--          static_cast<int>(tabs_to_close.size()) == count())
--      delegate()->AddTabAt(GURL(), -1, true);
+@@ -3821,15 +3912,16 @@ void TabStripModel::ExecuteCloseTabs(
+           "close-window-with-last-tab") == "never") {
+     delegate()->AddTabAt(GURL(), -1, true);
+   }
 -  ReentrancyCheck reentrancy_check(&reentrancy_guard_);
 -
 -  CreateHistoricalSplitIfClosing(tabs_to_close, close_types);
-+      static_cast<int>(tabs_to_close.size()) == count())
-+    delegate()->AddTabAt(GURL(), -1, true);
- 
+-
    std::vector<content::WebContents*> web_contents_to_close;
--  for (tabs::TabInterface* t : tabs_to_close) {
--    web_contents_to_close.push_back(t->GetContents());
-+  for (tabs::TabInterface* tab : tabs_to_close) {
-+    web_contents_to_close.push_back(tab->GetContents());
+   for (tabs::TabInterface* t : tabs_to_close) {
+     web_contents_to_close.push_back(t->GetContents());
    }
-+  AddEmptyTabBeforeClosingLastOrdinaryTabs(this, web_contents_to_close,
-+                                            closing_all_);
-+
-+  ReentrancyCheck reentrancy_check(&reentrancy_guard_);
-+
-+  CreateHistoricalSplitIfClosing(tabs_to_close, close_types);
  
++  AddEmptyTabBeforeClosingLastOrdinaryTabs(this, web_contents_to_close,
++                                         closing_all_);
++  ReentrancyCheck reentrancy_check(&reentrancy_guard_);
++  CreateHistoricalSplitIfClosing(tabs_to_close, close_types);
++
    CloseTabs(web_contents_to_close, close_types);
  }
-@@ -4078,6 +4176,14 @@ void TabStripModel::CloseTabs(base::span
+ 
+@@ -4490,6 +4582,14 @@ void TabStripModel::CloseTabs(base::span
      return;
    }
  
@@ -173,7 +157,7 @@
    if (closing_all) {
 --- a/chrome/browser/ui/tabs/tab_strip_model_unittest.cc
 +++ b/chrome/browser/ui/tabs/tab_strip_model_unittest.cc
-@@ -25,6 +25,7 @@
+@@ -29,6 +29,7 @@
  #include "base/strings/string_split.h"
  #include "base/strings/string_util.h"
  #include "base/strings/utf_string_conversions.h"
@@ -181,7 +165,7 @@
  #include "base/test/metrics/histogram_tester.h"
  #include "base/test/metrics/user_action_tester.h"
  #include "base/test/mock_callback.h"
-@@ -569,6 +570,166 @@ class TabStripModelTest : public testing
+@@ -632,6 +633,166 @@ class TabStripModelTest : public testing
    std::unique_ptr<TabStripModel> tabstrip_ = nullptr;
  };
  
@@ -350,7 +334,7 @@
  
 --- a/chrome/browser/ui/tabs/test_tab_strip_model_delegate.cc
 +++ b/chrome/browser/ui/tabs/test_tab_strip_model_delegate.cc
-@@ -20,7 +20,11 @@ void TestTabStripModelDelegate::AddTabAt
+@@ -23,7 +23,11 @@ void TestTabStripModelDelegate::AddTabAt
      int index,
      bool foreground,
      std::optional<tab_groups::TabGroupId> group,
@@ -361,9 +345,9 @@
 +  }
 +}
  
- Browser* TestTabStripModelDelegate::CreateNewStripWithTabs(
+ BrowserWindowInterface* TestTabStripModelDelegate::CreateNewStripWithTabs(
      std::vector<NewStripContents> tabs,
-@@ -107,7 +111,7 @@ bool TestTabStripModelDelegate::ShouldRu
+@@ -110,7 +114,7 @@ bool TestTabStripModelDelegate::ShouldRu
  
  bool TestTabStripModelDelegate::RunUnloadListenerBeforeClosing(
      content::WebContents* contents) {
@@ -372,7 +356,7 @@
  }
  
  bool TestTabStripModelDelegate::CanReload() const {
-@@ -137,7 +141,7 @@ bool TestTabStripModelDelegate::CanGoBac
+@@ -140,7 +144,7 @@ bool TestTabStripModelDelegate::CanGoBac
  }
  
  bool TestTabStripModelDelegate::IsNormalWindow() {
@@ -420,7 +404,7 @@
  
    // Overridden from TabStripModelDelegate:
    void AddTabAt(const GURL& url,
-@@ -96,6 +110,9 @@ class TestTabStripModelDelegate : public
+@@ -100,6 +114,9 @@ class TestTabStripModelDelegate : public
  
   private:
    raw_ptr<BrowserWindowInterface> browser_window_interface_;

@@ -1,0 +1,1865 @@
+Index: src/chrome/browser/ui/omnibox/arcium_command_action_router.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_action_router.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_action_router.cc
+@@ -3,6 +3,8 @@
+ 
+ #include "chrome/browser/ui/omnibox/arcium_command_action_router.h"
+ 
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++
+ #include <algorithm>
+ #include <string>
+ #include <utility>
+@@ -71,7 +73,7 @@ const gfx::VectorIcon& ActionGlyph(std::
+     return kOpenInBrowserIcon;
+   }
+   if (action == command_action::kOpenNewTab) {
+-    return kAdd2Icon;
++    return kAddIcon;
+   }
+   if (action == command_action::kOpenBackgroundTab ||
+       action == kActivateCommandAction) {
+@@ -170,17 +172,17 @@ PersistentRecordKind RecordKind(CommandP
+                      : PersistentRecordKind::kFavorite;
+ }
+ 
+-bool PersistentActionsEnabled(Browser* browser, HeliumSpaceService* spaces) {
++bool PersistentActionsEnabled(BrowserWindowInterface* browser, HeliumSpaceService* spaces) {
+   return browser && spaces && helium::IsHeliumFavoritesAndPinsEnabled() &&
+-         browser->type() == Browser::TYPE_NORMAL &&
+-         !browser->profile()->IsOffTheRecord() &&
+-         !browser->profile()->IsGuestSession() &&
+-         browser->profile()->GetPrefs()->GetBoolean(
++         browser->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
++         !browser->GetProfile()->IsOffTheRecord() &&
++         !browser->GetProfile()->IsGuestSession() &&
++         browser->GetProfile()->GetPrefs()->GetBoolean(
+              prefs::kArciumOmniboxPersistentItemsEnabled);
+ }
+ 
+ struct LiveTarget {
+-  Browser* browser = nullptr;
++  BrowserWindowInterface* browser = nullptr;
+   tabs::TabInterface* tab = nullptr;
+ };
+ 
+@@ -188,12 +190,12 @@ LiveTarget FindLiveTarget(Profile* profi
+   LiveTarget result;
+   ProfileBrowserCollection::GetForProfile(profile)->ForEach(
+       [profile, &identity, &result](BrowserWindowInterface* window) {
+-        Browser* browser = window->GetBrowserForMigrationOnly();
+-        if (!browser || browser->profile() != profile ||
+-            browser->session_id().id() != identity.browser_session_id) {
++        BrowserWindowInterface* browser = window;
++        if (!browser || browser->GetProfile() != profile ||
++            browser->GetSessionID().id() != identity.browser_session_id) {
+           return true;
+         }
+-        TabStripModel* model = browser->tab_strip_model();
++        TabStripModel* model = browser->GetTabStripModel();
+         for (int index = 0; index < model->count(); ++index) {
+           content::WebContents* contents = model->GetWebContentsAt(index);
+           if (contents && sessions::SessionTabHelper::IdForTab(contents).id() ==
+@@ -215,9 +217,9 @@ LiveTarget FindPersistentTarget(Profile*
+   LiveTarget result;
+   ProfileBrowserCollection::GetForProfile(profile)->ForEach(
+       [profile, spaces, &identity, &result](BrowserWindowInterface* window) {
+-        Browser* browser = window->GetBrowserForMigrationOnly();
+-        if (!browser || browser->profile() != profile ||
+-            browser->type() != Browser::TYPE_NORMAL ||
++        BrowserWindowInterface* browser = window;
++        if (!browser || browser->GetProfile() != profile ||
++            browser->GetType() != BrowserWindowInterface::TYPE_NORMAL ||
+             (IsPin(identity.kind) && spaces->GetExplicitSpaceIdForBrowser(
+                                          browser) != identity.space_id)) {
+           return true;
+@@ -237,27 +239,27 @@ LiveTarget FindPersistentTarget(Profile*
+   return result;
+ }
+ 
+-bool IsOrdinaryTab(Browser* browser,
++bool IsOrdinaryTab(BrowserWindowInterface* browser,
+                    tabs::TabInterface* tab,
+                    HeliumSpaceService* spaces) {
+-  if (!browser || browser->type() != Browser::TYPE_NORMAL || !tab ||
++  if (!browser || browser->GetType() != BrowserWindowInterface::TYPE_NORMAL || !tab ||
+       tab->GetBrowserWindowInterface() != browser ||
+       tabs::TemporaryTab::IsTemporary(tab->GetContents()) ||
+       (spaces && spaces->IsPersistentItemTab(tab))) {
+     return false;
+   }
+-  return browser->tab_strip_model()->GetIndexOfTab(tab) !=
++  return browser->GetTabStripModel()->GetIndexOfTab(tab) !=
+          TabStripModel::kNoTab;
+ }
+ 
+-bool IsOrdinaryStandalone(Browser* browser,
++bool IsOrdinaryStandalone(BrowserWindowInterface* browser,
+                           tabs::TabInterface* tab,
+                           HeliumSpaceService* spaces) {
+   return IsOrdinaryTab(browser, tab, spaces) && !tab->IsPinned() &&
+          !tab->GetGroup() && !tab->IsBlocked() && !tab->IsSplit();
+ }
+ 
+-bool CanPersistTab(Browser* browser,
++bool CanPersistTab(BrowserWindowInterface* browser,
+                    tabs::TabInterface* tab,
+                    HeliumSpaceService* spaces) {
+   return PersistentActionsEnabled(browser, spaces) &&
+@@ -467,30 +469,30 @@ WindowOpenDisposition InvocationDisposit
+   return ui::DispositionFromEventFlags(event_flags, base_disposition);
+ }
+ 
+-bool PrepareCurrentTab(base::WeakPtr<Browser> owner,
++bool PrepareCurrentTab(base::WeakPtr<BrowserWindowInterface> owner,
+                        const std::optional<CommandLiveTarget>& source) {
+   if (!owner || !source ||
+-      owner->session_id().id() != source->browser_session_id) {
++      owner->GetSessionID().id() != source->browser_session_id) {
+     return false;
+   }
+-  const LiveTarget target = FindLiveTarget(owner->profile(), *source);
++  const LiveTarget target = FindLiveTarget(owner->GetProfile(), *source);
+   if (target.browser != owner.get() || !target.tab) {
+     return false;
+   }
+   const tabs::TabHandle handle = target.tab->GetHandle();
+-  owner->tab_strip_model()->ActivateTabAt(
+-      owner->tab_strip_model()->GetIndexOfTab(target.tab));
++  owner->GetTabStripModel()->ActivateTabAt(
++      owner->GetTabStripModel()->GetIndexOfTab(target.tab));
+   return owner && handle.Get() &&
+-         owner->tab_strip_model()->GetActiveTab() == handle.Get();
++         owner->GetTabStripModel()->GetActiveTab() == handle.Get();
+ }
+ 
+-bool CanOpenSplit(Browser* owner,
++bool CanOpenSplit(BrowserWindowInterface* owner,
+                   tabs::TabInterface* source,
+                   HeliumSpaceService* spaces) {
+   const auto usable_member = [owner](tabs::TabInterface* tab) {
+-    return owner && owner->type() == Browser::TYPE_NORMAL && tab &&
++    return owner && owner->GetType() == BrowserWindowInterface::TYPE_NORMAL && tab &&
+            tab->GetBrowserWindowInterface() == owner &&
+-           owner->tab_strip_model()->GetIndexOfTab(tab) !=
++           owner->GetTabStripModel()->GetIndexOfTab(tab) !=
+                TabStripModel::kNoTab &&
+            !tabs::TemporaryTab::IsTemporary(tab->GetContents()) &&
+            !tab->GetGroup() && !tab->IsBlocked();
+@@ -504,7 +506,7 @@ bool CanOpenSplit(Browser* owner,
+   if (!source->IsSplit()) {
+     return is_saved(source) || !source->IsPinned();
+   }
+-  TabStripModel* model = owner->tab_strip_model();
++  TabStripModel* model = owner->GetTabStripModel();
+   const auto split = source->GetSplit();
+   if (!split || !model->ContainsSplit(*split)) {
+     return false;
+@@ -534,29 +536,29 @@ bool CanOpenSplit(Browser* owner,
+   });
+ }
+ 
+-void CloseUnusedCopy(base::WeakPtr<Browser> owner,
++void CloseUnusedCopy(base::WeakPtr<BrowserWindowInterface> owner,
+                      tabs::TabHandle candidate,
+                      HeliumSpaceService* spaces) {
+   if (!owner || !candidate.Get() ||
+       !IsOrdinaryStandalone(owner.get(), candidate.Get(), spaces)) {
+     return;
+   }
+-  const int index = owner->tab_strip_model()->GetIndexOfTab(candidate.Get());
++  const int index = owner->GetTabStripModel()->GetIndexOfTab(candidate.Get());
+   // No owner, router, or tab access is permitted after this close request.
+-  owner->tab_strip_model()->CloseWebContentsAt(index,
++  owner->GetTabStripModel()->CloseWebContentsAt(index,
+                                                TabCloseTypes::CLOSE_NONE);
+ }
+ 
+-CommandExecutionResult OpenSplitCopy(base::WeakPtr<Browser> owner,
++CommandExecutionResult OpenSplitCopy(base::WeakPtr<BrowserWindowInterface> owner,
+                                      CommandLiveTarget source_identity,
+                                      GURL url,
+                                      HeliumSpaceService* spaces) {
+   if (!owner || !url.SchemeIsHTTPOrHTTPS() ||
+-      owner->session_id().id() != source_identity.browser_session_id) {
++      owner->GetSessionID().id() != source_identity.browser_session_id) {
+     return Unavailable();
+   }
+   const LiveTarget source_target =
+-      FindLiveTarget(owner->profile(), source_identity);
++      FindLiveTarget(owner->GetProfile(), source_identity);
+   if (source_target.browser != owner.get() ||
+       !CanOpenSplit(owner.get(), source_target.tab, spaces)) {
+     return Unavailable();
+@@ -565,20 +567,20 @@ CommandExecutionResult OpenSplitCopy(bas
+   const auto original_split = source.Get()->GetSplit();
+   std::optional<tabs::TabHandle> other;
+   if (original_split) {
+-    if (!owner->tab_strip_model()->ContainsSplit(*original_split)) {
++    if (!owner->GetTabStripModel()->ContainsSplit(*original_split)) {
+       return Unavailable();
+     }
+     for (auto* tab :
+-         owner->tab_strip_model()->GetSplitData(*original_split)->ListTabs()) {
++         owner->GetTabStripModel()->GetSplitData(*original_split)->ListTabs()) {
+       if (tab != source.Get()) {
+         other = tab->GetHandle();
+       }
+     }
+   }
+   std::vector<tabs::TabHandle> existing_tabs;
+-  for (int index = 0; index < owner->tab_strip_model()->count(); ++index) {
++  for (int index = 0; index < owner->GetTabStripModel()->count(); ++index) {
+     existing_tabs.push_back(
+-        owner->tab_strip_model()->GetTabAtIndex(index)->GetHandle());
++        owner->GetTabStripModel()->GetTabAtIndex(index)->GetHandle());
+   }
+ 
+   // A copy preserves an existing Pin or Favorite association and prevents a
+@@ -590,7 +592,7 @@ CommandExecutionResult OpenSplitCopy(bas
+   if (!owner) {
+     return Unavailable();
+   }
+-  TabStripModel* model = owner->tab_strip_model();
++  TabStripModel* model = owner->GetTabStripModel();
+   const int inserted_index =
+       model->GetIndexOfWebContents(params.navigated_or_inserted_contents);
+   if (inserted_index == TabStripModel::kNoTab) {
+@@ -616,7 +618,7 @@ CommandExecutionResult OpenSplitCopy(bas
+     CloseUnusedCopy(owner, candidate, spaces);
+     return Unavailable();
+   }
+-  model = owner->tab_strip_model();
++  model = owner->GetTabStripModel();
+   if (model->GetActiveTab() != source.Get() ||
+       !CanOpenSplit(owner.get(), source.Get(), spaces) ||
+       !IsOrdinaryStandalone(owner.get(), candidate.Get(), spaces) ||
+@@ -640,7 +642,7 @@ CommandExecutionResult OpenSplitCopy(bas
+   // AddToNewSplit may return an ID without creating a split. GetSplitData is
+   // a checked getter, so probe the model's membership before trusting that ID.
+   if (owner && source.Get() && candidate.Get() && resulting_split &&
+-      owner->tab_strip_model()->ContainsSplit(*resulting_split) &&
++      owner->GetTabStripModel()->ContainsSplit(*resulting_split) &&
+       source.Get()->GetSplit() == resulting_split &&
+       candidate.Get()->GetSplit() == resulting_split) {
+     return Succeeded(u"Opened in Split", true);
+@@ -649,7 +651,7 @@ CommandExecutionResult OpenSplitCopy(bas
+   return Unavailable();
+ }
+ 
+-CommandExecutionResult RevealFolder(base::WeakPtr<Browser> context,
++CommandExecutionResult RevealFolder(base::WeakPtr<BrowserWindowInterface> context,
+                                     HeliumSpaceService* spaces,
+                                     CommandPersistentTarget target) {
+   if (!context || !spaces) {
+@@ -708,7 +710,7 @@ CommandExecutionResult RevealFolder(base
+   if (!context) {
+     return Unavailable();
+   }
+-  context->window()->Show();
++  context->GetWindow()->Show();
+   return Succeeded(u"Revealed folder", true);
+ }
+ 
+@@ -744,7 +746,7 @@ std::optional<GURL> BuildCommandSearchUr
+ struct ArciumCommandActionRouter::ResolvedTarget {
+   bool valid = false;
+   bool url_copy_safe = true;
+-  Browser* owner = nullptr;
++  BrowserWindowInterface* owner = nullptr;
+   tabs::TabInterface* tab = nullptr;
+   HeliumSpaceService* spaces = nullptr;
+   std::optional<CommandPersistentTarget> persistent;
+@@ -754,7 +756,7 @@ struct ArciumCommandActionRouter::Resolv
+ };
+ 
+ ArciumCommandActionRouter::ArciumCommandActionRouter(
+-    Browser* browser,
++    BrowserWindowInterface* browser,
+     CommandNativeActionCallbacks native_callbacks)
+     : browser_(browser), native_callbacks_(std::move(native_callbacks)) {}
+ 
+@@ -770,7 +772,7 @@ ArciumCommandActionRouter::ResolvedTarge
+   if (!browser_) {
+     return result;
+   }
+-  Profile* profile = browser_->profile();
++  Profile* profile = browser_->GetProfile();
+   result.spaces = helium::HeliumSpaceServiceFactory::GetForProfile(profile);
+   if (const auto* native = std::get_if<CommandNativeTarget>(&target)) {
+     if (native_callbacks_.resolve_url) {
+@@ -915,7 +917,7 @@ CommandMenu ArciumCommandActionRouter::R
+     AddAction(&menu, target, command_action::kOpenNewWindow,
+               u"Open in new window");
+     if (resolved.url_copy_safe &&
+-        helium::CanOpenUrlInLittleArc(browser_->profile(), resolved.url)) {
++        helium::CanOpenUrlInLittleArc(browser_->GetProfile(), resolved.url)) {
+       AddAction(&menu, target, command_action::kOpenLittleArc,
+                 u"Open in Little Arc");
+     }
+@@ -923,7 +925,7 @@ CommandMenu ArciumCommandActionRouter::R
+         invocation_.mode == CommandInvocationMode::kCurrentTab &&
+         invocation_.source_tab && resolved.url.SchemeIsHTTPOrHTTPS()) {
+       const LiveTarget source =
+-          FindLiveTarget(browser_->profile(), *invocation_.source_tab);
++          FindLiveTarget(browser_->GetProfile(), *invocation_.source_tab);
+       if (source.browser == browser_ &&
+           CanOpenSplit(source.browser, source.tab, resolved.spaces) &&
+           source.tab != resolved.tab &&
+@@ -939,18 +941,18 @@ CommandMenu ArciumCommandActionRouter::R
+   if (resolved.tab) {
+     AddAction(&menu, target, command_action::kReload, u"Reload");
+     const int index =
+-        resolved.owner->tab_strip_model()->GetIndexOfTab(resolved.tab);
++        resolved.owner->GetTabStripModel()->GetIndexOfTab(resolved.tab);
+     if (!resolved.persistent &&
+         IsOrdinaryTab(resolved.owner, resolved.tab, resolved.spaces) &&
+         chrome::CanDuplicateTabAt(resolved.owner, index)) {
+       AddAction(&menu, target, command_action::kDuplicate, u"Duplicate tab");
+     }
+-    if (resolved.owner->tab_strip_model()->IsTabClosable(resolved.tab)) {
++    if (resolved.owner->GetTabStripModel()->IsTabClosable(resolved.tab)) {
+       AddAction(&menu, target, command_action::kClose,
+                 resolved.persistent ? u"Close live tab" : u"Close tab");
+     }
+     if (!resolved.tab->GetContents()->GetLastCommittedURL().is_empty()) {
+-      const bool muted = IsSiteMuted(*resolved.owner->tab_strip_model(), index);
++      const bool muted = IsSiteMuted(*resolved.owner->GetTabStripModel(), index);
+       AddAction(&menu, target,
+                 muted ? command_action::kUnmuteSite : command_action::kMuteSite,
+                 muted ? u"Unmute site" : u"Mute site", kSiteMuteEntryId);
+@@ -1015,11 +1017,11 @@ CommandMenu ArciumCommandActionRouter::R
+   if (!resolved.valid) {
+     return menu;
+   }
+-  Profile* profile = browser_->profile();
++  Profile* profile = browser_->GetProfile();
+   ProfileBrowserCollection::GetForProfile(profile)->ForEach(
+       [profile, &menu, &resolved, query](BrowserWindowInterface* window) {
+-        Browser* browser = window->GetBrowserForMigrationOnly();
+-        if (!browser || browser->profile() != profile) {
++        BrowserWindowInterface* browser = window;
++        if (!browser || browser->GetProfile() != profile) {
+           return true;
+         }
+         const std::string_view space_id =
+@@ -1030,8 +1032,8 @@ CommandMenu ArciumCommandActionRouter::R
+             resolved.spaces ? resolved.spaces->GetSpaceById(space_id) : nullptr;
+         const std::u16string detail = base::StrCat(
+             {space ? space->name() : u"", space ? u" / " : u"", u"Window ",
+-             base::NumberToString16(browser->session_id().id())});
+-        TabStripModel* model = browser->tab_strip_model();
++             base::NumberToString16(browser->GetSessionID().id())});
++        TabStripModel* model = browser->GetTabStripModel();
+         for (int index = 0; index < model->count(); ++index) {
+           content::WebContents* contents = model->GetWebContentsAt(index);
+           if (!contents || contents->GetLastCommittedURL() != resolved.url ||
+@@ -1040,7 +1042,7 @@ CommandMenu ArciumCommandActionRouter::R
+             continue;
+           }
+           const CommandLiveTarget live{
+-              .browser_session_id = browser->session_id().id(),
++              .browser_session_id = browser->GetSessionID().id(),
+               .tab_session_id =
+                   sessions::SessionTabHelper::IdForTab(contents).id()};
+           CommandMenuEntry entry;
+@@ -1130,7 +1132,7 @@ CommandExecutionResult ArciumCommandActi
+     const CommandNativeTarget selection = *native;
+     const auto disposition =
+         InvocationDisposition(invocation_, intent.event_flags);
+-    const auto owner = browser_->AsWeakPtr();
++    const auto owner = browser_->GetWeakPtr();
+     const auto source = invocation_.source_tab;
+     if (disposition == WindowOpenDisposition::CURRENT_TAB &&
+         !PrepareCurrentTab(owner, source)) {
+@@ -1139,13 +1141,13 @@ CommandExecutionResult ArciumCommandActi
+     return accept ? accept.Run(selection, disposition) : Unavailable();
+   }
+   if (target.tab) {
+-    const auto owner = target.owner->AsWeakPtr();
++    const auto owner = target.owner->GetWeakPtr();
+     const tabs::TabHandle tab = target.tab->GetHandle();
+-    owner->tab_strip_model()->ActivateTabAt(
+-        owner->tab_strip_model()->GetIndexOfTab(tab.Get()));
++    owner->GetTabStripModel()->ActivateTabAt(
++        owner->GetTabStripModel()->GetIndexOfTab(tab.Get()));
+     if (owner && tab.Get() &&
+-        owner->tab_strip_model()->GetActiveTab() == tab.Get()) {
+-      owner->window()->Show();
++        owner->GetTabStripModel()->GetActiveTab() == tab.Get()) {
++      owner->GetWindow()->Show();
+       return Succeeded(u"Switched to tab", true);
+     }
+     return Unavailable();
+@@ -1161,7 +1163,7 @@ CommandExecutionResult ArciumCommandActi
+         .id = target.persistent->item_id,
+         .space_id = target.persistent->space_id};
+     HeliumSpaceService* spaces = target.spaces;
+-    Browser* source = browser_;
++    BrowserWindowInterface* source = browser_;
+     return spaces->ActivateOmniboxItem(source, item)
+                ? Succeeded(u"Opened saved item", true)
+                : Unavailable();
+@@ -1179,7 +1181,7 @@ CommandExecutionResult ArciumCommandActi
+   if (!target.url.is_valid() || target.url.is_empty()) {
+     return Unavailable();
+   }
+-  const auto owner = browser_->AsWeakPtr();
++  const auto owner = browser_->GetWeakPtr();
+   const auto source = invocation_.source_tab;
+   const GURL url = target.url;
+   const auto accept = native_callbacks_.accept;
+@@ -1212,7 +1214,7 @@ CommandExecutionResult ArciumCommandActi
+     return Unavailable();
+   }
+   const auto source = *invocation_.source_tab;
+-  const auto owner = browser_->AsWeakPtr();
++  const auto owner = browser_->GetWeakPtr();
+   const GURL url = target.url;
+   HeliumSpaceService* spaces = target.spaces;
+   return OpenSplitCopy(owner, source, url, spaces);
+@@ -1268,7 +1270,7 @@ CommandExecutionResult ArciumCommandActi
+     return ExecuteOpen(intent, target, WindowOpenDisposition::NEW_WINDOW);
+   }
+   if (action == command_action::kOpenLittleArc) {
+-    Profile* profile = browser_->profile();
++    Profile* profile = browser_->GetProfile();
+     const GURL url = target.url;
+     return helium::OpenUrlsInLittleArc(profile, {url})
+                ? Succeeded(u"Opened Little Arc", true)
+@@ -1299,7 +1301,7 @@ CommandExecutionResult ArciumCommandActi
+     const CommandPersistentTarget identity = *target.persistent;
+     const CommandDestination destination = *intent.destination;
+     HeliumSpaceService* spaces = target.spaces;
+-    Browser* context = browser_;
++    BrowserWindowInterface* context = browser_;
+     HeliumSpace* source = spaces->GetSpaceById(identity.space_id);
+     if (!source ||
+         !PersistentItemCodec::FindLink(source->pins(), identity.item_id)) {
+@@ -1344,7 +1346,7 @@ CommandExecutionResult ArciumCommandActi
+                : Unavailable();
+   }
+   if (action == command_action::kRevealFolder) {
+-    const auto context = browser_->AsWeakPtr();
++    const auto context = browser_->GetWeakPtr();
+     HeliumSpaceService* spaces = target.spaces;
+     const CommandPersistentTarget identity = *target.persistent;
+     return RevealFolder(context, spaces, identity);
+@@ -1353,7 +1355,7 @@ CommandExecutionResult ArciumCommandActi
+       action == command_action::kCollapseFolder) {
+     const CommandPersistentTarget identity = *target.persistent;
+     HeliumSpaceService* spaces = target.spaces;
+-    Browser* context = browser_;
++    BrowserWindowInterface* context = browser_;
+     const bool changed =
+         IsPin(identity.kind)
+             ? spaces->TogglePinFolderCollapsedInSpace(
+@@ -1368,7 +1370,7 @@ CommandExecutionResult ArciumCommandActi
+   if (action == command_action::kRemove) {
+     const CommandPersistentTarget identity = *target.persistent;
+     HeliumSpaceService* spaces = target.spaces;
+-    Browser* context = target.owner ? target.owner : browser_.get();
++    BrowserWindowInterface* context = target.owner ? target.owner : browser_.get();
+     const bool removed =
+         IsPin(identity.kind)
+             ? spaces->RemovePersistentItemInSpace(context, identity.space_id,
+@@ -1384,8 +1386,8 @@ CommandExecutionResult ArciumCommandActi
+     return Unavailable();
+   }
+   tabs::TabInterface* tab = target.tab;
+-  Browser* owner = target.owner;
+-  TabStripModel* model = owner->tab_strip_model();
++  BrowserWindowInterface* owner = target.owner;
++  TabStripModel* model = owner->GetTabStripModel();
+   HeliumSpaceService* spaces = target.spaces;
+   const int index = model->GetIndexOfTab(tab);
+   if (index == TabStripModel::kNoTab) {
+Index: src/chrome/browser/ui/omnibox/arcium_command_action_router.h
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_action_router.h
++++ src/chrome/browser/ui/omnibox/arcium_command_action_router.h
+@@ -13,7 +13,7 @@
+ #include "ui/base/page_transition_types.h"
+ #include "ui/base/window_open_disposition.h"
+ 
+-class Browser;
++class BrowserWindowInterface;
+ 
+ namespace arcium {
+ 
+@@ -74,7 +74,7 @@ struct CommandNativeActionCallbacks {
+ class ArciumCommandActionRouter {
+  public:
+   explicit ArciumCommandActionRouter(
+-      Browser* browser,
++      BrowserWindowInterface* browser,
+       CommandNativeActionCallbacks native_callbacks = {});
+   ~ArciumCommandActionRouter();
+ 
+@@ -105,7 +105,7 @@ class ArciumCommandActionRouter {
+       ui::PageTransition transition = ui::PAGE_TRANSITION_LINK);
+   CommandExecutionResult ExecuteSplit(const ResolvedTarget& target);
+ 
+-  raw_ptr<Browser> browser_;
++  raw_ptr<BrowserWindowInterface> browser_;
+   CommandNativeActionCallbacks native_callbacks_;
+   CommandInvocation invocation_;
+ };
+Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
+@@ -2,6 +2,8 @@
+ // Use of this source code is governed by the GPL-3.0 license.
+ 
+ #include "chrome/browser/ui/omnibox/arcium_command_action_router.h"
++
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/omnibox/arcium_command_providers.h"
+ 
+ #include <algorithm>
+@@ -196,33 +198,33 @@ class ArciumCommandEntryRoutingTest : pu
+ 
+ TEST_F(ArciumCommandEntryRoutingTest, NewTabCommandDefersCreation) {
+   AddTab(browser(), GURL("https://source.test/"));
+-  auto* source = browser()->tab_strip_model()->GetActiveWebContents();
+-  const int count = browser()->tab_strip_model()->count();
++  auto* source = browser()->GetTabStripModel()->GetActiveWebContents();
++  const int count = browser()->GetTabStripModel()->count();
+   ASSERT_TRUE(chrome::ExecuteCommand(browser(), IDC_NEW_TAB));
+   EXPECT_EQ((std::vector<bool>{true}), recording_window()->invocations);
+-  EXPECT_EQ(count, browser()->tab_strip_model()->count());
+-  EXPECT_EQ(source, browser()->tab_strip_model()->GetActiveWebContents());
++  EXPECT_EQ(count, browser()->GetTabStripModel()->count());
++  EXPECT_EQ(source, browser()->GetTabStripModel()->GetActiveWebContents());
+ }
+ 
+ TEST_F(ArciumCommandEntryRoutingTest, NewTabActionDefersCreation) {
+   AddTab(browser(), GURL("https://source.test/"));
+-  auto* source = browser()->tab_strip_model()->GetActiveWebContents();
+-  const int count = browser()->tab_strip_model()->count();
++  auto* source = browser()->GetTabStripModel()->GetActiveWebContents();
++  const int count = browser()->GetTabStripModel()->count();
+   auto* action = actions::ActionManager::Get().FindAction(
+       kActionNewTab, browser()->GetActions()->root_action_item());
+   ASSERT_TRUE(action);
+   action->InvokeAction();
+   EXPECT_EQ((std::vector<bool>{true}), recording_window()->invocations);
+-  EXPECT_EQ(count, browser()->tab_strip_model()->count());
+-  EXPECT_EQ(source, browser()->tab_strip_model()->GetActiveWebContents());
++  EXPECT_EQ(count, browser()->GetTabStripModel()->count());
++  EXPECT_EQ(source, browser()->GetTabStripModel()->GetActiveWebContents());
+ }
+ 
+ TEST_F(ArciumCommandEntryRoutingTest, FocusSearchUsesCurrentTabInvocation) {
+   AddTab(browser(), GURL("https://source.test/"));
+-  const int count = browser()->tab_strip_model()->count();
++  const int count = browser()->GetTabStripModel()->count();
+   chrome::FocusSearch(browser());
+   EXPECT_EQ((std::vector<bool>{false}), recording_window()->invocations);
+-  EXPECT_EQ(count, browser()->tab_strip_model()->count());
++  EXPECT_EQ(count, browser()->GetTabStripModel()->count());
+ }
+ 
+ TEST_F(ArciumCommandEntryRoutingTest, UnsupportedWindowCreatesOrdinaryTab) {
+@@ -230,11 +232,11 @@ TEST_F(ArciumCommandEntryRoutingTest, Un
+   profile()->GetPrefs()->SetString(prefs::kNewTabPageLocationOverride,
+                                  "about:blank");
+   AddTab(browser(), GURL("https://source.test/"));
+-  const int count = browser()->tab_strip_model()->count();
++  const int count = browser()->GetTabStripModel()->count();
+   recording_window()->handles_command_bar = false;
+   ASSERT_TRUE(chrome::ExecuteCommand(browser(), IDC_NEW_TAB));
+   EXPECT_EQ((std::vector<bool>{true}), recording_window()->invocations);
+-  EXPECT_EQ(count + 1, browser()->tab_strip_model()->count());
++  EXPECT_EQ(count + 1, browser()->GetTabStripModel()->count());
+ }
+ 
+ class ArciumCommandActionRouterTest : public BrowserWithTestWindowTest {
+@@ -276,7 +278,7 @@ class ArciumCommandActionRouterTest : pu
+           accepted_revision_ = native.result_revision;
+           accepted_disposition_ = disposition;
+           accepted_source_ =
+-              browser()->tab_strip_model()->GetActiveWebContents();
++              browser()->GetTabStripModel()->GetActiveWebContents();
+           return CommandExecutionResult{.success = true, .dismiss = true};
+         });
+     callbacks.can_open_url_copy =
+@@ -293,7 +295,7 @@ class ArciumCommandActionRouterTest : pu
+     accepted_source_ = nullptr;
+     base::RunLoop().RunUntilIdle();
+     for (auto& secondary : secondary_browsers_) {
+-      secondary->tab_strip_model()->CloseAllTabs();
++      secondary->GetTabStripModel()->CloseAllTabs();
+       secondary->GetFeatures().TearDownPreBrowserWindowDestruction();
+       secondary.reset();
+     }
+@@ -306,13 +308,13 @@ class ArciumCommandActionRouterTest : pu
+   tabs::TabInterface* AddOrdinaryTab(const char* url) {
+     AddTab(browser(), GURL(url));
+     return tabs::TabInterface::MaybeGetFromContents(
+-        browser()->tab_strip_model()->GetActiveWebContents());
++        browser()->GetTabStripModel()->GetActiveWebContents());
+   }
+ 
+   CommandLiveTarget Live(tabs::TabInterface* tab) {
+-    Browser* owner =
+-        tab->GetBrowserWindowInterface()->GetBrowserForMigrationOnly();
+-    return {.browser_session_id = owner->session_id().id(),
++    BrowserWindowInterface* owner =
++        tab->GetBrowserWindowInterface();
++    return {.browser_session_id = owner->GetSessionID().id(),
+             .tab_session_id =
+                 sessions::SessionTabHelper::IdForTab(tab->GetContents()).id()};
+   }
+@@ -338,9 +340,9 @@ class ArciumCommandActionRouterTest : pu
+                                                     std::move(pins));
+   }
+ 
+-  Browser* AddSecondaryBrowser() {
++  BrowserWindowInterface* AddSecondaryBrowser() {
+     secondary_browsers_.push_back(
+-        CreateBrowser(profile(), Browser::TYPE_NORMAL, false));
++        CreateBrowser(profile(), BrowserWindowInterface::TYPE_NORMAL, false));
+     spaces_->SetSpaceForBrowser(secondary_browsers_.back().get(), space_->id());
+     return secondary_browsers_.back().get();
+   }
+@@ -381,7 +383,7 @@ class ArciumCommandActionRouterTest : pu
+     EXPECT_EQ(original_home, home);
+     EXPECT_EQ(original_title, title);
+     ASSERT_TRUE(source_handle.Get()->GetSplit());
+-    TabStripModel* model = browser()->tab_strip_model();
++    TabStripModel* model = browser()->GetTabStripModel();
+     EXPECT_EQ(2, model->count());
+     ASSERT_TRUE(model->ContainsSplit(*source_handle.Get()->GetSplit()));
+     const auto members =
+@@ -412,7 +414,7 @@ class ArciumCommandActionRouterTest : pu
+     auto* companion = AddOrdinaryTab("https://companion.test/");
+     const tabs::TabHandle companion_handle = companion->GetHandle();
+     content::WebContents* companion_contents = companion->GetContents();
+-    TabStripModel* model = browser()->tab_strip_model();
++    TabStripModel* model = browser()->GetTabStripModel();
+     model->ActivateTabAt(model->GetIndexOfTab(saved));
+     const auto initial_split = model->AddToNewSplit(
+         {model->GetIndexOfTab(companion)}, split_tabs::SplitTabVisualData(),
+@@ -457,7 +459,7 @@ class ArciumCommandActionRouterTest : pu
+   raw_ptr<helium::HeliumSpaceService> spaces_ = nullptr;
+   raw_ptr<helium::HeliumSpace> space_ = nullptr;
+   std::unique_ptr<ArciumCommandActionRouter> router_;
+-  std::vector<std::unique_ptr<Browser>> secondary_browsers_;
++  std::vector<std::unique_ptr<BrowserWindowInterface>> secondary_browsers_;
+   base::UnguessableToken native_revision_;
+   base::UnguessableToken accepted_revision_;
+   bool native_url_copy_safe_ = true;
+@@ -543,7 +545,7 @@ TEST_F(ArciumCommandContextHistoryTest,
+   // Destroy tab history helpers while the service still accepts their cleanup.
+   // Context survives the subsequent real service shutdown notification.
+   session.reset();
+-  browser()->tab_strip_model()->CloseAllTabs();
++  browser()->GetTabStripModel()->CloseAllTabs();
+   base::RunLoop().RunUntilIdle();
+   history->Shutdown();
+   context.reset();
+@@ -652,8 +654,8 @@ TEST_F(ArciumCommandActionRouterTest, St
+   auto* captured = AddOrdinaryTab("https://captured.test/");
+   Capture(captured);
+   auto* survivor = AddOrdinaryTab("https://survivor.test/");
+-  browser()->tab_strip_model()->CloseWebContentsAt(
+-      browser()->tab_strip_model()->GetIndexOfTab(captured),
++  browser()->GetTabStripModel()->CloseWebContentsAt(
++      browser()->GetTabStripModel()->GetIndexOfTab(captured),
+       TabCloseTypes::CLOSE_NONE);
+   EXPECT_FALSE(router_->Execute(Intent(Native())).success);
+   EXPECT_EQ(0, native_accepts_);
+@@ -692,7 +694,7 @@ TEST_F(ArciumCommandActionRouterTest,
+   const CommandIntent retained = *split->intent;
+   native_url_copy_safe_ = false;
+   EXPECT_FALSE(router_->Execute(retained).success);
+-  EXPECT_EQ(1, browser()->tab_strip_model()->count());
++  EXPECT_EQ(1, browser()->GetTabStripModel()->count());
+   EXPECT_FALSE(source->GetSplit());
+   EXPECT_EQ(0, native_accepts_);
+ }
+@@ -709,7 +711,7 @@ TEST_F(ArciumCommandActionRouterTest, Sc
+   ASSERT_TRUE(pending);
+   EXPECT_TRUE(ui::PageTransitionCoreTypeIs(pending->GetTransitionType(),
+                                            ui::PAGE_TRANSITION_GENERATED));
+-  EXPECT_EQ(1, browser()->tab_strip_model()->count());
++  EXPECT_EQ(1, browser()->GetTabStripModel()->count());
+ }
+ 
+ TEST_F(ArciumCommandActionRouterTest, DormantCorpusDefersAndCoalescesRefreshes) {
+@@ -761,7 +763,7 @@ TEST_F(ArciumCommandActionRouterTest,
+     // the next explicit query restart must preserve.
+     base::RunLoop().RunUntilIdle();
+     AutocompleteMatch match(nullptr, 1000, false,
+-                            AutocompleteMatchType::HISTORY_URL);
++                            omnibox::AutocompleteMatchType::kHistoryUrl);
+     match.destination_url = seed_url;
+     match.contents = u"Retained suggestion";
+     match.fill_into_edit = u"https://retained-suggestion.test/";
+@@ -880,9 +882,9 @@ TEST_F(ArciumCommandActionRouterTest,
+   ASSERT_TRUE(url);
+   ASSERT_TRUE(router_->Execute(Intent(CommandUrlTarget{.url = *url})).success);
+ 
+-  ASSERT_EQ(1, browser()->tab_strip_model()->count());
++  ASSERT_EQ(1, browser()->GetTabStripModel()->count());
+   EXPECT_EQ(source->GetContents(),
+-            browser()->tab_strip_model()->GetActiveWebContents());
++            browser()->GetTabStripModel()->GetActiveWebContents());
+   const auto* pending = source->GetContents()->GetController().GetPendingEntry();
+   ASSERT_TRUE(pending);
+   EXPECT_EQ(GURL("https://chatgpt.com/?q=a%20fresh%20question"),
+@@ -900,8 +902,8 @@ TEST_F(ArciumCommandActionRouterTest,
+   ASSERT_TRUE(url);
+   ASSERT_TRUE(router_->Execute(Intent(CommandUrlTarget{.url = *url})).success);
+ 
+-  ASSERT_EQ(2, browser()->tab_strip_model()->count());
+-  auto* destination = browser()->tab_strip_model()->GetActiveWebContents();
++  ASSERT_EQ(2, browser()->GetTabStripModel()->count());
++  auto* destination = browser()->GetTabStripModel()->GetActiveWebContents();
+   ASSERT_NE(original, destination);
+   EXPECT_EQ(GURL("https://chatgpt.com/c/existing-conversation"),
+             original->GetLastCommittedURL());
+@@ -980,13 +982,13 @@ TEST_F(ArciumCommandActionRouterTest, Cl
+   auto* target = AddOrdinaryTab("https://target.test/");
+   const CommandLiveTarget identity = Live(target);
+   auto* survivor = AddOrdinaryTab("https://survivor.test/");
+-  browser()->tab_strip_model()->CloseWebContentsAt(
+-      browser()->tab_strip_model()->GetIndexOfTab(target),
++  browser()->GetTabStripModel()->CloseWebContentsAt(
++      browser()->GetTabStripModel()->GetIndexOfTab(target),
+       TabCloseTypes::CLOSE_NONE);
+   EXPECT_FALSE(router_->Execute(Intent(identity)).success);
+-  EXPECT_EQ(1, browser()->tab_strip_model()->count());
++  EXPECT_EQ(1, browser()->GetTabStripModel()->count());
+   EXPECT_EQ(survivor->GetContents(),
+-            browser()->tab_strip_model()->GetActiveWebContents());
++            browser()->GetTabStripModel()->GetActiveWebContents());
+   EXPECT_EQ(GURL("https://survivor.test/"),
+             survivor->GetContents()->GetLastCommittedURL());
+ }
+@@ -1005,9 +1007,9 @@ TEST_F(ArciumCommandActionRouterTest, Ac
+   EXPECT_FALSE(
+       router_->Execute(Intent(identity, command_action::kDuplicate)).success);
+   EXPECT_EQ(pins, space_->pins());
+-  EXPECT_EQ(1, browser()->tab_strip_model()->count());
++  EXPECT_EQ(1, browser()->GetTabStripModel()->count());
+   EXPECT_EQ(tab->GetContents(),
+-            browser()->tab_strip_model()->GetActiveWebContents());
++            browser()->GetTabStripModel()->GetActiveWebContents());
+ }
+ 
+ TEST_F(ArciumCommandActionRouterTest,
+@@ -1104,7 +1106,7 @@ TEST_F(ArciumCommandActionRouterTest,
+   const tabs::TabHandle second_handle = second->GetHandle();
+   auto* third = AddOrdinaryTab("https://third.test/");
+   const tabs::TabHandle third_handle = third->GetHandle();
+-  TabStripModel* model = browser()->tab_strip_model();
++  TabStripModel* model = browser()->GetTabStripModel();
+   ui::ListSelectionModel selection;
+   selection.SetSelectedIndex(model->GetIndexOfTab(first));
+   selection.AddIndexToSelection(model->GetIndexOfTab(second));
+@@ -1120,7 +1122,7 @@ TEST_F(ArciumCommandActionRouterTest,
+ TEST_F(ArciumCommandActionRouterTest, SiteMuteIgnoresOtherSelectedSites) {
+   auto* first = AddOrdinaryTab("https://first.test/");
+   auto* second = AddOrdinaryTab("https://second.test/");
+-  TabStripModel* model = browser()->tab_strip_model();
++  TabStripModel* model = browser()->GetTabStripModel();
+   ui::ListSelectionModel selection;
+   selection.SetSelectedIndex(model->GetIndexOfTab(first));
+   selection.AddIndexToSelection(model->GetIndexOfTab(second));
+@@ -1165,7 +1167,7 @@ TEST_F(ArciumCommandActionRouterTest, Pi
+   EXPECT_FALSE(HasAction(refreshed, command_action::kPin));
+   EXPECT_TRUE(HasAction(refreshed, command_action::kConvertToTab));
+   EXPECT_EQ(source->GetContents(),
+-            browser()->tab_strip_model()->GetActiveWebContents());
++            browser()->GetTabStripModel()->GetActiveWebContents());
+ }
+ 
+ TEST_F(ArciumCommandActionRouterTest, FolderMenusFilterFullTreeBeforeBound) {
+@@ -1275,7 +1277,7 @@ TEST_F(ArciumCommandActionRouterTest, Do
+   EXPECT_TRUE(spaces_->GetSpaceById("closed-space")->pins().empty());
+   EXPECT_EQ(active_pins, space_->pins());
+   EXPECT_EQ(space_->id(), spaces_->GetExplicitSpaceIdForBrowser(browser()));
+-  EXPECT_EQ(1, browser()->tab_strip_model()->count());
++  EXPECT_EQ(1, browser()->GetTabStripModel()->count());
+   EXPECT_EQ(GURL("https://untouched.test/"),
+             source->GetContents()->GetLastCommittedURL());
+ }
+@@ -1289,7 +1291,7 @@ TEST_F(ArciumCommandActionRouterTest,
+   ASSERT_TRUE(
+       spaces_->RemovePersistentItemInSpace(browser(), space_->id(), "target"));
+   EXPECT_FALSE(router_->Execute(selected).success);
+-  EXPECT_EQ(1, browser()->tab_strip_model()->count());
++  EXPECT_EQ(1, browser()->GetTabStripModel()->count());
+   EXPECT_EQ(GURL("https://untouched.test/"),
+             source->GetContents()->GetLastCommittedURL());
+ }
+@@ -1308,9 +1310,9 @@ TEST_F(ArciumCommandActionRouterTest, Re
+   EXPECT_TRUE(removed.dismiss);
+   ASSERT_TRUE(handle.Get());
+   EXPECT_FALSE(spaces_->IsPersistentItemTab(handle.Get()));
+-  EXPECT_EQ(1, browser()->tab_strip_model()->count());
++  EXPECT_EQ(1, browser()->GetTabStripModel()->count());
+   EXPECT_EQ(handle.Get()->GetContents(),
+-            browser()->tab_strip_model()->GetActiveWebContents());
++            browser()->GetTabStripModel()->GetActiveWebContents());
+   EXPECT_EQ(GURL("https://favorite.test/"),
+             handle.Get()->GetContents()->GetLastCommittedURL());
+ }
+@@ -1325,7 +1327,7 @@ TEST_F(ArciumCommandActionRouterTest,
+   ASSERT_TRUE(imported);
+   spaces_->SetSpaceForBrowser(browser(), imported->id());
+   space_ = spaces_->GetOrCreateSpace("local-space", u"Local");
+-  Browser* unrelated = AddSecondaryBrowser();
++  BrowserWindowInterface* unrelated = AddSecondaryBrowser();
+   unrelated->DidBecomeInactive();
+   unrelated->DidBecomeActive();
+   ASSERT_EQ(unrelated, ProfileBrowserCollection::GetForProfile(profile())
+@@ -1387,7 +1389,7 @@ TEST_F(ArciumCommandActionRouterTest, Sp
+   ASSERT_TRUE(spaces_->AddFavoriteFromTab(source));
+   EXPECT_TRUE(HasAction(router_->ResolveActions(destination, {}, {}),
+                         command_action::kOpenSplit));
+-  EXPECT_EQ(1, browser()->tab_strip_model()->count());
++  EXPECT_EQ(1, browser()->GetTabStripModel()->count());
+ }
+ 
+ TEST_F(ArciumCommandActionRouterTest, SplitPreservesCapturedRootPinSource) {
+@@ -1420,7 +1422,7 @@ TEST_F(ArciumCommandActionRouterTest, Sp
+   EXPECT_EQ(favorites, spaces_->GetFavoritesForBrowser(browser()));
+   ASSERT_TRUE(source_handle.Get()->GetSplit());
+   EXPECT_TRUE(source_handle.Get()->IsPinned());
+-  TabStripModel* model = browser()->tab_strip_model();
++  TabStripModel* model = browser()->GetTabStripModel();
+   EXPECT_EQ(2, model->count());
+   ASSERT_TRUE(model->ContainsSplit(*source_handle.Get()->GetSplit()));
+   const auto members =
+@@ -1456,7 +1458,7 @@ TEST_F(ArciumCommandActionRouterTest,
+   ASSERT_EQ(1u, old_spaces.entries.size());
+   const CommandIntent retained_move = *old_spaces.entries.front().intent;
+   auto* companion = AddOrdinaryTab("https://companion.test/");
+-  TabStripModel* model = browser()->tab_strip_model();
++  TabStripModel* model = browser()->GetTabStripModel();
+   model->ActivateTabAt(model->GetIndexOfTab(saved));
+   const auto initial_split = model->AddToNewSplit(
+       {model->GetIndexOfTab(companion)}, split_tabs::SplitTabVisualData(),
+@@ -1501,7 +1503,7 @@ TEST_F(ArciumCommandActionRouterTest,
+   ASSERT_TRUE(HasAction(router_->ResolveActions(favorite, {}, {}),
+                         command_action::kRemove));
+   auto* companion = AddOrdinaryTab("https://companion.test/");
+-  TabStripModel* model = browser()->tab_strip_model();
++  TabStripModel* model = browser()->GetTabStripModel();
+   model->ActivateTabAt(model->GetIndexOfTab(saved));
+   const auto initial_split = model->AddToNewSplit(
+       {model->GetIndexOfTab(companion)}, split_tabs::SplitTabVisualData(),
+@@ -1527,10 +1529,10 @@ TEST_F(ArciumCommandActionRouterTest,
+   Capture(source);
+   EXPECT_FALSE(HasAction(router_->ResolveActions(Live(source), {}, {}),
+                          command_action::kOpenSplit));
+-  Browser* other = AddSecondaryBrowser();
++  BrowserWindowInterface* other = AddSecondaryBrowser();
+   AddTab(other, GURL("https://other-window.test/"));
+   auto* other_tab = tabs::TabInterface::MaybeGetFromContents(
+-      other->tab_strip_model()->GetActiveWebContents());
++      other->GetTabStripModel()->GetActiveWebContents());
+   EXPECT_FALSE(HasAction(router_->ResolveActions(Live(other_tab), {}, {}),
+                          command_action::kOpenSplit));
+ }
+@@ -1539,7 +1541,7 @@ TEST_F(ArciumCommandActionRouterTest,
+        ExistingSplitRejectsUnassociatedPinnedPanes) {
+   auto* source = AddOrdinaryTab("https://source.test/");
+   auto* other = AddOrdinaryTab("https://other.test/");
+-  TabStripModel* model = browser()->tab_strip_model();
++  TabStripModel* model = browser()->GetTabStripModel();
+   model->ActivateTabAt(model->GetIndexOfTab(source));
+   const auto ordinary_split = model->AddToNewSplit(
+       {model->GetIndexOfTab(other)}, split_tabs::SplitTabVisualData(),
+@@ -1596,7 +1598,7 @@ TEST_F(ArciumCommandActionRouterTest,
+   ASSERT_TRUE(
+       router_->Execute(Intent(Pin(*id), command_action::kOpenSplit)).success);
+   ASSERT_TRUE(source->GetSplit());
+-  TabStripModel* model = browser()->tab_strip_model();
++  TabStripModel* model = browser()->GetTabStripModel();
+   EXPECT_EQ(3, model->count());
+   EXPECT_EQ(pin_handle.Get(),
+             spaces_->GetLiveTabForPersistentItem(
+@@ -1617,7 +1619,7 @@ TEST_F(ArciumCommandActionRouterTest,
+   auto* outgoing = AddOrdinaryTab("https://outgoing.test/");
+   const tabs::TabHandle outgoing_handle = outgoing->GetHandle();
+   const tabs::TabHandle source_handle = source->GetHandle();
+-  TabStripModel* model = browser()->tab_strip_model();
++  TabStripModel* model = browser()->GetTabStripModel();
+   model->ActivateTabAt(model->GetIndexOfTab(source));
+   const auto initial_split = model->AddToNewSplit(
+       {model->GetIndexOfTab(outgoing)}, split_tabs::SplitTabVisualData(),
+@@ -1656,12 +1658,12 @@ TEST_F(ArciumCommandActionRouterTest, Am
+       });
+   ASSERT_NE(selected, menu.entries.end());
+   const CommandIntent old_selection = *selected->intent;
+-  browser()->tab_strip_model()->CloseWebContentsAt(
+-      browser()->tab_strip_model()->GetIndexOfTab(first),
++  browser()->GetTabStripModel()->CloseWebContentsAt(
++      browser()->GetTabStripModel()->GetIndexOfTab(first),
+       TabCloseTypes::CLOSE_NONE);
+   EXPECT_FALSE(router_->Execute(old_selection).success);
+   EXPECT_EQ(second->GetContents(),
+-            browser()->tab_strip_model()->GetActiveWebContents());
++            browser()->GetTabStripModel()->GetActiveWebContents());
+   EXPECT_EQ(0, native_accepts_);
+ }
+ 
+Index: src/chrome/browser/ui/omnibox/arcium_command_corpus.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_corpus.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_corpus.cc
+@@ -52,11 +52,11 @@ namespace {
+ constexpr int kLiveTabRelevance = 4000;
+ constexpr int kFolderRelevance = 4000;
+ 
+-bool SavedItemsEligible(const Browser* browser) {
+-  if (!browser || !browser->is_type_normal()) {
++bool SavedItemsEligible(const BrowserWindowInterface* browser) {
++  if (!browser || (browser->GetType() != BrowserWindowInterface::TYPE_NORMAL)) {
+     return false;
+   }
+-  const Profile* profile = browser->profile();
++  const Profile* profile = browser->GetProfile();
+   return !profile->IsOffTheRecord() && !profile->IsGuestSession() &&
+          helium::IsHeliumFavoritesAndPinsEnabled();
+ }
+@@ -193,7 +193,7 @@ CommandRow ProjectLiveCommandRow(
+ class CommandLocalCorpus::Impl final : public BrowserCollectionObserver,
+                                        public TabStripModelObserver {
+  public:
+-  explicit Impl(Browser* browser, bool initially_active)
++  explicit Impl(BrowserWindowInterface* browser, bool initially_active)
+       : index_(
+             std::make_unique<CommandSearchIndex>(std::vector<CommandRecord>(),
+                                                  1)) {
+@@ -201,10 +201,10 @@ class CommandLocalCorpus::Impl final : p
+       return;
+     }
+     owner_ = browser->GetWeakPtr();
+-    browsers_ = ProfileBrowserCollection::GetForProfile(browser->profile());
++    browsers_ = ProfileBrowserCollection::GetForProfile(browser->GetProfile());
+     if (SavedItemsEligible(browser)) {
+       service_ =
+-          helium::HeliumSpaceServiceFactory::GetForProfile(browser->profile());
++          helium::HeliumSpaceServiceFactory::GetForProfile(browser->GetProfile());
+       if (service_) {
+         items_subscription_ =
+             service_->RegisterItemsChanged(base::BindRepeating(
+@@ -303,7 +303,7 @@ class CommandLocalCorpus::Impl final : p
+     }
+     auto* window = browsers_->FindBrowserWithID(
+         SessionID::FromSerializedValue(target.browser_session_id));
+-    auto* browser = window->GetBrowserForMigrationOnly();
++    auto* browser = window;
+     auto* tab = tabs::TabInterface::GetFromContents(contents);
+     std::optional<CommandPersistentTarget> saved_target;
+     bool at_saved_home = false;
+@@ -368,17 +368,17 @@ class CommandLocalCorpus::Impl final : p
+     if (!browser) {
+       return snapshot;
+     }
+-    auto* tab = browser->tab_strip_model()->GetActiveTab();
++    auto* tab = browser->GetTabStripModel()->GetActiveTab();
+     auto* contents = tab ? tab->GetContents() : nullptr;
+     if (!contents) {
+       return snapshot;
+     }
+     snapshot.text = base::UTF8ToUTF16(contents->GetVisibleURL().spec());
+     const auto tab_id = sessions::SessionTabHelper::IdForTab(contents);
+-    if (!browser->session_id().is_valid() || !tab_id.is_valid()) {
++    if (!browser->GetSessionID().is_valid() || !tab_id.is_valid()) {
+       return snapshot;
+     }
+-    const CommandLiveTarget target{browser->session_id().id(), tab_id.id()};
++    const CommandLiveTarget target{browser->GetSessionID().id(), tab_id.id()};
+     snapshot.invocation.source_tab = target;
+     auto projected = GetLiveRow(target);
+     if (!projected) {
+@@ -401,9 +401,9 @@ class CommandLocalCorpus::Impl final : p
+     GURL url;
+   };
+ 
+-  Browser* OwnerBrowser() const {
++  BrowserWindowInterface* OwnerBrowser() const {
+     return owner_ && !owner_->IsDeleteScheduled()
+-               ? owner_->GetBrowserForMigrationOnly()
++               ? owner_.get()
+                : nullptr;
+   }
+ 
+@@ -437,7 +437,6 @@ class CommandLocalCorpus::Impl final : p
+   }
+ 
+   void OnTabChangedAt(tabs::TabInterface* tab,
+-                      int index,
+                       TabChangeType change_type) override {
+     if (change_type == TabChangeType::kLoadingOnly) {
+       return;
+@@ -592,7 +591,7 @@ class CommandLocalCorpus::Impl final : p
+         std::u16string context;
+         std::string space_id;
+         if (saved_enabled) {
+-          auto* legacy_browser = window->GetBrowserForMigrationOnly();
++          auto* legacy_browser = window;
+           if (legacy_browser) {
+             space_id = service_->GetSpaceIdForBrowser(legacy_browser);
+             const auto space = space_names.find(space_id);
+@@ -689,7 +688,7 @@ class CommandLocalCorpus::Impl final : p
+   base::WeakPtrFactory<Impl> weak_factory_{this};
+ };
+ 
+-CommandLocalCorpus::CommandLocalCorpus(Browser* browser, bool initially_active)
++CommandLocalCorpus::CommandLocalCorpus(BrowserWindowInterface* browser, bool initially_active)
+     : impl_(std::make_unique<Impl>(browser, initially_active)) {}
+ void CommandLocalCorpus::SetActive(bool active) { impl_->SetActive(active); }
+ bool CommandLocalCorpus::ready() const { return impl_->ready(); }
+Index: src/chrome/browser/ui/omnibox/arcium_command_corpus.h
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_corpus.h
++++ src/chrome/browser/ui/omnibox/arcium_command_corpus.h
+@@ -14,7 +14,7 @@
+ #include "components/omnibox/browser/arcium_command_search.h"
+ #include "components/omnibox/browser/arcium_omnibox_item.h"
+ 
+-class Browser;
++class BrowserWindowInterface;
+ 
+ namespace content {
+ class WebContents;
+@@ -43,7 +43,7 @@ CommandRow ProjectLiveCommandRow(
+ // cached native snapshot; queries read them without enumerating saved items.
+ class CommandLocalCorpus {
+  public:
+-  explicit CommandLocalCorpus(Browser* browser, bool initially_active = true);
++  explicit CommandLocalCorpus(BrowserWindowInterface* browser, bool initially_active = true);
+   // Dormant corpora retain their snapshot and track invalidations without
+   // rebuilding. Activation posts a refresh before publishing local results.
+   void SetActive(bool active);
+Index: src/chrome/browser/ui/omnibox/arcium_command_providers.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_providers.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_providers.cc
+@@ -228,16 +228,16 @@ class FaviconFetcher {
+ }  // namespace
+ 
+ struct CommandSessionContext : history::HistoryServiceObserver {
+-  explicit CommandSessionContext(Browser* browser)
++  explicit CommandSessionContext(BrowserWindowInterface* browser)
+       : owner(browser->GetWeakPtr()),
+         corpus(browser, /*initially_active=*/false),
+-        fetcher(browser->profile()),
++        fetcher(browser->GetProfile()),
+         icons(base::BindRepeating(&FaviconFetcher::Fetch,
+                                   base::Unretained(&fetcher)),
+               base::BindRepeating(&FaviconFetcher::Cancel,
+                                   base::Unretained(&fetcher))) {
+     if (auto* history = HistoryServiceFactory::GetForProfile(
+-            browser->profile(), ServiceAccessType::EXPLICIT_ACCESS)) {
++            browser->GetProfile(), ServiceAccessType::EXPLICIT_ACCESS)) {
+       history_observation.Observe(history);
+       favicons_changed = history->AddFaviconsChangedCallback(
+           base::BindRepeating(&CommandIconCache::Invalidate,
+@@ -260,9 +260,9 @@ struct CommandSessionContext : history::
+     favicons_changed = {};
+     history_observation.Reset();
+   }
+-  Browser* browser() const {
++  BrowserWindowInterface* browser() const {
+     return owner && !owner->IsDeleteScheduled()
+-               ? owner->GetBrowserForMigrationOnly()
++               ? owner.get()
+                : nullptr;
+   }
+   base::WeakPtr<BrowserWindowInterface> owner;
+@@ -281,11 +281,11 @@ class CachedAutocompleteClient final : p
+  public:
+   explicit CachedAutocompleteClient(std::shared_ptr<CommandSessionContext> context)
+       : ChromeAutocompleteProviderClient(
+-            context->browser()->profile(),
++            context->browser()->GetProfile(),
+             base::BindRepeating(
+                 [](std::shared_ptr<CommandSessionContext> context) {
+                   auto* browser = context->browser();
+-                  return browser ? browser->tab_strip_model()
++                  return browser ? browser->GetTabStripModel()
+                                        ->GetActiveWebContents()
+                                  : nullptr;
+                 },
+@@ -293,7 +293,7 @@ class CachedAutocompleteClient final : p
+         context_(std::move(context)) {}
+   std::vector<ArciumOmniboxItem> GetArciumOmniboxItems() const override {
+     const auto* browser = context_->browser();
+-    const auto* profile = browser ? browser->profile() : nullptr;
++    const auto* profile = browser ? browser->GetProfile() : nullptr;
+     if (!profile || !CommandNativePersistentItemsAllowed(
+                         helium::IsHeliumFavoritesAndPinsEnabled(),
+                         profile->GetPrefs()->GetBoolean(
+@@ -322,7 +322,7 @@ class NativeQueryProvider final : public
+       : context_(std::move(context)),
+         controller_factory_(std::move(controller_factory)),
+         engines_(TemplateURLServiceFactory::GetForProfile(
+-            context_->browser()->profile())) {
++            context_->browser()->GetProfile())) {
+     if (engines_) {
+       engine_observation_.Observe(engines_);
+       UpdateEngine();
+@@ -414,7 +414,7 @@ class NativeQueryProvider final : public
+     if (!selection) {
+       return {false, false, u"This result is no longer available"};
+     }
+-    if (selection->match.type == AutocompleteMatchType::OPEN_TAB) {
++    if (selection->match.type == omnibox::AutocompleteMatchType::kOpenTab) {
+       return {false, false, u"Choose the tab to switch to"};
+     }
+     return AcceptSelection(*selection, disposition, false);
+@@ -448,10 +448,11 @@ class NativeQueryProvider final : public
+     }
+     int types = AutocompleteClassifier::DefaultOmniboxProviders();
+     if (web) {
+-      types &= AutocompleteProvider::TYPE_KEYWORD |
+-               AutocompleteProvider::TYPE_SEARCH |
+-               AutocompleteProvider::TYPE_ZERO_SUGGEST |
+-               AutocompleteProvider::TYPE_ON_DEVICE_HEAD;
++      types &= static_cast<int>(
++          AutocompleteProvider::Type::kKeyword |
++          AutocompleteProvider::Type::kSearch |
++          AutocompleteProvider::Type::kZeroSuggest |
++          AutocompleteProvider::Type::kOnDeviceHead);
+     }
+     AutocompleteControllerConfig config{.provider_types = types};
+     config.unscoped_open_tab_suggestions = !web;
+@@ -480,7 +481,7 @@ class NativeQueryProvider final : public
+     AutocompleteInput input = CreateCommandNativeInput(
+         query_.text,
+         query_.scope_id == kWebScope ? engine_keyword_ : std::u16string(),
+-        ChromeAutocompleteSchemeClassifier(context_->browser()->profile()));
++        ChromeAutocompleteSchemeClassifier(context_->browser()->GetProfile()));
+     if (query_.invocation.source_tab) {
+       if (auto* contents =
+               context_->corpus.GetContents(*query_.invocation.source_tab)) {
+@@ -529,11 +530,11 @@ class NativeQueryProvider final : public
+   CommandExecutionResult AcceptSelection(CommandNativeSelection selection,
+                                          WindowOpenDisposition disposition,
+                                          bool confirmed) {
+-    Browser* browser = context_->browser();
++    BrowserWindowInterface* browser = context_->browser();
+     if (!browser) {
+       return {false, false, u"This browser window is no longer available"};
+     }
+-    auto* location_bar = browser->GetFeatures().location_bar();
++    auto* location_bar = BrowserWindow::FromBrowser(browser)->GetLocationBar();
+     auto* client = location_bar && location_bar->GetOmniboxController()
+                        ? location_bar->GetOmniboxController()->client()
+                        : nullptr;
+@@ -587,7 +588,7 @@ class NativeQueryProvider final : public
+         selection.input.added_default_scheme_to_typed_url();
+     const bool entered_http =
+         selection.input.typed_url_had_http_scheme() &&
+-        selection.match.type == AutocompleteMatchType::URL_WHAT_YOU_TYPED;
++        selection.match.type == omnibox::AutocompleteMatchType::kUrlWhatYouTyped;
+     const std::u16string text = selection.user_text;
+     // Copy everything before owner navigation. Never read members afterwards.
+     client->OnAutocompleteAccept(
+@@ -656,7 +657,7 @@ class NativeQueryProvider final : public
+                                                    : CommandActivity::kCircle
+                      : item.is_live ? CommandActivity::kDot
+                                     : CommandActivity::kNone;
+-    } else if (match.type == AutocompleteMatchType::OPEN_TAB) {
++    } else if (match.type == omnibox::AutocompleteMatchType::kOpenTab) {
+       const auto tabs = context_->corpus.FindLiveTargets(match.destination_url);
+       row.category = u"Tab";
+       row.activity = CommandActivity::kDot;
+@@ -945,7 +946,7 @@ class LocalQueryProvider final : public
+ 
+ class RouterActionDelegate final : public CommandActionDelegate {
+  public:
+-  RouterActionDelegate(Browser* browser, CommandNativeActionCallbacks callbacks)
++  RouterActionDelegate(BrowserWindowInterface* browser, CommandNativeActionCallbacks callbacks)
+       : router_(browser, std::move(callbacks)) {}
+   void SetInvocation(const CommandInvocation& invocation) override {
+     router_.SetInvocation(invocation);
+@@ -965,13 +966,13 @@ class RouterActionDelegate final : publi
+ 
+ }  // namespace
+ 
+-std::unique_ptr<CommandSession> CreateCommandSession(Browser* browser) {
++std::unique_ptr<CommandSession> CreateCommandSession(BrowserWindowInterface* browser) {
+   std::shared_ptr<CommandSessionContext> context;
+   return CreateCommandSession(browser, context);
+ }
+ 
+ std::unique_ptr<CommandSession> CreateCommandSession(
+-    Browser* browser,
++    BrowserWindowInterface* browser,
+     std::shared_ptr<CommandSessionContext>& context,
+     CommandNativeControllerFactoryForTesting controller_factory) {
+   base::ElapsedTimer timer;
+Index: src/chrome/browser/ui/omnibox/arcium_command_providers.h
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_providers.h
++++ src/chrome/browser/ui/omnibox/arcium_command_providers.h
+@@ -12,7 +12,7 @@
+ #include "chrome/browser/ui/omnibox/arcium_command_session.h"
+ 
+ class AutocompleteController;
+-class Browser;
++class BrowserWindowInterface;
+ 
+ namespace arcium {
+ 
+@@ -100,13 +100,13 @@ std::unique_ptr<CommandSession> CreateCo
+ // This browser-owned factory contains the Profile/controller/URL integration.
+ // Presenters receive only CommandSession and its immutable value publications.
+ struct CommandSessionContext;
+-std::unique_ptr<CommandSession> CreateCommandSession(Browser* browser);
++std::unique_ptr<CommandSession> CreateCommandSession(BrowserWindowInterface* browser);
+ // Retain only browser data/cache between presentations. Each session still owns
+ // fresh query generations, action authority, selection, and subscriptions.
+ using CommandNativeControllerFactoryForTesting = base::RepeatingCallback<
+     std::shared_ptr<AutocompleteController>(bool web)>;
+ std::unique_ptr<CommandSession> CreateCommandSession(
+-    Browser* browser,
++    BrowserWindowInterface* browser,
+     std::shared_ptr<CommandSessionContext>& context,
+     CommandNativeControllerFactoryForTesting controller_factory = {});
+ 
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
+@@ -1,6 +1,8 @@
+ // Copyright 2026 The Arcium Authors
+ // Use of this source code is governed by the GPL-3.0 license.
+ #include "base/functional/bind.h"
++
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "base/metrics/histogram_macros_local.h"
+ #include "base/time/time.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -16,7 +18,7 @@
+ #include "ui/views/widget/widget.h"
+ 
+ bool BrowserView::ShowArciumNativeCommandPanel(bool new_tab) {
+-  if (!browser_->is_type_normal() || !toolbar_ || !GetWidget() ||
++  if ((browser_->GetType() != BrowserWindowInterface::TYPE_NORMAL) || !toolbar_ || !GetWidget() ||
+       GetWidget()->IsClosed() || !GetActiveWebContents()) return false;
+   auto* presentation = arcium::CommandPanelPresentation::Get(this);
+   if (!presentation) {
+@@ -25,7 +27,7 @@ bool BrowserView::ShowArciumNativeComman
+     options.anchor_bounds = base::BindRepeating([](base::WeakPtr<BrowserView> view) {
+       return view ? view->GetBoundsInScreen() : gfx::Rect();
+     }, weak_ptr_factory_.GetWeakPtr());
+-    auto* profile = browser_->profile()->GetOriginalProfile();
++    auto* profile = browser_->GetProfile()->GetOriginalProfile();
+     options.prefs = profile->GetPrefs();
+     options.scale = base::BindRepeating([](Profile* owner) {
+       return static_cast<float>(arcium::GetChromeUIScale(owner));
+Index: src/chrome/browser/ui/browser_shortcuts/arcium_shortcut_commands.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_shortcuts/arcium_shortcut_commands.cc
++++ src/chrome/browser/ui/browser_shortcuts/arcium_shortcut_commands.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/browser_shortcuts/arcium_shortcut_commands.h"
+ 
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++
+ #include <algorithm>
+ #include <cstddef>
+ #include <iterator>
+@@ -24,26 +26,26 @@ namespace browser_shortcuts::arcium {
+ 
+ namespace {
+ 
+-bool IsNormalBrowser(Browser* browser) {
+-  return browser && browser->is_type_normal() && browser->profile();
++bool IsNormalBrowser(BrowserWindowInterface* browser) {
++  return browser && (browser->GetType() == BrowserWindowInterface::TYPE_NORMAL) && browser->GetProfile();
+ }
+ 
+-bool IsEligiblePersistentBrowser(Browser* browser) {
++bool IsEligiblePersistentBrowser(BrowserWindowInterface* browser) {
+   if (!IsNormalBrowser(browser)) {
+     return false;
+   }
+-  Profile* const profile = browser->profile();
++  Profile* const profile = browser->GetProfile();
+   return !profile->IsOffTheRecord() && !profile->IsGuestSession();
+ }
+ 
+-bool SelectTab(Browser* browser,
++bool SelectTab(BrowserWindowInterface* browser,
+                bool next,
+                bool recent,
+                TabStripUserGestureDetails detail) {
+   if (!IsNormalBrowser(browser)) {
+     return false;
+   }
+-  TabStripModel* const model = browser->tab_strip_model();
++  TabStripModel* const model = browser->GetTabStripModel();
+   if (!model || model->count() < 2 ||
+       model->active_index() == TabStripModel::kNoTab) {
+     return false;
+@@ -61,27 +63,27 @@ bool SelectTab(Browser* browser,
+   return model->active_index() != old_index;
+ }
+ 
+-bool ActivateSpace(Browser* browser, helium::HeliumSpace* space) {
++bool ActivateSpace(BrowserWindowInterface* browser, helium::HeliumSpace* space) {
+   return IsEligiblePersistentBrowser(browser) && space &&
+          space->ActivateOrCreatePrimaryWindow() != nullptr;
+ }
+ 
+ }  // namespace
+ 
+-bool ToggleCurrentSpacePin(Browser* browser) {
++bool ToggleCurrentSpacePin(BrowserWindowInterface* browser) {
+   if (!IsEligiblePersistentBrowser(browser) ||
+       !helium::IsHeliumFavoritesAndPinsEnabled()) {
+     return false;
+   }
+ 
+-  TabStripModel* const model = browser->tab_strip_model();
++  TabStripModel* const model = browser->GetTabStripModel();
+   tabs::TabInterface* const tab = model ? model->GetActiveTab() : nullptr;
+   if (!tab) {
+     return false;
+   }
+ 
+   helium::HeliumSpaceService* const service =
+-      helium::HeliumSpaceServiceFactory::GetForProfile(browser->profile());
++      helium::HeliumSpaceServiceFactory::GetForProfile(browser->GetProfile());
+   if (!service) {
+     return false;
+   }
+@@ -99,13 +101,13 @@ bool ToggleCurrentSpacePin(Browser* brow
+   return helium::MakePin(tab);
+ }
+ 
+-bool SelectSpace(Browser* browser, size_t index) {
++bool SelectSpace(BrowserWindowInterface* browser, size_t index) {
+   if (!IsEligiblePersistentBrowser(browser)) {
+     return false;
+   }
+ 
+   helium::HeliumSpaceService* const service =
+-      helium::HeliumSpaceServiceFactory::GetForProfile(browser->profile());
++      helium::HeliumSpaceServiceFactory::GetForProfile(browser->GetProfile());
+   if (!service) {
+     return false;
+   }
+@@ -118,13 +120,13 @@ bool SelectSpace(Browser* browser, size_
+   return arc_index.has_value() && ActivateSpace(browser, spaces[*arc_index]);
+ }
+ 
+-bool SelectRelativeSpace(Browser* browser, bool next) {
++bool SelectRelativeSpace(BrowserWindowInterface* browser, bool next) {
+   if (!IsEligiblePersistentBrowser(browser)) {
+     return false;
+   }
+ 
+   helium::HeliumSpaceService* const service =
+-      helium::HeliumSpaceServiceFactory::GetForProfile(browser->profile());
++      helium::HeliumSpaceServiceFactory::GetForProfile(browser->GetProfile());
+   if (!service) {
+     return false;
+   }
+@@ -152,13 +154,13 @@ bool SelectRelativeSpace(Browser* browse
+   return ActivateSpace(browser, spaces[target_index]);
+ }
+ 
+-bool SelectSequentialTab(Browser* browser,
++bool SelectSequentialTab(BrowserWindowInterface* browser,
+                          bool next,
+                          TabStripUserGestureDetails detail) {
+   return SelectTab(browser, next, /*recent=*/false, detail);
+ }
+ 
+-bool SelectRecentTab(Browser* browser,
++bool SelectRecentTab(BrowserWindowInterface* browser,
+                      bool next,
+                      TabStripUserGestureDetails detail) {
+   return SelectTab(browser, next, /*recent=*/true, detail);
+Index: src/chrome/browser/ui/browser_shortcuts/arcium_shortcut_commands.h
+===================================================================
+--- src.orig/chrome/browser/ui/browser_shortcuts/arcium_shortcut_commands.h
++++ src/chrome/browser/ui/browser_shortcuts/arcium_shortcut_commands.h
+@@ -10,7 +10,7 @@
+ 
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
+ 
+-class Browser;
++class BrowserWindowInterface;
+ 
+ namespace browser_shortcuts::arcium {
+ 
+@@ -25,27 +25,27 @@ constexpr std::optional<size_t> SpaceInd
+ 
+ // Toggles the active tab's durable Space Pin. Favorites, ordinary Chromium
+ // pinned tabs, and ineligible tab contexts are left unchanged.
+-bool ToggleCurrentSpacePin(Browser* browser);
++bool ToggleCurrentSpacePin(BrowserWindowInterface* browser);
+ 
+ // Activates a Space by its zero-based profile index, creating its primary
+ // normal window when it does not already have one. Only Arc's first nine
+ // Spaces are addressable through numbered shortcuts.
+-bool SelectSpace(Browser* browser, size_t index);
++bool SelectSpace(BrowserWindowInterface* browser, size_t index);
+ 
+ // Activates the adjacent Space in the ordered profile Space list. `next`
+ // selects the next Space when true and the previous Space otherwise; the list
+ // wraps at either end.
+-bool SelectRelativeSpace(Browser* browser, bool next);
++bool SelectRelativeSpace(BrowserWindowInterface* browser, bool next);
+ 
+ // Selects tabs through TabStripModel's group-aware sequential or MRU APIs.
+ // These return false when the browser is ineligible or has fewer than two tabs.
+ bool SelectSequentialTab(
+-    Browser* browser,
++    BrowserWindowInterface* browser,
+     bool next,
+     TabStripUserGestureDetails detail = TabStripUserGestureDetails(
+         TabStripUserGestureDetails::GestureType::kKeyboard));
+ bool SelectRecentTab(
+-    Browser* browser,
++    BrowserWindowInterface* browser,
+     bool next,
+     TabStripUserGestureDetails detail = TabStripUserGestureDetails(
+         TabStripUserGestureDetails::GestureType::kKeyboard));
+Index: src/chrome/browser/ui/browser_shortcuts/arcium_shortcut_tab_actions.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_shortcuts/arcium_shortcut_tab_actions.cc
++++ src/chrome/browser/ui/browser_shortcuts/arcium_shortcut_tab_actions.cc
+@@ -77,9 +77,8 @@ std::u16string EscapeMarkdownDestination
+   return escaped;
+ }
+ 
+-Browser* GetBrowser(BrowserWindowInterface* browser_window) {
+-  return browser_window ? browser_window->GetBrowserForMigrationOnly()
+-                        : nullptr;
++BrowserWindowInterface* GetBrowser(BrowserWindowInterface* browser_window) {
++  return browser_window;
+ }
+ 
+ }  // namespace
+@@ -89,8 +88,8 @@ bool ClearUnpinnedTabs(BrowserWindowInte
+       browser_window->GetType() != BrowserWindowInterface::TYPE_NORMAL) {
+     return false;
+   }
+-  Browser* browser = GetBrowser(browser_window);
+-  TabStripModel* model = browser ? browser->tab_strip_model() : nullptr;
++  BrowserWindowInterface* browser = GetBrowser(browser_window);
++  TabStripModel* model = browser ? browser->GetTabStripModel() : nullptr;
+   if (!model) {
+     return false;
+   }
+@@ -98,7 +97,7 @@ bool ClearUnpinnedTabs(BrowserWindowInte
+   std::vector<tabs::TabHandle> tabs_to_close;
+   tabs_to_close.reserve(model->count());
+   helium::HeliumSpaceService* space_service =
+-      helium::HeliumSpaceServiceFactory::GetForProfile(browser->profile());
++      helium::HeliumSpaceServiceFactory::GetForProfile(browser->GetProfile());
+   // Capture the invoking window's effective Space before any close can run
+   // synchronous lifecycle callbacks that change its association.
+   const bool has_space_service = space_service != nullptr;
+@@ -123,14 +122,14 @@ bool ClearUnpinnedTabs(BrowserWindowInte
+   bool closed_any = false;
+   for (const tabs::TabHandle& tab_handle : tabs_to_close) {
+     BrowserWindowInterface* current_window = browser_weak.get();
+-    Browser* current_browser = GetBrowser(current_window);
++    BrowserWindowInterface* current_browser = GetBrowser(current_window);
+     TabStripModel* current_model =
+-        current_browser ? current_browser->tab_strip_model() : nullptr;
++        current_browser ? current_browser->GetTabStripModel() : nullptr;
+     if (!current_window || !current_browser || !current_model) {
+       break;
+     }
+     space_service = helium::HeliumSpaceServiceFactory::GetForProfile(
+-        current_browser->profile());
++        current_browser->GetProfile());
+     if (has_space_service &&
+         (!space_service ||
+          space_service->GetSpaceIdForBrowser(current_browser) !=
+@@ -141,7 +140,7 @@ bool ClearUnpinnedTabs(BrowserWindowInte
+     BrowserWindowInterface* tab_window =
+         tab ? tab->GetBrowserWindowInterface() : nullptr;
+     if (!tab || tab_window != current_window ||
+-        tab_window->GetBrowserForMigrationOnly() != current_browser ||
++        tab_window != current_browser ||
+         tab->IsPinned() ||
+         (space_service && space_service->IsPersistentItemTab(tab))) {
+       continue;
+@@ -181,9 +180,9 @@ std::u16string FormatTabMarkdownLink(std
+ }
+ 
+ bool CopyCurrentTabURLAsMarkdown(BrowserWindowInterface* browser_window) {
+-  Browser* browser = GetBrowser(browser_window);
++  BrowserWindowInterface* browser = GetBrowser(browser_window);
+   content::WebContents* web_contents =
+-      browser ? browser->tab_strip_model()->GetActiveWebContents() : nullptr;
++      browser ? browser->GetTabStripModel()->GetActiveWebContents() : nullptr;
+   if (!browser || !web_contents || !web_contents->GetVisibleURL().is_valid()) {
+     return false;
+   }
+@@ -197,8 +196,8 @@ bool CopyCurrentTabURLAsMarkdown(Browser
+ }
+ 
+ bool CloseSplitView(BrowserWindowInterface* browser_window) {
+-  Browser* browser = GetBrowser(browser_window);
+-  TabStripModel* model = browser ? browser->tab_strip_model() : nullptr;
++  BrowserWindowInterface* browser = GetBrowser(browser_window);
++  TabStripModel* model = browser ? browser->GetTabStripModel() : nullptr;
+   tabs::TabInterface* active_tab = model ? model->GetActiveTab() : nullptr;
+   if (!model || !active_tab) {
+     return false;
+@@ -216,8 +215,8 @@ bool CloseSplitView(BrowserWindowInterfa
+ bool FocusSplitViewPane(BrowserWindowInterface* browser_window,
+                         int pane_index,
+                         TabStripUserGestureDetails user_gesture) {
+-  Browser* browser = GetBrowser(browser_window);
+-  TabStripModel* model = browser ? browser->tab_strip_model() : nullptr;
++  BrowserWindowInterface* browser = GetBrowser(browser_window);
++  TabStripModel* model = browser ? browser->GetTabStripModel() : nullptr;
+   tabs::TabInterface* active_tab = model ? model->GetActiveTab() : nullptr;
+   if (!model || !active_tab || pane_index < 0) {
+     return false;
+@@ -251,8 +250,8 @@ bool FocusSplitViewPane(BrowserWindowInt
+ 
+ bool SelectNinthVisibleTab(BrowserWindowInterface* browser_window,
+                            TabStripUserGestureDetails user_gesture) {
+-  Browser* browser = GetBrowser(browser_window);
+-  TabStripModel* model = browser ? browser->tab_strip_model() : nullptr;
++  BrowserWindowInterface* browser = GetBrowser(browser_window);
++  TabStripModel* model = browser ? browser->GetTabStripModel() : nullptr;
+   if (!model) {
+     return false;
+   }
+Index: src/chrome/browser/ui/browser_shortcuts/arcium_shortcut_tab_actions_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_shortcuts/arcium_shortcut_tab_actions_unittest.cc
++++ src/chrome/browser/ui/browser_shortcuts/arcium_shortcut_tab_actions_unittest.cc
+@@ -3,6 +3,8 @@
+ // the terms of the GPL-3.0 license that can be found in the LICENSE file.
+ 
+ #include <memory>
++
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include <optional>
+ #include <string>
+ 
+@@ -82,7 +84,7 @@ class ArciumShortcutTabActionsBrowserTes
+     service_->SetSpaceForBrowser(browser(), space_->id());
+   }
+ 
+-  tabs::TabInterface* AddTabTo(Browser* target, const char* url) {
++  tabs::TabInterface* AddTabTo(BrowserWindowInterface* target, const char* url) {
+     AddTab(target, GURL(url));
+     return tabs::TabInterface::MaybeGetFromContents(
+         target->tab_strip_model()->GetActiveWebContents());
+@@ -121,14 +123,14 @@ TEST_F(ArciumShortcutTabActionsBrowserTe
+   helium::HeliumSpace* other_space =
+       service_->GetOrCreateSpace("other-space", u"Other Space");
+   ASSERT_TRUE(other_space);
+-  std::unique_ptr<Browser> other_browser =
+-      CreateBrowser(profile(), Browser::TYPE_NORMAL, /*hosted_app=*/false);
++  std::unique_ptr<BrowserWindowInterface> other_browser =
++      CreateBrowser(profile(), BrowserWindowInterface::TYPE_NORMAL, /*hosted_app=*/false);
+   ASSERT_TRUE(other_browser);
+   // TestBrowserWindow does not complete the window-close callback. Close tabs
+   // before the owned Browser destructor so it notifies browser collections.
+   // Keep cleanup active for fatal assertion exits after tab creation as well.
+   base::ScopedClosureRunner close_other_browser_tabs(base::BindOnce(
+-      [](Browser* browser) { browser->tab_strip_model()->CloseAllTabs(); },
++      [](BrowserWindowInterface* browser) { browser->GetTabStripModel()->CloseAllTabs(); },
+       other_browser.get()));
+   service_->SetSpaceForBrowser(other_browser.get(), other_space->id());
+   tabs::TabInterface* other_tab =
+@@ -142,12 +144,12 @@ TEST_F(ArciumShortcutTabActionsBrowserTe
+   EXPECT_NE(nullptr, favorite_handle.Get());
+   EXPECT_NE(nullptr, other_handle.Get());
+   EXPECT_NE(TabStripModel::kNoTab,
+-            browser()->tab_strip_model()->GetIndexOfTab(pin_handle.Get()));
++            browser()->GetTabStripModel()->GetIndexOfTab(pin_handle.Get()));
+   EXPECT_NE(
+       TabStripModel::kNoTab,
+-      browser()->tab_strip_model()->GetIndexOfTab(favorite_handle.Get()));
++      browser()->GetTabStripModel()->GetIndexOfTab(favorite_handle.Get()));
+   EXPECT_NE(TabStripModel::kNoTab,
+-            other_browser->tab_strip_model()->GetIndexOfTab(other_handle.Get()));
++            other_browser->GetTabStripModel()->GetIndexOfTab(other_handle.Get()));
+ }
+ 
+ }  // namespace browser_shortcuts::arcium
+Index: src/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
++++ src/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/omnibox/chrome_omnibox_client.h"
+ 
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++
+ #include "base/functional/callback_helpers.h"
+ 
+ #include <stddef.h>
+@@ -249,12 +251,12 @@ ExtensionControlledDialogResult SettingD
+ 
+ }  // namespace
+ 
+-bool ExecuteArciumOmniboxCommand(Browser* browser,
++bool ExecuteArciumOmniboxCommand(BrowserWindowInterface* browser,
+                                  const ArciumOmniboxItem& item) {
+   if (!browser) {
+     return false;
+   }
+-  Profile* profile = browser->profile();
++  Profile* profile = browser->GetProfile();
+   auto* spaces = helium::HeliumSpaceServiceFactory::GetForProfile(profile);
+   if (!spaces || !helium::IsHeliumFavoritesAndPinsEnabled() ||
+       !profile->GetPrefs()->GetBoolean(
+@@ -265,7 +267,7 @@ bool ExecuteArciumOmniboxCommand(Browser
+   const auto kind = item.kind == ArciumOmniboxItem::Kind::kFavorite
+                         ? helium::PersistentRecordKind::kFavorite
+                         : helium::PersistentRecordKind::kPin;
+-  auto* contents = browser->tab_strip_model()->GetActiveWebContents();
++  auto* contents = browser->GetTabStripModel()->GetActiveWebContents();
+   auto* tab =
+       contents ? tabs::TabInterface::MaybeGetFromContents(contents) : nullptr;
+   const bool current_tab_matches =
+Index: src/chrome/browser/ui/omnibox/chrome_omnibox_client.h
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/chrome_omnibox_client.h
++++ src/chrome/browser/ui/omnibox/chrome_omnibox_client.h
+@@ -37,7 +37,7 @@ class OmniboxPopupCloser;
+ 
+ // Executes a typed command against its qualified, still-valid source identity.
+ // Returns false for disabled features, stale tabs/items, or rejected mutations.
+-bool ExecuteArciumOmniboxCommand(Browser* browser,
++bool ExecuteArciumOmniboxCommand(BrowserWindowInterface* browser,
+                                  const ArciumOmniboxItem& item);
+ 
+ class ChromeOmniboxClient final : public OmniboxClient {
+Index: src/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.cc
++++ src/chrome/browser/ui/omnibox/alternate_nav_infobar_delegate.cc
+@@ -145,7 +145,7 @@ AlternateNavInfoBarDelegate::AlternateNa
+       match_from_zero_suggest_(
+           from_zero_suggest ||
+           (match && match->provider &&
+-           match->provider->type() == AutocompleteProvider::TYPE_ZERO_SUGGEST)),
++           match->provider->type() == AutocompleteProvider::Type::kZeroSuggest)),
+       match_(std::move(match)),
+       destination_url_(destination_url),
+       original_url_(original_url) {
+Index: src/chrome/browser/ui/omnibox/arcium_command_native_result.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_native_result.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_native_result.cc
+@@ -15,7 +15,7 @@ namespace arcium {
+ 
+ bool IsCommandNativeMatchSupported(const AutocompleteMatch& match) {
+   if (AutocompleteMatch::IsFeaturedSearchType(match.type) ||
+-      match.type == AutocompleteMatchType::NULL_RESULT_MESSAGE) {
++      match.type == omnibox::AutocompleteMatchType::kNullResultMessage) {
+     return false;
+   }
+   if (match.takeover_action) {
+@@ -110,7 +110,7 @@ std::optional<uint32_t> GetUnprojectedNa
+   const auto* match = result.default_match();
+   if (!match || !IsCommandNativeMatchSupported(*match) ||
+       !match->destination_url.is_valid() || match->arcium_item ||
+-      match->type == AutocompleteMatchType::OPEN_TAB ||
++      match->type == omnibox::AutocompleteMatchType::kOpenTab ||
+       match->takeover_action) {
+     return std::nullopt;
+   }
+Index: src/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
+@@ -911,7 +911,7 @@ TEST(ArciumCommandLocalPresentationTest,
+ 
+ AutocompleteMatch MakeNativeMatch(const char* url, int relevance) {
+   AutocompleteMatch match(nullptr, relevance, false,
+-                          AutocompleteMatchType::HISTORY_URL);
++                          omnibox::AutocompleteMatchType::kHistoryUrl);
+   match.destination_url = GURL(url);
+   match.fill_into_edit = u"original edit";
+   return match;
+@@ -921,7 +921,7 @@ AutocompleteMatch MakeNativePostMatch(st
+                                       std::string mime,
+                                       std::string body) {
+   auto match = MakeNativeMatch("https://search.test/search", 1500);
+-  match.type = AutocompleteMatchType::SEARCH_SUGGEST;
++  match.type = omnibox::AutocompleteMatchType::kSearchSuggest;
+   match.keyword = u"configured-engine";
+   match.fill_into_edit = terms;
+   match.contents = terms;
+@@ -959,9 +959,9 @@ class FakeOmniboxAction final : public O
+ 
+ TEST(ArciumCommandNativeMatchTest, SuppressesFeaturedSearchAndMessageTypes) {
+   constexpr AutocompleteMatchType::Type types[] = {
+-      AutocompleteMatchType::STARTER_PACK,
+-      AutocompleteMatchType::FEATURED_ENTERPRISE_SEARCH,
+-      AutocompleteMatchType::NULL_RESULT_MESSAGE};
++      omnibox::AutocompleteMatchType::kStarterPack,
++      omnibox::AutocompleteMatchType::kFeaturedEnterpriseSearch,
++      omnibox::AutocompleteMatchType::kNullResultMessage};
+   for (const auto type : types) {
+     SCOPED_TRACE(static_cast<int>(type));
+     auto match = MakeNativeMatch("https://result.test/", 1500);
+@@ -1018,7 +1018,7 @@ TEST(ArciumCommandNativeMatchTest,
+                                  i == 0 ? 10 : 1500 - static_cast<int>(i));
+     match.allowed_to_be_default_match = i != 2;
+     if (i == 1) {
+-      match.type = AutocompleteMatchType::STARTER_PACK;
++      match.type = omnibox::AutocompleteMatchType::kStarterPack;
+     } else if (i == 3) {
+       match.takeover_action =
+           base::MakeRefCounted<FakeOmniboxAction>(OmniboxActionId::SITE_SEARCH);
+@@ -1051,7 +1051,7 @@ TEST(ArciumCommandNativeMatchTest,
+ TEST(ArciumCommandNativeMatchTest,
+      FilteringOriginalDefaultDoesNotInventAnotherDefault) {
+   auto blocked_default = MakeNativeMatch("https://featured.test/", 10);
+-  blocked_default.type = AutocompleteMatchType::FEATURED_ENTERPRISE_SEARCH;
++  blocked_default.type = omnibox::AutocompleteMatchType::kFeaturedEnterpriseSearch;
+   blocked_default.allowed_to_be_default_match = true;
+   auto next = MakeNativeMatch("https://next.test/", 1500);
+   next.allowed_to_be_default_match = true;
+@@ -1080,7 +1080,7 @@ TEST(ArciumCommandNativeMatchTest,
+   go.fill_into_edit = u"example.test";
+   go.allowed_to_be_default_match = true;
+   auto search = MakeNativeMatch("https://search.test/?q=example.test", 1400);
+-  search.type = AutocompleteMatchType::SEARCH_WHAT_YOU_TYPED;
++  search.type = omnibox::AutocompleteMatchType::kSearchWhatYouTyped;
+   search.fill_into_edit = u"example.test";
+   search.allowed_to_be_default_match = true;
+   AutocompleteResult result;
+@@ -1092,7 +1092,7 @@ TEST(ArciumCommandNativeMatchTest,
+   EXPECT_EQ(0u, rows[0].ordinal);
+   EXPECT_TRUE(rows[0].is_default);
+   EXPECT_EQ(1u, rows[1].ordinal);
+-  EXPECT_EQ(static_cast<int>(AutocompleteMatchType::SEARCH_WHAT_YOU_TYPED),
++  EXPECT_EQ(static_cast<int>(omnibox::AutocompleteMatchType::kSearchWhatYouTyped),
+             rows[1].match_type);
+   EXPECT_FALSE(GetUnprojectedNativeDefaultOrdinal(result, rows));
+ }
+@@ -1146,7 +1146,7 @@ TEST(ArciumCommandNativeMatchTest,
+     EXPECT_FALSE(GetUnprojectedNativeDefaultOrdinal(result, {}));
+   }
+   auto live = MakeNativeMatch("https://live.test/", 1500);
+-  live.type = AutocompleteMatchType::OPEN_TAB;
++  live.type = omnibox::AutocompleteMatchType::kOpenTab;
+   live.allowed_to_be_default_match = true;
+   AutocompleteResult live_result;
+   live_result.AppendMatches({live});
+@@ -1207,7 +1207,7 @@ TEST(ArciumCommandNativeSelectionKeyTest
+   EXPECT_NE(key, CommandNativeSelectionKey(
+                      updated, base::UnguessableToken::Create(), 7));
+   updated = match;
+-  updated.type = AutocompleteMatchType::SEARCH_WHAT_YOU_TYPED;
++  updated.type = omnibox::AutocompleteMatchType::kSearchWhatYouTyped;
+   EXPECT_NE(key, CommandNativeSelectionKey(
+                      updated, base::UnguessableToken::Create(), 7));
+ }
+Index: src/chrome/browser/ui/omnibox/arcium_omnibox_post_navigation_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_omnibox_post_navigation_unittest.cc
++++ src/chrome/browser/ui/omnibox/arcium_omnibox_post_navigation_unittest.cc
+@@ -62,7 +62,7 @@ class ChromeOmniboxPostNavigationTest :
+       TemplateURLRef::PostContent* post_content,
+       WindowOpenDisposition disposition = WindowOpenDisposition::CURRENT_TAB) {
+     AutocompleteMatch match(nullptr, 1000, false,
+-                            AutocompleteMatchType::SEARCH_OTHER_ENGINE);
++                            omnibox::AutocompleteMatchType::kSearchOtherEngine);
+     match.destination_url = GURL("https://search.test/search");
+     match.extra_headers.emplace("X-Search-Integration", "omnibox-acceptance");
+     client_->OnAutocompleteAccept(
+Index: src/chrome/browser/ui/views/omnibox/omnibox_result_view_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/omnibox_result_view_unittest.cc
++++ src/chrome/browser/ui/views/omnibox/omnibox_result_view_unittest.cc
+@@ -369,7 +369,7 @@ TEST_F(OmniboxResultViewTest, Contextual
+ 
+ TEST_F(OmniboxResultViewTest, ArciumActionsShowTwoLineContextAndPassiveCue) {
+   AutocompleteMatch match;
+-  match.type = AutocompleteMatchType::BOOKMARK_TITLE;
++  match.type = omnibox::AutocompleteMatchType::kBookmarkTitle;
+   match.contents = u"Close live tab";
+   match.contents_class = {{0, ACMatchClassification::MATCH}};
+   match.description = u"Atlas · Pin · Work › Projects";
+@@ -404,7 +404,7 @@ TEST_F(OmniboxResultViewTest, ArciumActi
+ 
+ TEST_F(OmniboxResultViewTest, ArciumActionReuseClearsCommandAffordances) {
+   AutocompleteMatch command;
+-  command.type = AutocompleteMatchType::BOOKMARK_TITLE;
++  command.type = omnibox::AutocompleteMatchType::kBookmarkTitle;
+   command.contents = u"Add to Favorites";
+   command.description = u"Atlas · Tab · Work";
+   command.arcium_item = ArciumOmniboxItem();
+@@ -417,7 +417,7 @@ TEST_F(OmniboxResultViewTest, ArciumActi
+   ASSERT_TRUE(cell->command_hint()->GetVisible());
+ 
+   AutocompleteMatch navigation;
+-  navigation.type = AutocompleteMatchType::HISTORY_URL;
++  navigation.type = omnibox::AutocompleteMatchType::kHistoryUrl;
+   navigation.contents = u"Atlas";
+   navigation.description = u"atlas.test";
+   result_view()->SetMatch(navigation);
+@@ -432,7 +432,7 @@ TEST_F(OmniboxResultViewTest, ArciumActi
+ 
+ TEST_F(OmniboxResultViewTest, ArciumActionResizeDoesNotOverlapReturnCue) {
+   AutocompleteMatch command;
+-  command.type = AutocompleteMatchType::BOOKMARK_TITLE;
++  command.type = omnibox::AutocompleteMatchType::kBookmarkTitle;
+   command.contents = u"Move pin to Research";
+   command.description =
+       u"A long document title · Pin · Work › Projects → Research";
+@@ -462,7 +462,7 @@ TEST_F(OmniboxResultViewTest, ArciumActi
+ 
+ TEST_F(OmniboxResultViewTest, ArciumActionRepeatedLayoutKeepsReturnCueStable) {
+   AutocompleteMatch command;
+-  command.type = AutocompleteMatchType::BOOKMARK_TITLE;
++  command.type = omnibox::AutocompleteMatchType::kBookmarkTitle;
+   command.contents = u"Pin this tab";
+   command.description = u"Atlas · Tab · Work";
+   command.arcium_item = ArciumOmniboxItem();
+@@ -481,7 +481,7 @@ TEST_F(OmniboxResultViewTest, ArciumActi
+   auto* active_result = rows.front()->result_view();
+   auto* cell = active_result->suggestion_view_.get();
+   AutocompleteMatch navigation;
+-  navigation.type = AutocompleteMatchType::HISTORY_URL;
++  navigation.type = omnibox::AutocompleteMatchType::kHistoryUrl;
+   navigation.contents = u"Atlas";
+   navigation.description = u"atlas.test";
+   for (const int width : {320, 640}) {
+Index: src/components/omnibox/browser/bookmark_provider.cc
+===================================================================
+--- src.orig/components/omnibox/browser/bookmark_provider.cc
++++ src/components/omnibox/browser/bookmark_provider.cc
+@@ -251,7 +251,7 @@ void BookmarkProvider::DoAutocomplete(co
+         continue;
+       }
+       AutocompleteMatch command(this, (quality >= 35 ? 5000 : 700) + quality,
+-                                false, AutocompleteMatchType::BOOKMARK_TITLE);
++                                false, omnibox::AutocompleteMatchType::kBookmarkTitle);
+       command.allowed_to_be_default_match = false;
+       command.destination_url =
+           GURL("chrome://arcium-command/" + base::HexEncode(item.Identity()));
+@@ -273,7 +273,7 @@ void BookmarkProvider::DoAutocomplete(co
+       continue;
+     }
+     AutocompleteMatch match(this, ArciumItemRelevance(item, match_quality),
+-                            false, AutocompleteMatchType::BOOKMARK_TITLE);
++                            false, omnibox::AutocompleteMatchType::kBookmarkTitle);
+     match.allowed_to_be_default_match = true;
+     match.destination_url = item.url;
+     match.fill_into_edit = base::UTF8ToUTF16(item.url.spec());
