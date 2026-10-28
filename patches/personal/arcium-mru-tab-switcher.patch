@@ -1289,7 +1289,7 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
-@@ -0,0 +1,427 @@
+@@ -0,0 +1,436 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1320,7 +1320,15 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
 +    : model_(model),
 +      capture_size_pixels_(std::move(capture_size_pixels)),
 +      enabled_(std::move(enabled)),
-+      memory_registration_("MRUTabPreviewCache", std::nullopt, this) {
++      memory_registration_(
++          "MRUTabPreviewCache",
++          base::MemoryConsumerTraits(
++              base::MemoryConsumerTraits::EstimatedMemoryUsage::kMedium,
++              base::MemoryConsumerTraits::ReleaseMemoryCost::kFreesPagesWithoutTraversal,
++              base::MemoryConsumerTraits::InformationRetention::kLossless,
++              base::MemoryConsumerTraits::ExecutionType::kSynchronous,
++              base::MemoryConsumerTraits::RecreateMemoryCost::kExpensive),
++          this) {
 +  OnUpdateMemoryLimit();
 +  model_->AddObserver(this);
 +  WatchActiveTab();
@@ -1336,7 +1344,7 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
 +    return {};
 +  }
 +  auto* tab = handle.Get();
-+  auto* helper = tab ? ThumbnailTabHelper::FromWebContents(tab->GetContents())
++  auto* helper = tab ? ThumbnailTabHelper::From(tab)
 +                     : nullptr;
 +  // Discard deliberately retains a last-good image. A live document change
 +  // invalidates it, even when navigation reused the same RenderFrameHost.
@@ -1357,7 +1365,7 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
 +  auto image = Get(handle);
 +  if (!image.isNull()) {
 +    auto* tab = handle.Get();
-+    auto* helper = ThumbnailTabHelper::FromWebContents(tab->GetContents());
++    auto* helper = ThumbnailTabHelper::From(tab);
 +    const auto& entry = entries_.front();
 +    if (entry.sharp || !helper ||
 +        entry.thumbnail_generation == helper->thumbnail()->cached_data_generation()) {
@@ -1370,7 +1378,7 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
 +
 +void MRUTabPreviewCache::Prefetch(tabs::TabHandle handle, gfx::Size size) {
 +  if (!Get(handle).isNull()) {
-+    auto* helper = ThumbnailTabHelper::FromWebContents(handle.Get()->GetContents());
++    auto* helper = ThumbnailTabHelper::From(handle.Get());
 +    const auto& entry = entries_.front();
 +    if (entry.sharp || !helper || entry.thumbnail_generation ==
 +                                     helper->thumbnail()->cached_data_generation()) {
@@ -1427,7 +1435,7 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
 +    auto* contents = tab && model_->GetIndexOfTab(tab) != TabStripModel::kNoTab
 +                         ? tab->GetContents() : nullptr;
 +    auto* helper = contents
-+                       ? ThumbnailTabHelper::FromWebContents(contents)
++                       ? ThumbnailTabHelper::From(tab)
 +                       : nullptr;
 +    if (!helper || !contents->GetPrimaryMainFrame()) {
 +      auto alive = weak_factory_.GetWeakPtr();
@@ -1551,7 +1559,7 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
 +    entries_.erase(it);
 +  }
 +  auto* contents = tab->GetContents();
-+  auto* helper = ThumbnailTabHelper::FromWebContents(contents);
++  auto* helper = ThumbnailTabHelper::From(tab);
 +  entries_.push_front({handle, std::move(image), bytes, contents->GetWeakPtr(),
 +                      contents->GetPrimaryMainFrame()->GetWeakDocumentPtr(),
 +                      sharp,
@@ -1608,7 +1616,8 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
 +      !contents->CompletedFirstVisuallyNonEmptyPaint()) {
 +    return false;
 +  }
-+  auto* helper = ThumbnailTabHelper::FromWebContents(contents);
++  auto* tab = tabs::TabInterface::MaybeGetFromContents(contents);
++  auto* helper = tab ? ThumbnailTabHelper::From(tab) : nullptr;
 +  return helper && helper->thumbnail()->GetCaptureReadiness() !=
 +                       ThumbnailImage::CaptureReadiness::kNotReady;
 +}
@@ -1707,7 +1716,7 @@ Index: src/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
 +
 +void MRUTabPreviewCache::OnUpdateMemoryLimit() {
 +  budget_ = (24 * 1024 * 1024) *
-+            static_cast<size_t>(std::clamp(memory_limit(), 0, 100)) / 100;
++            static_cast<size_t>(std::clamp(memory_limit().percent(), 0, 100)) / 100;
 +}
 +
 +void MRUTabPreviewCache::OnReleaseMemory() {
