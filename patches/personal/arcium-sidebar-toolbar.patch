@@ -834,7 +834,7 @@
  // Minimum area next to caption buttons to use as a grab handle.
  constexpr int kVerticalTabsGrabHandleSize = 40;
  
-@@ -507,7 +513,10 @@ BrowserViewTabbedLayoutImpl::CalculateHo
+@@ -510,7 +516,10 @@ BrowserViewTabbedLayoutImpl::CalculateHo
    layout.min_content_width = kContentsContainerMinimumWidth;
  
    // Get information about the vertical tabstrip, if present.
@@ -846,7 +846,7 @@
    int min_vertical_tab_strip_width = 0;
    int preferred_vertical_tab_strip_width = 0;
    if (layout_data_->tab_strip_type == TabStripType::kVertical) {
-@@ -554,7 +563,13 @@ BrowserViewTabbedLayoutImpl::CalculateHo
+@@ -557,7 +566,13 @@ BrowserViewTabbedLayoutImpl::CalculateHo
            std::max(min_vertical_tab_strip_width,
                     std::min(remainder, preferred_vertical_tab_strip_width));
      }
@@ -861,7 +861,7 @@
        min_vertical_tab_strip_width = 0;
        preferred_vertical_tab_strip_width = 0;
      }
-@@ -754,10 +769,13 @@ int BrowserViewTabbedLayoutImpl::GetMini
+@@ -757,10 +772,13 @@ int BrowserViewTabbedLayoutImpl::GetMini
  
  gfx::Size BrowserViewTabbedLayoutImpl::GetMinimumMainAreaSize(
      const BrowserLayoutParams& params) const {
@@ -878,7 +878,7 @@
      toolbar_size.Enlarge(GetExclusionWidth(params), 0);
    }
    const gfx::Size bookmark_bar_size =
-@@ -832,6 +850,9 @@ BrowserViewTabbedLayoutImpl::GetVertical
+@@ -835,6 +853,9 @@ BrowserViewTabbedLayoutImpl::GetVertical
  
  int BrowserViewTabbedLayoutImpl::GetCollapsedVerticalTabStripRelativeTop()
      const {
@@ -888,7 +888,7 @@
    // When the top container isn't in the browser view, the exclusion won't apply
    // and the tabstrip goes all the way to the top.
    if (!IsParentedTo(views().top_container, views().browser_view)) {
-@@ -1034,17 +1055,31 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+@@ -1037,17 +1058,31 @@ BrowserViewTabbedLayoutImpl::CalculatePr
        // Reveal a stable expanded layout from the window edge. Resizing the
        // contents from zero makes Favorites change columns and tab labels pop
        // between compact and expanded layouts during the same transition.
@@ -924,7 +924,7 @@
  
        int top_offset = vertical_tab_strip_animation.top_offset;
        if (zen.enabled) {
-@@ -1080,7 +1115,7 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+@@ -1083,7 +1118,7 @@ BrowserViewTabbedLayoutImpl::CalculatePr
  
        // Content follows the exposed width, not the off-window portion of the
        // sliding sidebar.
@@ -933,7 +933,7 @@
          vertical_tab_strip_width = vertical_tab_strip_bounds.width();
        }
        if (!zen.floating_vertical_tab_strip) {
-@@ -1591,6 +1626,15 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+@@ -1594,6 +1629,15 @@ BrowserViewTabbedLayoutImpl::CalculatePr
            side_exclusion_width - side_distance_from_client_edge - 10 > 0;
      }
  
@@ -949,7 +949,7 @@
      views().vertical_tab_strip_region_view->SetHasLeadingExclusionForLayout(
          has_leading_exclusion);
      using FloatingStyle = VerticalTabStripRegionView::FloatingStyle;
-@@ -1719,7 +1763,8 @@ gfx::Rect BrowserViewTabbedLayoutImpl::C
+@@ -1722,7 +1766,8 @@ gfx::Rect BrowserViewTabbedLayoutImpl::C
    }
  
    // Lay out the bookmarks bar if one is present.
@@ -978,15 +978,55 @@
        status,
        controller->GetCurrentMotion(TabStripAnimations::kVerticalTabStrip));
  
-@@ -483,6 +484,15 @@ views::ProposedLayout VerticalTabStripRe
+@@ -447,18 +448,40 @@ views::ProposedLayout VerticalTabStripRe
+       organizer_panel_view_ ? organizer_panel_view_->GetPreferredSize()
+                             : gfx::Size();
+ 
++  auto* toolbar = browser_view()->toolbar();
++  const bool has_sidebar_toolbar = toolbar && toolbar->parent() == this;
++  const bool toolbar_visible =
++      has_sidebar_toolbar && browser_view()->IsSidebarNavigationActive() &&
++      browser_view()->IsToolbarVisible() &&
++      (!state_controller_->IsCollapsed() ||
++       IsSidebarNavigationTemporarilyExpanded());
++  const gfx::Size toolbar_size =
++      toolbar_visible ? toolbar->GetPreferredSize() : gfx::Size();
++
+   // Host size will be based on given bounds, or on preferred sizes if not
+   // specified.
+   layout.host_size = gfx::Size(
+       size_bounds.width().value_or(
+-          std::max(tab_strip_size.width(), organizer_panel_size.width())),
++          std::max({tab_strip_size.width(), organizer_panel_size.width(),
++                    toolbar_size.width()})),
+       size_bounds.height().value_or(
+           std::max(tab_strip_size.height(), organizer_panel_size.height()) +
+-          interior_margin_.height()));
++          interior_margin_.height() + toolbar_size.height()));
+   gfx::Rect available(layout.host_size);
+ 
+   available.Inset(interior_margin_);
+ 
++  if (has_sidebar_toolbar) {
++    const int toolbar_height =
++        std::min(toolbar_size.height(), std::max(0, available.height()));
++    layout.child_layouts.push_back(
++        {.child_view = toolbar,
++         .visible = toolbar_visible && toolbar_height > 0,
++         .bounds = gfx::Rect(available.x(), available.y(), available.width(),
++                             toolbar_height)});
++    available.Inset(gfx::Insets::TLBR(toolbar_height, 0, 0, 0));
++  }
++
+   // Just so that there's never a zero-size tabstrip.
+   available.set_height(std::max(1, available.height()));
+ 
+@@ -483,6 +506,12 @@ views::ProposedLayout VerticalTabStripRe
  }
  
  void VerticalTabStripRegionView::Layout(PassKey) {
 +  if (browser_view()->IsSidebarNavigationActive()) {
 +    auto* toolbar = browser_view()->toolbar();
-+    const bool expanded = !state_controller_->IsCollapsed() ||
-+                          IsSidebarNavigationTemporarilyExpanded();
-+    toolbar->SetVisible(expanded && browser_view()->IsToolbarVisible());
 +    toolbar->SetSidebarNavigationExclusion(
 +        sidebar_navigation_exclusion_width_,
 +        sidebar_navigation_exclusion_height_);
@@ -994,7 +1034,7 @@
    LayoutSuperclass<BaseTabStripRegionView>(this);
  
    // When animating the organizer panel in, as soon as it is visible, focus it.
-@@ -519,17 +529,31 @@ views::View* VerticalTabStripRegionView:
+@@ -519,17 +548,31 @@ views::View* VerticalTabStripRegionView:
    return bottom_button_container_;
  }
  
@@ -1029,7 +1069,7 @@
    const int minimum_width =
        full_hidden_layout
            ? 0
-@@ -553,10 +577,10 @@ gfx::Size VerticalTabStripRegionView::Ca
+@@ -553,10 +596,10 @@ gfx::Size VerticalTabStripRegionView::Ca
        *controller->GetCurrentValue(TabStripAnimations::kVerticalTabStrip,
                                     TabStripAnimations::kTabStripWidth);
    const bool full_hidden_layout =
@@ -1042,7 +1082,7 @@
    const double width = full_hidden_layout
                             ? target_collapse_state_.uncollapsed_width *
                                   expand_percent
-@@ -998,12 +1022,25 @@ void VerticalTabStripRegionView::OnTheme
+@@ -998,12 +1041,25 @@ void VerticalTabStripRegionView::OnTheme
    PreferredSizeChanged();
  }
  
@@ -1069,7 +1109,7 @@
      const float top_chrome_ratio = browser->GetTopChromeRevealRatio();
      const bool top_chrome_visible_or_pinned =
          top_chrome_ratio > 0.0f || browser->IsZenModeTopChromePinned();
-@@ -1376,7 +1413,9 @@ void VerticalTabStripRegionView::OnOmnib
+@@ -1376,7 +1432,9 @@ void VerticalTabStripRegionView::OnOmnib
    if (is_open) {
      if (!omnibox_open_lock_) {
        omnibox_open_lock_ =
@@ -1566,6 +1606,16 @@
  }
  
  void ToolbarView::OnShowMenuButtonChanged() {
+@@ -2695,7 +3003,8 @@ void ToolbarView::OnLocationBarCenteredC
+ }
+ 
+ void ToolbarView::UpdateLocationBarCentering() {
+-  if (display_mode_ != DisplayMode::kNormal || !layout_manager_ ||
++  if (sidebar_navigation_mode_ || display_mode_ != DisplayMode::kNormal ||
++      !layout_manager_ ||
+       !location_bar_is_centered_.GetValue()) {
+     return;
+   }
 --- a/chrome/browser/ui/views/toolbar/toolbar_view.h
 +++ b/chrome/browser/ui/views/toolbar/toolbar_view.h
 @@ -7,6 +7,7 @@
