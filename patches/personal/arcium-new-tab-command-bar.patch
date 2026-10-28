@@ -2,7 +2,7 @@ Index: src/chrome/browser/ui/browser_command_controller.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/browser_command_controller.cc
 +++ src/chrome/browser/ui/browser_command_controller.cc
-@@ -761,10 +761,7 @@ void BrowserCommandController::HandleCom
+@@ -791,10 +791,7 @@ void BrowserCommandController::HandleCom
        CloseWindow(browser_);
        break;
      case IDC_NEW_TAB: {
@@ -18,7 +18,7 @@ Index: src/chrome/browser/ui/browser_commands.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/browser_commands.cc
 +++ src/chrome/browser/ui/browser_commands.cc
-@@ -1292,6 +1292,12 @@ content::WebContents& NewTab(BrowserWind
+@@ -1450,6 +1450,12 @@ content::WebContents& NewTab(BrowserWind
    return *contents;
  }
  
@@ -35,7 +35,7 @@ Index: src/chrome/browser/ui/browser_commands.h
 ===================================================================
 --- src.orig/chrome/browser/ui/browser_commands.h
 +++ src/chrome/browser/ui/browser_commands.h
-@@ -115,6 +115,7 @@ void NewIncognitoWindow(Profile* profile
+@@ -129,6 +129,7 @@ void NewIncognitoWindow(Profile* profile
  void CloseWindow(BrowserWindowInterface* browser);
  content::WebContents& NewTab(BrowserWindowInterface* browser,
                               NewTabTypes context);
@@ -47,7 +47,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/omnibox/arcium_command_action_router.cc
 +++ src/chrome/browser/ui/omnibox/arcium_command_action_router.cc
-@@ -458,13 +458,9 @@ CommandMenu FilterActions(CommandMenu me
+@@ -460,13 +460,9 @@ CommandMenu FilterActions(CommandMenu me
    return menu;
  }
  
@@ -63,17 +63,17 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router.cc
 +                                       WindowOpenDisposition::CURRENT_TAB);
  }
  
- bool PrepareCurrentTab(base::WeakPtr<Browser> owner,
-@@ -1129,7 +1125,7 @@ CommandExecutionResult ArciumCommandActi
+ bool PrepareCurrentTab(base::WeakPtr<BrowserWindowInterface> owner,
+@@ -1131,7 +1127,7 @@ CommandExecutionResult ArciumCommandActi
      const auto accept = native_callbacks_.accept;
      const CommandNativeTarget selection = *native;
      const auto disposition =
 -        InvocationDisposition(invocation_, intent.event_flags);
 +        InvocationDisposition(intent.event_flags);
-     const auto owner = browser_->AsWeakPtr();
+     const auto owner = browser_->GetWeakPtr();
      const auto source = invocation_.source_tab;
      if (disposition == WindowOpenDisposition::CURRENT_TAB &&
-@@ -1167,7 +1163,7 @@ CommandExecutionResult ArciumCommandActi
+@@ -1169,7 +1165,7 @@ CommandExecutionResult ArciumCommandActi
                 : Unavailable();
    }
    return ExecuteOpen(intent, target,
@@ -86,7 +86,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
 +++ src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
-@@ -178,33 +178,47 @@ class RecordingCommandBrowserWindow : pu
+@@ -180,33 +180,47 @@ class RecordingCommandBrowserWindow : pu
   public:
    bool ShowArciumCommandBar(bool new_tab) override {
      invocations.push_back(new_tab);
@@ -110,7 +110,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
 -    return std::make_unique<RecordingCommandBrowserWindow>();
 +    auto window = std::make_unique<RecordingCommandBrowserWindow>();
 +    window->tab_count = base::BindLambdaForTesting([this] {
-+      return browser()->tab_strip_model()->count();
++      return browser()->GetTabStripModel()->count();
 +    });
 +    return window;
    }
@@ -122,37 +122,37 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
 -TEST_F(ArciumCommandEntryRoutingTest, NewTabCommandDefersCreation) {
 +TEST_F(ArciumCommandEntryRoutingTest, NewTabCommandCreatesBeforePresentation) {
    AddTab(browser(), GURL("https://source.test/"));
-   auto* source = browser()->tab_strip_model()->GetActiveWebContents();
-   const int count = browser()->tab_strip_model()->count();
+   auto* source = browser()->GetTabStripModel()->GetActiveWebContents();
+   const int count = browser()->GetTabStripModel()->count();
    ASSERT_TRUE(chrome::ExecuteCommand(browser(), IDC_NEW_TAB));
    EXPECT_EQ((std::vector<bool>{true}), recording_window()->invocations);
--  EXPECT_EQ(count, browser()->tab_strip_model()->count());
--  EXPECT_EQ(source, browser()->tab_strip_model()->GetActiveWebContents());
-+  EXPECT_EQ(count + 1, browser()->tab_strip_model()->count());
+-  EXPECT_EQ(count, browser()->GetTabStripModel()->count());
+-  EXPECT_EQ(source, browser()->GetTabStripModel()->GetActiveWebContents());
++  EXPECT_EQ(count + 1, browser()->GetTabStripModel()->count());
 +  EXPECT_EQ((std::vector<int>{count + 1}),
 +            recording_window()->counts_at_presentation);
-+  EXPECT_NE(source, browser()->tab_strip_model()->GetActiveWebContents());
++  EXPECT_NE(source, browser()->GetTabStripModel()->GetActiveWebContents());
  }
  
 -TEST_F(ArciumCommandEntryRoutingTest, NewTabActionDefersCreation) {
 +TEST_F(ArciumCommandEntryRoutingTest, NewTabActionCreatesBeforePresentation) {
    AddTab(browser(), GURL("https://source.test/"));
-   auto* source = browser()->tab_strip_model()->GetActiveWebContents();
-   const int count = browser()->tab_strip_model()->count();
-@@ -213,8 +227,10 @@ TEST_F(ArciumCommandEntryRoutingTest, Ne
+   auto* source = browser()->GetTabStripModel()->GetActiveWebContents();
+   const int count = browser()->GetTabStripModel()->count();
+@@ -215,8 +229,10 @@ TEST_F(ArciumCommandEntryRoutingTest, Ne
    ASSERT_TRUE(action);
    action->InvokeAction();
    EXPECT_EQ((std::vector<bool>{true}), recording_window()->invocations);
--  EXPECT_EQ(count, browser()->tab_strip_model()->count());
--  EXPECT_EQ(source, browser()->tab_strip_model()->GetActiveWebContents());
-+  EXPECT_EQ(count + 1, browser()->tab_strip_model()->count());
+-  EXPECT_EQ(count, browser()->GetTabStripModel()->count());
+-  EXPECT_EQ(source, browser()->GetTabStripModel()->GetActiveWebContents());
++  EXPECT_EQ(count + 1, browser()->GetTabStripModel()->count());
 +  EXPECT_EQ((std::vector<int>{count + 1}),
 +            recording_window()->counts_at_presentation);
-+  EXPECT_NE(source, browser()->tab_strip_model()->GetActiveWebContents());
++  EXPECT_NE(source, browser()->GetTabStripModel()->GetActiveWebContents());
  }
  
  TEST_F(ArciumCommandEntryRoutingTest, FocusSearchUsesCurrentTabInvocation) {
-@@ -607,13 +623,27 @@ TEST_F(ArciumCommandActionRouterTest, Na
+@@ -609,13 +625,27 @@ TEST_F(ArciumCommandActionRouterTest, Na
  }
  
  TEST_F(ArciumCommandActionRouterTest,
@@ -173,8 +173,8 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
 +  auto* captured = AddOrdinaryTab("about:blank");
 +  Capture(captured, CommandInvocationMode::kNewTab);
 +  auto* survivor = AddOrdinaryTab("https://survivor.test/");
-+  browser()->tab_strip_model()->CloseWebContentsAt(
-+      browser()->tab_strip_model()->GetIndexOfTab(captured),
++  browser()->GetTabStripModel()->CloseWebContentsAt(
++      browser()->GetTabStripModel()->GetIndexOfTab(captured),
 +      TabCloseTypes::CLOSE_NONE);
 +  EXPECT_FALSE(router_->Execute(Intent(Native())).success);
 +  EXPECT_EQ(0, native_accepts_);
@@ -183,7 +183,7 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
  }
  
  TEST_F(ArciumCommandActionRouterTest, NativeAcceptMayDestroyRouter) {
-@@ -895,7 +925,8 @@ TEST_F(ArciumCommandActionRouterTest,
+@@ -897,7 +927,8 @@ TEST_F(ArciumCommandActionRouterTest,
         ChatGPTNewTabQueryPreservesExistingConversationAndNavigatesToRoot) {
    auto* source = AddOrdinaryTab("https://chatgpt.com/c/existing-conversation");
    content::WebContents* original = source->GetContents();
@@ -193,9 +193,9 @@ Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
    const auto url = BuildCommandSearchUrl(kChatGPTScope, u"a fresh question");
    ASSERT_TRUE(url);
    ASSERT_TRUE(router_->Execute(Intent(CommandUrlTarget{.url = *url})).success);
-@@ -903,6 +934,7 @@ TEST_F(ArciumCommandActionRouterTest,
-   ASSERT_EQ(2, browser()->tab_strip_model()->count());
-   auto* destination = browser()->tab_strip_model()->GetActiveWebContents();
+@@ -905,6 +936,7 @@ TEST_F(ArciumCommandActionRouterTest,
+   ASSERT_EQ(2, browser()->GetTabStripModel()->count());
+   auto* destination = browser()->GetTabStripModel()->GetActiveWebContents();
    ASSERT_NE(original, destination);
 +  EXPECT_EQ(created->GetContents(), destination);
    EXPECT_EQ(GURL("https://chatgpt.com/c/existing-conversation"),
@@ -205,7 +205,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
-@@ -4,7 +4,9 @@
+@@ -6,7 +6,9 @@
  #include "base/metrics/histogram_macros_local.h"
  #include "base/time/time.h"
  #include "chrome/browser/profiles/profile.h"
@@ -215,7 +215,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_browser_view.cc
  #include "chrome/browser/ui/omnibox/arcium_command_providers.h"
  #include "chrome/browser/ui/views/frame/browser_view.h"
  #include "chrome/browser/ui/views/helium/arcium_chrome_ui_scale.h"
-@@ -35,6 +37,15 @@ bool BrowserView::ShowArciumNativeComman
+@@ -37,6 +39,15 @@ bool BrowserView::ShowArciumNativeComman
        return view ? arcium::CreateCommandSession(view->browser(), view->arcium_command_context_)
                    : nullptr;
      }, weak_ptr_factory_.GetWeakPtr());
@@ -266,7 +266,7 @@ Index: src/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
 +++ src/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
-@@ -543,11 +543,11 @@ void BrowserTabStripController::OnDropIn
+@@ -467,11 +467,11 @@ void BrowserTabStripController::OnDropIn
  }
  
  void BrowserTabStripController::CreateNewTab(NewTabTypes context) {
@@ -286,8 +286,8 @@ Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
 +++ src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
-@@ -5,6 +5,11 @@
- #include "chrome/browser/ui/views/frame/test_with_browser_view.h"
+@@ -7,6 +7,11 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
  
  #include <memory>
 +#include "chrome/browser/ui/omnibox/arcium_command_example_session.h"
@@ -298,7 +298,7 @@ Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
  #include <cstdlib>
  #include "base/run_loop.h"
  #include "chrome/browser/ui/helium/helium_space_service.h"
-@@ -402,3 +407,65 @@ TEST_F(ArciumBrowserChromeTest, FooterRa
+@@ -404,3 +409,65 @@ TEST_F(ArciumBrowserChromeTest, FooterRa
    EXPECT_LE(std::abs(footer->spaces_scroll_for_testing()->bounds().CenterPoint().x() -
                       footer->GetContentsBounds().CenterPoint().x()), 1);
  }
@@ -311,7 +311,7 @@ Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
 +            std::vector<arcium::CommandScopeDescriptor>{
 +                {.id = arcium::kOmniScope, .label = u"Omni"}});
 +      }));
-+  auto* model = browser()->tab_strip_model();
++  auto* model = browser()->GetTabStripModel();
 +  const int before = model->count();
 +  ASSERT_TRUE(chrome::ExecuteCommand(browser(), IDC_NEW_TAB));
 +  auto* presentation = arcium::CommandPanelPresentation::Get(browser_view());
@@ -349,14 +349,14 @@ Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
 +            std::vector<arcium::CommandScopeDescriptor>{
 +                {.id = arcium::kOmniScope, .label = u"Omni"}});
 +      }));
-+  auto* popup = CreateBrowserWithBrowserView(profile(), Browser::TYPE_POPUP);
++  auto* popup = CreateBrowserWithBrowserView(profile(), BrowserWindowInterface::TYPE_POPUP);
 +  AddTab(popup, GURL("https://popup.test/"));
-+  auto* original = popup->tab_strip_model()->GetActiveWebContents();
-+  const int before = browser()->tab_strip_model()->count();
++  auto* original = popup->GetTabStripModel()->GetActiveWebContents();
++  const int before = browser()->GetTabStripModel()->count();
 +  ASSERT_TRUE(chrome::ExecuteCommand(popup, IDC_NEW_TAB));
-+  EXPECT_EQ(1, popup->tab_strip_model()->count());
-+  EXPECT_EQ(original, popup->tab_strip_model()->GetActiveWebContents());
-+  EXPECT_EQ(before + 1, browser()->tab_strip_model()->count());
++  EXPECT_EQ(1, popup->GetTabStripModel()->count());
++  EXPECT_EQ(original, popup->GetTabStripModel()->GetActiveWebContents());
++  EXPECT_EQ(before + 1, browser()->GetTabStripModel()->count());
 +  auto* presentation = arcium::CommandPanelPresentation::Get(browser_view());
 +  ASSERT_TRUE(presentation);
 +  ASSERT_TRUE(base::test::RunUntil([&] { return presentation->is_open(); }));
