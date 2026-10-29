@@ -2,7 +2,7 @@ Index: src/chrome/browser/prefs/browser_prefs.cc
 ===================================================================
 --- src.orig/chrome/browser/prefs/browser_prefs.cc
 +++ src/chrome/browser/prefs/browser_prefs.cc
-@@ -88,6 +88,7 @@
+@@ -90,6 +90,7 @@
  #include "chrome/browser/tracing/chrome_tracing_delegate.h"
  #include "chrome/browser/ui/browser_shortcuts/browser_shortcut_prefs.h"
  #include "chrome/browser/ui/browser_ui_prefs.h"
@@ -10,7 +10,7 @@ Index: src/chrome/browser/prefs/browser_prefs.cc
  #include "chrome/browser/ui/network_profile_bubble.h"
  #include "chrome/browser/ui/performance_controls/performance_controls_metrics.h"
  #include "chrome/browser/ui/prefs/prefs_tab_helper.h"
-@@ -1411,6 +1412,7 @@ void RegisterLocalState(PrefRegistrySimp
+@@ -1538,6 +1539,7 @@ void RegisterLocalState(PrefRegistrySimp
    registry->RegisterIntegerPref(
        prefs::kHeliumCrashReportingMode,
        static_cast<int>(helium::CrashReportingMode::kAsk));
@@ -22,29 +22,29 @@ Index: src/chrome/browser/ui/BUILD.gn
 ===================================================================
 --- src.orig/chrome/browser/ui/BUILD.gn
 +++ src/chrome/browser/ui/BUILD.gn
-@@ -474,6 +474,10 @@ static_library("ui") {
-     "helium/helium_space_service_factory.h",
-     "helium/helium_little_arc.cc",
-     "helium/helium_little_arc.h",
-+    "helium/arcium_space_directory.cc",
-+    "helium/arcium_space_directory.h",
-+    "helium/arcium_space_icon.cc",
-+    "helium/arcium_space_icon.h",
-     "idle_bubble.h",
-     "managed_ui.cc",
-     "managed_ui.h",
-@@ -548,6 +552,7 @@ static_library("ui") {
+@@ -1665,6 +1665,7 @@ static_library("ui") {
+   ]
+ 
+   deps = [
++    "//third_party/phosphor-icons:phosphor_icons",
+     ":browser_element_identifiers",
      ":browser_otr_state",
      ":browser_ui_prefs",
-     ":incognito_allowed_url",
-+    "//third_party/phosphor-icons:phosphor_icons",
-     ":recently_audible_helper",
-     ":simple_message_box_internal",
-     ":tab_modal_confirm_dialog_delegate",
-@@ -4166,6 +4171,14 @@ static_library("ui") {
-       "views/frame/contents_web_view.h",
-       "views/helium/peek_controller.cc",
-       "views/helium/peek_controller.h",
+@@ -2405,6 +2406,10 @@ static_library("ui") {
+       "omnibox/arcium_command_session.cc",
+       "omnibox/arcium_command_session.h",
+       "helium/arcium_appearance_prefs.h",
++      "helium/arcium_space_directory.cc",
++      "helium/arcium_space_directory.h",
++      "helium/arcium_space_icon.cc",
++      "helium/arcium_space_icon.h",
+       "helium/helium_space.cc",
+       "helium/helium_space.h",
+       "helium/helium_space_service.cc",
+@@ -3701,6 +3706,14 @@ static_library("ui") {
+       "views/helium/frame_corner_radius.h",
+       "views/helium/glass_surface.cc",
+       "views/helium/glass_surface.h",
 +      "views/helium/arcium_space_theme_editor.cc",
 +      "views/helium/arcium_space_theme_editor.h",
 +      "views/helium/arcium_space_controls.cc",
@@ -53,9 +53,9 @@ Index: src/chrome/browser/ui/BUILD.gn
 +      "views/helium/arcium_space_editor_view.h",
 +      "views/helium/arcium_space_icon_picker.cc",
 +      "views/helium/arcium_space_icon_picker.h",
-       "views/frame/custom_corners.cc",
-       "views/frame/custom_corners.h",
-       "views/frame/custom_corners_background.cc",
+       "views/helium/native_frame_materials.cc",
+       "views/helium/native_frame_materials.h",
+     ]
 Index: src/chrome/browser/ui/helium/arcium_space_directory.cc
 ===================================================================
 --- /dev/null
@@ -2053,23 +2053,23 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 --- src.orig/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 +++ src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 @@ -12,6 +12,7 @@
- #include "base/check_is_test.h"
- #include "base/containers/adapters.h"
+ 
+ #include "base/callback_list.h"
  #include "base/functional/bind.h"
 +#include "base/task/sequenced_task_runner.h"
  #include "base/i18n/number_formatting.h"
  #include "base/i18n/rtl.h"
  #include "base/metrics/histogram_functions.h"
-@@ -42,6 +43,7 @@
+@@ -45,6 +46,7 @@
+ #include "chrome/browser/ui/views/frame/safe_invoke/safe_invoke.h"
  #include "chrome/browser/ui/views/frame/shadow_frame_view.h"
  #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
- #include "chrome/browser/ui/views/helium/arcium_chrome_ui_scale.h"
 +#include "chrome/browser/ui/views/helium/arcium_space_editor_view.h"
- #include "chrome/browser/ui/views/helium/frame_corner_radius.h"
  #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
  #include "chrome/browser/ui/views/tabs/common/root_tab_collection_node.h"
-@@ -84,6 +86,12 @@
- #include "ui/views/layout/layout_types.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+@@ -85,6 +87,12 @@
+ #include "ui/views/layout/proposed_layout.h"
  #include "ui/views/view.h"
  #include "ui/views/view_class_properties.h"
 +#include "ui/compositor/layer.h"
@@ -2081,10 +2081,14 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
  #include "ui/views/view_utils.h"
  
  namespace {
-@@ -174,6 +182,12 @@ VerticalTabStripRegionView::VerticalTabS
+@@ -191,8 +199,14 @@ VerticalTabStripRegionView::VerticalTabS
+   bottom_button_container_->SetProperty(
+       views::kFlexBehaviorKey,
        views::FlexSpecification(views::LayoutOrientation::kVertical,
-                                views::MinimumFlexSizeRule::kPreferred,
-                                views::MaximumFlexSizeRule::kPreferred));
+-                              views::MinimumFlexSizeRule::kPreferred,
+-                              views::MaximumFlexSizeRule::kPreferred));
++                               views::MinimumFlexSizeRule::kPreferred,
++                               views::MaximumFlexSizeRule::kPreferred));
 +  bottom_button_container_->SetEditSpaceCallback(
 +      base::BindRepeating(&VerticalTabStripRegionView::ShowSpaceEditor,
 +                          base::Unretained(this)));
@@ -2094,17 +2098,17 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
    bottom_button_container_->SetProperty(
        views::kMarginsKey,
        gfx::Insets::TLBR(kBottomContainerGap, region_horizontal_padding,
-@@ -437,6 +451,97 @@ void VerticalTabStripRegionView::Layout(
+@@ -520,6 +534,97 @@ void VerticalTabStripRegionView::Layout(
    }
  }
  
 +void VerticalTabStripRegionView::AnimateSpaceSwitch(int direction) {
-+  ui::Layer* layer = tab_strip_view_ ? tab_strip_view_->layer() : nullptr;
++  ui::Layer* layer = tab_strip_view() ? tab_strip_view()->layer() : nullptr;
 +  if (!layer || !gfx::Animation::ShouldRenderRichAnimation()) {
 +    return;
 +  }
 +  gfx::Transform start;
-+  start.Translate(direction * tab_strip_view_->width() / 3.f, 0);
++  start.Translate(direction * tab_strip_view()->width() / 3.f, 0);
 +  layer->SetTransform(start);
 +  layer->SetOpacity(0.f);
 +  views::AnimationBuilder()
@@ -2134,7 +2138,7 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 +  const int horizontal_padding = arcium::GetChromeLayoutConstant(
 +      this, LayoutConstant::kVerticalTabStripHorizontalPadding);
 +  auto editor = std::make_unique<ArciumSpaceEditorView>(
-+      browser_view_->browser(), profile, std::move(space_id),
++      browser_view()->browser(), profile, std::move(space_id),
 +      base::BindRepeating(&VerticalTabStripBottomContainer::SetThemePreview,
 +                          base::Unretained(bottom_button_container_.get())),
 +      base::BindRepeating(&VerticalTabStripRegionView::CloseSpaceEditor,
@@ -2147,11 +2151,11 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 +          .WithWeight(1));
 +  editor->SetProperty(views::kMarginsKey,
 +                      gfx::Insets::VH(0, horizontal_padding));
-+  space_editor_ = AddChildViewAt(std::move(editor),
-+                                 GetIndexOf(tab_area_spacer_).value_or(0));
++  space_editor_ = content_area_view_->AddChildViewAt(
++      std::move(editor), content_area_view_->GetIndexOf(tab_area_spacer_).value_or(0));
 +  for (views::View* view :
 +       {static_cast<views::View*>(new_tab_button_.get()),
-+        tab_area_spacer_.get(), static_cast<views::View*>(tab_strip_view_)}) {
++        tab_area_spacer_.get(), static_cast<views::View*>(tab_strip_view())}) {
 +    if (view) {
 +      view->SetVisible(false);
 +    }
@@ -2174,10 +2178,10 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 +  ArciumSpaceEditorView* editor = space_editor_;
 +  space_editor_ = nullptr;
 +  base::SequencedTaskRunner::GetCurrentDefault()->DeleteSoon(
-+      FROM_HERE, RemoveChildViewT(editor));
++      FROM_HERE, content_area_view_->RemoveChildViewT(editor));
 +  for (views::View* view :
 +       {static_cast<views::View*>(new_tab_button_.get()),
-+        tab_area_spacer_.get(), static_cast<views::View*>(tab_strip_view_)}) {
++        tab_area_spacer_.get(), static_cast<views::View*>(tab_strip_view())}) {
 +    if (view) {
 +      view->SetVisible(true);
 +    }
@@ -2190,8 +2194,8 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 +}
 +
  views::View* VerticalTabStripRegionView::GetDefaultFocusableChild() {
-   const int active_index = tab_strip_model_->active_index();
-   if (active_index != TabStripModel::kNoTab) {
+   tabs::TabInterface* active_tab = tab_strip_model()->GetActiveTab();
+   if (active_tab) {
 Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
@@ -2206,22 +2210,22 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
  #include "base/containers/flat_set.h"
  #include "base/memory/raw_ptr.h"
 +#include "base/memory/weak_ptr.h"
- #include "base/scoped_observation.h"
  #include "base/time/time.h"
  #include "base/timer/timer.h"
-@@ -34,7 +36,9 @@
- #include "ui/views/controls/resize_area_delegate.h"
+ #include "chrome/browser/ui/animation/browser_animation_types.h"
+@@ -35,7 +37,9 @@
  #include "ui/views/focus/focus_manager.h"
+ #include "ui/views/layout/delegating_layout_manager.h"
  
 +class ArciumSpaceEditorView;
  class BrowserView;
 +class Profile;
- class ExpandOnHoverLock;
- class NewTabButtonMenuModel;
  class VerticalNewTabButton;
-@@ -93,6 +97,15 @@ class VerticalTabStripRegionView final
+ class VerticalTabStripBottomContainer;
+ class VerticalTabStripFocusSwipeController;
+@@ -92,6 +96,15 @@ class VerticalTabStripRegionView final
  
-   bool IsPositionInWindowCaption(const gfx::Point& point);
+   bool IsPositionInWindowCaption(const gfx::Point& point) override;
  
 +  // Replaces the tab list with the Space form. An empty `space_id` creates a
 +  // Space; otherwise the form edits that Space of `profile`.
@@ -2233,9 +2237,9 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
 +  void CloseSpaceEditor();
 +
    void SetHasLeadingExclusionForLayout(bool has_leading_exclusion);
-   void SetZenModeFloatingStyleForLayout(bool floating);
- 
-@@ -255,6 +268,8 @@ class VerticalTabStripRegionView final
+   // How the tab strip is drawn while it floats over the contents.
+   enum class FloatingStyle {
+@@ -279,6 +292,8 @@ class VerticalTabStripRegionView final
    raw_ptr<VerticalTabStripBottomContainer> bottom_button_container_ = nullptr;
    raw_ptr<VerticalNewTabButton> new_tab_button_ = nullptr;
    raw_ptr<views::View> tab_area_spacer_ = nullptr;
@@ -2244,10 +2248,10 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
    raw_ptr<views::View> gemini_button_ = nullptr;
    raw_ptr<views::ResizeArea> resize_area_ = nullptr;
    raw_ptr<ShadowFrameView> shadow_frame_ = nullptr;
-@@ -323,6 +338,7 @@ class VerticalTabStripRegionView final
-   bool is_first_window_presentation_ = true;
-   base::ScopedObservation<views::Widget, views::WidgetObserver>
-       widget_observation_{this};
+@@ -345,6 +360,7 @@ class VerticalTabStripRegionView final
+   base::OneShotTimer mouse_exit_timer_;
+ 
+   base::CallbackListSubscription paint_as_active_subscription_;
 +  base::WeakPtrFactory<VerticalTabStripRegionView> weak_factory_{this};
  };
  
@@ -4514,13 +4518,13 @@ Index: src/chrome/browser/sessions/session_service.cc
 ===================================================================
 --- src.orig/chrome/browser/sessions/session_service.cc
 +++ src/chrome/browser/sessions/session_service.cc
-@@ -204,6 +204,11 @@ bool SessionService::ShouldRestore(Brows
-   // If the browser does not have a `restore_id`, then we restore the session.
-   return browser->create_params().restore_id == Browser::kDefaultRestoreId;
+@@ -227,6 +227,11 @@ bool SessionService::ShouldRestore(Brows
+   return BrowserInitState::From(browser)->create_params().restore_id ==
+          BrowserWindowCreateParams::kDefaultRestoreId;
  #else
 +  // Arcium opens a Space's window in a profile without restoring that
 +  // profile's other windows; restoration could reassign the new window.
-+  if (browser && !browser->should_trigger_session_restore()) {
++  if (browser && !BrowserInitState::From(browser)->should_trigger_session_restore()) {
 +    return false;
 +  }
    if (!has_open_trackable_browsers_ &&
@@ -4530,19 +4534,19 @@ Index: src/chrome/browser/ui/views/frame/browser_widget.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/browser_widget.cc
 +++ src/chrome/browser/ui/views/frame/browser_widget.cc
-@@ -22,6 +22,9 @@
- #include "chrome/browser/ui/browser.h"
+@@ -21,6 +21,9 @@
  #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
  #include "chrome/browser/ui/browser_window_state.h"
 +#include "chrome/browser/ui/helium/helium_space.h"
 +#include "chrome/browser/ui/helium/helium_space_service.h"
 +#include "chrome/browser/ui/helium/helium_space_service_factory.h"
  #include "chrome/browser/ui/ui_features.h"
  #include "chrome/browser/ui/immersive/immersive_mode_controller.h"
- #include "chrome/browser/ui/unload_controller.h"
-@@ -455,6 +458,25 @@ ui::ColorProviderKey BrowserWidget::GetC
- 
+ #include "chrome/browser/ui/sessions/session_service_browser_helper.h"
+@@ -493,6 +496,25 @@ ui::ColorProviderKey BrowserWidget::GetC
    key = theme_service->GetColorProviderKey(key, profile);
+   key.custom_theme = GetCustomTheme();
  
 +  // An Arcium Space theme replaces its profile's theme in this window. Widget
 +  // overrides below, such as tab group focus, still apply on top.
@@ -4570,7 +4574,7 @@ Index: src/chrome/browser/chrome_content_browser_client.cc
 ===================================================================
 --- src.orig/chrome/browser/chrome_content_browser_client.cc
 +++ src/chrome/browser/chrome_content_browser_client.cc
-@@ -184,6 +184,10 @@
+@@ -200,6 +200,10 @@
  #include "chrome/browser/ui/blocked_content/blocked_window_params.h"
  #include "chrome/browser/ui/blocked_content/chrome_popup_navigation_delegate.h"
  #include "chrome/browser/ui/color/chrome_color_id.h"
@@ -4581,7 +4585,7 @@ Index: src/chrome/browser/chrome_content_browser_client.cc
  #include "chrome/browser/ui/login/http_auth_coordinator.h"
  #include "chrome/browser/ui/navigator/browser_navigator.h"
  #include "chrome/browser/ui/navigator/browser_navigator_params.h"
-@@ -4154,6 +4158,20 @@ blink::mojom::PreferredColorScheme ToBli
+@@ -4059,6 +4063,20 @@ blink::mojom::PreferredColorScheme ToBli
  }
  #endif  // !BUILDFLAG(IS_ANDROID)
  
@@ -4602,7 +4606,7 @@ Index: src/chrome/browser/chrome_content_browser_client.cc
  std::tuple<blink::mojom::PreferredColorScheme,
             blink::mojom::PreferredColorScheme>
  GetPreferredColorScheme(const WebPreferences& web_prefs,
-@@ -4187,6 +4205,18 @@ GetPreferredColorScheme(const WebPrefere
+@@ -4094,6 +4112,18 @@ GetPreferredColorScheme(const WebPrefere
          web_contents->GetColorMode() == ui::ColorProviderKey::ColorMode::kLight
              ? blink::mojom::PreferredColorScheme::kLight
              : blink::mojom::PreferredColorScheme::kDark;

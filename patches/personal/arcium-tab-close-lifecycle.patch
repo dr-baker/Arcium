@@ -2,7 +2,7 @@
 # Preserve live tab subscriptions until the unload decision accepts removal.
 --- a/chrome/browser/ui/tabs/tab_strip_model.cc
 +++ b/chrome/browser/ui/tabs/tab_strip_model.cc
-@@ -430,7 +430,7 @@ struct TabStripModel::DetachNotification
+@@ -452,7 +452,7 @@ struct TabStripModel::DetachNotification
    std::vector<std::unique_ptr<DetachedTab>> detached_tab;
  
    // The selection model prior to any tabs being detached.
@@ -11,7 +11,7 @@
  };
  
  ///////////////////////////////////////////////////////////////////////////////
-@@ -4288,19 +4288,14 @@ bool TabStripModel::CloseWebContentses(
+@@ -4695,23 +4695,14 @@ bool TabStripModel::CloseWebContentses(
      return true;
    }
  
@@ -29,15 +29,19 @@
 -    if (tab_model->IsVisible() && !closing_all_) {
 -      tab_model->WillBecomeHidden(base::PassKey<TabStripModel>());
 -    }
--    tab_model->WillDetach(base::PassKey<TabStripModel>(),
--                          tabs::TabInterface::DetachReason::kDelete);
+-    // TODO(crbug.com/558720516): Remove this and always call WillDetach after
+-    // unload handlers below.
+-    if (!ShouldRunUnloadListenerBeforeClosing(contents)) {
+-      tab_model->WillDetach(base::PassKey<TabStripModel>(),
+-                            tabs::TabInterface::DetachReason::kDelete);
+-    }
 +    attempted_contents.push_back(contents->GetWeakPtr());
    }
 -
    // We only try the fast shutdown path if the whole browser process is *not*
    // shutting down. Fast shutdown during browser termination is handled in
    // browser_shutdown::OnShutdownStarting.
-@@ -4308,8 +4303,9 @@ bool TabStripModel::CloseWebContentses(
+@@ -4719,8 +4710,9 @@ bool TabStripModel::CloseWebContentses(
      // Construct a map of processes to the number of associated tabs that are
      // closing.
      base::flat_map<content::RenderProcessHost*, size_t> processes;
@@ -49,7 +53,7 @@
          continue;
        }
        content::RenderProcessHost* process =
-@@ -4323,36 +4319,73 @@ bool TabStripModel::CloseWebContentses(
+@@ -4734,50 +4726,81 @@ bool TabStripModel::CloseWebContentses(
      }
    }
  
@@ -141,14 +145,19 @@
 +  std::vector<std::unique_ptr<DetachedTab>> detached_tab;
 +  for (const auto& [contents, original_index] : original_indices) {
 +    if (!contents) {
-+      continue;
-+    }
-+    const int current_index = GetIndexOfWebContents(contents.get());
-+    if (current_index == kNoTab) {
        continue;
      }
+-
+-    tabs::TabModel* tab_model = GetTabModelAtIndex(current_index);
+-    if (ShouldRunUnloadListenerBeforeClosing(closing_contents)) {
+-      tab_model->WillDetach(base::PassKey<TabStripModel>(),
+-                            tabs::TabInterface::DetachReason::kDelete);
++    const int current_index = GetIndexOfWebContents(contents.get());
++    if (current_index == kNoTab) {
++      continue;
+     }
  
-@@ -4360,7 +4393,7 @@ bool TabStripModel::CloseWebContentses(
+     bool create_historical_tab =
          close_types & TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB;
  
      auto dt =
@@ -159,16 +168,16 @@
                            : TabRemovedReason::kDeleted,
 --- a/chrome/browser/ui/unload_controller.cc
 +++ b/chrome/browser/ui/unload_controller.cc
-@@ -14,6 +14,8 @@
- #include "chrome/browser/ui/browser.h"
- #include "chrome/browser/ui/browser_tabstrip.h"
- #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+@@ -30,6 +30,8 @@
+ #include "chrome/browser/ui/browser_window/public/desktop_browser_window_capabilities.h"
+ #include "chrome/browser/ui/chrome_pages.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
 +#include "chrome/browser/ui/helium/helium_space_service.h"
 +#include "chrome/browser/ui/tabs/tab_close_types_data.h"
  #include "chrome/browser/ui/tabs/tab_group_model.h"
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
  #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
-@@ -222,6 +224,9 @@ bool UnloadController::RunUnloadEventsHe
+@@ -406,6 +408,9 @@ bool UnloadController::RunUnloadEventsHe
  bool UnloadController::BeforeUnloadFired(content::WebContents* contents,
                                           bool proceed) {
    if (!proceed) {
@@ -178,16 +187,16 @@
      DevToolsWindow::OnPageCloseCanceled(contents);
  
      // Inform PerformanceManager that page close was aborted. Any priority boost
-@@ -437,6 +442,9 @@ void UnloadController::OnTabStripModelCh
+@@ -632,6 +637,9 @@ void UnloadController::OnTabStripModelCh
  }
  
  void UnloadController::TabStripEmpty() {
 +  if (helium::HeliumSpaceService::ShouldDeferEmptyTabStripClose(browser_)) {
 +    return;
 +  }
-   // Set is_attempting_to_close_browser_ here, so that extensions, etc, do not
-   // attempt to add tabs to the browser before it closes.
-   is_attempting_to_close_browser_ = true;
+   // Set state_ here, so that extensions, etc, do not attempt to add tabs to the
+   // browser before it closes.
+   if (state_ == State::kIdle) {
 --- a/chrome/browser/ui/views/helium/peek_controller_browsertest.cc
 +++ b/chrome/browser/ui/views/helium/peek_controller_browsertest.cc
 @@ -31,6 +31,8 @@

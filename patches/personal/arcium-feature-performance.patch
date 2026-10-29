@@ -65,26 +65,34 @@
      return nullptr;
 --- a/chrome/browser/ui/BUILD.gn
 +++ b/chrome/browser/ui/BUILD.gn
-@@ -4101,6 +4101,8 @@ static_library("ui") {
-       "views/frame/browser_view.h",
+@@ -3645,6 +3645,8 @@ static_library("ui") {
+       "views/frame/browser_view.cc",
        "views/frame/mru_tab_preview_cache.cc",
        "views/frame/mru_tab_preview_cache.h",
 +      "views/frame/mru_tab_performance.h",
 +      "views/frame/mru_tab_performance.cc",
        "views/frame/mru_tab_preview_rail.cc",
        "views/frame/mru_tab_preview_rail.h",
-       "views/frame/browser_widget.cc",
+       "views/helium/peek_controller.cc",
 --- a/chrome/browser/ui/views/frame/browser_view.cc
 +++ b/chrome/browser/ui/views/frame/browser_view.cc
-@@ -121,6 +121,7 @@
- #include "chrome/browser/ui/sharing_hub/sharing_hub_bubble_view.h"
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ 
++#include "chrome/browser/ui/views/frame/mru_tab_performance.h"
+ #include "chrome/browser/ui/views/frame/mru_tab_preview_cache.h"
+ #include "chrome/browser/ui/views/frame/mru_tab_preview_rail.h"
+ #include "chrome/browser/ui/views/helium/glass_surface.h"
+@@ -137,6 +138,7 @@
+ #include "chrome/browser/ui/side_panel/side_panel_enums.h"
  #include "chrome/browser/ui/side_panel/side_panel_registry.h"
  #include "chrome/browser/ui/side_panel/side_panel_ui.h"
 +#include "chrome/browser/ui/tab_ui_helper.h"
  #include "chrome/browser/ui/tabs/alert/tab_alert_controller.h"
- #include "chrome/browser/ui/tabs/projects/projects_panel_state_controller.h"
- #include "chrome/browser/ui/tabs/public/tab_dialog_manager.h"
-@@ -131,7 +132,6 @@
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/organizer/organizer_panel_controller.h"
+@@ -149,7 +151,6 @@
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
  #include "chrome/browser/ui/tabs/tab_strip_prefs.h"
  #include "chrome/browser/ui/tabs/tab_utils.h"
@@ -92,28 +100,15 @@
  #include "chrome/browser/ui/tabs/vertical_tab_strip_metrics.h"
  #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
  #include "chrome/browser/ui/toasts/toast_view.h"
-@@ -168,11 +168,9 @@
- #include "chrome/browser/ui/views/frame/layout/browser_view_layout.h"
- #include "chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.h"
- #include "chrome/browser/ui/views/frame/main_background_region_view.h"
-+#include "chrome/browser/ui/views/frame/mru_tab_performance.h"
- #include "chrome/browser/ui/views/frame/mru_tab_preview_cache.h"
- #include "chrome/browser/ui/views/frame/mru_tab_preview_rail.h"
--#include "chrome/browser/ui/views/helium/glass_surface.h"
--#include "ui/views/view_observer.h"
--#include "ui/views/view_shadow.h"
- #include "chrome/browser/ui/views/frame/multi_contents_view.h"
- #include "chrome/browser/ui/views/frame/multi_contents_view_delegate.h"
- #include "chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller.h"
-@@ -190,6 +188,7 @@
+@@ -207,6 +208,7 @@
  #include "chrome/browser/ui/views/glic/glic_button_interface.h"
  #include "chrome/browser/ui/views/global_media_controls/media_toolbar_button_view.h"
  #include "chrome/browser/ui/views/hats/hats_next_web_dialog.h"
 +#include "chrome/browser/ui/views/helium/glass_surface.h"
  #include "chrome/browser/ui/views/incognito_clear_browsing_data_dialog_coordinator.h"
  #include "chrome/browser/ui/views/infobars/infobar_container_view.h"
- #include "chrome/browser/ui/views/interaction/browser_elements_views.h"
-@@ -378,6 +377,8 @@
+ #include "chrome/browser/ui/views/intent_picker_bubble_view.h"
+@@ -392,6 +394,8 @@
  #include "ui/views/style/typography.h"
  #include "ui/views/view.h"
  #include "ui/views/view_class_properties.h"
@@ -122,7 +117,7 @@
  #include "ui/views/view_utils.h"
  #include "ui/views/views_features.h"
  #include "ui/views/widget/native_widget.h"
-@@ -963,6 +964,8 @@ class MRUTabSwitcherOverlay : public vie
+@@ -987,6 +991,8 @@ class MRUTabSwitcherOverlay : public vie
    ~MRUTabSwitcherOverlay() override {
      browser_view_->RemoveObserver(this);
      if (bubble_) {
@@ -131,7 +126,7 @@
        auto* bubble = bubble_.get();
        bubble_ = nullptr;
        browser_view_->RemoveChildViewT(bubble);
-@@ -971,6 +974,9 @@ class MRUTabSwitcherOverlay : public vie
+@@ -995,6 +1001,9 @@ class MRUTabSwitcherOverlay : public vie
  
    void Update(const std::vector<content::WebContents*>& starting_tabs,
                content::WebContents* selected_tab) {
@@ -141,7 +136,7 @@
      if (!starting_tabs.empty()) {
        tabs_ = starting_tabs;
      }
-@@ -983,6 +989,11 @@ class MRUTabSwitcherOverlay : public vie
+@@ -1007,6 +1016,11 @@ class MRUTabSwitcherOverlay : public vie
      bubble_->Update(tabs_, selected_index_);
      PositionView();
      bubble_->SetVisible(true);
@@ -153,7 +148,7 @@
    }
  
    class BubbleView : public views::View {
-@@ -1030,7 +1041,11 @@ class MRUTabSwitcherOverlay : public vie
+@@ -1054,7 +1068,11 @@ class MRUTabSwitcherOverlay : public vie
        rail_->SetLabelContrast(background, uses_backdrop);
      }
  
@@ -166,7 +161,7 @@
      const raw_ptr<BrowserView> browser_view_;
      raw_ptr<helium::GlassSurfaceView> glass_surface_ = nullptr;
      raw_ptr<MRUTabPreviewRail> rail_ = nullptr;
-@@ -1038,6 +1053,10 @@ class MRUTabSwitcherOverlay : public vie
+@@ -1062,6 +1080,10 @@ class MRUTabSwitcherOverlay : public vie
    };
  
   private:
@@ -177,7 +172,7 @@
    void OnViewBoundsChanged(views::View*) override {
      if (bubble_) {
        bubble_->Update(tabs_, selected_index_);
-@@ -1050,12 +1069,15 @@ class MRUTabSwitcherOverlay : public vie
+@@ -1074,12 +1096,15 @@ class MRUTabSwitcherOverlay : public vie
        return;
      }
      auto bubble = std::make_unique<BubbleView>(browser_view_);
@@ -193,7 +188,7 @@
    }
  
    void PositionView() {
-@@ -1068,6 +1090,9 @@ class MRUTabSwitcherOverlay : public vie
+@@ -1092,6 +1117,9 @@ class MRUTabSwitcherOverlay : public vie
    std::vector<content::WebContents*> tabs_;
    size_t selected_index_ = 0;
    raw_ptr<BubbleView> bubble_ = nullptr;
@@ -203,70 +198,6 @@
  };
  
  BEGIN_METADATA(MRUTabSwitcherOverlay, BubbleView)
---- a/chrome/browser/ui/views/frame/browser_view_unittest.cc
-+++ b/chrome/browser/ui/views/frame/browser_view_unittest.cc
-@@ -14,6 +14,7 @@
- #include "base/strings/strcat.h"
- #include "base/strings/utf_string_conversions.h"
- #include "base/test/metrics/histogram_tester.h"
-+#include "base/test/scoped_command_line.h"
- #include "build/build_config.h"
- #include "chrome/app/chrome_command_ids.h"
- #include "chrome/browser/ui/actions/chrome_action_id.h"
-@@ -37,11 +38,12 @@
- #include "chrome/browser/ui/views/frame/browser_frame_view.h"
- #include "chrome/browser/ui/views/frame/browser_widget.h"
- #include "chrome/browser/ui/views/frame/layout/browser_view_layout.h"
--#include "chrome/browser/ui/views/frame/mru_tab_switcher_visualizer.h"
- #include "chrome/browser/ui/views/frame/mru_tab_preview_rail.h"
-+#include "chrome/browser/ui/views/frame/mru_tab_switcher_visualizer.h"
- #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
- #include "chrome/browser/ui/views/frame/test_with_browser_view.h"
- #include "chrome/browser/ui/views/frame/top_container_view.h"
-+#include "chrome/browser/ui/views/helium/glass_surface.h"
- #include "chrome/browser/ui/views/infobars/infobar_container_view.h"
- #include "chrome/browser/ui/views/toolbar/app_menu_control.h"
- #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
-@@ -67,8 +69,8 @@
- #include "ui/gfx/scrollbar_size.h"
- #include "ui/views/accessibility/view_accessibility.h"
- #include "ui/views/bubble/bubble_dialog_delegate_view.h"
--#include "ui/views/controls/label.h"
- #include "ui/views/bubble/bubble_dialog_model_host.h"
-+#include "ui/views/controls/label.h"
- #include "ui/views/controls/webview/webview.h"
- #include "ui/views/focus/focus_manager.h"
- #include "ui/views/interaction/element_tracker_views.h"
-@@ -216,6 +218,29 @@ TEST_F(BrowserViewTest, MRUTabSwitcherSh
-   EXPECT_EQ(browser_view()->children().size(), original_child_count);
- }
- 
-+TEST_F(BrowserViewTest, MRUGlobalOpaqueBackendUsesFallback) {
-+  base::test::ScopedCommandLine command_line;
-+  command_line.GetProcessCommandLine()->AppendSwitchASCII(
-+      helium::kArciumGlassBackendSwitch, "opaque");
-+  auto* active = browser()->tab_strip_model()->GetActiveWebContents();
-+  browser_view()->SetSize(gfx::Size(1000, 800));
-+  UpdateMRUTabSwitcherVisualizer(browser_view(), {active}, active);
-+  helium::GlassSurfaceView* surface = nullptr;
-+  std::vector<views::View*> descendants{browser_view()->children().back()};
-+  while (!descendants.empty()) {
-+    auto* view = descendants.back();
-+    descendants.pop_back();
-+    if (auto* candidate = views::AsViewClass<helium::GlassSurfaceView>(view)) {
-+      surface = candidate;
-+    }
-+    descendants.insert(descendants.end(), view->children().begin(),
-+                       view->children().end());
-+  }
-+  ASSERT_TRUE(surface);
-+  EXPECT_FALSE(surface->uses_backdrop());
-+  StopMRUTabSwitcherVisualizer(browser_view());
-+}
-+
- TEST_F(BrowserViewTest, MRURailKeepsFiveCardsAndFitsNarrowWindows) {
-   std::vector<content::WebContents*> tabs;
-   for (int i = 0; i < 7; ++i) {
 --- a/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
 +++ b/chrome/browser/ui/views/frame/mru_tab_preview_cache.cc
 @@ -9,12 +9,15 @@
@@ -285,7 +216,7 @@
  #include "components/viz/common/frame_sinks/copy_output_result.h"
  #include "content/public/browser/render_frame_host.h"
  #include "content/public/browser/render_widget_host_view.h"
-@@ -61,18 +64,23 @@ gfx::ImageSkia MRUTabPreviewCache::Get(t
+@@ -69,18 +72,23 @@ gfx::ImageSkia MRUTabPreviewCache::Get(t
  
  void MRUTabPreviewCache::Request(tabs::TabHandle handle,
                                   gfx::Size size,
@@ -296,7 +227,7 @@
    auto image = Get(handle);
    if (!image.isNull()) {
      auto* tab = handle.Get();
-     auto* helper = ThumbnailTabHelper::FromWebContents(tab->GetContents());
+     auto* helper = ThumbnailTabHelper::From(tab);
      const auto& entry = entries_.front();
      if (entry.sharp || !helper ||
 -        entry.thumbnail_generation == helper->thumbnail()->cached_data_generation()) {
@@ -311,7 +242,7 @@
    Enqueue(handle, size, std::move(callback), high_priority);
  }
  
-@@ -118,11 +126,14 @@ void MRUTabPreviewCache::Enqueue(tabs::T
+@@ -126,11 +134,14 @@ void MRUTabPreviewCache::Enqueue(tabs::T
    // Keep a full five-card rail queued even while two stale decodes finish.
    if (high_priority) {
      if (queued_.size() >= 5) {
@@ -326,7 +257,7 @@
    }
    Pump();
  }
-@@ -149,6 +160,9 @@ void MRUTabPreviewCache::Pump() {
+@@ -157,6 +168,9 @@ void MRUTabPreviewCache::Pump() {
      }
      running_.push_back(job);
      job->thumbnail = helper->thumbnail();
@@ -336,7 +267,7 @@
      auto alive = weak_factory_.GetWeakPtr();
      job->thumbnail->RequestCachedImage(
          job->size,
-@@ -166,17 +180,24 @@ bool MRUTabPreviewCache::IsCurrent(
+@@ -174,17 +188,24 @@ bool MRUTabPreviewCache::IsCurrent(
      base::WeakPtr<content::WebContents> contents,
      const content::WeakDocumentPtr& document) const {
    auto* tab = handle.Get();
@@ -368,7 +299,7 @@
    std::erase(running_, job);
    job->thumbnail.reset();
    if (job->generation == generation_) {
-@@ -214,8 +235,10 @@ void MRUTabPreviewCache::CancelPendingRe
+@@ -222,8 +243,10 @@ void MRUTabPreviewCache::CancelPendingRe
    // Running tasks still count toward the concurrency cap until they finish.
  }
  
@@ -380,10 +311,10 @@
    auto* tab = handle.Get();
    if (!tab || model_->GetIndexOfTab(tab) == TabStripModel::kNoTab ||
        !tab->GetContents()->GetPrimaryMainFrame()) {
-@@ -260,18 +283,25 @@ void MRUTabPreviewCache::Store(tabs::Tab
+@@ -268,18 +291,25 @@ void MRUTabPreviewCache::Store(tabs::Tab
    }
    auto* contents = tab->GetContents();
-   auto* helper = ThumbnailTabHelper::FromWebContents(contents);
+   auto* helper = ThumbnailTabHelper::From(tab);
 -  entries_.push_front({handle, std::move(image), bytes, contents->GetWeakPtr(),
 -                      contents->GetPrimaryMainFrame()->GetWeakDocumentPtr(),
 -                      sharp,
@@ -410,7 +341,7 @@
    }
  }
  
-@@ -312,7 +342,8 @@ base::CallbackListSubscription MRUTabPre
+@@ -320,7 +350,8 @@ base::CallbackListSubscription MRUTabPre
  }
  
  bool MRUTabPreviewCache::IsPageReadyForCapture(content::WebContents* contents) {
@@ -420,7 +351,7 @@
        !contents->CompletedFirstVisuallyNonEmptyPaint()) {
      return false;
    }
-@@ -352,6 +383,9 @@ void MRUTabPreviewCache::CaptureDepartin
+@@ -361,6 +392,9 @@ void MRUTabPreviewCache::CaptureDepartin
      return;
    }
    capture_running_ = true;
@@ -430,7 +361,7 @@
    const gfx::Rect source_rect((source_size.width() - crop_width) / 2, 0,
                                crop_width, crop_height);
    view->CopyFromSurface(
-@@ -364,11 +398,13 @@ void MRUTabPreviewCache::CaptureDepartin
+@@ -373,11 +407,13 @@ void MRUTabPreviewCache::CaptureDepartin
              if (!self) {
                return;
              }
@@ -449,7 +380,7 @@
            contents->GetPrimaryMainFrame()->GetWeakDocumentPtr(),
            capture_generation_)));
  }
-@@ -381,6 +417,14 @@ void MRUTabPreviewCache::Captured(
+@@ -390,6 +426,14 @@ void MRUTabPreviewCache::Captured(
    const bool valid = generation == capture_generation_ && !image.isNull() &&
                       IsCurrent(handle, contents, document) &&
                       IsPageReadyForCapture(contents.get());
@@ -536,7 +467,7 @@
    auto cache = MakeCache();
 --- a/chrome/browser/ui/views/helium/glass_surface.cc
 +++ b/chrome/browser/ui/views/helium/glass_surface.cc
-@@ -223,6 +223,8 @@ void GlassSurfaceView::SetCornerRadii(
+@@ -224,6 +224,8 @@ void GlassSurfaceView::SetCornerRadii(
  }
  
  void GlassSurfaceView::UpdateLayer() {
@@ -605,7 +536,7 @@
 +}
 --- a/chrome/test/BUILD.gn
 +++ b/chrome/test/BUILD.gn
-@@ -10721,6 +10721,21 @@ if (!is_android && !is_chromeos_device)
+@@ -9248,6 +9248,21 @@ if (!is_android && !is_chromeos_device)
    }
  }
  
@@ -698,3 +629,43 @@
 +                                outcome);
 +  }
 +}
+--- a/chrome/browser/ui/views/frame/browser_view_browsertest.cc
++++ b/chrome/browser/ui/views/frame/browser_view_browsertest.cc
+@@ -4,6 +4,9 @@
+ 
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ 
++#include "base/test/scoped_command_line.h"
++#include "chrome/browser/ui/views/helium/glass_surface.h"
++
+ #include <vector>
+ #include "chrome/browser/ui/views/frame/mru_tab_switcher_visualizer.h"
+ #include "chrome/browser/ui/views/frame/mru_tab_preview_rail.h"
+@@ -2545,3 +2548,27 @@ IN_PROC_BROWSER_TEST_F(BrowserViewTest,
+   content::RunAllTasksUntilIdle();
+ }
+ 
++
++IN_PROC_BROWSER_TEST_F(BrowserViewTest, MRUGlobalOpaqueBackendUsesFallback) {
++  base::test::ScopedCommandLine command_line;
++  command_line.GetProcessCommandLine()->AppendSwitchASCII(
++      helium::kArciumGlassBackendSwitch, "opaque");
++  auto* active = browser()->tab_strip_model()->GetActiveWebContents();
++  browser_view()->SetSize(gfx::Size(1000, 800));
++  UpdateMRUTabSwitcherVisualizer(browser_view(), {active}, active);
++  helium::GlassSurfaceView* surface = nullptr;
++  std::vector<views::View*> descendants{browser_view()->children().back()};
++  while (!descendants.empty()) {
++    auto* view = descendants.back();
++    descendants.pop_back();
++    if (auto* candidate = views::AsViewClass<helium::GlassSurfaceView>(view)) {
++      surface = candidate;
++    }
++    descendants.insert(descendants.end(), view->children().begin(),
++                       view->children().end());
++  }
++  ASSERT_TRUE(surface);
++  EXPECT_FALSE(surface->uses_backdrop());
++  StopMRUTabSwitcherVisualizer(browser_view());
++}
++

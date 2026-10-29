@@ -23,7 +23,7 @@
           service->FindLiveAssociation(handle.Get())->token == token;
 --- a/chrome/browser/ui/views/tabs/common/BUILD.gn
 +++ b/chrome/browser/ui/views/tabs/common/BUILD.gn
-@@ -103,6 +103,9 @@ source_set("impl") {
+@@ -145,6 +145,9 @@ source_set("impl") {
      "//chrome/browser/ui/views/toolbar",
      "//chrome/browser/ui/window_metadata",
      "//components/contextual_tasks/public:feature_list",
@@ -33,32 +33,22 @@
      "//components/performance_manager",
      "//components/tab_groups",
      "//components/tabs:impl",
-@@ -188,16 +191,25 @@ source_set("unit_tests") {
-     ":common",
-     ":impl",
-     "//base/test:test_support",
+@@ -246,6 +249,15 @@ source_set("unit_tests") {
+     "tab_strip_layout_unittest.cc",
+   ]
+   deps = [
 +    "//chrome/browser/favicon",
-     "//chrome/browser/ui",
-     "//chrome/browser/ui:ui_features",
 +    "//chrome/browser/ui/tabs",
-     "//chrome/browser/ui/views/tabs/shared",
-     "//chrome/test:test_support",
-     "//chrome/test:test_support_ui",
 +    "//components/favicon/core/test:test_support",
 +    "//components/favicon_base",
 +    "//components/keyed_service/core",
-     "//components/tabs:test_support",
 +    "//testing/gmock",
-     "//testing/gtest",
 +    "//ui/base",
-     "//ui/events:test_support",
 +    "//ui/gfx",
-     "//ui/menus",
-     "//ui/views",
 +    "//url",
-   ]
- }
- 
+     ":common",
+     ":impl",
+     "//base/test:test_support",
 --- a/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
 +++ b/chrome/browser/ui/views/tabs/common/persistent_tab_view.cc
 @@ -66,12 +66,32 @@ constexpr int kFavoriteIconDesignWidth =
@@ -499,50 +489,28 @@
        ShouldApplyGeneratedFavicon(PersistentFaviconState::kPlaceholder));
 --- a/chrome/browser/ui/views/tabs/common/tab_view.cc
 +++ b/chrome/browser/ui/views/tabs/common/tab_view.cc
-@@ -5,7 +5,9 @@
+@@ -4,7 +4,20 @@
+ 
  #include "chrome/browser/ui/views/tabs/common/tab_view.h"
  
++#include "chrome/browser/ui/views/frame/browser_view.h"
++
  #include <algorithm>
 +#include <cmath>
- #include <optional>
 +#include <set>
- #include <string>
- 
- #include "base/command_line.h"
-@@ -16,9 +18,13 @@
- #include "base/metrics/user_metrics_action.h"
- #include "base/task/thread_pool.h"
- #include "base/time/time.h"
 +#include "chrome/browser/favicon/favicon_service_factory.h"
 +#include "chrome/browser/history/history_service_factory.h"
 +#include "components/history/core/browser/history_service.h"
- #include "chrome/browser/glic/browser_ui/tab_underline_controller.h"
- #include "chrome/browser/glic/browser_ui/tab_underline_view.h"
- #include "chrome/browser/glic/public/glic_enabling.h"
 +#include "chrome/browser/profiles/profile.h"
- #include "chrome/browser/themes/theme_properties.h"
- #include "chrome/browser/ui/browser_element_identifiers.h"
- #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
-@@ -58,6 +64,10 @@
- #include "chrome/grit/generated_resources.h"
- #include "chrome/grit/theme_resources.h"
- #include "components/contextual_tasks/public/features.h"
 +#include "components/favicon/core/favicon_service.h"
 +#include "components/favicon/content/content_favicon_driver.h"
 +#include "components/favicon_base/favicon_types.h"
 +#include "components/keyed_service/core/service_access_type.h"
- #include "components/tabs/public/tab_alert.h"
- #include "components/tabs/public/tab_interface.h"
- #include "third_party/skia/include/core/SkBitmap.h"
-@@ -80,6 +90,7 @@
- #include "ui/gfx/geometry/size.h"
- #include "ui/gfx/geometry/skia_conversions.h"
- #include "ui/gfx/geometry/transform.h"
 +#include "ui/gfx/image/image.h"
- #include "ui/gfx/image/image_skia_rep.h"
- #include "ui/views/accessibility/view_accessibility.h"
- #include "ui/views/animation/animation_builder.h"
-@@ -301,8 +312,13 @@ void TabView::SetFavoritePresentation(bo
+ #include "base/functional/bind.h"
+ #include "base/task/thread_pool.h"
+ #include "third_party/skia/include/core/SkBitmap.h"
+@@ -542,8 +555,13 @@ void TabView::SetFavoritePresentation(bo
    favorite_presentation_ = is_favorite;
    ++favorite_favicon_generation_;
    favorite_favicon_accent_color_.reset();
@@ -554,9 +522,9 @@
                                      : kIconDesignWidth);
 +  icon_->SetData(tab_data_);
  
-   for (TabChildConfig& config : tab_children_configs_) {
-     if (config.view == icon_) {
-@@ -333,6 +349,7 @@ void TabView::SetFavoritePresentation(bo
+   const bool selected =
+       GetSelectionState() != TabStyle::TabSelectionState::kInactive;
+@@ -566,6 +584,7 @@ void TabView::SetFavoritePresentation(bo
    InvalidateLayout();
    PreferredSizeChanged();
    if (favorite_presentation_) {
@@ -564,7 +532,7 @@
      ScheduleFavoriteFaviconColorAnalysis();
    }
  }
-@@ -1296,11 +1313,16 @@ void TabView::UpdateTabData(const tabs::
+@@ -1374,11 +1393,16 @@ void TabView::UpdateTabData(const tabs::
        old_data.favicon != tab_data_.favicon ||
        old_data.visible_url != tab_data_.visible_url ||
        old_data.should_themify_favicon != tab_data_.should_themify_favicon;
@@ -579,9 +547,9 @@
 +    icon_->ClearFavoriteFavicon();
 +  }
  
-   if (tabs::ShouldUpdateAccessibleName(old_data, tab_data_)) {
-     UpdateAccessibleName();
-@@ -1317,10 +1339,133 @@ void TabView::UpdateTabData(const tabs::
+ 
+   if (old_data.is_temporary != tab_data_.is_temporary) {
+@@ -1405,10 +1429,133 @@ void TabView::UpdateTabData(const tabs::
    SetHoverCardDataFrom(tab_data_);
  
    if (favorite_presentation_ && favorite_favicon_changed) {
@@ -717,7 +685,7 @@
    // Favorite accents only use decoded favicon images; those are safe to copy
 --- a/chrome/browser/ui/views/tabs/common/tab_view.h
 +++ b/chrome/browser/ui/views/tabs/common/tab_view.h
-@@ -12,6 +12,7 @@
+@@ -13,6 +13,7 @@
  #include "base/callback_list.h"
  #include "base/memory/raw_ptr.h"
  #include "base/scoped_observation.h"
@@ -725,9 +693,9 @@
  #include "chrome/browser/ui/tabs/tab_data.h"
  #include "chrome/browser/ui/tabs/tab_style.h"
  #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
-@@ -41,6 +42,10 @@ class TabCollectionNode;
- class TabIcon;
+@@ -43,6 +44,10 @@ class TabIcon;
  class TabTitle;
+ class TabStyleViews;
  
 +namespace favicon_base {
 +struct FaviconRawBitmapResult;
@@ -736,7 +704,7 @@
  namespace base {
  class TimeDelta;
  }  // namespace base
-@@ -210,6 +215,14 @@ class TabView : public views::View,
+@@ -208,6 +213,14 @@ class TabView : public views::View,
    void OnFavoriteFaviconColorAvailable(const GURL& requested_url,
                                         uint64_t generation,
                                         std::optional<SkColor> color);
@@ -762,7 +730,7 @@
    std::unique_ptr<GlowHoverController> hover_controller_;
 --- a/chrome/browser/ui/views/tabs/tab/tab_icon.cc
 +++ b/chrome/browser/ui/views/tabs/tab/tab_icon.cc
-@@ -175,7 +175,18 @@ void TabIcon::SetData(const tabs::TabDat
+@@ -144,7 +144,18 @@ void TabIcon::SetData(const tabs::TabDat
  
    inhibit_loading_animation_ = data.should_hide_throbber;
    is_monochrome_favicon_ = data.is_monochrome_favicon;
@@ -781,8 +749,8 @@
 +  }
    SetNetworkState(data.network_state);
    SetCrashed(data.is_crashed);
-   SetDiscarded(data.should_show_discard_status);
-@@ -196,6 +207,23 @@ void TabIcon::SetData(const tabs::TabDat
+   SetDiscarded(data.should_dim_favicon);
+@@ -165,6 +176,23 @@ void TabIcon::SetData(const tabs::TabDat
    }
  }
  
@@ -806,7 +774,7 @@
  void TabIcon::SetActiveState(bool is_active) {
    if (is_active_tab_ != is_active) {
      is_active_tab_ = is_active;
-@@ -375,7 +403,7 @@ void TabIcon::PaintAttentionIndicatorAnd
+@@ -314,7 +342,7 @@ void TabIcon::PaintAttentionIndicatorAnd
    // . a circle in the bottom right (or left in rtl) of the favicon.
    if (!icon.isNull()) {
      canvas->SaveLayerAlpha(0xff);
@@ -815,7 +783,7 @@
                           bounds.x(), bounds.y(), bounds.width(),
                           bounds.height(), false);
      cc::PaintFlags clear_flags;
-@@ -518,7 +546,7 @@ void TabIcon::MaybePaintFavicon(gfx::Can
+@@ -472,7 +500,7 @@ void TabIcon::MaybePaintFavicon(gfx::Can
      canvas->Translate(gfx::Vector2d(-bounds.x(), -bounds.y()));
    }
  
@@ -823,10 +791,10 @@
 +  canvas->DrawImageInt(icon, 0, 0, icon.width(), icon.height(),
                         bounds.x(), bounds.y(), bounds.width(), bounds.height(),
                         /*filter=*/true);
- 
+ }
 --- a/chrome/browser/ui/views/tabs/tab/tab_icon.h
 +++ b/chrome/browser/ui/views/tabs/tab/tab_icon.h
-@@ -22,6 +22,7 @@
+@@ -21,6 +21,7 @@
  #include "ui/gfx/paint_throbber.h"
  #include "ui/views/animation/animation_delegate_views.h"
  #include "ui/views/view.h"
@@ -834,7 +802,7 @@
  
  namespace base {
  class TickClock;
-@@ -62,6 +63,13 @@ class TabIcon : public views::View, publ
+@@ -61,6 +62,13 @@ class TabIcon : public views::View, publ
    // used to render the tab icon.
    void SetData(const tabs::TabData& data);
  
@@ -848,7 +816,7 @@
    // Sets whether this tab is currently active.
    void SetActiveState(bool is_active);
  
-@@ -89,6 +97,7 @@ class TabIcon : public views::View, publ
+@@ -88,6 +96,7 @@ class TabIcon : public views::View, publ
    void StepLoadingAnimation(const base::TimeDelta& elapsed_time);
  
    gfx::ImageSkia GetThemedIconForTesting() { return themed_favicon_; }
@@ -856,7 +824,7 @@
    bool GetActiveStateForTesting() { return is_active_tab_; }
  
    // Called by the parent view when the width available to draw the tab icon
-@@ -178,6 +187,10 @@ class TabIcon : public views::View, publ
+@@ -163,6 +172,10 @@ class TabIcon : public views::View, publ
    raw_ptr<const base::TickClock> clock_;
  
    ui::ImageModel favicon_;
@@ -869,8 +837,8 @@
    tabs::TabNetworkState network_state_ = tabs::TabNetworkState::kNone;
 --- a/components/favicon/content/content_favicon_driver.cc
 +++ b/components/favicon/content/content_favicon_driver.cc
-@@ -163,6 +163,27 @@ void ContentFaviconDriver::OnFaviconDele
-                                 content::FaviconStatus().image);
+@@ -196,6 +196,27 @@ void ContentFaviconDriver::OnFaviconUnav
+   }
  }
  
 +void ContentFaviconDriver::EnableLargeIcons() {
@@ -897,7 +865,7 @@
  void ContentFaviconDriver::DidUpdateFaviconURL(
      content::RenderFrameHost* rfh,
      const std::vector<blink::mojom::FaviconURLPtr>& candidates,
-@@ -258,6 +279,11 @@ void ContentFaviconDriver::DidFinishNavi
+@@ -294,6 +315,11 @@ void ContentFaviconDriver::DidFinishNavi
    if (url != bypass_cache_page_url_)
      bypass_cache_page_url_ = GURL();
  
@@ -908,10 +876,10 @@
 +
    // Get the favicon, either from history or request it from the net.
    FetchFavicon(url, navigation_handle->IsSameDocument());
- }
+ 
 --- a/components/favicon/content/content_favicon_driver.h
 +++ b/components/favicon/content/content_favicon_driver.h
-@@ -41,6 +41,9 @@ class ContentFaviconDriver
+@@ -44,6 +44,9 @@ class ContentFaviconDriver
  
    GURL GetManifestURL(content::RenderFrameHost* rfh);
  
@@ -921,7 +889,7 @@
   protected:
    ContentFaviconDriver(content::WebContents* web_contents,
                         CoreFaviconService* favicon_service);
-@@ -102,6 +105,7 @@ class ContentFaviconDriver
+@@ -109,6 +112,7 @@ class ContentFaviconDriver
        content::NavigationHandle* navigation_handle) override;
  
    GURL bypass_cache_page_url_;
@@ -931,12 +899,12 @@
  
 --- a/components/favicon/core/favicon_driver_impl.cc
 +++ b/components/favicon/core/favicon_driver_impl.cc
-@@ -39,6 +39,18 @@ FaviconDriverImpl::FaviconDriverImpl(Cor
+@@ -47,6 +47,18 @@ FaviconDriverImpl::FaviconDriverImpl(Cor
  
  FaviconDriverImpl::~FaviconDriverImpl() = default;
  
 +bool FaviconDriverImpl::EnableLargeIconHandlers() {
-+  if (kEnableTouchIcon || large_icons_enabled_) {
++  if (EnableTouchIcon() || large_icons_enabled_) {
 +    return false;
 +  }
 +  large_icons_enabled_ = true;
@@ -962,7 +930,7 @@
    // `favicon_service` may be null, which means favicons are not saved.
    explicit FaviconDriverImpl(CoreFaviconService* favicon_service);
    ~FaviconDriverImpl() override;
-@@ -65,6 +68,7 @@ class FaviconDriverImpl : public Favicon
+@@ -71,6 +74,7 @@ class FaviconDriverImpl : public Favicon
  
    // FaviconHandlers used to download the different kind of favicons.
    std::vector<std::unique_ptr<FaviconHandler>> handlers_;

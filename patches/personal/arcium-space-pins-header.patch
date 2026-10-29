@@ -2,7 +2,7 @@ Index: src/chrome/browser/ui/BUILD.gn
 ===================================================================
 --- src.orig/chrome/browser/ui/BUILD.gn
 +++ src/chrome/browser/ui/BUILD.gn
-@@ -4177,6 +4177,8 @@ static_library("ui") {
+@@ -3712,6 +3712,8 @@ static_library("ui") {
        "views/helium/arcium_space_controls.h",
        "views/helium/arcium_space_editor_view.cc",
        "views/helium/arcium_space_editor_view.h",
@@ -10,7 +10,7 @@ Index: src/chrome/browser/ui/BUILD.gn
 +      "views/helium/arcium_space_header_view.h",
        "views/helium/arcium_space_icon_picker.cc",
        "views/helium/arcium_space_icon_picker.h",
-       "views/frame/custom_corners.cc",
+       "views/helium/native_frame_materials.cc",
 Index: src/chrome/browser/ui/views/helium/arcium_space_header_view.cc
 ===================================================================
 --- /dev/null
@@ -338,17 +338,16 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
 +++ src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
-@@ -16,7 +16,9 @@
- #include "chrome/browser/ui/layout_constants.h"
- #include "chrome/browser/ui/tabs/tab_group_model.h"
- #include "chrome/browser/ui/tabs/tab_strip_model.h"
-+#include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -24,6 +24,8 @@
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/frame_separator.h"
  #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
 +#include "chrome/browser/ui/views/helium/arcium_space_header_view.h"
  #include "chrome/browser/ui/views/tabs/common/pin_tab_container_view.h"
  #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
  #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
-@@ -58,10 +60,22 @@ class MainTabsContentsView : public view
+@@ -68,10 +70,22 @@ class MainTabsContentsView : public view
      separator_->SetVisible(false);
    }
  
@@ -356,7 +355,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
 +  // `browser` adds the Space header that folds the Pins away.
 +  views::View* AddPersistent(
 +      std::unique_ptr<views::View> view,
-+      Browser* browser,
++      BrowserWindowInterface* browser,
 +      tabs::VerticalTabStripStateController* state_controller) {
      persistent_ = AddChildViewAt(std::move(view), 0);
      observations_.AddObservation(persistent_);
@@ -373,7 +372,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
      return persistent_;
    }
  
-@@ -76,6 +90,9 @@ class MainTabsContentsView : public view
+@@ -86,6 +100,9 @@ class MainTabsContentsView : public view
      observations_.RemoveObservation(view);
      if (view == persistent_) {
        persistent_ = nullptr;
@@ -383,7 +382,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
      } else if (view == tabs_) {
        tabs_ = nullptr;
      }
-@@ -86,6 +103,10 @@ class MainTabsContentsView : public view
+@@ -96,6 +113,10 @@ class MainTabsContentsView : public view
    views::Separator* separator() { return separator_; }
  
    bool IsPointInPersistentRegion(const gfx::Point& point_in_screen) const {
@@ -394,7 +393,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
      if (drop_preview_active_ && frozen_boundary_y_) {
        return point_in_screen.y() < *frozen_boundary_y_;
      }
-@@ -142,8 +163,15 @@ class MainTabsContentsView : public view
+@@ -152,8 +173,15 @@ class MainTabsContentsView : public view
      return std::nullopt;
    }
  
@@ -411,7 +410,7 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
        return false;
      }
      return std::ranges::any_of(
-@@ -159,6 +187,7 @@ class MainTabsContentsView : public view
+@@ -169,6 +197,7 @@ class MainTabsContentsView : public view
  
    raw_ptr<views::View> persistent_ = nullptr;
    raw_ptr<views::View> tabs_ = nullptr;
@@ -419,19 +418,23 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
    raw_ptr<views::Separator> separator_ = nullptr;
    bool drop_preview_active_ = false;
    std::optional<int> frozen_boundary_y_;
-@@ -533,7 +562,10 @@ void TabStripView::ScrollToView(views::V
+@@ -577,8 +606,13 @@ void TabStripView::ScrollToFitViews(view
    if (persistent_row_replacement_) {
      return;
    }
--  if (!view || !Contains(view)) {
-+  // Folded Pins have nothing to scroll to.
-+  if (!view || !Contains(view) ||
-+      (pins_container_view_ && !pins_container_view_->GetVisible() &&
-+       pins_container_view_->Contains(view))) {
+-  views::View* primary_view = (view1 && Contains(view1)) ? view1 : nullptr;
+-  views::View* secondary_view = (view2 && Contains(view2)) ? view2 : nullptr;
++  const auto can_scroll_to = [this](views::View* view) {
++    return view && Contains(view) &&
++           !(pins_container_view_ && !pins_container_view_->GetVisible() &&
++             pins_container_view_->Contains(view));
++  };
++  views::View* primary_view = can_scroll_to(view1) ? view1 : nullptr;
++  views::View* secondary_view = can_scroll_to(view2) ? view2 : nullptr;
+   if (!primary_view && !secondary_view) {
      return;
    }
- 
-@@ -702,8 +734,15 @@ views::View* TabStripView::AddScrollView
+@@ -786,8 +820,15 @@ views::View* TabStripView::AddScrollView
      std::unique_ptr<views::View> view) {
    if (auto* container = views::AsViewClass<PinTabContainerView>(view.get())) {
      pins_container_view_ = container;
@@ -448,12 +451,25 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
    }
    if (auto* container =
            views::AsViewClass<UnpinnedTabContainerView>(view.get())) {
-@@ -766,6 +805,8 @@ void TabStripView::EnsureVisibleInViewpo
-   // view out of the visible bounds will also trigger a scroll naturally.
-   views::View* const activated_view = activated_view_tracker_->view();
-   if (!activated_view || !Contains(activated_view) ||
-+      (pins_container_view_ && !pins_container_view_->GetVisible() &&
-+       pins_container_view_->Contains(activated_view)) ||
-       (collection_node_ &&
-        collection_node_->GetController()->GetDragHandler().IsDragging())) {
-     EnableOverflowVisuals(scroll_view);
+@@ -908,7 +949,9 @@ void TabStripView::EnsureViewsVisibleInV
+ 
+   for (views::View* view : {target_views_tracker_->primary_view(),
+                             target_views_tracker_->secondary_view()}) {
+-    if (view && Contains(view) && scroll_view->contents()->Contains(view)) {
++    if (view && Contains(view) && scroll_view->contents()->Contains(view) &&
++        !(pins_container_view_ && !pins_container_view_->GetVisible() &&
++          pins_container_view_->Contains(view))) {
+       gfx::Rect view_bounds = GetBoundsInScrollViewContents(view, scroll_view);
+       if (!has_valid_views) {
+         combined_bounds = view_bounds;
+@@ -960,7 +1003,9 @@ void TabStripView::EnsureViewsVisibleInV
+                                         : scroll_view->GetVisibleRect().width();
+   if (combined_size > viewport_size && !target_views_tracker_->empty()) {
+     views::View* primary_view = target_views_tracker_->primary_view();
+-    if (primary_view && scroll_view->contents()->Contains(primary_view)) {
++    if (primary_view && scroll_view->contents()->Contains(primary_view) &&
++        !(pins_container_view_ && !pins_container_view_->GetVisible() &&
++          pins_container_view_->Contains(primary_view))) {
+       combined_bounds =
+           GetBoundsInScrollViewContents(primary_view, scroll_view);
+     }

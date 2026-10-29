@@ -2,7 +2,7 @@ Index: src/chrome/browser/chrome_content_browser_client.cc
 ===================================================================
 --- src.orig/chrome/browser/chrome_content_browser_client.cc
 +++ src/chrome/browser/chrome_content_browser_client.cc
-@@ -187,7 +187,7 @@
+@@ -203,7 +203,7 @@
  #include "chrome/browser/ui/helium/helium_space.h"
  #include "chrome/browser/ui/helium/helium_space_service.h"
  #include "chrome/browser/ui/helium/helium_space_service_factory.h"
@@ -11,15 +11,15 @@ Index: src/chrome/browser/chrome_content_browser_client.cc
  #include "chrome/browser/ui/login/http_auth_coordinator.h"
  #include "chrome/browser/ui/navigator/browser_navigator.h"
  #include "chrome/browser/ui/navigator/browser_navigator_params.h"
-@@ -329,6 +329,7 @@
- #include "components/site_isolation/site_isolation_policy.h"
- #include "components/subresource_filter/content/browser/content_subresource_filter_throttle_manager.h"
+@@ -343,6 +343,7 @@
+ #include "components/site_token_provider/features.h"
  #include "components/supervised_user/core/common/features.h"
+ #include "components/sync_tab_context/http_rpc_constants.h"
 +#include "components/tabs/public/tab_interface.h"
  #include "components/translate/core/common/translate_switches.h"
  #include "components/user_prefs/user_prefs.h"
  #include "components/variations/variations_associated_data.h"
-@@ -4201,10 +4202,10 @@ GetPreferredColorScheme(const WebPrefere
+@@ -4108,10 +4109,10 @@ GetPreferredColorScheme(const WebPrefere
    } else {
      // WebUI and regular pages follow the browser theme color mode, provided by
      // the color provider.
@@ -34,7 +34,7 @@ Index: src/chrome/browser/chrome_content_browser_client.cc
      // An Arcium Space can give its pages a different light or dark mode from
      // its browser chrome.
      if (const helium::SpaceTheme* space_theme =
-@@ -4221,8 +4222,8 @@ GetPreferredColorScheme(const WebPrefere
+@@ -4128,8 +4129,8 @@ GetPreferredColorScheme(const WebPrefere
    // Update the preferred root scrollbar color based on the lightness level of
    // the toolbar's color.
    preferred_root_scrollbar_color_scheme =
@@ -49,26 +49,28 @@ Index: src/chrome/browser/ui/BUILD.gn
 ===================================================================
 --- src.orig/chrome/browser/ui/BUILD.gn
 +++ src/chrome/browser/ui/BUILD.gn
-@@ -474,6 +474,8 @@ static_library("ui") {
-     "helium/helium_space.cc",
-     "helium/helium_space.h",
-     "helium/space_palette.h",
-+    "helium/space_content_appearance.cc",
-+    "helium/space_content_appearance.h",
-     "helium/helium_space_service.cc",
-     "helium/helium_space_service.h",
-     "helium/helium_space_service_factory.cc",
-@@ -1431,6 +1433,8 @@ static_library("ui") {
-       "//chrome/browser/ui/webui/new_tab_page/action_chips",
-     ]
-     public_deps += [ "//components/themes" ]
-+    # ThemeSource resolves New Tab colors through the owning Space.
-+    allow_circular_includes_from += [ "//chrome/browser/ui/webui:theme_source" ]
+@@ -1994,6 +1994,10 @@ static_library("ui") {
    }
  
    if (!is_android) {
-@@ -2354,6 +2358,9 @@ static_library("ui") {
-       "//chrome/browser/ui/webui/ntp",
++    deps += [ "//chrome/browser/ui/webui:theme_source" ]
++    # ThemeSource resolves New Tab colors through the owning Space.
++    allow_circular_includes_from += [ "//chrome/browser/ui/webui:theme_source" ]
++
+     deps += [
+       ":ui_controller_factory",
+       "//chrome/browser/ui/browser_active_state_manager",
+@@ -2419,6 +2423,8 @@ static_library("ui") {
+       "helium/helium_space.cc",
+       "helium/helium_space.h",
+       "helium/space_palette.h",
++      "helium/space_content_appearance.cc",
++      "helium/space_content_appearance.h",
+       "helium/helium_space_service.cc",
+       "helium/helium_space_service.h",
+       "helium/helium_space_service_factory.cc",
+@@ -2911,6 +2917,9 @@ static_library("ui") {
+       # layout_constants.h from //chrome/browser/ui.
        "//chrome/browser/ui/webui/ntp:ntp_resource_cache",
  
 +      # Third-party New Tab uses the same per-Space content appearance.
@@ -81,7 +83,7 @@ Index: src/chrome/browser/ui/helium/arcium_settings_model.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/helium/arcium_settings_model.cc
 +++ src/chrome/browser/ui/helium/arcium_settings_model.cc
-@@ -873,6 +873,47 @@ bool ArciumSettingsModel::SetAppearanceM
+@@ -874,6 +874,47 @@ bool ArciumSettingsModel::SetAppearanceM
    return true;
  }
  
@@ -392,7 +394,7 @@ Index: src/chrome/browser/ui/views/frame/browser_widget.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/browser_widget.cc
 +++ src/chrome/browser/ui/views/frame/browser_widget.cc
-@@ -286,6 +286,10 @@ bool BrowserWidget::HandleKeyboardEvent(
+@@ -300,6 +300,10 @@ bool BrowserWidget::HandleKeyboardEvent(
           browser_native_widget_->HandleKeyboardEvent(event);
  }
  
@@ -407,15 +409,15 @@ Index: src/chrome/browser/ui/webui/new_tab_page/new_tab_page_handler.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/webui/new_tab_page/new_tab_page_handler.cc
 +++ src/chrome/browser/ui/webui/new_tab_page/new_tab_page_handler.cc
-@@ -60,6 +60,7 @@
+@@ -59,6 +59,7 @@
  #include "chrome/browser/ui/color/chrome_color_id.h"
  #include "chrome/browser/ui/hats/hats_service.h"
  #include "chrome/browser/ui/hats/hats_service_factory.h"
 +#include "chrome/browser/ui/helium/space_content_appearance.h"
  #include "chrome/browser/ui/tabs/public/tab_features.h"
  #include "chrome/browser/ui/views/new_tab_footer/footer_controller.h"
- #include "chrome/browser/ui/views/side_panel/customize_chrome/customize_chrome_utils.h"
-@@ -1254,9 +1255,9 @@ void NewTabPageHandler::OnNativeThemeUpd
+ #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX)
+@@ -1129,9 +1130,9 @@ void NewTabPageHandler::OnNativeThemeUpd
  }
  
  void NewTabPageHandler::OnThemeChanged() {
@@ -432,15 +434,15 @@ Index: src/chrome/browser/ui/webui/new_tab_page/new_tab_page_ui.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/webui/new_tab_page/new_tab_page_ui.cc
 +++ src/chrome/browser/ui/webui/new_tab_page/new_tab_page_ui.cc
-@@ -54,6 +54,7 @@
- #include "chrome/browser/sync/sync_service_factory.h"
+@@ -53,6 +53,7 @@
  #include "chrome/browser/themes/theme_service_factory.h"
  #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/search/ntp_user_data_logger.h"
 +#include "chrome/browser/ui/helium/space_content_appearance.h"
  #include "chrome/browser/ui/user_education/browser_user_education_interface.h"
- #include "chrome/browser/ui/views/side_panel/customize_chrome/customize_chrome_utils.h"
- #include "chrome/browser/ui/views/side_panel/customize_chrome/side_panel_controller_views.h"
-@@ -1416,7 +1417,8 @@ void NewTabPageUI::OnColorProviderChange
+ #include "chrome/browser/ui/webui/browser_command/browser_command_handler.h"
+ #include "chrome/browser/ui/webui/cr_components/composebox/composebox_handler.h"
+@@ -1363,7 +1364,8 @@ void NewTabPageUI::OnColorProviderChange
    if (!web_contents() || !web_ui()) {
      return;
    }
@@ -510,15 +512,15 @@ Index: src/chrome/browser/ui/webui/new_tab_page_third_party/new_tab_page_third_p
 ===================================================================
 --- src.orig/chrome/browser/ui/webui/new_tab_page_third_party/new_tab_page_third_party_ui.cc
 +++ src/chrome/browser/ui/webui/new_tab_page_third_party/new_tab_page_third_party_ui.cc
-@@ -12,6 +12,7 @@
- #include "chrome/browser/themes/theme_properties.h"
+@@ -13,6 +13,7 @@
  #include "chrome/browser/themes/theme_service.h"
  #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/search/ntp_user_data_logger.h"
 +#include "chrome/browser/ui/helium/space_content_appearance.h"
  #include "chrome/browser/ui/webui/cr_components/most_visited/most_visited_handler.h"
  #include "chrome/browser/ui/webui/favicon_source.h"
  #include "chrome/browser/ui/webui/new_tab_page_third_party/new_tab_page_third_party_handler.h"
-@@ -90,7 +91,8 @@ void CreateAndAddNewTabPageThirdPartyUiH
+@@ -91,7 +92,8 @@ void CreateAndAddNewTabPageThirdPartyUiH
    // TODO(crbug.com/40823895): Always mock theme provider in tests so that
    // `theme_provider` is never nullptr.
    if (theme_provider) {
@@ -532,7 +534,7 @@ Index: src/chrome/browser/ui/webui/ntp/ntp_resource_cache.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/webui/ntp/ntp_resource_cache.cc
 +++ src/chrome/browser/ui/webui/ntp/ntp_resource_cache.cc
-@@ -26,6 +26,7 @@
+@@ -27,6 +27,7 @@
  #include "chrome/browser/themes/theme_service_factory.h"
  #include "chrome/browser/ui/browser_window.h"
  #include "chrome/browser/ui/color/chrome_color_id.h"
@@ -540,7 +542,7 @@ Index: src/chrome/browser/ui/webui/ntp/ntp_resource_cache.cc
  #include "chrome/browser/ui/layout_constants.h"
  #include "chrome/browser/ui/webui/util/webui_util_desktop.h"
  #include "chrome/common/buildflags.h"
-@@ -201,9 +202,9 @@ base::RefCountedMemory* NTPResourceCache
+@@ -222,9 +223,9 @@ base::RefCountedMemory* NTPResourceCache
      return new_tab_incognito_css_.get();
    }
  
@@ -553,7 +555,7 @@ Index: src/chrome/browser/ui/webui/ntp/ntp_resource_cache.cc
    return new_tab_css_.get();
  }
  
-@@ -398,7 +399,8 @@ void NTPResourceCache::CreateNewTabCSS(
+@@ -480,7 +481,8 @@ void NTPResourceCache::CreateNewTabCSS(
  
    const ui::ThemeProvider& tp =
        ThemeService::GetThemeProviderForProfile(profile_);
@@ -567,21 +569,20 @@ Index: src/chrome/browser/ui/webui/theme_source.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/webui/theme_source.cc
 +++ src/chrome/browser/ui/webui/theme_source.cc
-@@ -24,6 +24,7 @@
- #include "chrome/browser/themes/theme_service_factory.h"
+@@ -27,6 +27,7 @@
+ #endif
  #include "chrome/browser/ui/color/chrome_color_id.h"
  #include "chrome/browser/ui/color/chrome_color_provider_utils.h"
 +#include "chrome/browser/ui/helium/space_content_appearance.h"
  #include "chrome/browser/ui/webui/current_channel_logo.h"
+ #if !BUILDFLAG(IS_ANDROID)
  #include "chrome/browser/ui/webui/ntp/ntp_resource_cache.h"
- #include "chrome/browser/ui/webui/ntp/ntp_resource_cache_factory.h"
-@@ -370,7 +371,8 @@ void ThemeSource::SendColorsCss(
-     const content::WebContents::Getter& wc_getter,
-     content::URLDataSource::GotDataCallback callback) {
-   base::ElapsedTimer timer;
--  const ui::ColorProvider& color_provider = wc_getter.Run()->GetColorProvider();
-+  const ui::ColorProvider& color_provider =
-+      helium::GetSpaceContentColorProvider(wc_getter.Run());
+@@ -492,7 +493,7 @@ void ThemeSource::SendColorsCss(
+     std::move(callback).Run(nullptr);
+     return;
+   }
+-  const ui::ColorProvider& color_provider = web_contents->GetColorProvider();
++  const ui::ColorProvider& color_provider = helium::GetSpaceContentColorProvider(web_contents);
  
  #if BUILDFLAG(IS_ANDROID)
    bool is_grayscale = false;

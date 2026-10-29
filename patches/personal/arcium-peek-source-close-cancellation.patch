@@ -2,21 +2,22 @@
 # Hold both exact documents until every source-close decision accepts.
 --- a/chrome/browser/ui/unload_controller.cc
 +++ b/chrome/browser/ui/unload_controller.cc
-@@ -5,9 +5,13 @@
+@@ -5,10 +5,14 @@
  #include "chrome/browser/ui/unload_controller.h"
  
  #include <algorithm>
 +#include <memory>
 +#include <utility>
  
+ #include "base/command_line.h"
 +#include "base/check.h"
  #include "base/functional/bind.h"
  #include "base/location.h"
 +#include "base/supports_user_data.h"
  #include "base/task/single_thread_task_runner.h"
+ #include "chrome/browser/browser_process.h"
  #include "chrome/browser/devtools/devtools_window.h"
- #include "chrome/browser/lifetime/application_lifetime_desktop.h"
-@@ -29,7 +33,9 @@
+@@ -49,7 +53,9 @@
  #include "components/tabs/public/tab_group.h"
  #include "components/tabs/public/tab_interface.h"
  #include "components/webapps/common/web_app_id.h"
@@ -26,7 +27,7 @@
  #include "content/public/browser/web_contents.h"
  #include "extensions/buildflags/buildflags.h"
  
-@@ -43,6 +49,75 @@
+@@ -63,6 +69,75 @@
  #include "chrome/browser/ash/boca/on_task/on_task_locked_controller.h"
  #endif  // BUILDFLAG(IS_CHROMEOS)
  
@@ -101,8 +102,30 @@
 +
  DEFINE_USER_DATA(UnloadController);
  
- ////////////////////////////////////////////////////////////////////////////////
-@@ -72,6 +147,12 @@ void UnloadController::AddTabUnloadHandl
+ namespace {
+@@ -138,14 +213,20 @@ bool UnloadController::HandleBeforeClose
+   if (close_status ==
+       BrowserWindowInterface::ClosingStatus::kDeniedUnloadHandlersNeedTime) {
+     switch (state_) {
+-      case State::kIdle:
++      case State::kIdle: {
+         CHECK(tabs_needing_before_unload_fired_.empty());
+         CHECK(tabs_needing_unload_fired_.empty());
+         CHECK(on_close_confirmed_.is_null());
+         tabs_needing_before_unload_fired_ = GetTabsNeedingBeforeUnloadFired();
+         TransitionTo(State::kRunningBeforeUnloadForWindowClose);
++        const auto controller = lifetime_factory_.GetWeakPtr();
++        TakeOverCoordinatedCloses();
++        if (!controller) {
++          return false;
++        }
+         ProcessPendingTabs(false);
+         break;
++      }
+       case State::kBeforeUnloadConfirmed:
+         // Multi-window shutdown (RunBeforeUnloadForShutdown) already confirmed
+         // beforeunload for all tabs in this window and moved them to
+@@ -234,6 +315,12 @@ void UnloadController::AddTabUnloadHandl
    tab_unload_handlers_.push_back(std::move(handler));
  }
  
@@ -115,12 +138,12 @@
  UnloadController::~UnloadController() {
    browser_->tab_strip_model()->RemoveObserver(this);
  }
-@@ -79,13 +160,28 @@ UnloadController::~UnloadController() {
+@@ -241,13 +328,28 @@ UnloadController::~UnloadController() {
  bool UnloadController::ShouldRunUnloadListenerBeforeClosing(
      content::WebContents* web_contents) {
    return !force_skip_warning_user_on_close_ &&
 -         ShouldRunUnloadEventsHelper(web_contents);
-+         ((!is_attempting_to_close_browser_ &&
++         ((!is_attempting_to_close_browser() &&
 +           (HasCoordinatedClose(web_contents) ||
 +            (tab_close_coordinator_ &&
 +             tab_close_coordinator_->ShouldDeferClose(web_contents)))) ||
@@ -134,12 +157,12 @@
 +  if (force_skip_warning_user_on_close_) {
 +    return false;
 +  }
-+  if (!is_attempting_to_close_browser_ && tab_close_coordinator_) {
++  if (!is_attempting_to_close_browser() && tab_close_coordinator_) {
 +    if (auto result = tab_close_coordinator_->DeferClose(web_contents)) {
 +      return *result;
 +    }
 +  }
-+  if (!is_attempting_to_close_browser_ &&
++  if (!is_attempting_to_close_browser() &&
 +      HandoffCoordinatedClose(web_contents)) {
 +    return true;
 +  }
@@ -147,7 +170,7 @@
  }
  
  void UnloadController::BeforeUnloadFired(content::WebContents* web_contents,
-@@ -97,10 +193,63 @@ void UnloadController::BeforeUnloadFired
+@@ -259,10 +361,63 @@ void UnloadController::BeforeUnloadFired
      return;
    }
  
@@ -162,7 +185,7 @@
 +  if (coordinated) {
 +    web_contents->RemoveUserData(&kCoordinatedCloseKey);
 +  }
-+  if (coordinated && is_attempting_to_close_browser_ &&
++  if (coordinated && is_attempting_to_close_browser() &&
 +      !force_skip_warning_user_on_close_ &&
 +      !tabs_needing_before_unload_fired_.contains(web_contents)) {
 +    // A moved reply cannot authorize an unrelated receiving-window close.
@@ -173,7 +196,7 @@
 +    }
 +    return;
 +  }
-+  if (!is_attempting_to_close_browser_ &&
++  if (!is_attempting_to_close_browser() &&
 +      !force_skip_warning_user_on_close_) {
 +    if (coordinator && coordinator->BeforeUnloadFired(web_contents, proceed)) {
 +      *proceed_to_fire_unload = false;
@@ -206,19 +229,29 @@
  }
  
  bool UnloadController::CanCloseContents(content::WebContents* contents) {
-+  const bool browser_wide_close = is_attempting_to_close_browser_ ||
++  const bool browser_wide_close = is_attempting_to_close_browser() ||
 +                                  force_skip_warning_user_on_close_;
    // Don't try to close the tab when the whole browser is being closed, since
    // that avoids the fast shutdown path where we just kill all the renderers.
-   if (is_attempting_to_close_browser_) {
-@@ -122,8 +271,24 @@ bool UnloadController::CanCloseContents(
+   if (is_attempting_to_close_browser()) {
+@@ -298,16 +453,34 @@ bool UnloadController::CanCloseContents(
+   // listener while closing). Keeping all tabs in TabStripModel ensures
+   // OnWindowClosing() records the full window in TabRestoreService and closes
+   // all tabs together via TabStripModel::CloseAllTabs().
++  bool can_close = false;
+   switch (state_) {
+     case State::kIdle:
+     case State::kRunningBeforeUnloadForShutdown:
+     case State::kBeforeUnloadConfirmed:
+-      return true;
++      can_close = true;
++      break;
+     case State::kRunningBeforeUnloadForWindowClose:
+     case State::kRunningUnload:
+     case State::kUnloadCompleted:
+-      return false;
++      break;
    }
- #endif
- 
--  return !is_attempting_to_close_browser_ ||
--         is_calling_before_unload_handlers();
-+  const bool can_close = !is_attempting_to_close_browser_ ||
-+                         is_calling_before_unload_handlers();
 +  if (can_close && !browser_wide_close && tab_close_coordinator_) {
 +    // Pair cancellation can invoke observers that invalidate the caller's
 +    // Browser/WebContents or transfer this close to the browser-wide queue.
@@ -238,7 +271,7 @@
  }
  
  bool UnloadController::ShouldRunUnloadEventsHelper(
-@@ -145,7 +310,9 @@ bool UnloadController::ShouldRunUnloadEv
+@@ -329,7 +502,9 @@ bool UnloadController::ShouldRunUnloadEv
    return should_show_custom_confirmation;
  }
  
@@ -249,7 +282,7 @@
    // If a tab unload handler indicates that beforeunload handling should be
    // skipped (for example, because the user already confirmed closing the tab
    // via a custom task confirmation dialog), return false immediately. This
-@@ -162,12 +329,62 @@ bool UnloadController::RunUnloadEventsHe
+@@ -346,12 +521,62 @@ bool UnloadController::RunUnloadEventsHe
      }
    }
  
@@ -316,23 +349,23 @@
        return true;
      }
    }
-@@ -180,6 +397,7 @@ bool UnloadController::RunUnloadEventsHe
-       !extensions::ExtensionRegistry::Get(browser_->profile())
+@@ -364,6 +589,7 @@ bool UnloadController::RunUnloadEventsHe
+       !extensions::ExtensionRegistry::Get(browser_->GetProfile())
             ->enabled_extensions()
             .GetExtensionOrAppByURL(url)) {
 +    clear_ordinary_pair();
      return false;
    }
  #endif  // (ENABLE_EXTENSIONS)
-@@ -189,6 +407,7 @@ bool UnloadController::RunUnloadEventsHe
+@@ -373,6 +599,7 @@ bool UnloadController::RunUnloadEventsHe
    // to the interception of it's content's beforeunload.
-   if (browser_->is_type_devtools() &&
+   if (browser_->GetType() == BrowserWindowInterface::Type::TYPE_DEVTOOLS &&
        DevToolsWindow::HasFiredBeforeUnloadEventForDevToolsBrowser(browser_)) {
 +    clear_ordinary_pair();
      return false;
    }
  
-@@ -218,9 +437,160 @@ bool UnloadController::RunUnloadEventsHe
+@@ -402,9 +629,160 @@ bool UnloadController::RunUnloadEventsHe
      contents->DispatchBeforeUnload(false /* auto_cancel */);
      return true;
    }
@@ -493,28 +526,10 @@
  bool UnloadController::BeforeUnloadFired(content::WebContents* contents,
                                           bool proceed) {
    if (!proceed) {
-@@ -305,9 +675,16 @@ UnloadController::GetBrowserClosingStatu
-   // 3. If a batched shutdown is in progress: start sending unload events and
-   //    return false.
-   // 4. Otherwise: return true.
-+  // Include an in-flight coordinated reply even while its native dialog makes
-+  // NeedToFireBeforeUnloadOrUnloadEvents report false.
-+  tabs_needing_before_unload_fired_ = GetTabsNeedingBeforeUnloadFired();
-   is_attempting_to_close_browser_ = true;
-+  const auto controller = lifetime_factory_.GetWeakPtr();
-+  TakeOverCoordinatedCloses();
-+  if (!controller) {
-+    return BrowserWindowInterface::ClosingStatus::kDeniedUnloadHandlersNeedTime;
-+  }
-   // Cases 1 and 4.
--  tabs_needing_before_unload_fired_ = GetTabsNeedingBeforeUnloadFired();
+@@ -523,6 +901,11 @@ bool UnloadController::RunBeforeUnloadFo
  
-   bool need_beforeunload_fired = !tabs_needing_before_unload_fired_.empty();
-   if (need_beforeunload_fired == is_calling_before_unload_handlers()) {
-@@ -340,6 +717,11 @@ bool UnloadController::TryToCloseWindow(
- 
-   is_attempting_to_close_browser_ = true;
    on_close_confirmed_ = on_close_confirmed;
+   TransitionTo(State::kRunningBeforeUnloadForShutdown);
 +  const auto controller = lifetime_factory_.GetWeakPtr();
 +  TakeOverCoordinatedCloses();
 +  if (!controller) {
@@ -523,7 +538,7 @@
  
    ProcessPendingTabs(skip_beforeunload);
    return !skip_beforeunload;
-@@ -367,6 +749,7 @@ UnloadController::GetTabsNeedingBeforeUn
+@@ -555,6 +938,7 @@ UnloadController::GetTabsNeedingBeforeUn
      content::WebContents* const contents =
          browser_->tab_strip_model()->GetWebContentsAt(i);
      const bool should_fire_beforeunload =
@@ -531,28 +546,28 @@
          contents->NeedToFireBeforeUnloadOrUnloadEvents() ||
          DevToolsWindow::NeedsToInterceptBeforeUnload(contents);
      // Note that we filter out tabs in `tabs_needing_unload_fired_` as they have
-@@ -381,6 +764,7 @@ UnloadController::GetTabsNeedingBeforeUn
+@@ -569,6 +953,7 @@ UnloadController::GetTabsNeedingBeforeUn
  }
  
  void UnloadController::CancelWindowClose() {
-+  const bool was_closing_browser = is_attempting_to_close_browser_;
++  const bool was_closing_browser = is_attempting_to_close_browser();
    // Note that this method may be called if closing was canceled in a number of
-   // different ways, so is_attempting_to_close_browser_ may be false. In that
+   // different ways, so is_attempting_to_close_browser() may be false. In that
    // case some of this code might not have an effect, but it's still useful to,
-@@ -394,6 +778,9 @@ void UnloadController::CancelWindowClose
-     std::move(on_close_confirmed_).Run(false);
+@@ -589,6 +974,9 @@ void UnloadController::CancelWindowClose
+   } else {
+     CHECK(on_close_confirmed.is_null());
    }
-   is_attempting_to_close_browser_ = false;
 +  if (was_closing_browser && tab_close_coordinator_) {
 +    tab_close_coordinator_->OnBrowserCloseCancelled();
 +  }
  
    chrome::OnClosingAllBrowsers(false);
  }
-@@ -502,8 +889,19 @@ void UnloadController::ProcessPendingTab
-   // Process beforeunload tabs first. When that queue is empty, process
-   // unload tabs.
+@@ -800,8 +1188,19 @@ void UnloadController::ProcessPendingTab
    if (!tabs_needing_before_unload_fired_.empty()) {
+     CHECK(state_ == State::kRunningBeforeUnloadForShutdown ||
+           state_ == State::kRunningBeforeUnloadForWindowClose);
 +    auto next = std::find_if(tabs_needing_before_unload_fired_.begin(),
 +                             tabs_needing_before_unload_fired_.end(),
 +                             [](content::WebContents* contents) {
@@ -570,9 +585,18 @@
      // Null check render_view_host here as this gets called on a PostTask and
      // the tab's render_view_host may have been nulled out.
      if (web_contents->GetPrimaryMainFrame()->GetRenderViewHost()) {
+@@ -1185,7 +1584,7 @@ void UnloadController::FinishWarnBeforeC
+       chrome::CloseWindow(browser_);
+       break;
+     case WarnBeforeClosingResult::kDoNotClose:
+-      // Reset UnloadController::is_attempting_to_close_browser_ so that we
++      // Reset UnloadController::is_attempting_to_close_browser() so that we
+       // don't prompt every time any tab is closed. http://crbug.com/40336263
+       CancelWindowClose();
+   }
 --- a/chrome/browser/ui/unload_controller.h
 +++ b/chrome/browser/ui/unload_controller.h
-@@ -6,12 +6,14 @@
+@@ -6,6 +6,7 @@
  #define CHROME_BROWSER_UI_UNLOAD_CONTROLLER_H_
  
  #include <memory>
@@ -580,14 +604,15 @@
  #include <set>
  #include <vector>
  
+@@ -13,6 +14,7 @@
  #include "base/functional/callback.h"
  #include "base/memory/raw_ptr.h"
  #include "base/memory/weak_ptr.h"
 +#include "base/unguessable_token.h"
  #include "chrome/browser/tab_contents/web_contents_collection.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
- #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
-@@ -22,6 +24,7 @@ class TabStripModel;
+ #include "chrome/browser/ui/download_close_type.h"
+@@ -24,6 +26,7 @@ class TabStripModel;
  
  namespace content {
  class WebContents;
@@ -595,7 +620,7 @@
  }  // namespace content
  
  class UnloadController : public WebContentsCollection::Observer,
-@@ -54,6 +57,28 @@ class UnloadController : public WebConte
+@@ -70,6 +73,28 @@ class UnloadController : public WebConte
          base::OnceCallback<void(bool /* confirmed */)> on_closed) = 0;
    };
  
@@ -624,7 +649,7 @@
    explicit UnloadController(BrowserWindowInterface* browser);
  
    void AddTabUnloadHandler(std::unique_ptr<TabUnloadHandler> handler);
-@@ -82,7 +107,19 @@ class UnloadController : public WebConte
+@@ -98,7 +123,19 @@ class UnloadController : public WebConte
  
    // Helper function to run beforeunload listeners on a WebContents.
    // Returns true if |contents| beforeunload listeners were invoked.
@@ -645,7 +670,7 @@
  
    // Called when a BeforeUnload handler is fired for |contents|. |proceed|
    // indicates the user's response to the Y/N BeforeUnload handler dialog. If
-@@ -137,7 +174,12 @@ class UnloadController : public WebConte
+@@ -242,7 +279,12 @@ class UnloadController : public WebConte
  
    void set_force_skip_warning_user_on_close(
        bool force_skip_warning_user_on_close) {
@@ -658,7 +683,7 @@
    }
    bool force_skip_warning_user_on_close() const {
      return force_skip_warning_user_on_close_;
-@@ -188,6 +230,12 @@ class UnloadController : public WebConte
+@@ -326,6 +368,12 @@ class UnloadController : public WebConte
    void OnCustomConfirmationClosed(
        base::WeakPtr<content::WebContents> web_contents,
        bool confirmed);
@@ -671,9 +696,9 @@
  
    bool IsUnclosableApp() const;
  
-@@ -231,7 +279,11 @@ class UnloadController : public WebConte
-   // Registered handlers that can intercept and confirm tab unload events.
-   std::vector<std::unique_ptr<TabUnloadHandler>> tab_unload_handlers_;
+@@ -457,7 +505,11 @@ class UnloadController : public WebConte
+   // shortly (after a PostTask).
+   bool is_delete_scheduled_ = false;
  
 +  base::WeakPtr<TabCloseCoordinator> tab_close_coordinator_;
    base::WeakPtrFactory<UnloadController> weak_factory_{this};
@@ -707,7 +732,7 @@
  #include "content/public/browser/web_contents.h"
  #include "third_party/skia/include/core/SkColor.h"
  #include "ui/base/l10n/l10n_util.h"
-@@ -177,10 +181,44 @@ gfx::Rect GetPeekCardBounds(gfx::Rect bo
+@@ -176,10 +180,44 @@ gfx::Rect GetPeekCardBounds(gfx::Rect bo
                     card_height);
  }
  
@@ -745,14 +770,14 @@
 +
  PeekController::PeekController(BrowserView* browser_view)
      : browser_view_(browser_view),
-       tab_strip_model_(browser_view->browser()->tab_strip_model()) {
+       tab_strip_model_(browser_view->browser()->GetTabStripModel()) {
    tab_strip_model_->AddObserver(this);
 +  UnloadController::From(browser_view_->browser())
 +      ->SetTabCloseCoordinator(weak_factory_.GetWeakPtr());
-   pref_change_registrar_.Init(browser_view_->browser()->profile()->GetPrefs());
+   pref_change_registrar_.Init(browser_view_->GetProfile()->GetPrefs());
    pref_change_registrar_.Add(
        prefs::kHeliumPeekEnabled,
-@@ -189,8 +227,13 @@ PeekController::PeekController(BrowserVi
+@@ -188,8 +226,13 @@ PeekController::PeekController(BrowserVi
  }
  
  PeekController::~PeekController() {
@@ -766,7 +791,7 @@
  }
  
  bool PeekController::Show(content::NavigationController::LoadURLParams params,
-@@ -223,6 +266,8 @@ bool PeekController::Show(content::Navig
+@@ -222,6 +265,8 @@ bool PeekController::Show(content::Navig
    preview_contents_ = tab->GetContents()->GetWeakPtr();
    Observe(preview_contents_.get());
    source_contents_ = source_contents->GetWeakPtr();
@@ -775,7 +800,7 @@
    preview_will_deactivate_subscription_ = tab->RegisterWillDeactivate(
        base::BindRepeating(&PeekController::OnPreviewWillDeactivate,
                            weak_factory_.GetWeakPtr()));
-@@ -330,7 +375,12 @@ void PeekController::ClearPresentation()
+@@ -329,7 +374,12 @@ void PeekController::ClearPresentation()
  }
  
  void PeekController::ResetPreviewState() {
@@ -788,7 +813,7 @@
    preview_will_deactivate_subscription_ = {};
    preview_did_activate_subscription_ = {};
    preview_will_detach_subscription_ = {};
-@@ -344,7 +394,465 @@ void PeekController::ResetPreviewState()
+@@ -343,7 +393,465 @@ void PeekController::ResetPreviewState()
    restore_source_on_close_ = false;
  }
  
@@ -821,7 +846,7 @@
 +         IsLiveTab(source_close_->preview.contents.get()) &&
 +         source_close_->source.contents.get() == source_contents_.get() &&
 +         source_close_->preview.contents.get() == preview_contents_.get() &&
-+         IsPeekEnabled(browser_view_->browser()->profile());
++         IsPeekEnabled(browser_view_->GetProfile());
 +}
 +
 +bool PeekController::IsCoordinatingClose(content::WebContents* contents) const {
@@ -862,7 +887,7 @@
 +  return contents == source_contents_.get() && IsLiveTab(contents) &&
 +         IsLiveTab(preview_contents_.get()) &&
 +         tabs::TemporaryTab::IsTemporary(preview_contents_.get()) &&
-+         IsPeekEnabled(browser_view_->browser()->profile());
++         IsPeekEnabled(browser_view_->GetProfile());
 +}
 +
 +std::optional<bool> PeekController::DeferClose(content::WebContents* contents) {
@@ -1125,7 +1150,7 @@
 +  if (source_close_ || close_pending_ || IsBrowserClosing() ||
 +      !IsLiveTab(source_contents_.get()) ||
 +      !IsLiveTab(preview_contents_.get()) ||
-+      !IsPeekEnabled(browser_view_->browser()->profile())) {
++      !IsPeekEnabled(browser_view_->GetProfile())) {
 +    return;
 +  }
 +  source_close_restore_pending_ = true;
@@ -1152,7 +1177,7 @@
 +  if (source.get() != source_contents_.get() ||
 +      preview.get() != preview_contents_.get() ||
 +      !IsLiveTab(source.get()) || !IsLiveTab(preview.get()) || close_pending_ ||
-+      !IsPeekEnabled(browser_view_->browser()->profile())) {
++      !IsPeekEnabled(browser_view_->GetProfile())) {
 +    return;
 +  }
 +  // Duplicate closes while cancellation unwinds join that canceled attempt.
@@ -1164,7 +1189,7 @@
 +  if (source.get() != source_contents_.get() ||
 +      preview.get() != preview_contents_.get() ||
 +      !IsLiveTab(source.get()) || !IsLiveTab(preview.get()) || close_pending_ ||
-+      IsBrowserClosing() || !IsPeekEnabled(browser_view_->browser()->profile())) {
++      IsBrowserClosing() || !IsPeekEnabled(browser_view_->GetProfile())) {
 +    return;
 +  }
 +  const auto* active = tab_strip_model_->GetActiveWebContents();
@@ -1254,7 +1279,7 @@
    if (!preview_contents_) {
      ClearPresentation();
      ResetPreviewState();
-@@ -352,7 +860,8 @@ void PeekController::Close() {
+@@ -351,7 +859,8 @@ void PeekController::Close() {
    }
    restore_source_on_close_ = true;
    ClearPresentation();
@@ -1264,7 +1289,7 @@
      return;
    }
    close_pending_ = true;
-@@ -360,9 +869,14 @@ void PeekController::Close() {
+@@ -359,9 +868,14 @@ void PeekController::Close() {
  }
  
  void PeekController::ScheduleClose(bool restore_source) {
@@ -1281,7 +1306,7 @@
      return;
    }
    close_pending_ = true;
-@@ -388,6 +902,9 @@ void PeekController::FinishClose(
+@@ -387,6 +901,9 @@ void PeekController::FinishClose(
        closing_all_ || tab_strip_model_->closing_all()) {
      return;
    }
@@ -1291,7 +1316,7 @@
    ClearPresentation();
    const int index =
        tab_strip_model_->GetIndexOfWebContents(preview_contents_.get());
-@@ -414,13 +931,35 @@ void PeekController::OnPreviewWillDeacti
+@@ -413,13 +930,35 @@ void PeekController::OnPreviewWillDeacti
    // Clear the passive source before normal selection can attach that source
    // to a ContentsWebView. Never double-host the source during tab activation.
    ClearPresentation();
@@ -1328,7 +1353,7 @@
      AttachPresentation();
    }
  }
-@@ -430,9 +969,8 @@ void PeekController::OnPreviewWillDetach
+@@ -429,9 +968,8 @@ void PeekController::OnPreviewWillDetach
      tabs::TabInterface::DetachReason reason) {
    ClearPresentation();
    if (reason == tabs::TabInterface::DetachReason::kDelete) {
@@ -1340,7 +1365,7 @@
      close_pending_ = true;
      close_scheduled_ = false;
      return;
-@@ -445,6 +983,9 @@ void PeekController::OnPreviewWillDetach
+@@ -444,6 +982,9 @@ void PeekController::OnPreviewWillDetach
  void PeekController::OnPreviewWillDiscard(tabs::TabInterface* tab,
                                            content::WebContents* old_contents,
                                            content::WebContents* new_contents) {
@@ -1350,7 +1375,7 @@
    ClearPresentation();
    preview_contents_ = new_contents->GetWeakPtr();
    Observe(new_contents);
-@@ -460,6 +1001,13 @@ void PeekController::OnTabStripModelChan
+@@ -459,6 +1000,13 @@ void PeekController::OnTabStripModelChan
      TabStripModel* model,
      const TabStripModelChange& change,
      const TabStripSelectionChange& selection) {
@@ -1364,7 +1389,7 @@
    if (change.type() == TabStripModelChange::kRemoved && preview_contents_) {
      bool preview_removed = false;
      bool source_removed = false;
-@@ -467,6 +1015,15 @@ void PeekController::OnTabStripModelChan
+@@ -466,6 +1014,15 @@ void PeekController::OnTabStripModelChan
        preview_removed |= removed.contents == preview_contents_.get();
        source_removed |= removed.contents == source_contents_.get();
      }
@@ -1380,7 +1405,7 @@
      const auto source = source_contents_;
      const bool restore = preview_removed && restore_source_on_close_ &&
                           !closing_all_;
-@@ -475,10 +1032,13 @@ void PeekController::OnTabStripModelChan
+@@ -474,10 +1031,13 @@ void PeekController::OnTabStripModelChan
        ResetPreviewState();
      } else if (source_removed) {
        ClearPresentation();
@@ -1395,7 +1420,7 @@
      }
      if (restore && source) {
        const auto selected = selection.new_contents
-@@ -499,6 +1059,17 @@ void PeekController::OnTabStripModelChan
+@@ -498,6 +1058,17 @@ void PeekController::OnTabStripModelChan
                weak_factory_.GetWeakPtr(), source, selected));
      }
    }
@@ -1413,7 +1438,7 @@
    if (change.type() == TabStripModelChange::kReplaced && preview_contents_ &&
        change.GetReplace()->new_contents == preview_contents_.get() &&
        !close_pending_ && !closing_all_) {
-@@ -516,11 +1087,16 @@ void PeekController::OnTabStripModelChan
+@@ -515,11 +1086,16 @@ void PeekController::OnTabStripModelChan
  void PeekController::OnSourceWillDetach(
      tabs::TabInterface* tab,
      tabs::TabInterface::DetachReason reason) {
@@ -1432,7 +1457,7 @@
    source_contents_.reset();
    ScheduleClose(/*restore_source=*/false);
  }
-@@ -528,7 +1104,11 @@ void PeekController::OnSourceWillDetach(
+@@ -527,7 +1103,11 @@ void PeekController::OnSourceWillDetach(
  void PeekController::OnSourceWillDiscard(tabs::TabInterface* tab,
                                           content::WebContents* old_contents,
                                           content::WebContents* new_contents) {
@@ -1444,7 +1469,7 @@
    source_contents_.reset();
    ScheduleClose(/*restore_source=*/false);
  }
-@@ -544,7 +1124,17 @@ void PeekController::OnTabCloseCancelled
+@@ -543,7 +1123,17 @@ void PeekController::OnTabCloseCancelled
  }
  
  void PeekController::BeforeUnloadFired(bool proceed) {
@@ -1463,7 +1488,7 @@
      // Observe actual renderer cancellation. The model's close-cancel signal
      // covers only oracle rejection, not the beforeunload dialog's answer.
      base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
-@@ -554,6 +1144,70 @@ void PeekController::BeforeUnloadFired(b
+@@ -553,6 +1143,70 @@ void PeekController::BeforeUnloadFired(b
    }
  }
  
@@ -1499,7 +1524,7 @@
 +      expected_source.get() != source_contents_.get() ||
 +      expected_preview.get() != preview_contents_.get() || !tab_strip_model_ ||
 +      close_pending_ || closing_all_ || tab_strip_model_->closing_all() ||
-+      !IsPeekEnabled(browser_view_->browser()->profile()) ||
++      !IsPeekEnabled(browser_view_->GetProfile()) ||
 +      tab_strip_model_->GetIndexOfWebContents(expected_source.get()) ==
 +          TabStripModel::kNoTab) {
 +    return;
@@ -1534,7 +1559,7 @@
  void PeekController::HandlePreviewCloseCancelled(
      base::WeakPtr<content::WebContents> expected_contents) {
    if (!expected_contents ||
-@@ -563,6 +1217,11 @@ void PeekController::HandlePreviewCloseC
+@@ -562,6 +1216,11 @@ void PeekController::HandlePreviewCloseC
            TabStripModel::kNoTab) {
      return;
    }
@@ -1546,7 +1571,7 @@
    closing_all_ = false;
    close_pending_ = false;
    close_scheduled_ = false;
-@@ -583,6 +1242,8 @@ void PeekController::HandlePreviewCloseC
+@@ -582,6 +1241,8 @@ void PeekController::HandlePreviewCloseC
  }
  
  void PeekController::WillCloseAllTabs(TabStripModel* model) {
@@ -1555,7 +1580,7 @@
    closing_all_ = true;
    ClearPresentation();
  }
-@@ -592,7 +1253,8 @@ void PeekController::CloseAllTabsStopped
+@@ -591,7 +1252,8 @@ void PeekController::CloseAllTabsStopped
    closing_all_ = false;
    if (!preview_contents_) {
      ResetPreviewState();
@@ -1565,7 +1590,7 @@
      // This also fires when closing pauses for a beforeunload response. Actual
      // cancellation is handled by BeforeUnloadFired after the user's answer.
      AttachPresentation();
-@@ -600,6 +1262,7 @@ void PeekController::CloseAllTabsStopped
+@@ -599,6 +1261,7 @@ void PeekController::CloseAllTabsStopped
  }
  
  void PeekController::OnTabStripModelDestroyed(TabStripModel* model) {
@@ -1573,7 +1598,7 @@
    ClearPresentation();
    ResetPreviewState();
    tab_strip_model_ = nullptr;
-@@ -615,16 +1278,24 @@ void PeekController::OpenInTab() {
+@@ -614,16 +1277,24 @@ void PeekController::OpenInTab() {
    if (!preview_contents_) {
      return;
    }
