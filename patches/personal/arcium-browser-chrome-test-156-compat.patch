@@ -1,0 +1,316 @@
+--- a/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
++++ b/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
+@@ -2,7 +2,11 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#include "chrome/browser/ui/views/frame/test_with_browser_view.h"
++#include "chrome/test/base/in_process_browser_test.h"
++#include "chrome/test/base/ui_test_utils.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_tabstrip.h"
++#include "content/public/test/browser_test.h"
+ 
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ 
+@@ -24,9 +28,6 @@
+ #include "base/functional/bind.h"
+ #include "base/scoped_observation.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+-#include "chrome/browser/ui/color/chrome_color_mixers.h"
+-#include "components/color/color_mixers.h"
+-#include "ui/color/color_provider_manager.h"
+ #include "ui/gfx/color_palette.h"
+ #include "chrome/browser/ui/helium/space_palette.h"
+ #include "chrome/browser/ui/views/frame/browser_widget.h"
+@@ -61,37 +62,28 @@
+ #include "ui/views/controls/label.h"
+ #include "ui/views/view_class_properties.h"
+ 
+-class ArciumBrowserChromeTest : public TestWithBrowserView {
++class ArciumBrowserChromeTest : public InProcessBrowserTest {
+  protected:
+-  TestingProfile::TestingFactories GetTestingFactories() override {
+-    auto factories = TestWithBrowserView::GetTestingFactories();
+-    factories.emplace_back(
+-        PinnedToolbarActionsModelFactory::GetInstance(),
+-        base::BindRepeating([](content::BrowserContext* context)
+-                               -> std::unique_ptr<KeyedService> {
++  void SetUpBrowserContextKeyedServices(
++      content::BrowserContext* context) override {
++    PinnedToolbarActionsModelFactory::GetInstance()->SetTestingFactory(
++        context, base::BindRepeating([](content::BrowserContext* context)
++                                        -> std::unique_ptr<KeyedService> {
+           return std::make_unique<PinnedToolbarActionsModel>(
+               Profile::FromBrowserContext(context));
+         }));
+-    factories.emplace_back(
+-        helium::HeliumSpaceServiceFactory::GetInstance(),
+-        base::BindOnce([](content::BrowserContext* context)
+-                           -> std::unique_ptr<KeyedService> {
++    helium::HeliumSpaceServiceFactory::GetInstance()->SetTestingFactory(
++        context, base::BindRepeating([](content::BrowserContext* context)
++                                        -> std::unique_ptr<KeyedService> {
+           return std::make_unique<helium::HeliumSpaceService>(
+               Profile::FromBrowserContext(context));
+         }));
+-    return factories;
+   }
+ 
+-  void SetUp() override {
+-    TestWithBrowserView::SetUp();
+-    // TestWithBrowserView omits ChromeViewsTestBase's mixer registration.
+-    // Use the production color pipeline before asserting cached view colors.
+-    ui::ColorProviderManager::Get().AppendColorProviderInitializer(
+-        base::BindRepeating(color::AddComponentsColorMixers));
+-    ui::ColorProviderManager::Get().AppendColorProviderInitializer(
+-        base::BindRepeating(AddChromeColorMixers));
+-    browser_view()->GetWidget()->ThemeChanged();
+-    AddTab(browser(), GURL("https://example.com/"));
++  void SetUpOnMainThread() override {
++    InProcessBrowserTest::SetUpOnMainThread();
++    // The browser fixture supplies the initial tab and production color mixers.
++    ASSERT_EQ(1, browser()->GetTabStripModel()->count());
+     prefs()->SetInteger(arcium::kChromeUIScalePref, 100);
+     prefs()->SetBoolean(prefs::kHeliumRoundedFrame, true);
+     prefs()->SetInteger(arcium::kChromeFrameBorderWidthPref, 12);
+@@ -100,16 +92,19 @@ class ArciumBrowserChromeTest : public T
+     controller->SetVerticalTabsEnabled(true);
+     controller->SetTabStripRightAligned(false);
+     browser_view()->GetWidget()->Show();
+-    browser_view()->SetSize(gfx::Size(1000, 800));
++    ui_test_utils::SetAndWaitForBounds(*browser(),
++                                      gfx::Rect(60, 60, 1000, 800));
+     Layout();
+   }
+ 
+-  void TearDown() override {
+-    TestWithBrowserView::TearDown();
+-    ui::ColorProviderManager::ResetForTesting();
++  Profile* profile() { return browser()->GetProfile(); }
++  BrowserView* browser_view() {
++    return BrowserView::GetBrowserViewForBrowser(browser());
+   }
+-
+-  PrefService* prefs() { return browser()->GetProfile()->GetPrefs(); }
++  void AddTab(BrowserWindowInterface* browser, const GURL& url) {
++    chrome::AddTabAt(browser, url, /*index=*/-1, /*foreground=*/true);
++  }
++  PrefService* prefs() { return profile()->GetPrefs(); }
+   void Layout() { browser_view()->GetWidget()->LayoutRootViewIfNecessary(); }
+ };
+ 
+@@ -127,7 +122,7 @@ class DragTestInfoBarDelegate : public C
+ };
+ }
+ 
+-TEST_F(ArciumBrowserChromeTest, HiddenToolbarTopFrameDragsWithoutClaimingPage) {
++IN_PROC_BROWSER_TEST_F(ArciumBrowserChromeTest, HiddenToolbarTopFrameDragsWithoutClaimingPage) {
+   prefs()->SetBoolean(arcium::kShowToolbarPref, false);
+   auto* view = browser_view()->multi_contents_view();
+   for (int scale : {75, 100, 150}) {
+@@ -147,7 +142,7 @@ TEST_F(ArciumBrowserChromeTest, HiddenTo
+   }
+ }
+ 
+-TEST_F(ArciumBrowserChromeTest, StackedSplitTopPageNeverBecomesWindowCaption) {
++IN_PROC_BROWSER_TEST_F(ArciumBrowserChromeTest, StackedSplitTopPageNeverBecomesWindowCaption) {
+   AddTab(browser(), GURL("https://second.test/"));
+   auto* model = browser()->GetTabStripModel();
+   model->AddToNewSplit({1 - model->active_index()},
+@@ -168,7 +163,7 @@ TEST_F(ArciumBrowserChromeTest, StackedS
+   }
+ }
+ 
+-TEST_F(ArciumBrowserChromeTest, InfobarPaddingDragsAndControlsRemainClient) {
++IN_PROC_BROWSER_TEST_F(ArciumBrowserChromeTest, InfobarPaddingDragsAndControlsRemainClient) {
+   gfx::ScopedAnimationDurationScaleMode animations(
+       gfx::ScopedAnimationDurationScaleMode::ZERO_DURATION);
+   auto infobar = ConfirmInfoBar::Create(std::make_unique<DragTestInfoBarDelegate>());
+@@ -203,7 +198,7 @@ TEST_F(ArciumBrowserChromeTest, InfobarP
+   client(dismiss);
+   manager->RemoveInfoBar(bar);
+ }
+-TEST_F(ArciumBrowserChromeTest, HiddenToolbarHasEvenUnattachedFrameEdges) {
++IN_PROC_BROWSER_TEST_F(ArciumBrowserChromeTest, HiddenToolbarHasEvenUnattachedFrameEdges) {
+   ASSERT_TRUE(browser_view()->ShouldDrawVerticalTabStrip());
+   ASSERT_TRUE(chrome::IsCommandEnabled(browser(), IDC_ARCIUM_TOGGLE_TOOLBAR));
+   chrome::ExecuteCommand(browser(), IDC_ARCIUM_TOGGLE_TOOLBAR);
+@@ -220,7 +215,7 @@ TEST_F(ArciumBrowserChromeTest, HiddenTo
+   EXPECT_EQ(view->GetActiveContentsContainerView()->bounds().y(), 0);
+ }
+ 
+-TEST_F(ArciumBrowserChromeTest, HiddenToolbarHasEvenSplitFrameEdges) {
++IN_PROC_BROWSER_TEST_F(ArciumBrowserChromeTest, HiddenToolbarHasEvenSplitFrameEdges) {
+   AddTab(browser(), GURL("https://example.org/"));
+   auto* model = browser()->GetTabStripModel();
+   ASSERT_EQ(model->count(), 2);
+@@ -239,7 +234,7 @@ TEST_F(ArciumBrowserChromeTest, HiddenTo
+   EXPECT_EQ(view->split_view_insets_for_testing().top(), 0);
+ }
+ 
+-TEST_F(ArciumBrowserChromeTest, HorizontalTabsRetainTopAttachment) {
++IN_PROC_BROWSER_TEST_F(ArciumBrowserChromeTest, HorizontalTabsRetainTopAttachment) {
+   tabs::VerticalTabStripStateController::From(browser())
+       ->SetVerticalTabsEnabled(false);
+   prefs()->SetBoolean(arcium::kShowToolbarPref, false);
+@@ -249,7 +244,7 @@ TEST_F(ArciumBrowserChromeTest, Horizont
+                 ->GetActiveContentsContainerView()->bounds().y(), 0);
+ }
+ 
+-TEST_F(ArciumBrowserChromeTest, SidebarDefaultPreservesExplicitTopBarChoice) {
++IN_PROC_BROWSER_TEST_F(ArciumBrowserChromeTest, SidebarDefaultPreservesExplicitTopBarChoice) {
+   prefs()->ClearPref(arcium::kArcSidebarNavigationEnabledPref);
+   EXPECT_TRUE(prefs()->GetBoolean(arcium::kArcSidebarNavigationEnabledPref));
+   EXPECT_TRUE(browser_view()->IsSidebarNavigationActive());
+@@ -257,7 +252,7 @@ TEST_F(ArciumBrowserChromeTest, SidebarD
+   EXPECT_FALSE(browser_view()->IsSidebarNavigationActive());
+ }
+ 
+-TEST_F(ArciumBrowserChromeTest, SidebarAddressSurvivesSavedHiddenTopBar) {
++IN_PROC_BROWSER_TEST_F(ArciumBrowserChromeTest, SidebarAddressSurvivesSavedHiddenTopBar) {
+   prefs()->SetBoolean(arcium::kShowToolbarPref, false);
+   prefs()->SetBoolean(arcium::kArcSidebarNavigationEnabledPref, true);
+   Layout();
+@@ -278,7 +273,7 @@ TEST_F(ArciumBrowserChromeTest, SidebarA
+   EXPECT_TRUE(chrome::IsCommandEnabled(browser(), IDC_ARCIUM_TOGGLE_TOOLBAR));
+ }
+ 
+-TEST_F(ArciumBrowserChromeTest, SidebarCaptionMatchesNavigationRowAtEachScale) {
++IN_PROC_BROWSER_TEST_F(ArciumBrowserChromeTest, SidebarCaptionMatchesNavigationRowAtEachScale) {
+   prefs()->SetBoolean(arcium::kArcSidebarNavigationEnabledPref, true);
+   auto* toolbar = browser_view()->toolbar();
+   for (int scale : {100, 110}) {
+@@ -293,7 +288,7 @@ TEST_F(ArciumBrowserChromeTest, SidebarC
+   }
+ }
+ 
+-TEST_F(ArciumBrowserChromeTest, HiddenTopBarRetainsIntrinsicCaptionHeight) {
++IN_PROC_BROWSER_TEST_F(ArciumBrowserChromeTest, HiddenTopBarRetainsIntrinsicCaptionHeight) {
+   const int visible_height =
+       browser_view()->GetFrameElementInfo().toolbar_minimum_height;
+   ASSERT_GT(visible_height, 0);
+@@ -303,7 +298,7 @@ TEST_F(ArciumBrowserChromeTest, HiddenTo
+             visible_height);
+ }
+ 
+-TEST_F(ArciumBrowserChromeTest, HoverLockPreservesSavedCollapseAndFinalPresentation) {
++IN_PROC_BROWSER_TEST_F(ArciumBrowserChromeTest, HoverLockPreservesSavedCollapseAndFinalPresentation) {
+   gfx::ScopedAnimationDurationScaleMode no_animation(
+       gfx::ScopedAnimationDurationScaleMode::ZERO_DURATION);
+   prefs()->SetBoolean(arcium::kArcSidebarNavigationEnabledPref, true);
+@@ -378,7 +373,7 @@ class PaletteThemeChangeObserver : publi
+ };
+ }  // namespace
+ 
+-TEST_F(ArciumBrowserChromeTest, ColorModeRefreshesCachedPaletteAndOwnedWidgets) {
++IN_PROC_BROWSER_TEST_F(ArciumBrowserChromeTest, ColorModeRefreshesCachedPaletteAndOwnedWidgets) {
+   auto* spaces = helium::HeliumSpaceServiceFactory::GetForProfile(browser()->GetProfile());
+   ASSERT_TRUE(spaces);
+   auto* space = spaces->GetOrCreateSpace("mode-palette", u"Mode palette");
+@@ -431,7 +426,7 @@ TEST_F(ArciumBrowserChromeTest, ColorMod
+   EXPECT_EQ(space->theme(), saved_theme);
+ }
+ 
+-TEST_F(ArciumBrowserChromeTest, FooterSpacesCenterBetweenFixedEndButtons) {
++IN_PROC_BROWSER_TEST_F(ArciumBrowserChromeTest, FooterSpacesCenterBetweenFixedEndButtons) {
+   auto* footer = browser_view()->vertical_tab_strip_region_view_for_testing()
+                      ->GetBottomContainer();
+   for (int width : {220, 320}) {
+@@ -448,7 +443,7 @@ TEST_F(ArciumBrowserChromeTest, FooterSp
+   }
+ }
+ 
+-TEST_F(ArciumBrowserChromeTest, FooterOverflowKeepsEndButtonsAndScrollableSpaces) {
++IN_PROC_BROWSER_TEST_F(ArciumBrowserChromeTest, FooterOverflowKeepsEndButtonsAndScrollableSpaces) {
+   auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(
+       browser()->GetProfile());
+   ASSERT_TRUE(service);
+@@ -467,7 +462,7 @@ TEST_F(ArciumBrowserChromeTest, FooterOv
+             footer->GetContentsBounds().right());
+ }
+ 
+-TEST_F(ArciumBrowserChromeTest, FooterActionChangesLiveAndRetainsCenterWhenHidden) {
++IN_PROC_BROWSER_TEST_F(ArciumBrowserChromeTest, FooterActionChangesLiveAndRetainsCenterWhenHidden) {
+   auto* footer = browser_view()->vertical_tab_strip_region_view_for_testing()
+                      ->GetBottomContainer();
+   auto* button = static_cast<ArciumSpaceIconButton*>(
+@@ -493,7 +488,7 @@ TEST_F(ArciumBrowserChromeTest, FooterAc
+   EXPECT_EQ(prefs()->GetInteger(arcium::kSidebarFooterActionPref), 999);
+ }
+ 
+-TEST_F(ArciumBrowserChromeTest, FooterRailAndExpandedPresentationRemainDistinct) {
++IN_PROC_BROWSER_TEST_F(ArciumBrowserChromeTest, FooterRailAndExpandedPresentationRemainDistinct) {
+   auto* footer = browser_view()->vertical_tab_strip_region_view_for_testing()
+                      ->GetBottomContainer();
+   footer->OnCollapseStateChanged(tabs::VerticalTabStripCollapseState::kCollapsed);
+@@ -508,13 +503,16 @@ TEST_F(ArciumBrowserChromeTest, FooterRa
+                      footer->GetContentsBounds().CenterPoint().x()), 1);
+ }
+ 
+-TEST_F(ArciumBrowserChromeTest, NewTabCommandRepeatsInsidePanelAndSurvivesEscape) {
++IN_PROC_BROWSER_TEST_F(ArciumBrowserChromeTest, NewTabCommandRepeatsInsidePanelAndSurvivesEscape) {
+   prefs()->SetString(prefs::kNewTabPageLocationOverride, "about:blank");
+   arcium::CommandPanelPresentation::SetSessionFactoryForTesting(
+       browser_view(), base::BindRepeating([]() -> std::unique_ptr<arcium::CommandSession> {
+         return std::make_unique<arcium::CommandExampleSession>(
+             std::vector<arcium::CommandScopeDescriptor>{
+-                {.id = arcium::kOmniScope, .label = u"Omni"}});
++                {.id = arcium::kOmniScope,
++                   .label = u"Omni",
++                   .placeholder = u"Search or enter URL…",
++                   .accessibility_description = u"Search everything or enter URL"}});
+       }));
+   auto* model = browser()->GetTabStripModel();
+   const int before = model->count();
+@@ -546,16 +544,18 @@ TEST_F(ArciumBrowserChromeTest, NewTabCo
+   EXPECT_EQ(before + 2, model->count());
+ }
+ 
+-TEST_F(ArciumBrowserChromeTest, PopupNewTabOpensPanelInDestinationWindow) {
++IN_PROC_BROWSER_TEST_F(ArciumBrowserChromeTest, PopupNewTabOpensPanelInDestinationWindow) {
+   prefs()->SetString(prefs::kNewTabPageLocationOverride, "about:blank");
+   arcium::CommandPanelPresentation::SetSessionFactoryForTesting(
+       browser_view(), base::BindRepeating([]() -> std::unique_ptr<arcium::CommandSession> {
+         return std::make_unique<arcium::CommandExampleSession>(
+             std::vector<arcium::CommandScopeDescriptor>{
+-                {.id = arcium::kOmniScope, .label = u"Omni"}});
++                {.id = arcium::kOmniScope,
++                   .label = u"Omni",
++                   .placeholder = u"Search or enter URL…",
++                   .accessibility_description = u"Search everything or enter URL"}});
+       }));
+-  auto* popup = CreateBrowserWithBrowserView(profile(), BrowserWindowInterface::TYPE_POPUP);
+-  AddTab(popup, GURL("https://popup.test/"));
++  auto* popup = CreateBrowserForPopup(profile());
+   auto* original = popup->GetTabStripModel()->GetActiveWebContents();
+   const int before = browser()->GetTabStripModel()->count();
+   ASSERT_TRUE(chrome::ExecuteCommand(popup, IDC_NEW_TAB));
+--- a/chrome/test/BUILD.gn
++++ b/chrome/test/BUILD.gn
+@@ -9923,7 +9923,6 @@ if (!is_android && toolkit_views) {
+       "../browser/renderer_context_menu/render_view_context_menu_unittest.cc",
+       "../browser/ui/helium/helium_space_service_unittest.cc",
+       "../browser/ui/profiles/profile_picker_unittest.cc",
+-      "../browser/ui/views/frame/arcium_browser_chrome_unittest.cc",
+     "../browser/ui/helium/arcium_space_icon_unittest.cc",
+     ]
+ 
+@@ -9934,6 +9933,9 @@ if (!is_android && toolkit_views) {
+     ]
+ 
+     deps = [
++      "//chrome/test/base:chrome_render_view_host_test_harness",
++      "//components/enterprise/net/core:test_support",
++      "//components/send_tab_to_self:test_support",
+       "//chrome/browser/picture_in_picture",
+       "//chrome/browser/ui/views:layout_provider",
+       "//components/global_media_controls",
+@@ -10017,6 +10019,7 @@ if (!is_android && toolkit_views) {
+     defines = [ "HAS_OUT_OF_PROC_TEST_RUNNER" ]
+ 
+     sources = [
++      "../browser/ui/views/frame/arcium_browser_chrome_unittest.cc",
+       "../browser/picture_in_picture/auto_picture_in_picture_tab_helper_browsertest.cc",
+       "../browser/importer/arcium_arc_import_browsertest.cc",
+       "../browser/ui/views/helium/peek_controller_browsertest.cc",
