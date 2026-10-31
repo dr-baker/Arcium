@@ -3,7 +3,7 @@ Index: src/components/tabs/BUILD.gn
 ===================================================================
 --- src.orig/components/tabs/BUILD.gn
 +++ src/components/tabs/BUILD.gn
-@@ -31,6 +31,7 @@
+@@ -32,6 +32,7 @@ source_set("public") {
      "public/tab_handle_factory.h",
      "public/tab_interface.h",
      "public/tab_strip_collection.h",
@@ -11,7 +11,7 @@ Index: src/components/tabs/BUILD.gn
      "public/unpinned_tab_collection.h",
    ]
  
-@@ -63,6 +64,7 @@
+@@ -64,6 +65,7 @@ source_set("impl") {
      "impl/tab_interface.cc",
      "impl/tab_network_state.cc",
      "impl/tab_strip_collection.cc",
@@ -21,7 +21,7 @@ Index: src/components/tabs/BUILD.gn
  
 Index: src/components/tabs/impl/temporary_tab.cc
 ===================================================================
---- src.orig/components/tabs/impl/temporary_tab.cc
+--- /dev/null
 +++ src/components/tabs/impl/temporary_tab.cc
 @@ -0,0 +1,51 @@
 +// Copyright 2026 The Chromium Authors
@@ -77,7 +77,7 @@ Index: src/components/tabs/impl/temporary_tab.cc
 +}  // namespace tabs
 Index: src/components/tabs/public/temporary_tab.h
 ===================================================================
---- src.orig/components/tabs/public/temporary_tab.h
+--- /dev/null
 +++ src/components/tabs/public/temporary_tab.h
 @@ -0,0 +1,55 @@
 +// Copyright 2026 The Chromium Authors
@@ -152,7 +152,7 @@ Index: src/chrome/browser/sessions/session_tab_helper_factory.cc
  #include "extensions/buildflags/buildflags.h"
  
  #if BUILDFLAG(ENABLE_SESSION_SERVICE)
-@@ -26,6 +26,10 @@
+@@ -26,6 +26,10 @@ namespace {
  #if BUILDFLAG(ENABLE_SESSION_SERVICE)
  sessions::SessionTabHelperDelegate* GetSessionTabHelperDelegate(
      content::WebContents* web_contents) {
@@ -165,17 +165,17 @@ Index: src/chrome/browser/sessions/session_tab_helper_factory.cc
    if (IsRelevantToAppSessionService(web_contents)) {
 Index: src/chrome/browser/sessions/session_service_base.cc
 ===================================================================
---- a/chrome/browser/sessions/session_service_base.cc
-+++ b/chrome/browser/sessions/session_service_base.cc
-@@ -46,6 +46,7 @@
- #include "components/split_tabs/split_tab_visual_data.h"
+--- src.orig/chrome/browser/sessions/session_service_base.cc
++++ src/chrome/browser/sessions/session_service_base.cc
+@@ -54,6 +54,7 @@
+ #include "components/tab_groups/tab_group_id.h"
  #include "components/tabs/public/split_tab_data.h"
  #include "components/tabs/public/tab_group.h"
 +#include "components/tabs/public/temporary_tab.h"
+ #include "content/public/browser/navigation_controller.h"
  #include "content/public/browser/navigation_details.h"
  #include "content/public/browser/navigation_entry.h"
- #include "content/public/browser/session_storage_namespace.h"
-@@ -263,6 +264,9 @@
+@@ -273,6 +274,9 @@ void SessionServiceBase::SetTabIndexInWi
  }
  
  void SessionServiceBase::TabInserted(WebContents* contents) {
@@ -185,7 +185,7 @@ Index: src/chrome/browser/sessions/session_service_base.cc
    sessions::SessionTabHelper* session_tab_helper =
        sessions::SessionTabHelper::FromWebContents(contents);
    if (!ShouldTrackChangesToWindow(session_tab_helper->window_id())) {
-@@ -296,6 +300,9 @@
+@@ -306,6 +310,9 @@ void SessionServiceBase::TabInserted(Web
  }
  
  void SessionServiceBase::TabClosing(WebContents* contents) {
@@ -194,8 +194,8 @@ Index: src/chrome/browser/sessions/session_service_base.cc
 +  }
    // Allow the associated sessionStorage to get deleted; it won't be needed
    // in the session restore.
-   content::SessionStorageNamespace* session_storage_namespace =
-@@ -307,6 +314,9 @@
+   content::SessionStorageNamespaceHandle* session_storage_namespace =
+@@ -317,6 +324,9 @@ void SessionServiceBase::TabClosing(WebC
  }
  
  void SessionServiceBase::TabRestored(WebContents* tab, bool pinned) {
@@ -205,14 +205,13 @@ Index: src/chrome/browser/sessions/session_service_base.cc
    if (!is_saving_enabled_) {
      return;
    }
-@@ -709,12 +719,30 @@
-           browser->session_id(),
+@@ -721,13 +731,29 @@ void SessionServiceBase::BuildCommandsFo
+           browser->GetSessionID(),
            BrowserWindow::FromBrowser(browser)->IsVisibleOnAllWorkspaces()));
  
-+  TabStripModel* tab_strip = browser->tab_strip_model();
++  TabStripModel* tab_strip = browser->GetTabStripModel();
 +  int persisted_active_index = tab_strip->active_index();
-+  content::WebContents* const active_contents =
-+      tab_strip->GetActiveWebContents();
++  content::WebContents* const active_contents = tab_strip->GetActiveWebContents();
 +  if (const auto* temporary_tab =
 +          active_contents ? tabs::TemporaryTab::FromWebContents(active_contents)
 +                          : nullptr;
@@ -230,49 +229,48 @@ Index: src/chrome/browser/sessions/session_service_base.cc
 +  }
    command_storage_manager()->AppendRebuildCommand(
        sessions::CreateSetSelectedTabInWindowCommand(
--          browser->session_id(), browser->tab_strip_model()->active_index()));
-+          browser->session_id(), selected_session_index));
+-          browser->GetSessionID(),
+-          browser->GetTabStripModel()->active_index()));
++          browser->GetSessionID(), selected_session_index));
  
    // Set the visual data for each tab group.
--  TabStripModel* tab_strip = browser->tab_strip_model();
+-  TabStripModel* tab_strip = browser->GetTabStripModel();
    if (tab_strip->SupportsTabGroups()) {
      TabGroupModel* group_model = tab_strip->group_model();
      tab_groups::TabGroupSyncService* tab_group_service =
-@@ -747,19 +775,26 @@
-               split_id, tab_strip->GetSplitData(split_id)->visual_data()));
+@@ -773,19 +799,26 @@ void SessionServiceBase::BuildCommandsFo
      }
+   }
  
--    int index = 0;
-+    int model_index = 0;
-+    int session_index = 0;
-     for (const tabs::TabInterface* tab_interface : *tab_strip) {
-       WebContents* tab = tab_interface->GetContents();
-       DCHECK(tab);
-+      if (tabs::TemporaryTab::IsTemporary(tab)) {
-+        ++model_index;
-+        continue;
-+      }
-       const std::optional<tab_groups::TabGroupId> group_id =
--          tab_strip->GetTabGroupForTab(index);
-+          tab_strip->GetTabGroupForTab(model_index);
-       const std::optional<split_tabs::SplitTabId> split_id =
--          tab_strip->GetSplitForTab(index);
--
--      BuildCommandsForTab(browser->session_id(), tab, index, group_id, split_id,
--                          tab_interface->IsPinned(), tab_to_available_range);
--
--      index++;
-+          tab_strip->GetSplitForTab(model_index);
-+
-+      BuildCommandsForTab(browser->session_id(), tab, session_index, group_id,
-+                          split_id, tab_interface->IsPinned(),
-+                          tab_to_available_range);
-+
+-  int index = 0;
++  int model_index = 0;
++  int session_index = 0;
+   for (const tabs::TabInterface* tab_interface : *tab_strip) {
+     WebContents* tab = tab_interface->GetContents();
+     DCHECK(tab);
++    if (tabs::TemporaryTab::IsTemporary(tab)) {
 +      ++model_index;
-+      ++session_index;
-     }
++      continue;
++    }
+     const std::optional<tab_groups::TabGroupId> group_id =
+-        tab_strip->GetTabGroupForTab(index);
++        tab_strip->GetTabGroupForTab(model_index);
+     const std::optional<split_tabs::SplitTabId> split_id =
+-        tab_strip->GetSplitForTab(index);
++        tab_strip->GetSplitForTab(model_index);
  
-   windows_to_track->insert(browser->session_id());
+-    BuildCommandsForTab(browser->GetSessionID(), tab, index, group_id, split_id,
+-                        tab_interface->IsPinned(), tab_to_available_range);
++    BuildCommandsForTab(browser->GetSessionID(), tab, session_index, group_id,
++                        split_id, tab_interface->IsPinned(),
++                        tab_to_available_range);
+ 
+-    index++;
++    ++model_index;
++    ++session_index;
+   }
+ 
+   windows_to_track->insert(browser->GetSessionID());
 Index: src/chrome/browser/ui/sessions/session_service_browser_helper.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/sessions/session_service_browser_helper.cc
@@ -285,15 +283,15 @@ Index: src/chrome/browser/ui/sessions/session_service_browser_helper.cc
  #include "base/time/time.h"
  #include "chrome/browser/profiles/profile.h"
  #include "chrome/browser/sessions/app_session_service.h"
-@@ -21,6 +22,7 @@
- #include "components/split_tabs/split_tab_id.h"
+@@ -24,6 +25,7 @@
+ #include "components/tab_groups/tab_group_id.h"
  #include "components/tabs/public/split_tab_data.h"
  #include "components/tabs/public/tab_group.h"
 +#include "components/tabs/public/temporary_tab.h"
  #include "content/public/browser/web_contents.h"
  
  namespace {
-@@ -67,14 +69,27 @@
+@@ -94,14 +96,27 @@ void SessionServiceBrowserHelper::OnTabS
          sessions::SessionTabHelper::FromWebContents(contents.contents)
              ->SetWindowID(session_id_);
  
@@ -323,7 +321,7 @@ Index: src/chrome/browser/ui/sessions/session_service_browser_helper.cc
            }
          }
        }
-@@ -82,6 +97,7 @@
+@@ -109,6 +124,7 @@ void SessionServiceBrowserHelper::OnTabS
      }
      case TabStripModelChange::kRemoved: {
        for (const auto& contents : change.GetRemove()->contents) {
@@ -331,7 +329,7 @@ Index: src/chrome/browser/ui/sessions/session_service_browser_helper.cc
          SessionServiceBase* service = GetSessionService();
          if (service &&
              TabRemoveReasonUtils::WillDeleteTab(contents.remove_reason)) {
-@@ -92,20 +108,21 @@
+@@ -119,20 +135,21 @@ void SessionServiceBrowserHelper::OnTabS
            SessionServiceBase* service_existing = GetSessionServiceIfExisting();
            if (service_existing) {
              service_existing->SetSelectedTabInWindow(
@@ -357,7 +355,7 @@ Index: src/chrome/browser/ui/sessions/session_service_browser_helper.cc
        SessionServiceBase* session_service = GetSessionService();
        if (session_service) {
          session_service->TabClosing(replace->old_contents);
-@@ -114,13 +131,25 @@
+@@ -141,13 +158,25 @@ void SessionServiceBrowserHelper::OnTabS
        // Insert new session logic:
        sessions::SessionTabHelper::FromWebContents(replace->new_contents)
            ->SetWindowID(session_id_);
@@ -386,7 +384,7 @@ Index: src/chrome/browser/ui/sessions/session_service_browser_helper.cc
          }
  
          // The new_contents may end up with a different navigation stack. Force
-@@ -144,12 +173,14 @@
+@@ -171,12 +200,14 @@ void SessionServiceBrowserHelper::OnTabS
    // up by sessions when created.
    SessionServiceBase* service = GetSessionServiceIfExisting();
    if (service && !tab_strip_model->closing_all()) {
@@ -407,7 +405,7 @@ Index: src/chrome/browser/ui/sessions/session_service_browser_helper.cc
    }
  }
  
-@@ -196,7 +227,7 @@
+@@ -223,7 +254,7 @@ void SessionServiceBrowserHelper::OnTabP
    DCHECK(!IsRelevantToAppSessionService(browser_type_));
    SessionService* session_service =
        SessionServiceFactory::GetForProfileIfExisting(&*profile_);
@@ -416,11 +414,12 @@ Index: src/chrome/browser/ui/sessions/session_service_browser_helper.cc
      session_service->SetPinnedState(
          session_id_, sessions::SessionTabHelper::IdForTab(tab->GetContents()),
          tab->IsPinned());
-@@ -250,47 +281,100 @@
+@@ -277,47 +308,100 @@ void SessionServiceBrowserHelper::OnSpli
    }
  }
  
 -void SessionServiceBrowserHelper::SyncHistoryWithTabs(int index) {
+-  SessionServiceBase* service = GetSessionService();
 +int SessionServiceBrowserHelper::GetSessionIndexForContents(
 +    content::WebContents* contents) const {
 +  int session_index = 0;
@@ -435,7 +434,9 @@ Index: src/chrome/browser/ui/sessions/session_service_browser_helper.cc
 +  }
 +  return 0;
 +}
-+
+ 
+-  SessionService* session_service =
+-      SessionServiceFactory::GetForProfileIfExisting(&*profile_);
 +content::WebContents* SessionServiceBrowserHelper::GetPersistedActiveContents()
 +    const {
 +  content::WebContents* active = tab_strip_model_->GetActiveWebContents();
@@ -455,18 +456,20 @@ Index: src/chrome/browser/ui/sessions/session_service_browser_helper.cc
 +  }
 +  return nullptr;
 +}
-+
+ 
+-  if (!service && !session_service) {
 +void SessionServiceBrowserHelper::OnTemporaryTabPromoted(
 +    content::WebContents* contents) {
 +  if (tab_strip_model_->closing_all()) {
-+    return;
-+  }
+     return;
+   }
+-
+-  if (index >= tab_strip_model_->count()) {
 +  const int index = tab_strip_model_->GetIndexOfWebContents(contents);
 +  if (index == TabStripModel::kNoTab) {
-+    return;
-+  }
-   SessionServiceBase* service = GetSessionService();
--
+     return;
+   }
++  SessionServiceBase* service = GetSessionService();
 +  if (service) {
 +    service->TabInserted(contents);
 +    service->TabRestored(contents, tab_strip_model_->IsTabPinned(index));
@@ -480,20 +483,7 @@ Index: src/chrome/browser/ui/sessions/session_service_browser_helper.cc
 +                               base::Time::Now());
 +  }
 +}
-+
-+void SessionServiceBrowserHelper::SyncHistoryWithTabs() {
-+  SessionServiceBase* service = GetSessionService();
-   SessionService* session_service =
-       SessionServiceFactory::GetForProfileIfExisting(&*profile_);
--
-   if (!service && !session_service) {
-     return;
-   }
--
--  if (index >= tab_strip_model_->count()) {
--    return;
--  }
--
+ 
 -  int current_index = index;
 -  for (tabs::TabCollection::TabIterator it(
 -           tab_strip_model_->GetTabAtIndex(index));
@@ -501,6 +491,13 @@ Index: src/chrome/browser/ui/sessions/session_service_browser_helper.cc
 -    content::WebContents* web_contents = it->GetContents();
 -    if (web_contents) {
 -      SessionID tab_id = sessions::SessionTabHelper::IdForTab(web_contents);
++void SessionServiceBrowserHelper::SyncHistoryWithTabs() {
++  SessionServiceBase* service = GetSessionService();
++  SessionService* session_service =
++      SessionServiceFactory::GetForProfileIfExisting(&*profile_);
++  if (!service && !session_service) {
++    return;
++  }
 +  int model_index = 0;
 +  int session_index = 0;
 +  for (const tabs::TabInterface* tab : *tab_strip_model_) {
@@ -509,10 +506,9 @@ Index: src/chrome/browser/ui/sessions/session_service_browser_helper.cc
 +      const SessionID tab_id = sessions::SessionTabHelper::IdForTab(contents);
        if (service) {
 -        service->SetPinnedState(session_id_, tab_id, it->IsPinned());
--      }
--
 +        service->SetPinnedState(session_id_, tab_id, tab->IsPinned());
-+      }
+       }
+-
        if (!IsRelevantToAppSessionService(browser_type_) && session_service) {
          session_service->SetTabIndexInWindow(session_id_, tab_id,
 -                                             current_index);
@@ -520,16 +516,14 @@ Index: src/chrome/browser/ui/sessions/session_service_browser_helper.cc
 -        std::optional<tab_groups::TabGroupId> group_id =
 -            tab_strip_model_->GetTabGroupForTab(current_index);
 -        session_service->SetTabGroup(session_id_, tab_id, std::move(group_id));
--      }
--    }
--    current_index++;
 +                                             session_index);
 +        session_service->SetTabGroup(
 +            session_id_, tab_id,
 +            tab_strip_model_->GetTabGroupForTab(model_index));
-+      }
+       }
 +      ++session_index;
-+    }
+     }
+-    current_index++;
 +    ++model_index;
    }
  }
@@ -543,7 +537,7 @@ Index: src/chrome/browser/ui/sessions/session_service_browser_helper.cc
    // See comment in `OnTabGroupChanged`.
    DCHECK(!IsRelevantToAppSessionService(browser_type_));
    SessionService* const session_service =
-@@ -307,6 +391,9 @@
+@@ -334,6 +418,9 @@ void SessionServiceBrowserHelper::Update
  void SessionServiceBrowserHelper::UpdateSplitTabSessionData(
      tabs::TabInterface* tab,
      std::optional<split_tabs::SplitTabId> split_id) {
@@ -566,12 +560,12 @@ Index: src/chrome/browser/ui/sessions/session_service_browser_helper.h
  
 +#include "base/callback_list.h"
  #include "base/memory/raw_ref.h"
+ #include "build/build_config.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
- #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
-@@ -58,7 +60,10 @@
-   void OnSplitTabChanged(const SplitTabChange& change) override;
+@@ -83,7 +85,10 @@ class SessionServiceBrowserHelper : publ
+   ui::ScopedUnownedUserData<SessionServiceBrowserHelper>
+       scoped_unowned_user_data_;
  
-  private:
 -  void SyncHistoryWithTabs(int index);
 +  void SyncHistoryWithTabs();
 +  int GetSessionIndexForContents(content::WebContents* contents) const;
@@ -580,9 +574,9 @@ Index: src/chrome/browser/ui/sessions/session_service_browser_helper.h
    void UpdateTabGroupSessionDataForTab(
        tabs::TabInterface* tab,
        std::optional<tab_groups::TabGroupId> group);
-@@ -70,6 +75,8 @@
-   SessionServiceBase* GetSessionService();
-   SessionServiceBase* GetSessionServiceIfExisting();
+@@ -103,6 +108,8 @@ class SessionServiceBrowserHelper : publ
+       std::nullopt;
+ #endif
  
 +  std::map<content::WebContents*, base::CallbackListSubscription>
 +      temporary_tab_subscriptions_;
@@ -593,32 +587,31 @@ Index: src/chrome/browser/ui/browser_live_tab_context.h
 ===================================================================
 --- src.orig/chrome/browser/ui/browser_live_tab_context.h
 +++ src/chrome/browser/ui/browser_live_tab_context.h
-@@ -132,6 +132,12 @@
+@@ -143,6 +143,11 @@ class BrowserLiveTabContext : public ses
        Profile* profile);
  
   private:
-+  // Session-facing indices omit temporary contents; the TabStripModel retains
-+  // its ordinary ownership, count and selection indices.
++  // Session indices omit temporary contents; the model retains its own indices.
 +  std::vector<content::WebContents*> GetSessionContents() const;
 +  content::WebContents* GetSessionSelectedContents() const;
 +  int GetModelIndexForSessionIndex(int index) const;
 +
+   ui::ScopedUnownedUserData<BrowserLiveTabContext> scoped_unowned_user_data_;
+ 
    const raw_ref<BrowserWindowInterface> browser_;
-   const raw_ref<TabStripModel> tab_strip_model_;
-   const raw_ref<Profile> profile_;
 Index: src/chrome/browser/ui/browser_live_tab_context.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/browser_live_tab_context.cc
 +++ src/chrome/browser/ui/browser_live_tab_context.cc
-@@ -48,6 +48,7 @@
+@@ -53,6 +53,7 @@
  #include "components/tab_groups/tab_group_visual_data.h"
  #include "components/tabs/public/split_tab_data.h"
  #include "components/tabs/public/tab_group.h"
 +#include "components/tabs/public/temporary_tab.h"
  #include "content/public/browser/navigation_controller.h"
- #include "content/public/browser/session_storage_namespace.h"
+ #include "content/public/browser/session_storage_namespace_handle.h"
  #include "content/public/browser/web_contents.h"
-@@ -124,12 +125,54 @@
+@@ -165,12 +166,54 @@ sessions::SessionWindow::WindowType Brow
    return window_type_;
  }
  
@@ -675,7 +668,7 @@ Index: src/chrome/browser/ui/browser_live_tab_context.cc
  }
  
  std::string BrowserLiveTabContext::GetAppName() const {
-@@ -142,16 +185,19 @@
+@@ -183,12 +226,14 @@ std::string BrowserLiveTabContext::GetUs
  
  sessions::LiveTab* BrowserLiveTabContext::GetLiveTabAt(int index) const {
    return sessions::ContentLiveTab::GetOrCreateForWebContents(
@@ -692,13 +685,16 @@ Index: src/chrome/browser/ui/browser_live_tab_context.cc
 +             : nullptr;
  }
  
+ void BrowserLiveTabContext::ActivateRestoredTab(sessions::LiveTab* tab) {
+@@ -202,6 +247,7 @@ void BrowserLiveTabContext::ActivateRest
+ 
  std::map<std::string, std::string> BrowserLiveTabContext::GetExtraDataForTab(
      int index) const {
 +  index = GetModelIndexForSessionIndex(index);
    std::map<std::string, std::string> extra_data;
  
    glic::PopulateGlicExtraData(tab_strip_model_->GetTabAtIndex(index),
-@@ -167,12 +213,13 @@
+@@ -227,12 +273,13 @@ BrowserLiveTabContext::GetExtraDataForWi
  
  std::optional<tab_groups::TabGroupId> BrowserLiveTabContext::GetTabGroupForTab(
      int index) const {
@@ -714,7 +710,7 @@ Index: src/chrome/browser/ui/browser_live_tab_context.cc
  }
  
  const tab_groups::TabGroupVisualData*
-@@ -233,7 +280,7 @@
+@@ -302,7 +349,7 @@ BrowserLiveTabContext::GetGroupIdForSave
  }
  
  bool BrowserLiveTabContext::IsTabPinned(int index) const {
@@ -723,7 +719,7 @@ Index: src/chrome/browser/ui/browser_live_tab_context.cc
  }
  
  void BrowserLiveTabContext::SetVisualDataForGroup(
-@@ -263,6 +310,13 @@
+@@ -354,6 +401,13 @@ sessions::LiveTab* BrowserLiveTabContext
      bool select,
      bool is_restoring_group_or_window,
      sessions::tab_restore::Type original_session_type) {
@@ -741,7 +737,7 @@ Index: src/chrome/browser/ui/browser_tab_strip_model_delegate.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/browser_tab_strip_model_delegate.cc
 +++ src/chrome/browser/ui/browser_tab_strip_model_delegate.cc
-@@ -50,6 +50,7 @@
+@@ -60,6 +60,7 @@
  #include "components/split_tabs/split_tab_visual_data.h"
  #include "components/tab_groups/tab_group_id.h"
  #include "components/tabs/public/tab_group.h"
@@ -749,7 +745,7 @@ Index: src/chrome/browser/ui/browser_tab_strip_model_delegate.cc
  #include "content/public/browser/site_instance.h"
  #include "content/public/browser/web_contents.h"
  #include "content/public/browser/web_contents_delegate.h"
-@@ -193,7 +194,8 @@
+@@ -228,7 +229,8 @@ void BrowserTabStripModelDelegate::MoveG
  
  std::optional<SessionID> BrowserTabStripModelDelegate::CreateHistoricalTab(
      content::WebContents* contents) {
@@ -759,12 +755,12 @@ Index: src/chrome/browser/ui/browser_tab_strip_model_delegate.cc
      return std::nullopt;
    }
  
-@@ -203,9 +205,18 @@
-   // We only create historical tab entries for tabbed browser windows.
-   if (service && browser_->CanSupportWindowFeature(
-                      Browser::WindowFeature::kFeatureTabStrip)) {
+@@ -239,9 +241,18 @@ std::optional<SessionID> BrowserTabStrip
+   if (service &&
+       WindowFeatureController::From(browser_)->CanSupportWindowFeature(
+           WindowFeatureController::WindowFeature::kFeatureTabStrip)) {
 +    int session_index = 0;
-+    for (const tabs::TabInterface* tab : *browser_->tab_strip_model()) {
++    for (const tabs::TabInterface* tab : *browser_->GetTabStripModel()) {
 +      if (tab->GetContents() == contents) {
 +        break;
 +      }
@@ -774,7 +770,7 @@ Index: src/chrome/browser/ui/browser_tab_strip_model_delegate.cc
 +    }
      return service->CreateHistoricalTab(
          sessions::ContentLiveTab::GetOrCreateForWebContents(contents),
--        browser_->tab_strip_model()->GetIndexOfWebContents(contents));
+-        browser_->GetTabStripModel()->GetIndexOfWebContents(contents));
 +        session_index);
    }
    return std::nullopt;
@@ -783,7 +779,7 @@ Index: src/chrome/browser/ui/tabs/tab_data.h
 ===================================================================
 --- src.orig/chrome/browser/ui/tabs/tab_data.h
 +++ src/chrome/browser/ui/tabs/tab_data.h
-@@ -69,6 +69,9 @@
+@@ -72,6 +72,9 @@ struct TabData {
    bool pinned = false;
    bool blocked = false;
  
@@ -793,7 +789,7 @@ Index: src/chrome/browser/ui/tabs/tab_data.h
    scoped_refptr<ThumbnailImage> thumbnail;
    scoped_refptr<const TabResourceUsage> tab_resource_usage;
    base::WeakPtr<tab_groups::CollaborationMessagingTabData>
-@@ -105,6 +108,7 @@
+@@ -109,6 +112,7 @@ class TabDataObserver {
  
    raw_ptr<tabs::TabInterface> tab_interface_;
    base::CallbackListSubscription tab_ui_change_subscription_;
@@ -805,7 +801,7 @@ Index: src/chrome/browser/ui/tabs/tab_data.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/tabs/tab_data.cc
 +++ src/chrome/browser/ui/tabs/tab_data.cc
-@@ -23,6 +23,7 @@
+@@ -24,6 +24,7 @@
  #include "components/collaboration/public/messaging/messaging_backend_service.h"
  #include "components/tabs/public/tab_alert.h"
  #include "components/tabs/public/tab_interface.h"
@@ -813,7 +809,7 @@ Index: src/chrome/browser/ui/tabs/tab_data.cc
  #include "content/public/browser/web_contents.h"
  
  namespace tabs {
-@@ -46,6 +47,8 @@
+@@ -47,6 +48,8 @@ TabData TabData::FromTabInterface(tabs::
    tab_data.should_display_url = tab_ui_helper->ShouldDisplayURL();
    tab_data.visible_url = tab_ui_helper->GetVisibleURL();
    tab_data.needs_attention = tab_ui_helper->needs_attention();
@@ -822,9 +818,9 @@ Index: src/chrome/browser/ui/tabs/tab_data.cc
    tab_data.should_show_discard_status =
        tab_ui_helper->ShouldShowDiscardStatus();
    tab_data.discarded_memory_savings =
-@@ -100,7 +103,8 @@
-          is_tab_discarded == other.is_tab_discarded &&
+@@ -104,7 +107,8 @@ bool TabData::operator==(const TabData&
           last_committed_url == other.last_committed_url &&
+          should_dim_favicon == other.should_dim_favicon &&
           alert_state == other.alert_state && pinned == other.pinned &&
 -         blocked == other.blocked && thumbnail == other.thumbnail &&
 +         blocked == other.blocked && is_temporary == other.is_temporary &&
@@ -832,9 +828,9 @@ Index: src/chrome/browser/ui/tabs/tab_data.cc
           tab_resource_usage == other.tab_resource_usage;
  }
  
-@@ -129,6 +133,13 @@
-       tab_interface_->RegisterWillDetach(base::BindRepeating(
-           &TabDataObserver::OnTabDetached, base::Unretained(this)));
+@@ -139,6 +143,13 @@ TabDataObserver::TabDataObserver(TabInte
+           base::BindRepeating(&TabDataObserver::OnResourceUsageChanged,
+                               base::Unretained(this)));
  
 +  if (auto* temporary_tab =
 +          TemporaryTab::FromWebContents(tab_interface_->GetContents())) {
@@ -846,7 +842,7 @@ Index: src/chrome/browser/ui/tabs/tab_data.cc
    // Initialize the tab data.
    OnTabUIChange();
  }
-@@ -182,6 +193,12 @@
+@@ -192,6 +203,12 @@ void TabDataObserver::OnBlockedStateChan
  void TabDataObserver::OnTabDiscarded(tabs::TabInterface* tab_interface,
                                       content::WebContents* old_web_contents,
                                       content::WebContents* new_web_contents) {
@@ -857,9 +853,9 @@ Index: src/chrome/browser/ui/tabs/tab_data.cc
 +            &TabDataObserver::OnTabUIChange, base::Unretained(this)));
 +  }
    // Update the thumbnail because the thumbnail's delegate has changed after a
-   // discard.
-   ThumbnailTabHelper* const thumbnail_tab_helper =
-@@ -198,6 +215,7 @@
+   // discard. TabFeatures has already recreated the helper for the new
+   // contents: it subscribed to the discard callback list first.
+@@ -209,6 +226,7 @@ void TabDataObserver::OnTabDetached(tabs
                                      tabs::TabInterface::DetachReason reason) {
    if (reason == tabs::TabInterface::DetachReason::kDelete) {
      tab_ui_change_subscription_ = base::CallbackListSubscription();
@@ -871,7 +867,7 @@ Index: src/chrome/browser/ui/tabs/tab_model.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/tabs/tab_model.cc
 +++ src/chrome/browser/ui/tabs/tab_model.cc
-@@ -26,6 +26,7 @@
+@@ -28,6 +28,7 @@
  #include "components/tabs/public/split_tab_collection.h"
  #include "components/tabs/public/tab_collection.h"
  #include "components/tabs/public/tab_group_tab_collection.h"
@@ -879,7 +875,7 @@ Index: src/chrome/browser/ui/tabs/tab_model.cc
  #include "components/web_modal/modal_dialog_host.h"
  #include "components/web_modal/web_contents_modal_dialog_host.h"
  #include "content/public/browser/navigation_controller.h"
-@@ -459,6 +460,11 @@
+@@ -444,6 +445,11 @@ void TabModel::WriteIntoTrace(perfetto::
  std::unique_ptr<content::WebContents> TabModel::DiscardContents(
      std::unique_ptr<content::WebContents> contents) {
    CHECK_EQ(contents_->GetBrowserContext(), contents->GetBrowserContext());
@@ -893,8 +889,8 @@ Index: src/chrome/browser/ui/tabs/tab_model.cc
    std::unique_ptr<content::WebContents> old_contents =
 Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
 ===================================================================
---- a/chrome/browser/ui/tabs/tab_strip_model.cc
-+++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+--- src.orig/chrome/browser/ui/tabs/tab_strip_model.cc
++++ src/chrome/browser/ui/tabs/tab_strip_model.cc
 @@ -108,6 +108,7 @@
  #include "components/tabs/public/tab_group_tab_collection.h"
  #include "components/tabs/public/tab_interface.h"
@@ -903,22 +899,21 @@ Index: src/chrome/browser/ui/tabs/tab_strip_model.cc
  #include "components/tabs/public/unpinned_tab_collection.h"
  #include "components/web_modal/web_contents_modal_dialog_manager.h"
  #include "components/webapps/common/web_app_id.h"
-@@ -4124,7 +4125,9 @@
-   const int delta = direction == TabRelativeDirection::kNext ? 1 : -1;
+@@ -4580,6 +4581,9 @@ void TabStripModel::SelectRelativeTab(Ta
    int index = (start_index + count() + delta) % count();
-   std::optional<tab_groups::TabGroupId> group = GetTabGroupForTab(index);
--  while (group.has_value() && IsGroupCollapsed(group.value())) {
-+  while (index != start_index &&
-+         (tabs::TemporaryTab::IsTemporary(GetWebContentsAt(index)) ||
-+          (group.has_value() && IsGroupCollapsed(group.value())))) {
-     index = (index + count() + delta) % count();
-     group = GetTabGroupForTab(index);
-   }
+ 
+   auto is_tab_invalid = [this, &focused_group](int i) {
++    if (tabs::TemporaryTab::IsTemporary(GetWebContentsAt(i))) {
++      return true;
++    }
+     // Do not select the tab if it is in a collapsed group.
+     if (IsTabCollapsed(i)) {
+       return true;
 Index: src/chrome/browser/ui/views/tabs/tab.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/tab.cc
 +++ src/chrome/browser/ui/views/tabs/tab.cc
-@@ -1329,6 +1329,9 @@
+@@ -1584,6 +1584,9 @@ void Tab::OnTabDataChanged(TabChangeType
  
    tabs::TabData old(std::move(data_));
    data_ = tab_data;
@@ -932,7 +927,7 @@ Index: src/chrome/browser/ui/views/tabs/tab_container_impl.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/tab_container_impl.cc
 +++ src/chrome/browser/ui/views/tabs/tab_container_impl.cc
-@@ -1551,6 +1551,10 @@
+@@ -1662,6 +1662,10 @@ Tab* TabContainerImpl::FindTabHitByPoint
  }
  
  bool TabContainerImpl::ShouldTabBeVisible(const Tab* tab) const {
@@ -947,7 +942,7 @@ Index: src/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
 +++ src/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
-@@ -260,7 +260,13 @@
+@@ -259,7 +259,13 @@ TabStripLayoutHelper::CalculateIdealBoun
            : std::nullopt;
  
    std::vector<TabWidthConstraints> tab_widths;
@@ -961,7 +956,7 @@ Index: src/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
      auto active =
          (i == active_tab_slot_index || i == active_split_tab_slot_index)
              ? TabActive::kActive
-@@ -281,7 +287,23 @@
+@@ -280,7 +286,23 @@ TabStripLayoutHelper::CalculateIdealBoun
      tab_widths.emplace_back(state, size_info);
    }
  
@@ -990,10 +985,10 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_view.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/common/tab_view.cc
 +++ src/chrome/browser/ui/views/tabs/common/tab_view.cc
-@@ -1057,6 +1057,12 @@
- void TabView::UpdateTabData(const tabs::TabInterface* tab) {
+@@ -1184,6 +1184,12 @@ void TabView::SetSelection(bool selected
+ void TabView::UpdateTabData(const tabs::TabData& data) {
    tabs::TabData old_data = std::move(tab_data_);
-   tab_data_ = tab_data_observer_->tab_data();
+   tab_data_ = data;
 +  if (old_data.is_temporary != tab_data_.is_temporary) {
 +    SetVisible(!tab_data_.is_temporary);
 +    if (parent()) {
@@ -1001,36 +996,21 @@ Index: src/chrome/browser/ui/views/tabs/common/tab_view.cc
 +    }
 +  }
  
-   if (tabs::ShouldUpdateAccessibleName(old_data, tab_data_)) {
-     UpdateAccessibleName();
-Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
-===================================================================
---- src.orig/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
-+++ src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
-@@ -119,6 +119,10 @@
-   // Layout children in order. Children will have their preferred height and
-   // fill available width.
-   for (auto* child : children) {
-+    if (!child->GetVisible()) {
-+      layouts.child_layouts.emplace_back(child, false, gfx::Rect());
-+      continue;
-+    }
-     // The leading inset should not be applied for tab groups when the tab strip
-     // is collapsed since the group color line is drawn in that space.
-     int x =
+   tabs::TabInterface* tab = const_cast<tabs::TabInterface*>(GetTabInterface());
+ 
 Index: src/chrome/browser/ui/webui/tab_search/tab_search_page_handler.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/webui/tab_search/tab_search_page_handler.cc
 +++ src/chrome/browser/ui/webui/tab_search/tab_search_page_handler.cc
-@@ -66,6 +66,7 @@
+@@ -68,6 +68,7 @@
  #include "components/tabs/public/tab_alert.h"
  #include "components/tabs/public/tab_group_tab_collection.h"
  #include "components/tabs/public/tab_interface.h"
 +#include "components/tabs/public/temporary_tab.h"
  #include "components/user_education/common/tutorial/tutorial_identifier.h"
  #include "components/user_education/common/tutorial/tutorial_service.h"
- #include "third_party/abseil-cpp/absl/container/flat_hash_set.h"
-@@ -540,9 +541,11 @@
+ #include "content/public/browser/navigation_controller.h"
+@@ -522,9 +523,11 @@ void TabSearchPageHandler::WalkContainer
        // entries during loading and thus has no title/URL. Skip any such
        // pending tabs. These tabs will be added to the list later on once
        // loading has finished.
@@ -1045,7 +1025,7 @@ Index: src/chrome/browser/ui/webui/tab_search/tab_search_page_handler.cc
          tab_search::mojom::TabPtr tab = GetTab(tab_interface);
          tab_dedup_keys.insert(DedupKey(tab->url, tab->group_id));
          window->tabs.push_back(std::move(tab));
-@@ -985,7 +988,7 @@
+@@ -978,7 +981,7 @@ void TabSearchPageHandler::OnTabDataChan
    }
  
    tabs::TabInterface* const tab = handle->Get();
@@ -1054,3 +1034,37 @@ Index: src/chrome/browser/ui/webui/tab_search/tab_search_page_handler.cc
      return;
    }
  
+Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
++++ src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
+@@ -14,6 +14,7 @@
+ #include "chrome/browser/ui/views/tabs/common/tab_group_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_layout_utils.h"
++#include "chrome/browser/ui/views/tabs/common/tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
+ #include "chrome/browser/ui/views/tabs/horizontal/horizontal_tab_closing_helper.h"
+ #include "components/tab_groups/tab_group_id.h"
+@@ -355,6 +356,10 @@ gfx::Size UnpinnedTabContainerViewLayout
+   int num_children = 0;
+   for (const auto* child :
+        tab_container_view->collection_node_->GetDirectChildren()) {
++    if (const auto* tab = views::AsViewClass<TabView>(child);
++        tab && tab->data().is_temporary) {
++      continue;
++    }
+     bool should_show = true;
+     if (focused_group_id.has_value()) {
+       std::optional<tab_groups::TabGroupId> group_id =
+@@ -380,6 +385,10 @@ bool UnpinnedTabContainerViewLayout::IsC
+     const UnpinnedTabContainerView* tab_container_view,
+     std::optional<tab_groups::TabGroupId> focused_group_id,
+     const views::View* child) const {
++  if (const auto* tab = views::AsViewClass<TabView>(child);
++      tab && tab->data().is_temporary) {
++    return false;
++  }
+   if (!CanBeVisible(child)) {
+     return false;
+   }

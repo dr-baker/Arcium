@@ -12,6 +12,7 @@ HEADER = 'chrome/browser/ui/omnibox/arcium_command_design.h'
 
 
 def schema():
+    """Load and validate the command-bar design schema."""
     value = json.loads((ROOT / 'devutils/ui/command_bar_design.json').read_text())
     assert value['version'] == 1
     seen = set()
@@ -25,11 +26,14 @@ def schema():
         else:
             assert token['min'] <= token['default'] <= token['max'] and token['step'] > 0
             if token['type'] == 'int':
-                assert all(type(token[k]) is int for k in ('min', 'default', 'max', 'step'))
+                assert all(
+                    isinstance(token[k], int) and not isinstance(token[k], bool)
+                    for k in ('min', 'default', 'max', 'step'))
     return value
 
 
 def cpp(value):
+    """Generate the typed design fields and preference parser."""
     tokens = value['tokens']
     text = '''// Generated from devutils/ui/command_bar_design.json. Do not edit.
 #ifndef CHROME_BROWSER_UI_OMNIBOX_ARCIUM_COMMAND_DESIGN_H_
@@ -50,10 +54,12 @@ namespace arcium {
 // layout, typing or animation callbacks. Missing fields retain compiled defaults.
 struct CommandPanelDesign {
 '''
-    for t in tokens:
-        kind = 'std::optional<SkColor>' if t['type'] == 'color' else t['type']
-        initial = ('std::nullopt' if not t['default'] else f'SkColorSetA(0x{t["default"][1:]}, 255)') if t['type'] == 'color' else str(t['default'])
-        text += f'  {kind} {t["key"]} = {initial};\n'
+    for token in tokens:
+        kind = 'std::optional<SkColor>' if token['type'] == 'color' else token['type']
+        initial = ('std::nullopt'
+                   if not token['default'] else f'SkColorSetA(0x{token["default"][1:]}, 255)'
+                   ) if token['type'] == 'color' else str(token['default'])
+        text += f'  {kind} {token["key"]} = {initial};\n'
     text += '''  friend bool operator==(const CommandPanelDesign&,
                          const CommandPanelDesign&) = default;
 };
@@ -66,10 +72,10 @@ inline std::optional<CommandPanelDesign> ParseCommandPanelDesign(
   CommandPanelDesign result;
   for (const auto [key, value] : values) {
 '''
-    for t in tokens:
-        key = t['key']
+    for token in tokens:
+        key = token['key']
         text += f'    if (key == "{key}") {{\n'
-        if t['type'] == 'color':
+        if token['type'] == 'color':
             text += f'''      const auto* color = value.GetIfString();
       if (!color) return std::nullopt;
       if (color->empty()) {{ result.{key} = std::nullopt; continue; }}
@@ -83,10 +89,11 @@ inline std::optional<CommandPanelDesign> ParseCommandPanelDesign(
         else:
             text += f'''      if (!value.is_int() && !value.is_double()) return std::nullopt;
       const double number = value.GetDouble();
-      if (!std::isfinite(number) || number < {t['min']} || number > {t['max']}'''
-            if t['type'] == 'int': text += ' ||\n          std::trunc(number) != number'
+      if (!std::isfinite(number) || number < {token['min']} || number > {token['max']}'''
+            if token['type'] == 'int':
+                text += ' ||\n          std::trunc(number) != number'
             text += ') return std::nullopt;\n'
-            text += f'      result.{key} = static_cast<{t["type"]}>(number);\n'
+            text += f'      result.{key} = static_cast<{token["type"]}>(number);\n'
         text += '      continue;\n    }\n'
     text += '''    return std::nullopt;  // Reject misspellings and unsupported versions.
   }
@@ -105,7 +112,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
     data = cpp(schema())
     if args.check:
-        if args.output.read_text() != data: parser.error('Generated command design header is stale')
+        if args.output.read_text() != data:
+            parser.error('Generated command design header is stale')
     else:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(data)

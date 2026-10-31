@@ -825,11 +825,11 @@ Index: src/chrome/browser/ui/webui/onboarding/onboarding_handler.cc
  #include "base/strings/utf_string_conversions.h"
 +#include "base/task/sequenced_task_runner.h"
  #include "base/values.h"
+ #include "build/build_config.h"
  #include "chrome/browser/browser_process.h"
- #include "chrome/browser/extensions/webstore_install_with_prompt.h"
-@@ -25,6 +29,39 @@
- #include "extensions/browser/extension_registry.h"
- #include "extensions/common/extension.h"
+@@ -30,6 +34,39 @@
+ #include "base/mac/mac_util.h"
+ #endif
  
 +namespace {
 +
@@ -867,7 +867,7 @@ Index: src/chrome/browser/ui/webui/onboarding/onboarding_handler.cc
  OnboardingMessageHandler::OnboardingMessageHandler(
      content::BrowserContext* browser_context)
      : browser_context_(browser_context),
-@@ -32,36 +69,46 @@ OnboardingMessageHandler::OnboardingMess
+@@ -37,36 +74,46 @@ OnboardingMessageHandler::OnboardingMess
        pref_service_(profile_->GetPrefs()) {
    pref_change_registrar_.Init(pref_service_);
  
@@ -931,7 +931,7 @@ Index: src/chrome/browser/ui/webui/onboarding/onboarding_handler.cc
    FireWebUIListener("helium-prefs-changed", GetPreferencesDict());
  }
  
-@@ -261,10 +308,16 @@ void OnboardingMessageHandler::HandleSet
+@@ -273,10 +320,16 @@ void OnboardingMessageHandler::HandleSet
      return RejectJavascriptCallback(callback_id, "pref is not a string");
    }
  
@@ -955,15 +955,15 @@ Index: src/chrome/browser/ui/webui/onboarding/onboarding_handler.h
 ===================================================================
 --- src.orig/chrome/browser/ui/webui/onboarding/onboarding_handler.h
 +++ src/chrome/browser/ui/webui/onboarding/onboarding_handler.h
-@@ -43,6 +43,7 @@ class OnboardingMessageHandler : public
-   void HandleGetExtensions(const base::ListValue& args);
-   void HandleInstallExtension(const base::ListValue& args);
+@@ -47,6 +47,7 @@ class OnboardingMessageHandler : public
+   void HandleOpenFilesAndFoldersSettings(const base::ListValue& args);
+ #endif
    void OnPreferencesChanged();
 +  void NotifyPreferencesChanged();
  
    void DoInstallExtension(const std::string& callback_id,
                            const std::string& extension_id);
-@@ -64,6 +65,7 @@ class OnboardingMessageHandler : public
+@@ -68,6 +69,7 @@ class OnboardingMessageHandler : public
    raw_ptr<Profile> profile_ = nullptr;
    raw_ptr<PrefService> pref_service_ = nullptr;
    PrefChangeRegistrar pref_change_registrar_;
@@ -1896,7 +1896,7 @@ Index: src/chrome/browser/importer/BUILD.gn
      "//chrome/browser/profiles:profile_util",
      "//chrome/browser/search_engines",
      "//chrome/browser/webdata_services",
-@@ -134,6 +145,7 @@ source_set("unit_tests") {
+@@ -135,6 +146,7 @@ source_set("unit_tests") {
    testonly = true
    sources = [
      "arcium_arc_import_coordinator_unittest.cc",
@@ -3471,15 +3471,15 @@ Index: src/chrome/browser/prefs/browser_prefs.cc
 ===================================================================
 --- src.orig/chrome/browser/prefs/browser_prefs.cc
 +++ src/chrome/browser/prefs/browser_prefs.cc
-@@ -107,6 +107,7 @@
+@@ -109,6 +109,7 @@
  #include "chrome/browser/updates/announcement_notification/announcement_notification_service.h"
  #include "chrome/browser/webauthn/webauthn_pref_names.h"
  #include "chrome/common/buildflags.h"
 +#include "chrome/browser/importer/arcium_arc_import_prefs.h"
  #include "chrome/common/pref_names.h"
  #include "chrome/common/secure_origin_allowlist.h"
- #include "components/accessibility_annotator/core/prefs.h"
-@@ -1398,6 +1399,7 @@ std::string GetCountry() {
+ #include "components/autofill/core/common/autofill_prefs.h"
+@@ -1525,6 +1526,7 @@ std::string GetCountry() {
  }
  
  void RegisterLocalState(PrefRegistrySimple* registry) {
@@ -3487,7 +3487,7 @@ Index: src/chrome/browser/prefs/browser_prefs.cc
    // Call outs to individual subsystems that register Local State (browser-wide)
    // prefs en masse. See RegisterProfilePrefs for per-profile prefs. Please
    // keep this list alphabetized.
-@@ -1720,6 +1722,7 @@ void RegisterLocalState(PrefRegistrySimp
+@@ -1857,6 +1859,7 @@ void RegisterLocalState(PrefRegistrySimp
  // Register prefs applicable to all profiles.
  void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry,
                            const std::string& locale) {
@@ -3499,15 +3499,24 @@ Index: src/chrome/browser/ui/BUILD.gn
 ===================================================================
 --- src.orig/chrome/browser/ui/BUILD.gn
 +++ src/chrome/browser/ui/BUILD.gn
-@@ -508,6 +508,8 @@ static_library("ui") {
-     "webui/fileicon_source.h",
-     "webui/metrics_handler.cc",
-     "webui/metrics_handler.h",
-+    "webui/onboarding/arc_spaces_import_handler.cc",
-+    "webui/onboarding/arc_spaces_import_handler.h",
-     "webui/onboarding/onboarding_handler.cc",
-     "webui/onboarding/onboarding_handler.h",
-     "webui/onboarding/onboarding_page_ui.cc",
+@@ -1994,6 +1994,8 @@ static_library("ui") {
+   }
+ 
+   if (!is_android) {
++    deps += [ "//chrome/browser/ui/webui:onboarding" ]
++    allow_circular_includes_from += [ "//chrome/browser/ui/webui:onboarding" ]
+     deps += [ "//chrome/browser/ui/webui:theme_source" ]
+     # ThemeSource resolves New Tab colors through the owning Space.
+     allow_circular_includes_from += [ "//chrome/browser/ui/webui:theme_source" ]
+@@ -2420,6 +2422,8 @@ static_library("ui") {
+       "helium/arcium_space_directory.h",
+       "helium/arcium_space_icon.cc",
+       "helium/arcium_space_icon.h",
++      "webui/onboarding/arc_spaces_import_handler.cc",
++      "webui/onboarding/arc_spaces_import_handler.h",
+       "helium/helium_space.cc",
+       "helium/helium_space.h",
+       "helium/space_palette.h",
 Index: src/chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.cc
 ===================================================================
 --- /dev/null
@@ -3751,17 +3760,17 @@ Index: src/chrome/browser/ui/webui/onboarding/onboarding_page_ui.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/webui/onboarding/onboarding_page_ui.cc
 +++ src/chrome/browser/ui/webui/onboarding/onboarding_page_ui.cc
-@@ -5,6 +5,7 @@
- #include "chrome/browser/ui/webui/onboarding/onboarding_page_ui.h"
- 
+@@ -7,6 +7,7 @@
+ #include "base/strings/strcat.h"
+ #include "build/build_config.h"
  #include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/ui/webui/onboarding/arc_spaces_import_handler.h"
  #include "chrome/browser/ui/webui/onboarding/onboarding_handler.h"
  #include "chrome/browser/ui/webui/settings/brave_import_data_handler.h"
  #include "chrome/browser/ui/webui/settings/search_engines_handler.h"
-@@ -36,6 +37,7 @@ HeliumOnboardingPage::HeliumOnboardingPa
-   // https://github.com/sveltejs/svelte/issues/14438
-   source->DisableTrustedTypesCSP();
+@@ -48,6 +49,7 @@ HeliumOnboardingPage::HeliumOnboardingPa
+       base::StrCat({webui::kDefaultTrustedTypesPolicies,
+                     " svelte-trusted-html;"}));
  
 +  web_ui->AddMessageHandler(std::make_unique<ArcSpacesImportHandler>());
    web_ui->AddMessageHandler(
@@ -3771,7 +3780,7 @@ Index: src/chrome/common/importer/BUILD.gn
 ===================================================================
 --- src.orig/chrome/common/importer/BUILD.gn
 +++ src/chrome/common/importer/BUILD.gn
-@@ -158,3 +158,14 @@ if (!is_android) {
+@@ -159,3 +159,14 @@ if (!is_android) {
      ]
    }
  }
@@ -3849,15 +3858,15 @@ Index: src/chrome/test/BUILD.gn
 ===================================================================
 --- src.orig/chrome/test/BUILD.gn
 +++ src/chrome/test/BUILD.gn
-@@ -7294,6 +7294,7 @@ test("unit_tests") {
-       "../browser/ui/webui/commerce/price_tracking_handler_unittest.cc",
-       "../browser/ui/webui/commerce/shopping_list_context_menu_controller_unittest.cc",
-       "../browser/ui/webui/constrained_web_dialog_ui_unittest.cc",
-+      "../browser/ui/webui/onboarding/onboarding_handler_unittest.cc",
-       "../browser/ui/webui/managed_ui_handler_unittest.cc",
-       "../browser/ui/webui/searchbox/contextual_searchbox_handler_unittest.cc",
-       "../browser/ui/webui/settings/downloads_handler_unittest.cc",
-@@ -11468,6 +11469,8 @@ if (!is_android && toolkit_views) {
+@@ -5636,6 +5636,7 @@ test("unit_tests") {
+   deps += [ "//base:path_service_unittest" ]
+ 
+   if (!is_android) {
++    sources += [ "../browser/ui/webui/onboarding/onboarding_handler_unittest.cc" ]
+     deps += [
+       "//chrome/browser/background:unit_tests",
+       "//chrome/browser/child_module:unit_tests",
+@@ -9913,6 +9914,8 @@ if (!is_android && toolkit_views) {
    test("arcium_feature_settings_unit_tests") {
      sources = [
        "../browser/importer/arcium_arc_import_coordinator_unittest.cc",
@@ -3866,7 +3875,7 @@ Index: src/chrome/test/BUILD.gn
        "../browser/chrome_content_browser_client_unittest.cc",
        "../browser/ui/views/tabs/common/persistent_tab_view_unittest.cc",
        "../browser/extensions/api/settings_private/prefs_util_unittest.cc",
-@@ -11498,6 +11501,7 @@ if (!is_android && toolkit_views) {
+@@ -9943,6 +9946,7 @@ if (!is_android && toolkit_views) {
        "//chrome/browser/favicon",
        "//chrome/browser/importer",
        "//chrome/browser/importer:impl",
@@ -3878,7 +3887,7 @@ Index: src/chrome/utility/BUILD.gn
 ===================================================================
 --- src.orig/chrome/utility/BUILD.gn
 +++ src/chrome/utility/BUILD.gn
-@@ -91,11 +91,10 @@ static_library("utility") {
+@@ -96,11 +96,10 @@ static_library("utility") {
    }
  
    if (!is_android) {
@@ -3891,7 +3900,7 @@ Index: src/chrome/utility/BUILD.gn
        "importer/bookmarks_file_importer.cc",
        "importer/bookmarks_file_importer.h",
        "importer/brave_external_process_importer_bridge.cc",
-@@ -273,10 +272,10 @@ if (!is_android) {
+@@ -291,10 +290,10 @@ if (!is_android) {
    executable("arc_sidebar_snapshot_tests") {
      testonly = true
      sources = [
@@ -3903,7 +3912,7 @@ Index: src/chrome/utility/BUILD.gn
        "//base",
        "//testing/gtest",
        "//testing/gtest:gtest_main",
-@@ -303,6 +302,7 @@ if (!is_android) {
+@@ -321,6 +320,7 @@ if (!is_android) {
      }
  
      deps = [
@@ -4102,15 +4111,15 @@ Index: src/components/helium_onboarding/helium_onboarding_strings.grdp
  </message>
  
  <message name="IDS_HELIUM_ONBOARDING_DATA_IMPORT_TITLE" desc="Title of the onboarding screen for importing browser data.">
-   Take your stuff with you
+   Import from other browsers
  </message>
  <message name="IDS_HELIUM_ONBOARDING_DATA_IMPORT_SUBTITLE" desc="Subtitle of the onboarding screen for importing browser data.">
 -  Bring bookmarks and history from other browsers. Arc's sidebar comes over as Spaces and Pins.
 +  Bring bookmarks and history from your other browsers.
  </message>
- <message name="IDS_HELIUM_ONBOARDING_DATA_IMPORT_BOOKMARKS" desc="Label for bookmarks as an importable data type.">
-   Bookmarks
-@@ -189,11 +226,196 @@
+ <message name="IDS_HELIUM_ONBOARDING_DATA_IMPORT_PROMPT_TITLE" desc="Title of the prompt asking to look for other browsers before showing import options.">
+   Find browsers to import from
+@@ -213,11 +250,196 @@
    Couldn't import. Try again, or deselect to skip.
  </message>
  
@@ -4308,7 +4317,7 @@ Index: src/components/helium_onboarding/helium_onboarding_strings.grdp
  </message>
  <message name="IDS_HELIUM_ONBOARDING_PASSWORD_IMPORT_GUIDE" desc="Link label linking to a password manager import guide. Short title for a guide.">
    Import
-@@ -221,7 +443,7 @@
+@@ -245,7 +467,7 @@
    Secure and the most popular open-source password manager. Offers data storage in Europe or US. Free with an optional paid plan. Can be self-hosted.
  </message>
  <message name="IDS_HELIUM_ONBOARDING_PASSWORD_MANAGERS_ONE_PASSWORD" desc="Onboarding description of 1Password as a password manager option.">
@@ -4317,7 +4326,7 @@ Index: src/components/helium_onboarding/helium_onboarding_strings.grdp
  </message>
  <message name="IDS_HELIUM_ONBOARDING_PASSWORD_MANAGERS_DASHLANE" desc="Onboarding description of Dashlane as a password manager option.">
    Popular, paid, and closed-source password manager. Stores data in Europe. Known for aggressive upselling tactics.
-@@ -233,4 +455,4 @@
+@@ -257,4 +479,4 @@
    Free, local, and open-source password manager for advanced users. Requires technical knowledge to set up and use. Cannot sync without extra software.
  </message>
  
@@ -4476,7 +4485,7 @@ Index: src/components/helium_onboarding/src/App.svelte
  
      <!-- Keep navigation mounted on Finish so it can animate out. -->
 @@ -97,15 +148,21 @@
-         min-height: 100vh;
+         min-height: 100dvh;
          background: var(--bg-gradient-start);
  
 +        /* Static backdrop for every page, painted once. The shimmer plays
@@ -4557,8 +4566,8 @@ Index: src/components/helium_onboarding/src/app.css
      --page-scroll-gradient-mask: linear-gradient(
          to bottom,
          rgba(0, 0, 0, 1) 90%,
-@@ -6,6 +27,34 @@
-     );
+@@ -11,6 +32,34 @@
+     --navigation-clearance: 96px;
  }
  
 +@media (prefers-color-scheme: dark) {
@@ -4592,7 +4601,7 @@ Index: src/components/helium_onboarding/src/app.css
  body {
      display: flex;
      justify-content: center;
-@@ -42,13 +91,13 @@ h2 {
+@@ -47,13 +96,13 @@ h2 {
  
  .onboarding-page.visible {
      visibility: visible;
@@ -4608,7 +4617,7 @@ Index: src/components/helium_onboarding/src/app.css
      animation-fill-mode: forwards;
  }
  
-@@ -73,15 +122,15 @@ h2 {
+@@ -78,12 +127,11 @@ h2 {
      align-items: center;
  }
  
@@ -4616,23 +4625,19 @@ Index: src/components/helium_onboarding/src/app.css
 +   re-rasterizes it every frame, and two pages overlap during each step. */
  @keyframes page-in {
      from {
--        translate: 0 30px;
--        filter: blur(8px);
+-        translate: 0 40px;
+-        opacity: 0;
+-    }
+-    10% {
 +        translate: 0 16px;
          opacity: 0;
      }
      to {
-         opacity: 1;
--        filter: none;
-     }
- }
- 
-@@ -93,8 +142,7 @@ h2 {
+@@ -102,7 +150,7 @@ h2 {
      to {
          opacity: 0;
          visibility: hidden;
--        translate: 0 -30px;
--        filter: blur(8px);
+-        translate: 0 -40px;
 +        translate: 0 -10px;
      }
  }
@@ -4649,15 +4654,7 @@ Index: src/components/helium_onboarding/src/components/PageNavigation.svelte
          Spinner,
      } from "@imput/helium-prism";
      import { s } from "../lib/strings";
-@@ -10,7 +11,6 @@
-     import {
-         acceptLatestSchema,
-         askToBeDefault,
--        importableProfiles,
-         importProfile,
-         setPref,
-     } from "../lib/browser";
-@@ -22,12 +22,18 @@
+@@ -23,12 +24,18 @@
          selectedProfiles,
          previouslyImportedProfiles,
          failedProfiles,
@@ -4676,7 +4673,7 @@ Index: src/components/helium_onboarding/src/components/PageNavigation.svelte
      let working = $state(false);
      let stepFailed = $state(false);
  
-@@ -47,18 +53,26 @@
+@@ -55,21 +62,32 @@
              }
              break;
  
@@ -4694,24 +4691,28 @@ Index: src/components/helium_onboarding/src/components/PageNavigation.svelte
 +            break;
 +
          case "DataImport": {
--            const byIndex = new Map(
--                $importableProfiles.map(profile => [profile.index, profile])
--            );
+             const profiles = $importableProfiles.filter(
+-                profile => $selectedProfiles.has(profile.id)
++                profile => !profile.isArc && $selectedProfiles.has(profile.id)
+             );
+             const idByIndex = new Map(
+                 profiles.map(profile => [profile.index, profile.id])
+             );
              // importProfile runs one job at a time and resolves each job with
 -            // its own result. Extensions are never requested here.
 +            // its own result. Arc has its own route, and extensions are never
 +            // requested here.
              const results = await Promise.all(
-                 [...$selectedProfiles].map(index => importProfile(
--                    index,
--                    byIndex.get(index)?.isArc
+                 profiles.map(profile => importProfile(
+-                    profile.index,
+-                    profile.isArc
 -                        ? { bookmarks: true, arcSidebarAsPins: true }
 -                        : { bookmarks: true, history: true }
-+                    index, { bookmarks: true, history: true }
++                    profile.index, { bookmarks: true, history: true }
                  ))
              );
              const succeeded = results
-@@ -115,17 +129,24 @@
+@@ -133,17 +151,24 @@
          {#if stepFailed}
              <p class="navigation-error" role="alert">{s.button.failed}</p>
          {/if}
@@ -4719,7 +4720,7 @@ Index: src/components/helium_onboarding/src/components/PageNavigation.svelte
 -            <IconArrowLeft />
 -            {s.button.back}
 -        </Button>
--        <Button disabled={working} primary onclick={next}>
+-        <Button disabled={nextDisabled} primary onclick={next}>
 -            {#if working}
 +        {#if arcAction?.stop}
 +            <Button onclick={() => arcImport.cancel()}>
@@ -4732,7 +4733,7 @@ Index: src/components/helium_onboarding/src/components/PageNavigation.svelte
 +                {s.button.back}
 +            </Button>
 +        {/if}
-+        <Button disabled={working || arcAction?.busy} primary onclick={next}>
++        <Button disabled={nextDisabled || arcAction?.busy} primary onclick={next}>
 +            {#if working || arcAction?.busy}
                  <Spinner size={18} />
              {:else}
@@ -4743,7 +4744,7 @@ Index: src/components/helium_onboarding/src/components/PageNavigation.svelte
          </Button>
      </div>
  </div>
-@@ -148,9 +169,7 @@
+@@ -166,9 +191,7 @@
  
          &.visible {
              visibility: visible;
@@ -4754,7 +4755,7 @@ Index: src/components/helium_onboarding/src/components/PageNavigation.svelte
          }
      }
  
-@@ -170,11 +189,14 @@
+@@ -188,11 +211,14 @@
          height: calc(100% + var(--bottom-space) + var(--misclick-protect));
          top: calc(-1 * var(--misclick-protect));
          position: absolute;
@@ -6476,7 +6477,7 @@ Index: src/components/helium_onboarding/src/lib/chrome-send-polyfill.ts
 ===================================================================
 --- src.orig/components/helium_onboarding/src/lib/chrome-send-polyfill.ts
 +++ src/components/helium_onboarding/src/lib/chrome-send-polyfill.ts
-@@ -95,12 +95,18 @@ const defaultBrowser: DefaultBrowserInfo
+@@ -96,12 +96,18 @@ const defaultBrowser: DefaultBrowserInfo
  
  let profileName = 'Work';
  
@@ -6495,7 +6496,7 @@ Index: src/components/helium_onboarding/src/lib/chrome-send-polyfill.ts
  
  const importerListSimple = [
      [ "Safari", "", safari_has ],
-@@ -120,7 +126,8 @@ const importerListSimple = [
+@@ -121,7 +127,8 @@ const importerListSimple = [
      [ "Opera", "lalala", chrome_has_favs ],
      [ "Yandex", "Бла бла бла", chrome_has_favs ],
      [ "NAVER Whale", "Work", chrome_has ],
@@ -6505,7 +6506,7 @@ Index: src/components/helium_onboarding/src/lib/chrome-send-polyfill.ts
      [ "Dia", "Person 1", chrome_has ],
      [ "Microsoft Edge", "Profile 1", chrome_has ],
      [ "Microsoft Edge", "Bill Gates", chrome_has ],
-@@ -130,12 +137,15 @@ const importerListSimple = [
+@@ -131,13 +138,16 @@ const importerListSimple = [
      [ "Perplexity Comet", "Work", chrome_has ],
  ] as const;
  
@@ -6515,6 +6516,7 @@ Index: src/components/helium_onboarding/src/lib/chrome-send-polyfill.ts
 +).map((data, index) => {
      const [ name, profileName, features ] = data;
      return {
+         id: 1000 + index,
          name,
          index,
          profileName,
@@ -6522,7 +6524,7 @@ Index: src/components/helium_onboarding/src/lib/chrome-send-polyfill.ts
          history: features.has('history'),
          favorites: features.has('favorites'),
          passwords: features.has('passwords'),
-@@ -240,6 +250,10 @@ const _send_polyfill = (msg: string, par
+@@ -243,6 +253,10 @@ const _send_polyfill = (msg: string, par
                  : cr.ImportDataStatus.SUCCEEDED
              );
          }, 2000);
@@ -6842,9 +6844,13 @@ Index: src/components/helium_onboarding/src/lib/onboarding-flow.ts
 ===================================================================
 --- src.orig/components/helium_onboarding/src/lib/onboarding-flow.ts
 +++ src/components/helium_onboarding/src/lib/onboarding-flow.ts
-@@ -4,32 +4,62 @@ import { derived, get, writable } from "
- import { preferences } from "../lib/browser";
- import { canBeDefaultBrowser, importableProfiles, isDefaultBrowser } from "./browser";
+@@ -5,36 +5,66 @@ import { derived, get, writable } from "
+ import {
+     canBeDefaultBrowser,
+     isDefaultBrowser,
++    importableProfiles,
+     preferences,
+ } from "./browser";
  
 +// Welcome asks "Coming from Arc?" before anything else. Importing comes
 +// before the services, search, password manager, and default browser steps.
@@ -6897,20 +6903,21 @@ Index: src/components/helium_onboarding/src/lib/onboarding-flow.ts
 +        case 'ArcSpaces':
 +            return get(setupRoute) !== 'arcCustom';
          case 'DataImport':
--            // skip if nothing to import
--            return get(importableProfiles).length === 0;
+-            return platform.is.android;
 +            // Shown whenever the user picked another browser, so an empty
 +            // list says so instead of silently skipping their choice.
-+            return get(setupRoute) !== 'other';
++            return platform.is.android || get(setupRoute) !== 'other';
          case 'PasswordManager':
              // skip if we aren't allowed to install extensions
              const pref = get(preferences);
--            return !pref['services.ext_proxy'] || !pref['services.enabled'];
-+            return !pref['services.user_consented'] || !pref['services.ext_proxy'] || !pref['services.enabled'];
+-            return platform.is.android
+-                || !pref['services.ext_proxy']
+-                || !pref['services.enabled'];
++            return platform.is.android || !pref['services.user_consented'] || !pref['services.ext_proxy'] || !pref['services.enabled'];
          case 'DefaultBrowser':
              // skip if we're already default (we can't undefault ourselves)
-             return !canBeDefaultBrowser || get(isDefaultBrowser);
-@@ -49,7 +79,8 @@ const getPageNumber = (current: number,
+             return platform.is.android || !canBeDefaultBrowser || get(isDefaultBrowser);
+@@ -54,7 +84,8 @@ const getPageNumber = (current: number,
          next += direction;
      }
  
@@ -6920,7 +6927,7 @@ Index: src/components/helium_onboarding/src/lib/onboarding-flow.ts
  }
  
  export const nextPage = () => {
-@@ -60,11 +91,10 @@ export const previousPage = () => {
+@@ -65,11 +96,10 @@ export const previousPage = () => {
      index.update((current) => getPageNumber(current, -1));
  }
  
@@ -7152,20 +7159,20 @@ Index: src/components/helium_onboarding/src/pages/DataImport.svelte
 ===================================================================
 --- src.orig/components/helium_onboarding/src/pages/DataImport.svelte
 +++ src/components/helium_onboarding/src/pages/DataImport.svelte
-@@ -2,9 +2,8 @@
-     import { IconWorld } from "@imput/helium-prism";
-     import { s } from "../lib/strings";
-     import type { BrowserProfile } from "../lib/cr";
+@@ -3,9 +3,9 @@
+     import { get } from "svelte/store";
+     import { fade } from "svelte/transition";
+     import { getBoolean, s } from "../lib/strings";
 -    import { currentPage } from "../lib/onboarding-flow";
--    import { importableProfiles } from "../lib/browser";
--    import { browserIcons } from "../lib/nonfree-icons";
 +    import { currentPage, otherImportableProfiles } from "../lib/onboarding-flow";
-+    import { browserIconUrl } from "../lib/browser-icons";
+     import type { BrowserProfile } from "../lib/cr";
+-    import { importableProfiles, importDiscovery } from "../lib/browser";
++    import { importDiscovery } from "../lib/browser";
  
      import PageHeader from "../components/PageHeader.svelte";
-     import ProfileImportOption from "../components/ProfileImportOption.svelte";
-@@ -14,7 +13,8 @@
-     const visible = $derived($currentPage === "DataImport");
+     import ImportNotice from "../components/ImportNotice.svelte";
+@@ -43,7 +43,8 @@
+     });
  
      const sorted = $derived.by(() => {
 -        const grouped = $importableProfiles.reduce(
@@ -7174,61 +7181,18 @@ Index: src/components/helium_onboarding/src/pages/DataImport.svelte
              (acc, profile) => {
                  (acc[profile.name] ??= []).push(profile);
                  return acc;
-@@ -25,27 +25,6 @@
-         return Object.entries(grouped)
-             .sort(([a], [b]) => a.localeCompare(b));
-     });
--
--    const browserIconMap = {
--        Arc: "arc",
--        Brave: "brave",
--        Chromium: "chromium",
--        Dia: "dia",
--        Opera: "opera",
--        Safari: "safari",
--        Vivaldi: "vivaldi",
--        Yandex: "yandex",
--        Zen: "zen",
--
--        "Google Chrome": "chrome",
--        "Google Chrome Beta": "chrome_beta",
--        "Google Chrome Canary": "chrome_canary",
--        "Google Chrome Dev": "chrome_dev",
--        "Microsoft Edge": "edge",
--        "Mozilla Firefox": "firefox",
--        "NAVER Whale": "whale",
--        "Perplexity Comet": "comet",
--    } as const;
- </script>
- 
- <div id="data-import-page" class="onboarding-page" class:visible>
-@@ -56,9 +35,11 @@
-             Icon={IconTransferIn}
-         />
-         <div class="page-content">
-+            {#if !sorted.length}
-+                <p class="notice" role="status">{s.origin.otherEmpty}</p>
-+            {/if}
-             {#each sorted as [browser, profiles]}
--                {@const icon = browserIconMap[browser as keyof typeof browserIconMap]}
--                {@const url = icon && browserIcons[icon]}
-+                {@const url = browserIconUrl(browser)}
-                 <div class="browser-header">
-                     <div class="browser-icon">
-                         {#if url}
-@@ -88,6 +69,12 @@
-         gap: var(--gap-3);
-     }
- 
-+    .notice {
-+        margin-top: var(--gap-4);
-+        font-size: 17px;
-+        color: var(--secondary);
-+    }
-+
-     .browser-header {
-         display: flex;
-         width: 100%;
+@@ -82,9 +83,9 @@
+                 </div>
+             {:else}
+                 <div class={["page-content", { animate: animateDiscovery }]}>
+-                    {#if $importableProfiles.length === 0}
++                    {#if !sorted.length}
+                         <ImportNotice role="status">
+-                            <p>{s.dataImport.noBrowsers}</p>
++                            <p>{s.origin.otherEmpty}</p>
+                         </ImportNotice>
+                     {/if}
+                     {#each sorted as [browser, profiles] (browser)}
 Index: src/components/helium_onboarding/src/pages/Finish.svelte
 ===================================================================
 --- src.orig/components/helium_onboarding/src/pages/Finish.svelte
@@ -7237,7 +7201,7 @@ Index: src/components/helium_onboarding/src/pages/Finish.svelte
          IconCheck,
      } from "@imput/helium-prism";
      import { s } from "../lib/strings";
--    import { setPref } from "../lib/browser";
+-    import { setPref, openNewTab } from "../lib/browser";
 -    import { currentPage, previousPage } from "../lib/onboarding-flow";
 +    import { preferences, preferencesBootstrap, retryPreferences, completeOnboarding } from "../lib/browser";
 +    import { currentPage, previousPage, standaloneImport } from "../lib/onboarding-flow";
@@ -7245,7 +7209,7 @@ Index: src/components/helium_onboarding/src/pages/Finish.svelte
  
 -    const done = async () => {
 -        await setPref('completed_onboarding', true);
--        window.open("chrome://newtab", "_self");
+-        openNewTab();
 +    let finishing = $state(false);
 +    let finished = $state(false);
 +    const preferencesReady = () => typeof $preferences.completed_onboarding === "boolean";
@@ -7333,7 +7297,7 @@ Index: src/components/helium_onboarding/src/pages/Welcome.svelte
 ===================================================================
 --- src.orig/components/helium_onboarding/src/pages/Welcome.svelte
 +++ src/components/helium_onboarding/src/pages/Welcome.svelte
-@@ -1,342 +1,542 @@
+@@ -1,335 +1,542 @@
  <script lang="ts">
 -    import { flushSync, onMount } from "svelte";
 +    import { onDestroy } from "svelte";
@@ -7348,7 +7312,7 @@ Index: src/components/helium_onboarding/src/pages/Welcome.svelte
      } from "@imput/helium-prism";
      import { s } from "../lib/strings";
      import { parseLocalizedString } from "../lib/i18n";
--    import { setPref, acceptLatestSchema } from "../lib/browser";
+-    import { setPref, acceptLatestSchema, openNewTab } from "../lib/browser";
 -    import {
 -        currentPage,
 -        hasSeenIntro,
@@ -7361,7 +7325,7 @@ Index: src/components/helium_onboarding/src/pages/Welcome.svelte
 -        acceptLatestSchema();
 -        await setPref('services.user_consented', true);
 -        await setPref('completed_onboarding', true);
--        window.open("chrome://newtab", "_self");
+-        openNewTab();
 -    }
 -
 -    const visible = $derived($currentPage === "Welcome");
@@ -7850,7 +7814,7 @@ Index: src/components/helium_onboarding/src/pages/Welcome.svelte
 -            calc(var(--onboarding-intro-delay) + 0.85s)
 -            both;
 -        view-transition-name: welcome-logo;
--        will-change: transform, filter, opacity;
+-        will-change: transform, opacity;
 -    }
 -
 -    #welcome-page.visible.intro {
@@ -7900,7 +7864,6 @@ Index: src/components/helium_onboarding/src/pages/Welcome.svelte
 -    :global(::view-transition-old(welcome-logo)),
 -    :global(::view-transition-new(welcome-logo)) {
 -        animation: none;
--        filter: none;
 -        height: 100%;
 -        object-fit: contain;
 -        width: 100%;
@@ -7940,18 +7903,12 @@ Index: src/components/helium_onboarding/src/pages/Welcome.svelte
          from {
 -            opacity: 0;
 -            transform: translateY(360px);
--            filter: blur(10px);
 +            --rows-fade: 36px;
          }
--
--        90% {
--            filter: none;
--        }
 -
          to {
 -            opacity: 1;
 -            transform: none;
--            filter: none;
 +            --rows-fade: 0px;
          }
      }
@@ -7996,7 +7953,13 @@ Index: src/components/helium_onboarding/src/pages/Welcome.svelte
 +        margin-top: 18px;
 +        color: var(--tertiary);
 +    }
-+
+ 
+-        #welcome-logo-intro {
+-            animation:
+-                intro-logo-center
+-                0.5s
+-                calc(var(--onboarding-intro-delay) + 0.2s)
+-                both;
 +    #welcome-footer {
 +        display: flex;
 +        flex-direction: column;
@@ -8006,13 +7969,7 @@ Index: src/components/helium_onboarding/src/pages/Welcome.svelte
 +        padding-top: 20px;
 +        font-size: 13px;
 +        color: var(--tertiary);
- 
--        #welcome-logo-intro {
--            animation:
--                intro-logo-center
--                0.5s
--                calc(var(--onboarding-intro-delay) + 0.2s)
--                both;
++
 +        p {
 +            font-size: 13px;
          }
@@ -8768,7 +8725,7 @@ Index: src/components/helium_onboarding/tests/arc-spaces.test.mjs
 +    const exports = {};
 +    const context = vm.createContext({exports, location: {search}, URLSearchParams, require: name =>
 +        name === 'svelte/store' ? stores : name === 'svelte/reactivity' ? {SvelteSet: Set}
-+        : name === '../lib/browser' || name === './browser' ? browser : assert.fail(name)});
++        : name === './platform' ? {platform: {is: {android: false}}} : name === '../lib/browser' || name === './browser' ? browser : assert.fail(name)});
 +    vm.runInContext(transpile(readFileSync('src/lib/onboarding-flow.ts', 'utf8')), context);
 +    return {...exports, browser, page: () => stores.get(exports.currentPage)};
 +}
@@ -10600,3 +10557,27 @@ Index: src/components/helium_onboarding/vite.config.ts
          target: 'chrome140',
          assetsInlineLimit: (filename) => filename.endsWith('.svg')
      }
+Index: src/chrome/browser/ui/webui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/webui/BUILD.gn
++++ src/chrome/browser/ui/webui/BUILD.gn
+@@ -676,6 +676,7 @@ source_set("onboarding") {
+     "//extensions/browser",
+   ]
+   deps = [
++    "//chrome/browser/importer",
+     "//base",
+     "//chrome/browser:browser_process",
+     "//chrome/browser/extensions",
+Index: src/components/helium_onboarding/tests/import-navigation.test.mjs
+===================================================================
+--- src.orig/components/helium_onboarding/tests/import-navigation.test.mjs
++++ src/components/helium_onboarding/tests/import-navigation.test.mjs
+@@ -66,6 +66,7 @@ function navigation(importerHarness, ext
+     let advances = 0;
+     const context = vm.createContext({
+         exports: {}, $derived: value => value, $state: value => value, SvelteSet: Set,
++        standaloneImport: false, $arcCta: null,
+         $currentPage: 'DataImport', $userChoseHeliumAsDefault: false,
+         $importableProfiles: [profile(1), profile(2)], $selectedProfiles: new Set([101, 102]),
+         $importDiscovery: {refreshing: false},

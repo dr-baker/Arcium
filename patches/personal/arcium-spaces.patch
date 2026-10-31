@@ -2,7 +2,7 @@ Index: src/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
 ===================================================================
 --- src.orig/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
 +++ src/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
-@@ -257,6 +257,7 @@
+@@ -263,6 +263,7 @@
  #include "chrome/browser/ui/autofill/autofill_client_provider_factory.h"
  #include "chrome/browser/ui/find_bar/find_bar_state_factory.h"
  #include "chrome/browser/ui/hats/hats_service_factory.h"
@@ -10,7 +10,7 @@ Index: src/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
  #include "chrome/browser/ui/prefs/prefs_tab_helper.h"
  #include "chrome/browser/ui/safety_hub/menu_notification_service_factory.h"
  #include "chrome/browser/ui/safety_hub/notification_permission_review_service_factory.h"
-@@ -1302,6 +1303,7 @@ void ChromeBrowserMainExtraPartsProfiles
+@@ -1311,6 +1312,7 @@ void ChromeBrowserMainExtraPartsProfiles
    PersonalContextServiceFactory::GetInstance();
  #if !BUILDFLAG(IS_ANDROID)
    PinnedTabServiceFactory::GetInstance();
@@ -22,8 +22,8 @@ Index: src/chrome/browser/sessions/session_restore.cc
 ===================================================================
 --- src.orig/chrome/browser/sessions/session_restore.cc
 +++ src/chrome/browser/sessions/session_restore.cc
-@@ -64,6 +64,8 @@
- #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+@@ -68,6 +68,8 @@
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
  #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
  #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
 +#include "chrome/browser/ui/helium/helium_space_service.h"
@@ -31,7 +31,7 @@ Index: src/chrome/browser/sessions/session_restore.cc
  #include "chrome/browser/ui/navigator/browser_navigator.h"
  #include "chrome/browser/ui/navigator/browser_navigator_params.h"
  #include "chrome/browser/ui/startup/startup_browser_creator.h"
-@@ -834,6 +836,12 @@ class SessionRestoreImpl : public Browse
+@@ -868,6 +870,12 @@ class SessionRestoreImpl : public Browse
  #endif
        }
  
@@ -44,44 +44,33 @@ Index: src/chrome/browser/sessions/session_restore.cc
        // 2. Track TYPE_NORMAL browsers.
        if (is_normal_window) {
          has_normal_browser = true;
-@@ -1216,7 +1224,7 @@ class SessionRestoreImpl : public Browse
-       ui::mojom::WindowShowState show_state,
-       const std::string& app_name,
-       const std::string& user_title,
--      const std::map<std::string, std::string>& /*extra_data*/,
-+      const std::map<std::string, std::string>& extra_data,
-       int32_t restore_id) {
-     Browser::CreateParams params(type, profile_, false);
-     params.initial_bounds = bounds;
-@@ -1244,6 +1252,10 @@ class SessionRestoreImpl : public Browse
- 
+@@ -1371,6 +1379,11 @@ class SessionRestoreImpl : public Browse
      base::TimeTicks now = base::TimeTicks::Now();
-     Browser* browser = Browser::Create(params);
-+    if (helium::HeliumSpaceService* space_service =
+     BrowserWindowInterface* browser_window =
+         CreateBrowserWindow(std::move(params));
++    if (auto* service =
 +            helium::HeliumSpaceServiceFactory::GetForProfile(profile_)) {
-+      space_service->RestoreSpaceForBrowserFromSession(browser, extra_data);
++      service->RestoreSpaceForBrowserFromSession(
++          browser_window->GetBrowserForMigrationOnly(), extra_data);
 +    }
-     if (auto* manager = InitialWebUIWindowMetricsManager::From(browser)) {
+     if (auto* manager =
+             InitialWebUIWindowMetricsManager::From(browser_window)) {
        manager->SetWindowCreationInfo(
-           waap::NewWindowCreationSource::kSessionRestore, now);
 Index: src/chrome/browser/sessions/session_service_base.cc
 ===================================================================
 --- src.orig/chrome/browser/sessions/session_service_base.cc
 +++ src/chrome/browser/sessions/session_service_base.cc
-@@ -26,9 +26,12 @@
- #include "chrome/browser/sessions/session_service_utils.h"
- #include "chrome/browser/sessions/tab_restore_service_factory.h"
+@@ -29,6 +29,9 @@
  #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
-+#include "chrome/browser/ui/arcium/tab_provenance.h"
+ #include "chrome/browser/ui/browser_init_state.h"
  #include "chrome/browser/ui/browser_window.h"
- #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
- #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/arcium/tab_provenance.h"
 +#include "chrome/browser/ui/helium/helium_space_service.h"
 +#include "chrome/browser/ui/helium/helium_space_service_factory.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
  #include "chrome/browser/ui/startup/startup_browser_creator.h"
- #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
- #include "chrome/browser/ui/tabs/tab_group_model.h"
-@@ -672,6 +675,13 @@
+@@ -682,6 +685,13 @@ void SessionServiceBase::BuildCommandsFo
          sessions::CreatePinnedStateCommand(session_id, true));
    }
  
@@ -93,32 +82,32 @@ Index: src/chrome/browser/sessions/session_service_base.cc
 +  }
 +
    // Record the association between the sessionStorage namespace and the tab.
-   content::SessionStorageNamespace* session_storage_namespace =
+   content::SessionStorageNamespaceHandle* session_storage_namespace =
        tab->GetController().GetDefaultSessionStorageNamespace();
-@@ -718,6 +728,18 @@
-       sessions::CreateSetWindowVisibleOnAllWorkspacesCommand(
-           browser->session_id(),
+@@ -731,6 +741,18 @@ void SessionServiceBase::BuildCommandsFo
+           browser->GetSessionID(),
            BrowserWindow::FromBrowser(browser)->IsVisibleOnAllWorkspaces()));
-+
+ 
 +  if (auto* space_service = helium::HeliumSpaceServiceFactory::GetForProfile(
-+          browser->profile())) {
++          browser->GetProfile())) {
 +    const std::string_view space_id =
-+        space_service->GetSpaceIdForBrowser(browser);
++        space_service->GetSpaceIdForBrowser(browser->GetBrowserForMigrationOnly());
 +    if (!space_id.empty()) {
 +      command_storage_manager()->AppendRebuildCommand(
 +          sessions::CreateAddWindowExtraDataCommand(
-+              browser->session_id(), helium::kHeliumSpaceIdWindowExtraDataKey,
++              browser->GetSessionID(), helium::kHeliumSpaceIdWindowExtraDataKey,
 +              std::string(space_id)));
 +    }
 +  }
- 
-   TabStripModel* tab_strip = browser->tab_strip_model();
++
+   TabStripModel* tab_strip = browser->GetTabStripModel();
    int persisted_active_index = tab_strip->active_index();
+   content::WebContents* const active_contents = tab_strip->GetActiveWebContents();
 Index: src/chrome/browser/ui/BUILD.gn
 ===================================================================
 --- src.orig/chrome/browser/ui/BUILD.gn
 +++ src/chrome/browser/ui/BUILD.gn
-@@ -360,6 +360,21 @@ if (!is_android) {
+@@ -1538,6 +1538,21 @@ if (!is_android) {
    }
  }
  
@@ -140,42 +129,35 @@ Index: src/chrome/browser/ui/BUILD.gn
  # Use a static library here because many test binaries depend on this but don't
  # require many files from it. This makes linking more efficient.
  # TODO(https://crbug.com/353332589): Once //chrome/browser is properly
-@@ -368,11 +383,21 @@ if (!is_android) {
- # circular includes from each other.
- static_library("ui") {
-   sources = [
-+    "arcium/optional_navigation.cc",
-+    "arcium/optional_navigation.h",
-+    "arcium/tab_provenance.cc",
-+    "arcium/tab_provenance.h",
-     "confirm_bubble.h",
-     "crypto_module_password_dialog.h",
-     "enterprise_startup_dialog.h",
-     "helium/helium_layout_state_controller.cc",
-     "helium/helium_layout_state_controller.h",
-+    "helium/helium_space.cc",
-+    "helium/helium_space.h",
-+    "helium/helium_space_service.cc",
-+    "helium/helium_space_service.h",
-+    "helium/helium_space_service_factory.cc",
-+    "helium/helium_space_service_factory.h",
-     "idle_bubble.h",
-     "managed_ui.cc",
-     "managed_ui.h",
+@@ -2296,6 +2311,16 @@ static_library("ui") {
+   } else {
+     # !is_android
+     sources = [
++      "arcium/optional_navigation.cc",
++      "arcium/optional_navigation.h",
++      "arcium/tab_provenance.cc",
++      "arcium/tab_provenance.h",
++      "helium/helium_space.cc",
++      "helium/helium_space.h",
++      "helium/helium_space_service.cc",
++      "helium/helium_space_service.h",
++      "helium/helium_space_service_factory.cc",
++      "helium/helium_space_service_factory.h",
+       # This file physically lives in //chrome/browser but is compiled here so
+       # that //chrome/browser:browser has no remaining sources. It registers
+       # WebUI interface binders for desktop, which need this target's headers.
 Index: src/chrome/browser/ui/browser_live_tab_context.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/browser_live_tab_context.cc
 +++ src/chrome/browser/ui/browser_live_tab_context.cc
-@@ -20,6 +20,7 @@
- #include "chrome/browser/sessions/session_service_utils.h"
- #include "chrome/browser/sessions/tab_restore_service_factory.h"
- #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
-+#include "chrome/browser/ui/arcium/tab_provenance.h"
- #include "chrome/browser/ui/browser.h"
- #include "chrome/browser/ui/browser_commands.h"
+@@ -26,11 +26,14 @@
  #include "chrome/browser/ui/browser_tab_strip_model_delegate.h"
-@@ -29,6 +30,8 @@
+ #include "chrome/browser/ui/browser_tabrestore.h"
+ #include "chrome/browser/ui/browser_window.h"
++#include "chrome/browser/ui/arcium/tab_provenance.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
  #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
  #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
 +#include "chrome/browser/ui/helium/helium_space_service.h"
@@ -183,7 +165,7 @@ Index: src/chrome/browser/ui/browser_live_tab_context.cc
  #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
  #include "chrome/browser/ui/tabs/tab_group_model.h"
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
-@@ -202,13 +205,21 @@
+@@ -252,6 +255,8 @@ std::map<std::string, std::string> Brows
  
    glic::PopulateGlicExtraData(tab_strip_model_->GetTabAtIndex(index),
                                &extra_data);
@@ -192,39 +174,29 @@ Index: src/chrome/browser/ui/browser_live_tab_context.cc
  
    return extra_data;
  }
- 
+@@ -259,6 +264,11 @@ std::map<std::string, std::string> Brows
  std::map<std::string, std::string>
  BrowserLiveTabContext::GetExtraDataForWindow() const {
--  return std::map<std::string, std::string>();
-+  std::map<std::string, std::string> extra_data;
+   std::map<std::string, std::string> data;
 +  if (auto* service =
 +          helium::HeliumSpaceServiceFactory::GetForProfile(&profile_.get())) {
 +    service->AddSpaceToSessionExtraData(browser_->GetBrowserForMigrationOnly(),
-+                                        &extra_data);
++                                      &data);
 +  }
-+  return extra_data;
- }
  
- std::optional<tab_groups::TabGroupId> BrowserLiveTabContext::GetTabGroupForTab(
-@@ -470,7 +481,7 @@
-     ui::mojom::WindowShowState show_state,
-     const std::string& workspace,
-     const std::string& user_title,
--    const std::map<std::string, std::string>& /*extra_data*/) {
-+    const std::map<std::string, std::string>& extra_data) {
-   std::unique_ptr<Browser::CreateParams> create_params;
-   if (ShouldCreateAppWindowForAppName(profile, app_name)) {
-     // Only trusted app popup windows should ever be restored.
-@@ -496,6 +507,10 @@
-   create_params->user_title = user_title;
+   if (base::FeatureList::IsEnabled(features::kTabGroupsFocusing)) {
+     if (std::optional<tab_groups::TabGroupId> focused_group =
+@@ -617,6 +627,11 @@ sessions::LiveTabContext* BrowserLiveTab
  
-   Browser* browser = Browser::Create(*create_params.get());
+   BrowserWindowInterface* browser =
+       CreateBrowserWindow(std::move(*create_params));
 +  if (auto* service =
 +          helium::HeliumSpaceServiceFactory::GetForProfile(profile)) {
-+    service->RestoreSpaceForBrowserFromSession(browser, extra_data);
++    service->RestoreSpaceForBrowserFromSession(
++        browser->GetBrowserForMigrationOnly(), extra_data);
 +  }
  
-   return browser->GetFeatures().live_tab_context();
+   return BrowserLiveTabContext::From(browser);
  }
 Index: src/chrome/browser/ui/helium/helium_space.cc
 ===================================================================
@@ -394,7 +366,7 @@ Index: src/chrome/browser/ui/helium/helium_space.h
 +#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_SPACE_H_
 Index: src/chrome/browser/ui/helium/helium_space_service.cc
 ===================================================================
---- src.orig/chrome/browser/ui/helium/helium_space_service.cc
+--- /dev/null
 +++ src/chrome/browser/ui/helium/helium_space_service.cc
 @@ -0,0 +1,218 @@
 +// Copyright 2026 The Helium Authors
@@ -821,33 +793,23 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 +++ src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
-@@ -34,6 +34,7 @@
- #include "chrome/browser/ui/tabs/tab_group_model.h"
- #include "chrome/browser/ui/tabs/vertical_tab_strip_state.h"
- #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
-+#include "chrome/browser/ui/ui_features.h"
- #include "chrome/browser/ui/views/animations/tab_strip_animations.h"
- #include "chrome/browser/ui/views/frame/base_tab_strip_region_view.h"
- #include "chrome/browser/ui/views/frame/browser_view.h"
-@@ -50,7 +51,9 @@
- #include "chrome/browser/ui/views/tabs/common/tab_view.h"
- #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
+@@ -54,6 +54,7 @@
+ #include "chrome/browser/ui/views/tabs/organizer/organizer_panel_utils.h"
  #include "chrome/browser/ui/views/tabs/shared/drop_arrow.h"
-+#include "chrome/browser/ui/views/tabs/new_tab_button.h"
  #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h"
 +#include "chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_focus_swipe_controller.h"
  #include "chrome/browser/ui/web_applications/app_browser_controller.h"
  #include "chrome/grit/generated_resources.h"
- #include "components/tabs/public/tab_group.h"
-@@ -68,6 +71,7 @@
- #include "ui/views/background.h"
+@@ -69,6 +70,7 @@
+ #include "ui/gfx/geometry/point.h"
  #include "ui/views/controls/button/label_button.h"
  #include "ui/views/controls/focus_ring.h"
 +#include "ui/views/controls/menu/menu_runner.h"
  #include "ui/views/controls/resize_area.h"
- #include "ui/views/controls/scroll_view.h"
- #include "ui/views/controls/separator.h"
-@@ -88,6 +92,17 @@ constexpr int kSnapDistance = 15;
+ #include "ui/views/focus/focus_manager.h"
+ #include "ui/views/interaction/element_tracker_views.h"
+@@ -90,6 +92,17 @@ constexpr int kSnapDistance = 15;
  constexpr int kBottomContainerGap = 2;
  constexpr int kDefaultWidthSnapDistance = 6;
  
@@ -865,24 +827,30 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
  // Shadow is used in expand-on-hover mode. Shadow radius and opacity are dynamic
  // and set by the layout.
  constexpr int kExpandOnHoverShadowElevation = 4;
-@@ -127,16 +142,36 @@ VerticalTabStripRegionView::VerticalTabS
-                                    views::MinimumFlexSizeRule::kPreferred,
-                                    views::MaximumFlexSizeRule::kPreferred));
+@@ -141,16 +154,42 @@ VerticalTabStripRegionView::VerticalTabS
+   const int region_horizontal_padding =
+       GetLayoutConstant(LayoutConstant::kVerticalTabStripHorizontalPadding);
  
 +  auto new_tab_button =
 +      std::make_unique<VerticalNewTabButton>(browser_view->browser());
-+  new_tab_button->set_context_menu_controller(this);
++  new_tab_button->SetOnContextMenuWillShowCallback(base::BindRepeating(
++      &VerticalTabStripRegionView::OnNewTabButtonContextMenuWillShow,
++      base::Unretained(this)));
++  new_tab_button->SetOnContextMenuClosedCallback(base::BindRepeating(
++      &VerticalTabStripRegionView::OnNewTabButtonContextMenuClosed,
++      base::Unretained(this)));
 +  new_tab_button_pressed_subscription_ =
 +      new_tab_button->RegisterWillInvokeActionCallback(base::BindRepeating(
 +          &VerticalTabStripRegionView::RecordNewTabButtonPressed,
 +          base::Unretained(this)));
-+  new_tab_button_ = AddChildView(std::move(new_tab_button));
++  new_tab_button_ = content_area_view_->AddChildView(std::move(new_tab_button));
 +  new_tab_button_->SetProperty(
 +      views::kMarginsKey,
 +      gfx::Insets::TLBR(kBottomContainerGap, region_horizontal_padding,
-+                        kBottomContainerGap, region_horizontal_padding));
++                       kBottomContainerGap, region_horizontal_padding));
 +
-+  tab_area_spacer_ = AddChildView(std::make_unique<views::View>());
++  tab_area_spacer_ =
++      content_area_view_->AddChildView(std::make_unique<views::View>());
 +  tab_area_spacer_->SetProperty(
 +      views::kFlexBehaviorKey,
 +      views::FlexSpecification(
@@ -891,8 +859,8 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 +          views::MaximumFlexSizeRule::kUnbounded)
 +          .WithWeight(1));
 +
-   bottom_button_container_ =
-       AddChildView(std::make_unique<VerticalTabStripBottomContainer>(
+   bottom_button_container_ = content_area_view_->AddChildView(
+       std::make_unique<VerticalTabStripBottomContainer>(
 -          state_controller_, root_action_item, browser_view->browser(),
 -          base::BindRepeating(
 -              &VerticalTabStripRegionView::RecordNewTabButtonPressed,
@@ -903,38 +871,18 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 -      views::FlexSpecification(views::MinimumFlexSizeRule::kPreferred,
 -                               views::MaximumFlexSizeRule::kUnbounded));
 +      views::FlexSpecification(views::LayoutOrientation::kVertical,
-+                               views::MinimumFlexSizeRule::kPreferred,
-+                               views::MaximumFlexSizeRule::kPreferred));
++                              views::MinimumFlexSizeRule::kPreferred,
++                              views::MaximumFlexSizeRule::kPreferred));
    bottom_button_container_->SetProperty(
        views::kMarginsKey,
        gfx::Insets::TLBR(kBottomContainerGap, region_horizontal_padding,
-@@ -666,6 +701,42 @@ void VerticalTabStripRegionView::OnResiz
+@@ -759,6 +798,22 @@ void VerticalTabStripRegionView::OnResiz
    }
  }
  
-+void VerticalTabStripRegionView::ShowContextMenuForViewImpl(
-+    views::View* source,
-+    const gfx::Point& point,
-+    ui::mojom::MenuSourceType source_type) {
-+  if (!features::IsTabGroupMenuMoreEntryPointsEnabled()) {
-+    return;
-+  }
-+
-+  context_menu_model_ =
-+      std::make_unique<NewTabButtonMenuModel>(browser_view_->browser());
-+  new_tab_context_menu_hover_lock_ = GetExpandOnHoverLock(
-+      ExpandOnHoverLockType::kKeepCurrentState);
-+
-+  constexpr int32_t kMenuRunnerFlags =
-+      views::MenuRunner::HAS_MNEMONICS | views::MenuRunner::CONTEXT_MENU;
-+  context_menu_runner_ = std::make_unique<views::MenuRunner>(
-+      context_menu_model_.get(), kMenuRunnerFlags,
-+      base::BindRepeating(
-+          &VerticalTabStripRegionView::OnNewTabButtonContextMenuClosed,
-+          base::Unretained(this)));
-+  context_menu_runner_->RunMenuAt(
-+      source->GetWidget(), nullptr, gfx::Rect(point, gfx::Size()),
-+      views::MenuAnchorPosition::kTopLeft, source_type);
++void VerticalTabStripRegionView::OnNewTabButtonContextMenuWillShow() {
++  new_tab_context_menu_hover_lock_ =
++      GetExpandOnHoverLock(ExpandOnHoverLockType::kKeepCurrentState);
 +}
 +
 +void VerticalTabStripRegionView::OnNewTabButtonContextMenuClosed() {
@@ -951,92 +899,44 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
  void VerticalTabStripRegionView::SetCollapsedStateUpdatedCallback(
      base::RepeatingCallback<void(bool)> callback) {
    update_state_controller_collapsed_callback_ = std::move(callback);
-@@ -729,8 +800,8 @@ views::View* VerticalTabStripRegionView:
-   tab_strip_view_ = static_cast<TabStripView*>(AddChildView(std::move(view)));
-   tab_strip_view_->SetProperty(
+@@ -839,18 +894,17 @@ void VerticalTabStripRegionView::AddTabS
+     std::unique_ptr<views::View> view) {
+   view->SetProperty(
        views::kFlexBehaviorKey,
 -      views::FlexSpecification(views::MinimumFlexSizeRule::kScaleToMinimum,
 -                               views::MaximumFlexSizeRule::kPreferred));
 +      views::FlexSpecification(
 +          base::BindRepeating(&GetTopAnchoredTabStripSize)));
-   tab_strip_view_->SetProperty(views::kMarginsKey,
-                                gfx::Insets::TLBR(0, 0, kBottomContainerGap, 0));
+   view->SetProperty(views::kMarginsKey,
+                     gfx::Insets::TLBR(0, 0, kBottomContainerGap, 0));
  
-@@ -738,6 +809,20 @@ views::View* VerticalTabStripRegionView:
-       root_node_->RegisterOnActiveTabChangedCallback(
-           base::BindRepeating(&VerticalTabStripRegionView::OnActiveTabChanged,
-                               base::Unretained(this)));
-+  tab_children_added_subscription_ =
-+      root_node_->RegisterOnChildrenAddedCallback(base::BindRepeating(
-+          &VerticalTabStripRegionView::OnTabCollectionChanged,
-+          base::Unretained(this)));
-+  tab_child_removed_subscription_ =
-+      root_node_->RegisterOnChildRemovedCallback(base::BindRepeating(
-+          &VerticalTabStripRegionView::OnTabCollectionChanged,
-+          base::Unretained(this)));
-+  tab_child_moved_subscription_ = root_node_->RegisterOnChildMovedCallback(
-+      base::BindRepeating(
-+          [](VerticalTabStripRegionView* region, TabCollectionNode*) {
-+            region->OnTabCollectionChanged();
-+          },
-+          base::Unretained(this)));
+   views::View* const content_parent =
+       content_area_view_ ? content_area_view_.get() : this;
+-  std::optional<size_t> bottom_container_index =
+-      content_parent->GetIndexOf(bottom_button_container_);
+-  CHECK(bottom_container_index.has_value());
+-  content_parent->AddChildViewAt(std::move(view),
+-                                 bottom_container_index.value());
++  std::optional<size_t> new_tab_button_index =
++      content_parent->GetIndexOf(new_tab_button_);
++  CHECK(new_tab_button_index.has_value());
++  content_parent->AddChildViewAt(std::move(view), new_tab_button_index.value());
  
    // Pre-set the animation values to the appropriate state.
    auto* const animation_controller =
-@@ -758,10 +843,9 @@ views::View* VerticalTabStripRegionView:
-               &VerticalTabStripRegionView::OnExpandOnHoverEnabledChanged,
-               base::Unretained(this)));
- 
--  std::optional<size_t> bottom_container_index =
--      GetIndexOf(bottom_button_container_);
--  CHECK(bottom_container_index.has_value());
--  ReorderChildView(tab_strip_view_, bottom_container_index.value());
-+  std::optional<size_t> new_tab_button_index = GetIndexOf(new_tab_button_);
-+  CHECK(new_tab_button_index.has_value());
-+  ReorderChildView(tab_strip_view_, new_tab_button_index.value());
- 
-   OnCollapseStateChanged(state_controller_->GetCollapseState());
- 
-@@ -771,6 +855,9 @@ views::View* VerticalTabStripRegionView:
- void VerticalTabStripRegionView::ClearTabStripView(views::View* view) {
-   on_animation_update_subscription_.reset();
-   on_active_tab_changed_subscription_.reset();
-+  tab_children_added_subscription_ = {};
-+  tab_child_removed_subscription_ = {};
-+  tab_child_moved_subscription_ = {};
-   expand_on_hover_enabled_changed_subscription_.reset();
-   omnibox_tab_helper_observation_.Reset();
- 
 Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
 +++ src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
-@@ -5,6 +5,7 @@
- #ifndef CHROME_BROWSER_UI_VIEWS_FRAME_VERTICAL_TAB_STRIP_REGION_VIEW_H_
- #define CHROME_BROWSER_UI_VIEWS_FRAME_VERTICAL_TAB_STRIP_REGION_VIEW_H_
- 
-+#include <memory>
- #include <optional>
- 
- #include "base/callback_list.h"
-@@ -27,12 +28,16 @@
- #include "ui/base/interaction/element_tracker.h"
- #include "ui/base/metadata/metadata_header_macros.h"
- #include "ui/events/event_handler.h"
-+#include "ui/views/context_menu_controller.h"
- #include "ui/gfx/geometry/point.h"
- #include "ui/views/accessible_pane_view.h"
- #include "ui/views/controls/resize_area_delegate.h"
- #include "ui/views/focus/focus_manager.h"
+@@ -36,6 +36,7 @@
+ #include "ui/views/layout/delegating_layout_manager.h"
  
  class BrowserView;
-+class ExpandOnHoverLock;
-+class NewTabButtonMenuModel;
 +class VerticalNewTabButton;
  class VerticalTabStripBottomContainer;
+ class VerticalTabStripFocusSwipeController;
  class ShadowFrameView;
- 
-@@ -41,6 +46,7 @@ class VerticalTabStripStateController;
+@@ -45,6 +46,7 @@ class VerticalTabStripStateController;
  }  // namespace tabs
  
  namespace views {
@@ -1044,37 +944,18 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
  class ResizeArea;
  class Separator;
  class View;
-@@ -54,6 +60,7 @@ class VerticalTabStripRegionView final
-       public views::ResizeAreaDelegate,
-       public OmniboxTabHelper::Observer,
-       public tabs::VerticalTabStripStateController::Delegate,
-+      public views::ContextMenuController,
-       public views::WidgetObserver {
-   METADATA_HEADER(VerticalTabStripRegionView, BaseTabStripRegionView)
- 
-@@ -121,6 +128,12 @@ class VerticalTabStripRegionView final
-   // views::ResizeAreaDelegate:
-   void OnResize(int resize_amount, bool done_resizing) override;
- 
-+  // views::ContextMenuController:
-+  void ShowContextMenuForViewImpl(
-+      views::View* source,
-+      const gfx::Point& point,
-+      ui::mojom::MenuSourceType source_type) override;
-+
-   // tabs::VerticalTabStripStateController::Delegate
-   void SetCollapsedStateUpdatedCallback(
-       base::RepeatingCallback<void(bool)> callback) override;
-@@ -229,12 +242,16 @@ class VerticalTabStripRegionView final
+@@ -252,6 +254,9 @@ class VerticalTabStripRegionView final
    void OnOmniboxPopupVisibilityChanged(bool is_open) override;
  
-   void OnActiveTabChanged(const tabs::TabInterface* active_tab);
-+  void OnTabCollectionChanged();
+   void OnActiveTabChanged(const tabs::TabInterface* active_tab) override;
++  void OnTabCollectionChanged() override;
++  void OnNewTabButtonContextMenuWillShow();
 +  void OnNewTabButtonContextMenuClosed();
  
-   // Whether a leading exclusion exists due to window controls.
-   bool has_leading_exclusion_ = false;
-   bool zen_mode_floating_style_ = false;
+   // Organizer panel:
+   raw_ptr<views::View> organizer_panel_view_ = nullptr;
+@@ -269,6 +274,8 @@ class VerticalTabStripRegionView final
+   gfx::Insets interior_margin_;
  
    raw_ptr<VerticalTabStripBottomContainer> bottom_button_container_ = nullptr;
 +  raw_ptr<VerticalNewTabButton> new_tab_button_ = nullptr;
@@ -1082,23 +963,18 @@ Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
    raw_ptr<views::View> gemini_button_ = nullptr;
    raw_ptr<views::ResizeArea> resize_area_ = nullptr;
    raw_ptr<ShadowFrameView> shadow_frame_ = nullptr;
-@@ -263,6 +280,10 @@ class VerticalTabStripRegionView final
+@@ -296,6 +303,7 @@ class VerticalTabStripRegionView final
    tabs::VerticalTabStripState target_collapse_state_;
  
    base::CallbackListSubscription collapsed_state_changed_subscription_;
 +  base::CallbackListSubscription new_tab_button_pressed_subscription_;
-+  base::CallbackListSubscription tab_children_added_subscription_;
-+  base::CallbackListSubscription tab_child_removed_subscription_;
-+  base::CallbackListSubscription tab_child_moved_subscription_;
    base::RepeatingCallback<void(bool)>
        update_state_controller_collapsed_callback_;
  
-@@ -274,6 +295,10 @@ class VerticalTabStripRegionView final
+@@ -308,6 +316,8 @@ class VerticalTabStripRegionView final
    std::optional<base::TimeTicks> time_at_expand_on_hover_timer_start_;
    int expand_on_hover_heuristic_samples_ = 0;
  
-+  std::unique_ptr<NewTabButtonMenuModel> context_menu_model_;
-+  std::unique_ptr<views::MenuRunner> context_menu_runner_;
 +  std::unique_ptr<ExpandOnHoverLock> new_tab_context_menu_hover_lock_;
 +
    // Given that both lock counters are non-zero, force_collapse_lock_count_ will
@@ -1108,27 +984,22 @@ Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_conta
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
 +++ src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
-@@ -4,36 +4,39 @@
- 
+@@ -5,36 +5,38 @@
  #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h"
  
-+#include "base/functional/bind.h"
+ #include "base/functional/bind.h"
 +#include "base/strings/utf_string_conversions.h"
  #include "chrome/browser/ui/browser_element_identifiers.h"
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 +#include "chrome/browser/ui/helium/helium_space.h"
 +#include "chrome/browser/ui/helium/helium_space_service.h"
 +#include "chrome/browser/ui/helium/helium_space_service_factory.h"
- #include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/layout_constants.h"
  #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
--#include "chrome/browser/ui/ui_features.h"
 -#include "chrome/browser/ui/views/frame/browser_view.h"
 -#include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
--#include "chrome/browser/ui/views/tabs/new_tab_button.h"
 -#include "chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.h"
--#include "ui/actions/actions.h"
  #include "ui/base/metadata/metadata_impl_macros.h"
--#include "ui/views/controls/menu/menu_runner.h"
 -#include "ui/views/view_class_properties.h"
 +#include "ui/views/controls/button/label_button.h"
  
@@ -1144,7 +1015,12 @@ Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_conta
                kVerticalTabStripBottomContainerElementId);
  
 -  auto new_tab_button = std::make_unique<VerticalNewTabButton>(browser_);
--  new_tab_button->set_context_menu_controller(this);
+-  new_tab_button->SetOnContextMenuWillShowCallback(base::BindRepeating(
+-      &VerticalTabStripBottomContainer::OnNewTabButtonContextMenuWillShow,
+-      base::Unretained(this)));
+-  new_tab_button->SetOnContextMenuClosedCallback(base::BindRepeating(
+-      &VerticalTabStripBottomContainer::OnNewTabButtonContextMenuClosed,
+-      base::Unretained(this)));
 -
 -  new_tab_button_pressed_subscription_ =
 -      new_tab_button->RegisterWillInvokeActionCallback(
@@ -1168,7 +1044,7 @@ Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_conta
  
    OnCollapseStateChanged(state_controller->GetCollapseState());
    collapsed_state_change_subscription_ =
-@@ -44,7 +47,6 @@ VerticalTabStripBottomContainer::Vertica
+@@ -45,7 +47,6 @@ VerticalTabStripBottomContainer::Vertica
  
  VerticalTabStripBottomContainer::~VerticalTabStripBottomContainer() = default;
  
@@ -1176,7 +1052,7 @@ Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_conta
  bool VerticalTabStripBottomContainer::IsPositionInWindowCaption(
      const gfx::Point& point) {
    for (views::View* child : children()) {
-@@ -64,64 +66,77 @@ void VerticalTabStripBottomContainer::On
+@@ -65,39 +66,77 @@ void VerticalTabStripBottomContainer::On
      tabs::VerticalTabStripCollapseState state) {
    // Updating the styles immediately at start of the animation by including
    // collapsing state.
@@ -1186,32 +1062,12 @@ Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_conta
 +  UpdateButtonStyles(tab_strip_collapsed_);
  }
  
--void VerticalTabStripBottomContainer::ShowContextMenuForViewImpl(
--    View* source,
--    const gfx::Point& point,
--    ui::mojom::MenuSourceType source_type) {
--  if (features::IsTabGroupMenuMoreEntryPointsEnabled()) {
--    context_menu_model_ = std::make_unique<NewTabButtonMenuModel>(browser_);
--
--    int32_t menu_runner_flags =
--        views::MenuRunner::HAS_MNEMONICS | views::MenuRunner::CONTEXT_MENU;
--
--    BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(browser_);
--    CHECK(browser_view);
--    CHECK(browser_view->tab_strip_view());
--    expand_on_hover_lock_ =
--        browser_view->tab_strip_view()->GetExpandOnHoverLock(
--            ExpandOnHoverLockType::kKeepCurrentState);
--
--    // `base::Unretained(this)` is safe because `context_menu_runner_` is owned
--    // by `this`, ensuring the callback cannot outlive `this`.
--    auto on_menu_closed = base::BindRepeating(
--        &VerticalTabStripBottomContainer::OnNewTabButtonContextMenuClosed,
--        base::Unretained(this));
--
--    context_menu_runner_ = std::make_unique<views::MenuRunner>(
--        context_menu_model_.get(), menu_runner_flags,
--        std::move(on_menu_closed));
+-void VerticalTabStripBottomContainer::OnNewTabButtonContextMenuWillShow() {
+-  BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(browser_);
+-  CHECK(browser_view);
+-  CHECK(browser_view->tab_strip_view());
+-  expand_on_hover_lock_ = browser_view->tab_strip_view()->GetExpandOnHoverLock(
+-      ExpandOnHoverLockType::kKeepCurrentState);
 +void VerticalTabStripBottomContainer::ToggleSpacesList() {
 +  if (tab_strip_collapsed_) {
 +    state_controller_->RequestCollapse(false);
@@ -1229,11 +1085,10 @@ Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_conta
 +  spaces_disclosure_button_->SetText(spaces_expanded_ ? u"Hide Spaces"
 +                                                      : u"Spaces");
 +  InvalidateLayout();
-+}
+ }
  
--    context_menu_runner_->RunMenuAt(
--        source->GetWidget(), nullptr, gfx::Rect(point, gfx::Size()),
--        views::MenuAnchorPosition::kTopLeft, source_type);
+-void VerticalTabStripBottomContainer::OnNewTabButtonContextMenuClosed() {
+-  expand_on_hover_lock_.reset();
 +void VerticalTabStripBottomContainer::RebuildSpacesList() {
 +  spaces_list_->RemoveAllChildViews();
 +  auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(
@@ -1249,11 +1104,12 @@ Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_conta
 +    row->SetHorizontalAlignment(gfx::ALIGN_LEFT);
 +    row->SetTooltipText(u"Open this Space window");
 +    spaces_list_->AddChildView(std::move(row));
-   }
++  }
  }
  
--void VerticalTabStripBottomContainer::OnNewTabButtonContextMenuClosed() {
--  expand_on_hover_lock_.reset();
+-void VerticalTabStripBottomContainer::UpdateButtonStyles(bool collapsed) {
+-  auto orientation = collapsed ? views::LayoutOrientation::kVertical
+-                               : views::LayoutOrientation::kHorizontal;
 +void VerticalTabStripBottomContainer::ActivateSpace(std::string space_id) {
 +  auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(
 +      browser_->GetProfile());
@@ -1264,12 +1120,8 @@ Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_conta
 +    service->SetActiveSpace(space_id);
 +    space->ActivateOrCreatePrimaryWindow();
 +  }
- }
++}
  
- void VerticalTabStripBottomContainer::UpdateButtonStyles(bool collapsed) {
--  auto orientation = collapsed ? views::LayoutOrientation::kVertical
--                               : views::LayoutOrientation::kHorizontal;
--
 -  // Setting button's layout based on collapsed state
 -  SetOrientation(orientation);
 -  SetCrossAxisAlignment(collapsed ? views::LayoutAlignment::kStretch
@@ -1284,6 +1136,7 @@ Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_conta
 -          collapsed ? views::MaximumFlexSizeRule::kPreferred
 -                    : views::MaximumFlexSizeRule::kUnbounded,
 -          false, views::MinimumFlexSizeRule::kPreferred));
++void VerticalTabStripBottomContainer::UpdateButtonStyles(bool collapsed) {
 +  // This stack contains only the bottom-anchored Space selector. Tab content
 +  // and the New Tab control remain together at the top of the sidebar.
 +  SetOrientation(views::LayoutOrientation::kVertical);
@@ -1307,37 +1160,36 @@ Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_conta
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h
 +++ src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h
-@@ -5,14 +5,11 @@
+@@ -5,15 +5,11 @@
  #ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_STRIP_BOTTOM_CONTAINER_H_
  #define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_STRIP_BOTTOM_CONTAINER_H_
  
--#include "ui/views/context_menu_controller.h"
+-#include "base/callback_list.h"
+-#include "base/memory/raw_ptr.h"
+-#include "ui/base/metadata/metadata_header_macros.h"
 +#include <string>
 +
  #include "ui/views/layout/flex_layout_view.h"
  
  class BrowserWindowInterface;
 -class ExpandOnHoverLock;
--class NewTabButtonMenuModel;
 -class VerticalNewTabButton;
 -
  namespace actions {
  class ActionItem;
  }  // namespace actions
-@@ -23,44 +20,37 @@ enum class VerticalTabStripCollapseState
+@@ -23,15 +19,18 @@ class VerticalTabStripStateController;
+ enum class VerticalTabStripCollapseState;
  }  // namespace tabs
  
- namespace views {
--class MenuRunner;
+-// Bottom container of the vertical tab strip which includes the new tab button.
++namespace views {
 +class LabelButton;
 +class View;
- }  // namespace views
- 
--// Bottom container of the vertical tab strip which includes the new tab button.
--class VerticalTabStripBottomContainer : public views::FlexLayoutView,
--                                        public views::ContextMenuController {
++}  // namespace views
++
 +// Bottom-anchored Space selector for the vertical tab strip.
-+class VerticalTabStripBottomContainer : public views::FlexLayoutView {
+ class VerticalTabStripBottomContainer : public views::FlexLayoutView {
    METADATA_HEADER(VerticalTabStripBottomContainer, views::FlexLayoutView)
   public:
    VerticalTabStripBottomContainer(
@@ -1349,16 +1201,11 @@ Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_conta
    ~VerticalTabStripBottomContainer() override;
  
    bool IsPositionInWindowCaption(const gfx::Point& point);
- 
+@@ -39,17 +38,19 @@ class VerticalTabStripBottomContainer :
    void OnCollapseStateChanged(tabs::VerticalTabStripCollapseState state);
  
--  // views::ContextMenuController:
--  void ShowContextMenuForViewImpl(
--      View* source,
--      const gfx::Point& point,
--      ui::mojom::MenuSourceType source_type) override;
--
   private:
+-  void OnNewTabButtonContextMenuWillShow();
 -  void OnNewTabButtonContextMenuClosed();
 +  void ToggleSpacesList();
 +  void RebuildSpacesList();
@@ -1376,8 +1223,6 @@ Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_conta
    base::CallbackListSubscription collapsed_state_change_subscription_;
 -  base::CallbackListSubscription new_tab_button_pressed_subscription_;
 -
--  std::unique_ptr<NewTabButtonMenuModel> context_menu_model_;
--  std::unique_ptr<views::MenuRunner> context_menu_runner_;
 -  std::unique_ptr<ExpandOnHoverLock> expand_on_hover_lock_;
  };
  
@@ -1386,7 +1231,7 @@ Index: src/chrome/common/pref_names.h
 ===================================================================
 --- src.orig/chrome/common/pref_names.h
 +++ src/chrome/common/pref_names.h
-@@ -981,6 +981,9 @@
+@@ -998,6 +998,9 @@ inline constexpr char kPartitionPerHostZ
  
  #if !BUILDFLAG(IS_ANDROID)
  inline constexpr char kPinnedTabs[] = "pinned_tabs";
@@ -1580,12 +1425,12 @@ Index: src/chrome/browser/ui/browser_tabrestore.cc
 @@ -17,6 +17,7 @@
  #include "chrome/browser/sessions/session_service_base.h"
  #include "chrome/browser/sessions/session_service_lookup.h"
- #include "chrome/browser/tab_contents/tab_util.h"
-+#include "chrome/browser/ui/arcium/tab_provenance.h"
- #include "chrome/browser/ui/browser.h"
  #include "chrome/browser/ui/browser_window.h"
++#include "chrome/browser/ui/arcium/tab_provenance.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
  #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_activation_tracker.h"
-@@ -88,6 +89,7 @@ std::unique_ptr<WebContents> CreateResto
+ #include "chrome/browser/ui/tab_ui_helper.h"
+@@ -86,6 +87,7 @@ std::unique_ptr<WebContents> CreateResto
    glic::RestoreGlicStateFromExtraData(web_contents.get(), extra_data);
    send_tab_to_self::SendTabToSelfActivationTracker::RestoreFromExtraData(
        web_contents.get(), extra_data);
@@ -1744,3 +1589,40 @@ Index: src/chrome/browser/ui/arcium/optional_navigation_unittest.cc
 +
 +}  // namespace
 +}  // namespace arcium
+Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
++++ src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
+@@ -500,6 +500,7 @@ void BaseTabStripRegionView::OnWidgetVis
+ 
+ void BaseTabStripRegionView::OnChildrenAdded(
+     const tabs::TabCollectionNodes& handles) {
++  OnTabCollectionChanged();
+   if (new_tab_button_pressed_start_time_.has_value()) {
+     base::UmaHistogramTimes(
+         "TabStrip.TimeToCreateNewTabFromPress",
+@@ -529,10 +530,12 @@ void BaseTabStripRegionView::OnChildrenA
+ }
+ 
+ void BaseTabStripRegionView::OnChildrenRemoved() {
++  OnTabCollectionChanged();
+   hover_tab_selector_->CancelTabTransition();
+ }
+ 
+ void BaseTabStripRegionView::OnChildMoved(TabCollectionNode* moved_node) {
++  OnTabCollectionChanged();
+   hover_tab_selector_->CancelTabTransition();
+   if (tab_strip_view_ && !is_first_window_presentation_) {
+     tab_strip_view_->OnChildMoved(moved_node);
+Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/base_tab_strip_region_view.h
++++ src/chrome/browser/ui/views/frame/base_tab_strip_region_view.h
+@@ -130,6 +130,7 @@ class BaseTabStripRegionView : public Ta
+ 
+   void RecordNewTabButtonPressed();
+   virtual void OnActiveTabChanged(const tabs::TabInterface* active_tab);
++  virtual void OnTabCollectionChanged() {}
+ 
+   void SetLinkDropArrow(const std::optional<BrowserRootView::DropIndex>& index);
+   virtual gfx::Point GetLinkDropArrowPosition(

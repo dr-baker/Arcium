@@ -1,50 +1,32 @@
 --- a/chrome/browser/signin/account_preview_data_service_factory_unittest.cc
 +++ b/chrome/browser/signin/account_preview_data_service_factory_unittest.cc
-@@ -5,11 +5,8 @@
- #include "chrome/browser/signin/account_preview_data_service_factory.h"
- 
- #include "base/test/with_feature_override.h"
--#include "chrome/browser/prefs/browser_prefs.h"
- #include "chrome/test/base/testing_profile.h"
--#include "components/signin/public/base/signin_pref_names.h"
- #include "components/signin/public/base/signin_switches.h"
--#include "components/sync_preferences/testing_pref_service_syncable.h"
- #include "content/public/test/browser_task_environment.h"
- #include "testing/gtest/include/gtest/gtest.h"
- 
-@@ -27,24 +24,11 @@
-   TestingProfile profile_;
+@@ -31,7 +31,8 @@ class AccountPreviewDataServiceFactoryTe
+   content::BrowserTaskEnvironment task_environment_;
  };
  
 -TEST_P(AccountPreviewDataServiceFactoryTest, GetForProfile) {
--  if (IsParamFeatureEnabled()) {
--    EXPECT_TRUE(AccountPreviewDataServiceFactory::GetForProfile(&profile_));
--  } else {
--    EXPECT_FALSE(AccountPreviewDataServiceFactory::GetForProfile(&profile_));
--  }
--}
--
--TEST_P(AccountPreviewDataServiceFactoryTest, GetForProfile_SigninDisallowed) {
--  auto prefs = std::make_unique<sync_preferences::TestingPrefServiceSyncable>();
--  RegisterUserProfilePrefs(prefs->registry());
--  prefs->SetUserPref(prefs::kSigninAllowed, base::Value(false));
--  prefs->SetUserPref(prefs::kSigninAllowedOnNextStartup, base::Value(false));
--
--  TestingProfile::Builder builder;
--  builder.SetPrefService(std::move(prefs));
--  std::unique_ptr<TestingProfile> profile = builder.Build();
--  EXPECT_FALSE(AccountPreviewDataServiceFactory::GetForProfile(profile.get()));
 +TEST_P(AccountPreviewDataServiceFactoryTest,
 +       GetForProfileUnavailableInBothFeatureStates) {
-+  // The factory does not provide this service in the current product build,
-+  // even when the rollout feature is enabled.
-+  EXPECT_FALSE(AccountPreviewDataServiceFactory::GetForProfile(&profile_));
+   TestingProfile::Builder builder;
+   builder.AddTestingFactory(
+       AccountPreviewDataServiceFactory::GetInstance(),
+@@ -39,12 +40,7 @@ TEST_P(AccountPreviewDataServiceFactoryT
+           &AccountPreviewDataServiceFactoryTest::BuildServiceInstance));
+   std::unique_ptr<TestingProfile> profile = builder.Build();
+ 
+-  if (IsParamFeatureEnabled()) {
+-    EXPECT_TRUE(AccountPreviewDataServiceFactory::GetForProfile(profile.get()));
+-  } else {
+-    EXPECT_FALSE(
+-        AccountPreviewDataServiceFactory::GetForProfile(profile.get()));
+-  }
++  EXPECT_FALSE(AccountPreviewDataServiceFactory::GetForProfile(profile.get()));
  }
  
- INSTANTIATE_FEATURE_OVERRIDE_TEST_SUITE(AccountPreviewDataServiceFactoryTest);
+ TEST_P(AccountPreviewDataServiceFactoryTest, NullWhileTestingByDefault) {
 --- a/chrome/browser/signin/accounts_policy_manager_browsertest.cc
 +++ b/chrome/browser/signin/accounts_policy_manager_browsertest.cc
-@@ -47,75 +47,7 @@
+@@ -47,75 +47,7 @@ class AccountsPolicyManagerBrowserTest :
  };
  
  IN_PROC_BROWSER_TEST_F(AccountsPolicyManagerBrowserTest,
@@ -112,7 +94,7 @@
 -  EXPECT_FALSE(entry);
 -
 -  // The current profile should be different.
--  EXPECT_NE(browser()->profile()->GetPath(), default_profile_path);
+-  EXPECT_NE(browser()->GetProfile()->GetPath(), default_profile_path);
 -}
 -
 -IN_PROC_BROWSER_TEST_F(AccountsPolicyManagerBrowserTest,
@@ -121,7 +103,7 @@
    // Sign in with a managed account.
    identity_test_env()->MakePrimaryAccountAvailable(
        kManagedEmail, signin::ConsentLevel::kSignin);
-@@ -135,7 +67,7 @@
+@@ -135,7 +67,7 @@ IN_PROC_BROWSER_TEST_F(AccountsPolicyMan
  }
  
  IN_PROC_BROWSER_TEST_F(AccountsPolicyManagerBrowserTest,
@@ -130,7 +112,7 @@
    base::FilePath default_profile_path =
        g_browser_process->profile_manager()->user_data_dir().AppendASCII(
            chrome::kInitialProfile);
-@@ -155,13 +87,18 @@
+@@ -155,13 +87,18 @@ IN_PROC_BROWSER_TEST_F(AccountsPolicyMan
    // proves the flow was not triggered.
    EXPECT_TRUE(entry);
  
@@ -150,7 +132,7 @@
 +  EXPECT_EQ(error.type(), SigninUIError::Type::kSigninDisallowed);
  
    // The current profile should be the default one.
-   EXPECT_EQ(browser()->profile()->GetPath(), default_profile_path);
+   EXPECT_EQ(browser()->GetProfile()->GetPath(), default_profile_path);
 --- a/chrome/browser/signin/accounts_policy_manager_unittest.cc
 +++ b/chrome/browser/signin/accounts_policy_manager_unittest.cc
 @@ -17,6 +17,7 @@
@@ -161,7 +143,7 @@
  #include "components/signin/public/base/signin_pref_names.h"
  #include "components/signin/public/identity_manager/identity_test_environment.h"
  #include "content/public/test/browser_task_environment.h"
-@@ -71,10 +72,6 @@
+@@ -71,10 +72,6 @@ class AccountsPolicyManagerTest : public
          "accounts_policy_manager_test_profile_path");
    }
  
@@ -172,21 +154,21 @@
    Profile* GetProfile() {
      DCHECK(profile_);
      return profile_.get();
-@@ -93,6 +90,13 @@
- 
-   signin::IdentityManager* identity_manager() {
+@@ -95,6 +92,13 @@ class AccountsPolicyManagerTest : public
      return GetIdentityTestEnv()->identity_manager();
-+  }
-+
+   }
+ 
 +  void ReconcileSigninPolicy() {
 +    AccountsPolicyManagerFactory::GetForProfile(GetProfile())
 +        ->EnsurePrimaryAccountAllowedForProfile(
 +            GetProfile(),
 +            signin_metrics::ProfileSignout::kSigninNotAllowedOnProfileInit);
-   }
- 
++  }
++
   private:
-@@ -103,28 +107,23 @@
+   content::BrowserTaskEnvironment task_environment_;
+   TestingProfileManager profile_manager_;
+@@ -103,28 +107,23 @@ class AccountsPolicyManagerTest : public
        identity_test_env_adaptor_;
  };
  
@@ -195,34 +177,34 @@
    GetIdentityTestEnv()->MakePrimaryAccountAvailable(
        "test@foo.com", signin::ConsentLevel::kSignin);
 -  GetProfile()->GetPrefs()->SetBoolean(prefs::kSigninAllowed, false);
-+  ASSERT_TRUE(GetIdentityTestEnv()->identity_manager()->HasPrimaryAccount(
-+      signin::ConsentLevel::kSignin));
-+  ReconcileSigninPolicy();
- 
-   EXPECT_FALSE(GetIdentityTestEnv()->identity_manager()->HasPrimaryAccount(
-       signin::ConsentLevel::kSignin));
- }
- 
--TEST_F(AccountsPolicyManagerTest, ClearPrimaryAccountWhenPatternNotAllowed) {
-+TEST_F(AccountsPolicyManagerTest,
-+       RemoveProfileWhenSigninUnavailableAndSignoutBlocked) {
-   GetIdentityTestEnv()->MakePrimaryAccountAvailable(
-       "test@foo.com", signin::ConsentLevel::kSignin);
--  GetLocalState()->SetString(prefs::kGoogleServicesUsernamePattern,
--                             ".*@bar.com");
 -
 -  EXPECT_FALSE(GetIdentityTestEnv()->identity_manager()->HasPrimaryAccount(
 +  ASSERT_TRUE(GetIdentityTestEnv()->identity_manager()->HasPrimaryAccount(
        signin::ConsentLevel::kSignin));
 -}
 -
--TEST_F(AccountsPolicyManagerTest, ClearProfileWhenSigninAndSignoutNotAllowed) {
+-TEST_F(AccountsPolicyManagerTest, ClearPrimaryAccountWhenPatternNotAllowed) {
 -  GetIdentityTestEnv()->MakePrimaryAccountAvailable(
 -      "test@foo.com", signin::ConsentLevel::kSignin);
+-  GetLocalState()->SetString(prefs::kGoogleServicesUsernamePattern,
+-                             ".*@bar.com");
++  ReconcileSigninPolicy();
+ 
+   EXPECT_FALSE(GetIdentityTestEnv()->identity_manager()->HasPrimaryAccount(
+       signin::ConsentLevel::kSignin));
+ }
+ 
+-TEST_F(AccountsPolicyManagerTest, ClearProfileWhenSigninAndSignoutNotAllowed) {
++TEST_F(AccountsPolicyManagerTest,
++       RemoveProfileWhenSigninUnavailableAndSignoutBlocked) {
+   GetIdentityTestEnv()->MakePrimaryAccountAvailable(
+       "test@foo.com", signin::ConsentLevel::kSignin);
++  ASSERT_TRUE(GetIdentityTestEnv()->identity_manager()->HasPrimaryAccount(
++      signin::ConsentLevel::kSignin));
  
    // Create a second profile.
    GetProfileManager()->CreateTestingProfile(
-@@ -133,12 +132,12 @@
+@@ -133,12 +132,12 @@ TEST_F(AccountsPolicyManagerTest, ClearP
            GetIdentityTestEnvironmentFactories());
    ASSERT_EQ(2u, GetProfileManager()->profile_manager()->GetNumberOfProfiles());
  
@@ -248,7 +230,7 @@
  #include "components/signin/public/base/signin_switches.h"
  #include "components/sync_preferences/testing_pref_service_syncable.h"
  #include "components/unexportable_keys/fake_unexportable_key_service.h"
-@@ -47,7 +46,6 @@
+@@ -47,7 +46,6 @@ struct BoundSessionCookieRefreshServiceF
    std::string test_name;
    std::vector<FeatureRef> enabled_features;
    std::vector<FeatureRef> disabled_features;
@@ -256,7 +238,7 @@
    bool is_service_expected = false;
    ~BoundSessionCookieRefreshServiceFactoryTestParams() = default;
  };
-@@ -57,42 +55,24 @@
+@@ -57,42 +55,24 @@ const BoundSessionCookieRefreshServiceFa
          "Enabled",
          {switches::kEnableBoundSessionCredentials},
          {},
@@ -276,8 +258,8 @@
          {switches::kEnableBoundSessionCredentials},
 -        std::nullopt,
          BUILDFLAG(IS_WIN),
--    },
--    {
+     },
+     {
 -        "DisabledByPolicy",
 -        {switches::kEnableBoundSessionCredentials},
 -        {},
@@ -290,8 +272,8 @@
 -        {switches::kEnableBoundSessionCredentials},
 -        true,
 -        true,
-     },
-     {
+-    },
+-    {
          "DisabledWithContinuityEnabled",
          {kEnableBoundSessionCredentialsContinuity},
          {switches::kEnableBoundSessionCredentials},
@@ -299,7 +281,7 @@
          true,
      },
      {
-@@ -100,14 +80,12 @@
+@@ -100,14 +80,12 @@ const BoundSessionCookieRefreshServiceFa
          {},
          {switches::kEnableBoundSessionCredentials,
           kEnableBoundSessionCredentialsContinuity},
@@ -314,7 +296,7 @@
          true,
      },
      {
-@@ -115,7 +93,6 @@
+@@ -115,7 +93,6 @@ const BoundSessionCookieRefreshServiceFa
          {switches::kBoundSessionCredentialsKillSwitch,
           switches::kEnableBoundSessionCredentials},
          {},
@@ -322,7 +304,7 @@
          false,
      },
  };
-@@ -145,10 +122,6 @@
+@@ -145,10 +122,6 @@ class BoundSessionCookieRefreshServiceFa
      std::unique_ptr<TestingPrefServiceSyncable> prefs =
          std::make_unique<TestingPrefServiceSyncable>();
      RegisterUserProfilePrefs(prefs->registry());
@@ -333,28 +315,9 @@
      profile_builder.SetPrefService(std::move(prefs));
  
      original_profile_ = profile_builder.Build();
---- a/chrome/browser/signin/dice_signed_in_profile_creator_unittest.cc
-+++ b/chrome/browser/signin/dice_signed_in_profile_creator_unittest.cc
-@@ -28,7 +28,6 @@
- #include "chrome/test/base/fake_profile_manager.h"
- #include "chrome/test/base/testing_browser_process.h"
- #include "chrome/test/base/testing_profile.h"
--#include "components/signin/public/base/signin_pref_names.h"
- #include "components/signin/public/identity_manager/identity_manager.h"
- #include "components/signin/public/identity_manager/identity_test_environment.h"
- #include "content/public/browser/storage_partition.h"
-@@ -211,8 +210,6 @@
-     CreateCookies(profile_.get(), {{"https://google.com", "newgoogle2"},
-                                    {"https://example.com", "newexample2"}});
- 
--    profile_->GetPrefs()->SetString(prefs::kSigninInterceptionIDPCookiesUrl,
--                                    "https://www.google.com/");
-   }
- 
-   void VerifyCookiesMoved() {
 --- a/chrome/browser/signin/dice_web_signin_interceptor_browsertest.cc
 +++ b/chrome/browser/signin/dice_web_signin_interceptor_browsertest.cc
-@@ -1651,179 +1651,6 @@
+@@ -1939,185 +1939,6 @@ IN_PROC_BROWSER_TEST_F(
              ChromeSigninUserChoice::kAlwaysAsk);
  }
  
@@ -404,8 +367,9 @@
 -
 -  AccountInfo account_info =
 -      MakeAccountInfoAvailableAndUpdate(params.email, "example.com");
--  signin::SetCookieAccounts(identity_manager, test_url_loader_factory(),
--                            {{account_info.email, account_info.gaia}});
+-  signin::SetCookieAccounts(
+-      identity_manager, test_url_loader_factory(),
+-      {{std::string(account_info.GetEmail()), account_info.GetGaiaId()}});
 -
 -  // Enforce enterprise profile separation.
 -  GetProfile()->GetPrefs()->SetString(prefs::kManagedAccountsSigninRestriction,
@@ -430,11 +394,13 @@
 -  DiceWebSigninInterceptor* interceptor =
 -      DiceWebSigninInterceptorFactory::GetForProfile(
 -          Profile::FromBrowserContext(web_contents->GetBrowserContext()));
--  interceptor->MaybeInterceptWebSignin(web_contents, account_info.account_id,
--                                       signin_metrics::AccessPoint::kWebSignin,
--                                       /*is_new_account=*/true,
--                                       /*is_sync_signin=*/false);
--  interceptor->OnDiceSigninSessionComplete(account_info.account_id, {});
+-  interceptor->MaybeInterceptWebSignin(
+-      web_contents, account_info.GetAccountId(),
+-      signin_metrics::AccessPoint::kWebSignin,
+-      /*is_new_account=*/true,
+-      /*is_chrome_signin=*/false,
+-      /*primary_is_connected=*/signin::Tribool::kUnknown);
+-  interceptor->OnDiceSigninSessionComplete(account_info.GetAccountId(), {});
 -
 -  if (params.expect_bubble_shown) {
 -    // Wait for the interception to be complete.
@@ -447,7 +413,7 @@
 -            params.expect_bubble_shown
 -                ? std::optional<SigninUIError>()
 -                : SigninUIError::UsernameNotAllowedByPatternFromPrefs(
--                      account_info.email));
+-                      account_info.GetEmail()));
 -  EXPECT_FALSE(interceptor->is_interception_in_progress());
 -  // If the interception happened, the account was moved to another profile.
 -  // Otherwise the account was removed entirely.
@@ -466,15 +432,16 @@
 -      MakeAccountInfoAvailableAndUpdate("bob@example.com", "example.com");
 -  IdentityManagerFactory::GetForProfile(GetProfile())
 -      ->GetPrimaryAccountMutator()
--      ->SetPrimaryAccount(primary_account_info.account_id,
+-      ->SetPrimaryAccount(primary_account_info.GetAccountId(),
 -                          signin::ConsentLevel::kSignin,
 -                          signin_metrics::AccessPoint::kStartPage);
 -  enterprise_util::SetUserAcceptedAccountManagement(GetProfile(), true);
 -
 -  AccountInfo account_info =
 -      MakeAccountInfoAvailableAndUpdate(params.email, "example.com");
--  signin::SetCookieAccounts(identity_manager, test_url_loader_factory(),
--                            {{account_info.email, account_info.gaia}});
+-  signin::SetCookieAccounts(
+-      identity_manager, test_url_loader_factory(),
+-      {{std::string(account_info.GetEmail()), account_info.GetGaiaId()}});
 -
 -  // Do not enforce enterprise profile separation.
 -  GetProfile()->GetPrefs()->SetString(prefs::kManagedAccountsSigninRestriction,
@@ -497,11 +464,13 @@
 -  DiceWebSigninInterceptor* interceptor =
 -      DiceWebSigninInterceptorFactory::GetForProfile(
 -          Profile::FromBrowserContext(web_contents->GetBrowserContext()));
--  interceptor->MaybeInterceptWebSignin(web_contents, account_info.account_id,
--                                       signin_metrics::AccessPoint::kWebSignin,
--                                       /*is_new_account=*/true,
--                                       /*is_sync_signin=*/false);
--  interceptor->OnDiceSigninSessionComplete(account_info.account_id, {});
+-  interceptor->MaybeInterceptWebSignin(
+-      web_contents, account_info.GetAccountId(),
+-      signin_metrics::AccessPoint::kWebSignin,
+-      /*is_new_account=*/true,
+-      /*is_chrome_signin=*/false,
+-      /*primary_is_connected=*/signin::Tribool::kUnknown);
+-  interceptor->OnDiceSigninSessionComplete(account_info.GetAccountId(), {});
 -
 -  if (params.expect_bubble_shown) {
 -    // Wait for the interception to be complete.
@@ -521,7 +490,7 @@
 -  }
 -  EXPECT_EQ(
 -      identity_manager->GetPrimaryAccountId(signin::ConsentLevel::kSignin),
--      primary_account_info.account_id);
+-      primary_account_info.GetAccountId());
 -}
 -
 -INSTANTIATE_TEST_SUITE_P(
@@ -536,7 +505,7 @@
                         ForcedEnterpriseInterceptionTestNoForcedInterception) {
 --- a/chrome/browser/signin/dice_web_signin_interceptor_unittest.cc
 +++ b/chrome/browser/signin/dice_web_signin_interceptor_unittest.cc
-@@ -914,11 +914,6 @@
+@@ -972,11 +972,6 @@ TEST_P(DiceWebSigninInterceptorManagedAc
  
  TEST_P(DiceWebSigninInterceptorManagedAccountTest,
         EnforceManagedAccountSecondaryAccountNotAllowed) {
@@ -548,7 +517,7 @@
    AccountInfo primary_account_info =
        identity_test_env()->MakePrimaryAccountAvailable(
            "alice@example.com", signin::ConsentLevel::kSignin);
-@@ -946,11 +941,6 @@
+@@ -1004,11 +999,6 @@ TEST_P(DiceWebSigninInterceptorManagedAc
  
  TEST_P(DiceWebSigninInterceptorManagedAccountTest,
         EnforceManagedAccountSecondaryAccountAllowedReauth) {
@@ -560,7 +529,7 @@
    AccountInfo primary_account_info =
        identity_test_env()->MakePrimaryAccountAvailable(
            "alice@example.com", signin::ConsentLevel::kSignin);
-@@ -966,11 +956,6 @@
+@@ -1025,11 +1015,6 @@ TEST_P(DiceWebSigninInterceptorManagedAc
  
  TEST_P(DiceWebSigninInterceptorManagedAccountTest,
         EnforceManagedAccountSecondaryAccountNotAllowedReauth) {
@@ -572,7 +541,7 @@
    AccountInfo primary_account_info =
        identity_test_env()->MakePrimaryAccountAvailable(
            "alice@example.com", signin::ConsentLevel::kSignin);
-@@ -998,11 +983,6 @@
+@@ -1057,11 +1042,6 @@ TEST_P(DiceWebSigninInterceptorManagedAc
  
  TEST_P(DiceWebSigninInterceptorManagedAccountTest,
         EnforceManagedAccountSecondaryConsumerAccountNotAllowed) {
@@ -584,7 +553,7 @@
    AccountInfo primary_account_info =
        identity_test_env()->MakePrimaryAccountAvailable(
            "alice@example.com", signin::ConsentLevel::kSignin);
-@@ -1030,11 +1010,6 @@
+@@ -1089,11 +1069,6 @@ TEST_P(DiceWebSigninInterceptorManagedAc
  
  TEST_P(DiceWebSigninInterceptorManagedAccountTest,
         EnforceManagedAccountSecondaryAccountAllowed) {
@@ -596,7 +565,7 @@
    AccountInfo primary_account_info =
        identity_test_env()->MakePrimaryAccountAvailable(
            "alice@example.com", signin::ConsentLevel::kSignin);
-@@ -1815,11 +1790,6 @@
+@@ -2007,11 +1982,6 @@ TEST_F(DiceWebSigninInterceptorTest, Wai
  
  TEST_F(DiceWebSigninInterceptorTest,
         ConsumerAccountForcedEnterpriseInterceptionOnEmptyProfile) {
@@ -608,7 +577,7 @@
    base::HistogramTester histogram_tester;
    AccountInfo account_info =
        identity_test_env()->MakeAccountAvailable("alice@gmail.com");
-@@ -1842,11 +1812,6 @@
+@@ -2115,11 +2085,6 @@ TEST_F(
  }
  
  TEST_F(DiceWebSigninInterceptorTest, ConsumerAccountAllowedOnEmptyProfile) {
@@ -620,7 +589,7 @@
    base::HistogramTester histogram_tester;
    AccountInfo account_info =
        identity_test_env()->MakeAccountAvailable("alice@gmail.com");
-@@ -1866,11 +1831,6 @@
+@@ -2139,11 +2104,6 @@ TEST_F(DiceWebSigninInterceptorTest, Con
  
  TEST_F(DiceWebSigninInterceptorTest,
         ConsumerAccountForcedEnterpriseInterceptionOnManagedProfile) {
@@ -634,7 +603,7 @@
        identity_test_env()->MakePrimaryAccountAvailable(
 --- a/chrome/browser/signin/signin_promo_unittest.cc
 +++ b/chrome/browser/signin/signin_promo_unittest.cc
-@@ -643,7 +643,7 @@
+@@ -785,7 +785,7 @@ TEST_F(ShowSigninPromoTestWithFeatureFla
  
  TEST_F(ShowSigninPromoTestWithFeatureFlags,
         RecordSignInPromoShownWithoutAccount) {
@@ -643,7 +612,7 @@
    AccountInfo account =
        MakeAccountAvailable(identity_manager(), "test@email.com");
  
-@@ -691,7 +691,7 @@
+@@ -833,7 +833,7 @@ TEST_F(ShowSigninPromoTestWithFeatureFla
  
  TEST_F(ShowSigninPromoTestWithFeatureFlags,
         RecordSignInPromoShownWithoutAccount_PromoShouldShowForDifferentType) {
@@ -652,7 +621,7 @@
    AccountInfo account =
        MakeAccountAvailable(identity_manager(), "test@email.com");
  
-@@ -732,7 +732,7 @@
+@@ -874,7 +874,7 @@ TEST_F(ShowSigninPromoTestWithFeatureFla
    auto* identity_test_env = identity_test_env_adaptor->identity_test_env();
    identity_test_env->SetTestURLLoaderFactory(&url_loader_factory);
  
@@ -661,7 +630,7 @@
    AccountInfo account = identity_test_env->MakeAccountAvailable(
        identity_test_env->CreateAccountAvailabilityOptionsBuilder()
            .WithCookie(true)
-@@ -791,7 +791,7 @@
+@@ -933,7 +933,7 @@ TEST_F(ShowSigninPromoTestWithFeatureFla
            GetDataTypesForTransportOnlyMode())
        .WillByDefault(testing::Return(syncer::DataTypeSet::All()));
  
@@ -670,7 +639,7 @@
    AccountInfo account = identity_test_env->MakeAccountAvailable(
        identity_test_env->CreateAccountAvailabilityOptionsBuilder()
            .WithCookie(true)
-@@ -846,7 +846,7 @@
+@@ -988,7 +988,7 @@ TEST_F(ShowSigninPromoTestWithFeatureFla
            GetDataTypesForTransportOnlyMode())
        .WillByDefault(testing::Return(syncer::DataTypeSet::All()));
  
@@ -679,7 +648,7 @@
    identity_test_env->MakeAccountAvailable(
        identity_test_env->CreateAccountAvailabilityOptionsBuilder()
            .WithCookie(true)
-@@ -877,7 +877,7 @@
+@@ -1019,7 +1019,7 @@ class ShowSigninPromoTestWithoutPhase2Fo
  
  TEST_F(ShowSigninPromoTestWithoutPhase2FollowUp,
         RecordSignInPromoShownWithoutAccount_BookmarkPromoAlwaysShown) {
@@ -688,7 +657,7 @@
    MakeAccountAvailable(identity_manager(), "test@email.com");
    ASSERT_TRUE(ShouldShowBookmarkSignInPromo(*profile()));
  
-@@ -923,7 +923,7 @@
+@@ -1065,7 +1065,7 @@ TEST_F(ShowSigninPromoTestWithoutPhase2F
            GetDataTypesForTransportOnlyMode())
        .WillByDefault(testing::Return(syncer::DataTypeSet::All()));
  
@@ -697,7 +666,7 @@
    identity_test_env->MakeAccountAvailable(
        identity_test_env->CreateAccountAvailabilityOptionsBuilder()
            .WithCookie(true)
-@@ -952,45 +952,9 @@
+@@ -1094,45 +1094,9 @@ class ShowSigninPromoTestWithFeatureFlag
   private:
    base::test::ScopedFeatureList scoped_feature_list_;
  };
@@ -744,7 +713,7 @@
    AccountInfo account =
        MakeAccountAvailable(identity_manager(), "test@email.com");
  
-@@ -1001,18 +965,6 @@
+@@ -1143,18 +1107,6 @@ TEST_F(ShowSigninPromoTestWithFeatureFla
    RecordSignInPromoShown(signin_metrics::AccessPoint::kBookmarkBubble,
                           profile());
  
@@ -761,9 +730,9 @@
 -      profile()->GetPrefs()->GetInteger(
 -          prefs::kBookmarkSignInPromoShownCountPerProfileForLimitsExperiment));
    EXPECT_EQ(0, SigninPrefs(*profile()->GetPrefs())
-                    .GetPasswordSigninPromoImpressionCount(account.gaia));
+                    .GetPasswordSigninPromoImpressionCount(account.GetGaiaId()));
    EXPECT_EQ(0, SigninPrefs(*profile()->GetPrefs())
-@@ -1046,7 +998,7 @@
+@@ -1188,7 +1140,7 @@ TEST_F(ShowSigninPromoTestWithFeatureFla
    auto* identity_test_env = identity_test_env_adaptor->identity_test_env();
    identity_test_env->SetTestURLLoaderFactory(&url_loader_factory);
  
@@ -772,7 +741,7 @@
    AccountInfo account = identity_test_env->MakeAccountAvailable(
        identity_test_env->CreateAccountAvailabilityOptionsBuilder()
            .WithCookie(true)
-@@ -1059,18 +1011,6 @@
+@@ -1201,18 +1153,6 @@ TEST_F(ShowSigninPromoTestWithFeatureFla
    RecordSignInPromoShown(signin_metrics::AccessPoint::kBookmarkBubble,
                           profile.get());
  
@@ -789,9 +758,9 @@
 -      profile.get()->GetPrefs()->GetInteger(
 -          prefs::kBookmarkSignInPromoShownCountPerProfileForLimitsExperiment));
    EXPECT_EQ(1, SigninPrefs(*profile.get()->GetPrefs())
-                    .GetPasswordSigninPromoImpressionCount(account.gaia));
+                    .GetPasswordSigninPromoImpressionCount(account.GetGaiaId()));
    EXPECT_EQ(1, SigninPrefs(*profile.get()->GetPrefs())
-@@ -1143,27 +1083,6 @@
+@@ -1285,27 +1225,6 @@ TEST_F(ShowSigninPromoTestWithFeatureFla
  
    EXPECT_FALSE(ShouldShowBookmarkSignInPromo(*profile()));
  }
@@ -819,175 +788,59 @@
  TEST_F(ShowSigninPromoTestWithFeatureFlagsPromoLimitsExperiment,
         SearchAIModePromoLimitsDoNotAffectOtherPromos) {
    ASSERT_TRUE(ShouldShowSearchAIModeSignInPromo(*profile()));
-@@ -1268,13 +1187,11 @@
+@@ -1416,10 +1335,9 @@ class AvatarButtonPromoManagerTest : pub
  };
  
  TEST_F(AvatarButtonPromoManagerTest, PromoTypesUseDifferentShownLimits) {
--  std::array<ProfileMenuAvatarButtonPromoInfo::Type, 6> promo_type_list{
+-  std::array<ProfileMenuAvatarButtonPromoInfo::Type, 5> promo_type_list{
 +  std::array<ProfileMenuAvatarButtonPromoInfo::Type, 4> promo_type_list{
        ProfileMenuAvatarButtonPromoInfo::Type::kHistorySyncPromo,
        ProfileMenuAvatarButtonPromoInfo::Type::kBatchUploadPromo,
 -      ProfileMenuAvatarButtonPromoInfo::Type::kBatchUploadBookmarksPromo,
        ProfileMenuAvatarButtonPromoInfo::Type::
            kBatchUploadWindows10DepreciationPromo,
--      ProfileMenuAvatarButtonPromoInfo::Type::kSyncPromo,
        ProfileMenuAvatarButtonPromoInfo::Type::kSigninPromo,
-   };
- 
-@@ -1295,13 +1212,11 @@
+@@ -1444,10 +1362,9 @@ TEST_F(AvatarButtonPromoManagerTest, Pro
  }
  
  TEST_F(AvatarButtonPromoManagerTest, PromoTypesUseDifferentUsedLimits) {
--  std::array<ProfileMenuAvatarButtonPromoInfo::Type, 6> promo_type_list{
+-  std::array<ProfileMenuAvatarButtonPromoInfo::Type, 5> promo_type_list{
 +  std::array<ProfileMenuAvatarButtonPromoInfo::Type, 4> promo_type_list{
        ProfileMenuAvatarButtonPromoInfo::Type::kHistorySyncPromo,
        ProfileMenuAvatarButtonPromoInfo::Type::kBatchUploadPromo,
 -      ProfileMenuAvatarButtonPromoInfo::Type::kBatchUploadBookmarksPromo,
        ProfileMenuAvatarButtonPromoInfo::Type::
            kBatchUploadWindows10DepreciationPromo,
--      ProfileMenuAvatarButtonPromoInfo::Type::kSyncPromo,
        ProfileMenuAvatarButtonPromoInfo::Type::kSigninPromo,
-   };
- 
-@@ -1611,10 +1526,8 @@
+@@ -1806,7 +1723,6 @@ INSTANTIATE_TEST_SUITE_P(
      testing::ValuesIn(
          {ProfileMenuAvatarButtonPromoInfo::Type::kHistorySyncPromo,
           ProfileMenuAvatarButtonPromoInfo::Type::kBatchUploadPromo,
 -         ProfileMenuAvatarButtonPromoInfo::Type::kBatchUploadBookmarksPromo,
           ProfileMenuAvatarButtonPromoInfo::Type::
               kBatchUploadWindows10DepreciationPromo,
--         ProfileMenuAvatarButtonPromoInfo::Type::kSyncPromo,
           ProfileMenuAvatarButtonPromoInfo::Type::kSigninPromo}));
- 
- class ComputeProfileMenuAvatarButtonPromoInfoParamTest
-@@ -1718,17 +1631,6 @@
- 
-     UpdateAccountInfoForAccount(identity_manager, account_info);
- 
--    // This simplifies the setup for tests that expect to show the SyncPromo.
--    if (switches::IsAvatarSyncPromoFeatureEnabled()) {
--      // Simulate setting enough time passing for the cookie change.
--      profile()->GetPrefs()->SetDouble(
--          prefs::kGaiaCookieChangedTime,
--          (base::Time::Now() -
--           (switches::GetAvatarSyncPromoFeatureMinimumCookeAgeParam() +
--            base::Minutes(1)))
--              .InSecondsFSinceUnixEpoch());
--    }
--
-     return account_info;
-   }
- 
-@@ -1778,9 +1680,6 @@
+@@ -1909,9 +1825,6 @@ class ComputeProfileMenuAvatarButtonProm
          break;
        case ProfileMenuAvatarButtonPromoInfo::Type::kBatchUploadBookmarksPromo: {
          AccountInfo primary_account = Signin();
 -        profile()->GetPrefs()->SetString(
 -            prefs::kGoogleServicesLastSyncingGaiaId,
--            primary_account.gaia.ToString());
+-            primary_account.GetGaiaId().ToString());
          batch_upload_test_helper_.SetReturnDescriptions(
              syncer::BOOKMARKS, GetLocalDataCount(promo_type));
          break;
-@@ -1896,10 +1795,8 @@
+@@ -2215,7 +2128,6 @@ INSTANTIATE_TEST_SUITE_P(
      testing::ValuesIn(
          {ProfileMenuAvatarButtonPromoInfo::Type::kHistorySyncPromo,
           ProfileMenuAvatarButtonPromoInfo::Type::kBatchUploadPromo,
 -         ProfileMenuAvatarButtonPromoInfo::Type::kBatchUploadBookmarksPromo,
           ProfileMenuAvatarButtonPromoInfo::Type::
               kBatchUploadWindows10DepreciationPromo,
--         ProfileMenuAvatarButtonPromoInfo::Type::kSyncPromo,
           ProfileMenuAvatarButtonPromoInfo::Type::kSigninPromo}));
- 
- #endif  // BUILDFLAG(ENABLE_DICE_SUPPORT)
---- a/chrome/browser/signin/signin_util_unittest.cc
-+++ b/chrome/browser/signin/signin_util_unittest.cc
-@@ -422,21 +422,6 @@
-         /*sync_everything=*/false, syncer::UserSelectableTypeSet());
-   }
- 
--  void SetupForAvatarSyncPromo(bool managed_account = false) {
--    SignInAndSetUpSyncService(managed_account);
--    DisableAllSyncedDataTypes();
--
--    // Simulate setting enough time passing for the cookie change.
--    profile()->GetPrefs()->SetDouble(
--        prefs::kGaiaCookieChangedTime,
--        (base::Time::Now() -
--         (switches::GetAvatarSyncPromoFeatureMinimumCookeAgeParam() +
--          base::Minutes(1)))
--            .InSecondsFSinceUnixEpoch());
--
--    // The rest of the setup should be aligned with the default profile
--    // initialization/signin.
--  }
- 
-  private:
-   // Use this flag to simplify test writing and not restrict to Windows only.
-@@ -620,61 +605,6 @@
-   EXPECT_TRUE(test_sync_service()->GetUserSettings()->GetSelectedTypes().Has(
-       syncer::UserSelectableType::kSavedTabGroups));
- }
--
--TEST_F(SigninUtilHistorySyncOptinTest, ShouldShowAvatarSyncPromo) {
--  SetupForAvatarSyncPromo();
--  EXPECT_TRUE(signin_util::ShouldShowAvatarSyncPromo(profile()));
--}
--
--TEST_F(SigninUtilHistorySyncOptinTest,
--       ShouldNotShowAvatarSyncPromoManagedAccounts) {
--  SetupForAvatarSyncPromo(/*managed_account*/ true);
--  EXPECT_FALSE(signin_util::ShouldShowAvatarSyncPromo(profile()));
--}
--
--TEST_F(SigninUtilHistorySyncOptinTest,
--       ShouldShowAvatarSyncPromoBasedOnProfleAlreadySyncing) {
--  SetupForAvatarSyncPromo();
--  ASSERT_TRUE(signin_util::ShouldShowAvatarSyncPromo(profile()));
--
--  // Promo should not show if the previously syncing gaia id is different than
--  // the current signed in one.
--  const GaiaId previously_syncing_gaia_id("syncing_gaia_id");
--  ASSERT_NE(previously_syncing_gaia_id, kSignedInGaiaId);
--  profile()->GetPrefs()->SetString(prefs::kGoogleServicesLastSyncingGaiaId,
--                                   previously_syncing_gaia_id.ToString());
--  EXPECT_FALSE(signin_util::ShouldShowAvatarSyncPromo(profile()));
--
--  // Promo can show if the gaia id match.
--  profile()->GetPrefs()->SetString(prefs::kGoogleServicesLastSyncingGaiaId,
--                                   kSignedInGaiaId.ToString());
--  EXPECT_TRUE(signin_util::ShouldShowAvatarSyncPromo(profile()));
--}
--
--TEST_F(SigninUtilHistorySyncOptinTest,
--       ShouldShowAvatarSyncPromoBasedOnGaiaCookieAge) {
--  SetupForAvatarSyncPromo();
--  ASSERT_TRUE(signin_util::ShouldShowAvatarSyncPromo(profile()));
--
--  // Promo should not show if the gaia cookie age is too short.
--  profile()->GetPrefs()->SetDouble(
--      prefs::kGaiaCookieChangedTime,
--      (base::Time::Now() -
--       (switches::GetAvatarSyncPromoFeatureMinimumCookeAgeParam() -
--        base::Minutes(1)))
--          .InSecondsFSinceUnixEpoch());
--  EXPECT_FALSE(signin_util::ShouldShowAvatarSyncPromo(profile()));
--
--  // Promo can show if the gaia cookie age is long enough.
--  profile()->GetPrefs()->SetDouble(
--      prefs::kGaiaCookieChangedTime,
--      (base::Time::Now() -
--       (switches::GetAvatarSyncPromoFeatureMinimumCookeAgeParam() +
--        base::Minutes(1)))
--          .InSecondsFSinceUnixEpoch());
--  EXPECT_TRUE(signin_util::ShouldShowAvatarSyncPromo(profile()));
--}
--
- class SigninUtilHistorySyncOptinForManagedSettingsTest
-     : public SigninUtilHistorySyncOptinTest,
-       public testing::WithParamInterface<syncer::UserSelectableType> {};
 --- a/chrome/browser/ui/signin/BUILD.gn
 +++ b/chrome/browser/ui/signin/BUILD.gn
-@@ -231,7 +231,6 @@
+@@ -252,7 +252,6 @@ if (!is_android) {
  
      if (enable_dice_support) {
        sources += [
@@ -997,57 +850,35 @@
          "signin_view_controller_browsertest.cc",
 --- a/chrome/browser/ui/views/profiles/avatar_toolbar_button_browsertest.cc
 +++ b/chrome/browser/ui/views/profiles/avatar_toolbar_button_browsertest.cc
-@@ -467,17 +467,6 @@
-     AccountInfo account_info = MakePrimaryAccountAvailableWithName(
-         signin::ConsentLevel::kSignin, email, name);
- 
--    // This simplifies the setup for tests that expect to show the SyncPromo.
--    if (switches::IsAvatarSyncPromoFeatureEnabled()) {
--      // Simulate setting enough time passing for the cookie change.
--      GetBrowser()->GetProfile()->GetPrefs()->SetDouble(
--          prefs::kGaiaCookieChangedTime,
--          (base::Time::Now() -
--           (switches::GetAvatarSyncPromoFeatureMinimumCookeAgeParam() +
--            base::Minutes(1)))
--              .InSecondsFSinceUnixEpoch());
--    }
--
-     return account_info;
-   }
- 
-@@ -835,9 +824,6 @@
+@@ -822,9 +822,6 @@ class AvatarToolbarButtonInterfaceBaseBr
                  GetIdentityManager()->GetPrimaryAccountInfo(
                      signin::ConsentLevel::kSignin));
          CHECK(!primary_account.IsEmpty());
--        GetBrowser()->profile()->GetPrefs()->SetString(
+-        GetBrowser()->GetProfile()->GetPrefs()->SetString(
 -            prefs::kGoogleServicesLastSyncingGaiaId,
--            primary_account.gaia.ToString());
+-            primary_account.GetGaiaId().ToString());
          break;
        }
        case signin::ProfileMenuAvatarButtonPromoInfo::Type::
-@@ -2295,10 +2281,7 @@
-     ,
-     MAYBE_AvatarToolbarButtonPromoBrowserTest,
+@@ -2198,8 +2195,6 @@ INSTANTIATE_TEST_SUITE_P(
      ValuesIn({signin::ProfileMenuAvatarButtonPromoInfo::Type::kHistorySyncPromo,
--              signin::ProfileMenuAvatarButtonPromoInfo::Type::kSyncPromo,
                signin::ProfileMenuAvatarButtonPromoInfo::Type::kBatchUploadPromo,
--              signin::ProfileMenuAvatarButtonPromoInfo::Type::
--                  kBatchUploadBookmarksPromo,
                signin::ProfileMenuAvatarButtonPromoInfo::Type::
+-                  kBatchUploadBookmarksPromo,
+-              signin::ProfileMenuAvatarButtonPromoInfo::Type::
                    kBatchUploadWindows10DepreciationPromo}));
  
-@@ -2539,10 +2522,7 @@
-     ,
-     MAYBE_AvatarToolbarButtonPromoClickBrowserTest,
+ // TODO(crbug.com/331746545): Check the flaky test suite issue on Windows.
+@@ -2520,8 +2515,6 @@ INSTANTIATE_TEST_SUITE_P(
      ValuesIn({signin::ProfileMenuAvatarButtonPromoInfo::Type::kHistorySyncPromo,
--              signin::ProfileMenuAvatarButtonPromoInfo::Type::kSyncPromo,
                signin::ProfileMenuAvatarButtonPromoInfo::Type::kBatchUploadPromo,
--              signin::ProfileMenuAvatarButtonPromoInfo::Type::
--                  kBatchUploadBookmarksPromo,
                signin::ProfileMenuAvatarButtonPromoInfo::Type::
+-                  kBatchUploadBookmarksPromo,
+-              signin::ProfileMenuAvatarButtonPromoInfo::Type::
                    kBatchUploadWindows10DepreciationPromo}));
  
-@@ -3780,32 +3760,8 @@
+ // TODO(crbug.com/331746545): Check flaky test issue on windows.
+@@ -3762,32 +3755,8 @@ class AvatarToolbarButtonSignInBenefitsI
    base::test::ScopedFeatureList feature_list_;
  };
  
@@ -1056,7 +887,7 @@
 -  // Sign in a user before the sync-to-signin migration.
 -  Signin(/*email=*/u"test@gmail.com", /*name=*/u"Account");
 -
--  PrefService* prefs = browser()->profile()->GetPrefs();
+-  PrefService* prefs = browser()->GetProfile()->GetPrefs();
 -  ASSERT_FALSE(
 -      prefs->GetBoolean(prefs::kPrimaryAccountSetAfterSigninMigration));
 -}
@@ -1080,7 +911,7 @@
  // Tests that the IPH bubble for signin benefits is not shown for users who have
  // signed in after the sync-to-signin migration.
  IN_PROC_BROWSER_TEST_F(AvatarToolbarButtonSignInBenefitsIphBrowserTest,
-@@ -3822,32 +3778,8 @@
+@@ -3804,32 +3773,8 @@ IN_PROC_BROWSER_TEST_F(AvatarToolbarButt
    EXPECT_FALSE(WillShowPromo());
  }
  
@@ -1089,7 +920,7 @@
 -  // Sign in a user before the sync-to-signin migration.
 -  Signin(/*email=*/u"test@gmail.com", /*name=*/u"Account");
 -
--  PrefService* prefs = browser()->profile()->GetPrefs();
+-  PrefService* prefs = browser()->GetProfile()->GetPrefs();
 -  ASSERT_FALSE(
 -      prefs->GetBoolean(prefs::kPrimaryAccountSetAfterSigninMigration));
 -
@@ -1115,7 +946,7 @@
            AvatarToolbarButtonBrowserTestBase> {
 --- a/chrome/browser/ui/views/profiles/profile_picker_view_browsertest.cc
 +++ b/chrome/browser/ui/views/profiles/profile_picker_view_browsertest.cc
-@@ -1954,60 +1954,6 @@
+@@ -1913,60 +1913,6 @@ IN_PROC_BROWSER_TEST_P(ForceSigninProfil
    }));
  }
  
@@ -1178,7 +1009,7 @@
  
 --- a/chrome/browser/ui/webui/settings/people_handler_unittest.cc
 +++ b/chrome/browser/ui/webui/settings/people_handler_unittest.cc
-@@ -479,10 +479,6 @@
+@@ -483,10 +483,6 @@ class PeopleHandlerTest
                  .empty();
    }
  
@@ -1189,7 +1020,7 @@
    void TriggerPrimaryAccountInPersistentError() {
      ASSERT_TRUE(identity_manager()->HasPrimaryAccount(ConsentLevel::kSignin));
  
-@@ -1330,7 +1326,6 @@
+@@ -1456,7 +1452,6 @@ TEST_F(PeopleHandlerTest,
    const std::string email("user@gmail.com");
    identity_test_env()->MakePrimaryAccountAvailable(email,
                                                     ConsentLevel::kSignin);
@@ -1197,7 +1028,7 @@
  
    CreatePeopleHandler();
  
-@@ -1353,7 +1348,6 @@
+@@ -1479,7 +1474,6 @@ TEST_F(PeopleHandlerTest, ChromeSigninUs
    const std::string email("user@gmail.com");
    AccountInfo account_info = identity_test_env()->MakePrimaryAccountAvailable(
        email, ConsentLevel::kSignin);
@@ -1205,7 +1036,7 @@
  
    CreatePeopleHandler();
  
-@@ -1476,7 +1470,6 @@
+@@ -1602,7 +1596,6 @@ TEST(PeopleHandlerWebOnlySigninTest, Chr
  TEST_F(PeopleHandlerTest, SigninPendingThenSignout) {
    identity_test_env()->MakePrimaryAccountAvailable(kTestUser,
                                                     ConsentLevel::kSignin);
@@ -1213,7 +1044,7 @@
    CreatePeopleHandler();
  
    ASSERT_FALSE(HasSyncStatusUpdateChangedEvent());
-@@ -1522,7 +1515,6 @@
+@@ -1648,7 +1641,6 @@ TEST_F(PeopleHandlerTest, SigninPendingT
  TEST_F(PeopleHandlerTest, SigninPendingThenReauth) {
    identity_test_env()->MakePrimaryAccountAvailable(kTestUser,
                                                     ConsentLevel::kSignin);
@@ -1221,7 +1052,7 @@
    CreatePeopleHandler();
  
    ASSERT_FALSE(HasSyncStatusUpdateChangedEvent());
-@@ -1574,7 +1566,6 @@
+@@ -1700,7 +1692,6 @@ TEST_F(PeopleHandlerTest, HandleStartSig
    const char kManagedEmail[] = "user@managedchrome.com";
    AccountInfo account = identity_test_env()->MakePrimaryAccountAvailable(
        kManagedEmail, ConsentLevel::kSignin);
@@ -1257,7 +1088,7 @@
  #include "content/public/test/browser_task_environment.h"
  #include "google_apis/gaia/gaia_id.h"
  #include "testing/gtest/include/gtest/gtest.h"
-@@ -31,165 +24,23 @@
+@@ -31,178 +24,23 @@ class CanOfferSigninTest : public testin
    }
  
    Profile* profile() { return profile_; }
@@ -1290,41 +1121,32 @@
 -                     /*allow_account_from_other_profile=*/false);
 -  EXPECT_FALSE(error.IsOk());
 -  EXPECT_EQ(error, SigninUIError::NoProfile("user@gmail.com"));
-+TEST_F(CanOfferSigninTest, IsDisallowedWithoutProfile) {
-+  const std::string email = "user@gmail.com";
-+  EXPECT_EQ(SigninUIError::SigninDisallowed(email),
-+            CanOfferSignin(nullptr, GaiaId("12345"), email,
-+                           /*allow_account_from_other_profile=*/false));
- }
- 
+-}
+-
 -TEST_F(CanOfferSigninTest, Default) {
 -  EXPECT_TRUE(CanOfferSignin(profile(), GaiaId("12345"), "user@gmail.com",
 -                             /*allow_account_from_other_profile=*/false)
 -                  .IsOk());
-+TEST_F(CanOfferSigninTest, IsDisallowedWithProfile) {
-+  const std::string email = "user@gmail.com";
-+  EXPECT_EQ(SigninUIError::SigninDisallowed(email),
-+            CanOfferSignin(profile(), GaiaId("12345"), email,
-+                           /*allow_account_from_other_profile=*/false));
- }
+-}
 -
 -TEST_F(CanOfferSigninTest, ProfileConnected) {
 -  const AccountInfo account_info = signin::MakePrimaryAccountAvailable(
 -      IdentityManagerFactory::GetForProfile(profile()), "foo@gmail.com",
 -      signin::ConsentLevel::kSync);
 -
--  EXPECT_TRUE(CanOfferSignin(profile(), account_info.gaia, account_info.email,
+-  EXPECT_TRUE(CanOfferSignin(profile(), account_info.GetGaiaId(),
+-                             std::string(account_info.GetEmail()),
 -                             /*allow_account_from_other_profile=*/false)
 -                  .IsOk());
--  EXPECT_TRUE(CanOfferSignin(profile(), account_info.gaia, "foo",
+-  EXPECT_TRUE(CanOfferSignin(profile(), account_info.GetGaiaId(), "foo",
 -                             /*allow_account_from_other_profile=*/false)
 -                  .IsOk());
 -  SigninUIError error =
--      CanOfferSignin(profile(), account_info.gaia, "user@gmail.com",
+-      CanOfferSignin(profile(), account_info.GetGaiaId(), "user@gmail.com",
 -                     /*allow_account_from_other_profile=*/false);
 -  EXPECT_FALSE(error.IsOk());
--  EXPECT_EQ(error, SigninUIError::WrongReauthAccount("user@gmail.com",
--                                                     account_info.email));
+-  EXPECT_EQ(error, SigninUIError::WrongReauthAccount(
+-                       "user@gmail.com", std::string(account_info.GetEmail())));
 -}
 -
 -TEST_F(CanOfferSigninTest, UsernameNotAllowed) {
@@ -1346,8 +1168,13 @@
 -                     /*allow_account_from_other_profile=*/false);
 -  EXPECT_FALSE(error.IsOk());
 -  EXPECT_EQ(error, SigninUIError::SigninCookiesDisallowed("user@gmail.com"));
--}
--
++TEST_F(CanOfferSigninTest, IsDisallowedWithoutProfile) {
++  const std::string email = "user@gmail.com";
++  EXPECT_EQ(SigninUIError::SigninDisallowed(email),
++            CanOfferSignin(nullptr, GaiaId("12345"), email,
++                           /*allow_account_from_other_profile=*/false));
+ }
+ 
 -// Tests that cookie errors have lower priority than other errors.
 -TEST_F(CanOfferSigninTest, UsernameNotAllowedAndNoSigninCookies) {
 -  // Set a cookie error.
@@ -1366,7 +1193,12 @@
 -  EXPECT_FALSE(error.IsOk());
 -  EXPECT_EQ(error, SigninUIError::UsernameNotAllowedByPatternFromPrefs(
 -                       "foo@gmail.com"));
--}
++TEST_F(CanOfferSigninTest, IsDisallowedWithProfile) {
++  const std::string email = "user@gmail.com";
++  EXPECT_EQ(SigninUIError::SigninDisallowed(email),
++            CanOfferSignin(profile(), GaiaId("12345"), email,
++                           /*allow_account_from_other_profile=*/false));
+ }
 -
 -class CanOfferSigninWithSigninToSyncFeatureTest
 -    : public base::test::WithFeatureOverride,
@@ -1374,7 +1206,14 @@
 - public:
 -  CanOfferSigninWithSigninToSyncFeatureTest()
 -      : base::test::WithFeatureOverride(
--            syncer::kReplaceSyncPromosWithSignInPromos) {}
+-            syncer::kReplaceSyncPromosWithSignInPromos) {
+-    scoped_feature_list_.InitWithFeatureState(
+-        syncer::kReplaceSyncPromosWithSigninPromosNewSignin,
+-        IsParamFeatureEnabled());
+-  }
+-
+- private:
+-  base::test::ScopedFeatureList scoped_feature_list_;
 -};
 -
 -TEST_P(CanOfferSigninWithSigninToSyncFeatureTest,
@@ -1384,12 +1223,14 @@
 -      signin::ConsentLevel::kSync);
 -
 -  Profile* second_profile = CreateTestingProfile("second");
--  SigninUIError error = CanOfferSignin(
--      second_profile, first_account_info.gaia, first_account_info.email,
--      /*allow_account_from_other_profile=*/false);
+-  SigninUIError error =
+-      CanOfferSignin(second_profile, first_account_info.GetGaiaId(),
+-                     std::string(first_account_info.GetEmail()),
+-                     /*allow_account_from_other_profile=*/false);
 -  EXPECT_FALSE(error.IsOk());
 -  EXPECT_EQ(error, SigninUIError::AccountAlreadyUsedByAnotherProfile(
--                       first_account_info.email, profile()->GetPath()));
+-                       std::string(first_account_info.GetEmail()),
+-                       profile()->GetPath()));
 -}
 -
 -TEST_P(CanOfferSigninWithSigninToSyncFeatureTest,
@@ -1402,9 +1243,10 @@
 -      signin::ConsentLevel::kSync);
 -
 -  Profile* second_profile = CreateTestingProfile("second");
--  SigninUIError error = CanOfferSignin(
--      second_profile, first_account_info.gaia, first_account_info.email,
--      /*allow_account_from_other_profile=*/false);
+-  SigninUIError error =
+-      CanOfferSignin(second_profile, first_account_info.GetGaiaId(),
+-                     std::string(first_account_info.GetEmail()),
+-                     /*allow_account_from_other_profile=*/false);
 -  EXPECT_TRUE(error.IsOk());
 -}
 -
@@ -1415,19 +1257,21 @@
 -      signin::ConsentLevel::kSignin);
 -
 -  Profile* second_profile = CreateTestingProfile("second");
--  SigninUIError error = CanOfferSignin(
--      second_profile, first_account_info.gaia, first_account_info.email,
--      /*allow_account_from_other_profile=*/false);
+-  SigninUIError error =
+-      CanOfferSignin(second_profile, first_account_info.GetGaiaId(),
+-                     std::string(first_account_info.GetEmail()),
+-                     /*allow_account_from_other_profile=*/false);
 -  if (IsParamFeatureEnabled()) {
 -    EXPECT_FALSE(error.IsOk());
 -    EXPECT_EQ(error, SigninUIError::AccountAlreadyUsedByAnotherProfile(
--                         first_account_info.email, profile()->GetPath()));
+-                         std::string(first_account_info.GetEmail()),
+-                         profile()->GetPath()));
 -  } else {
 -    EXPECT_TRUE(error.IsOk());
 -  }
 -
--  EXPECT_TRUE(CanOfferSignin(second_profile, first_account_info.gaia,
--                             first_account_info.email,
+-  EXPECT_TRUE(CanOfferSignin(second_profile, first_account_info.GetGaiaId(),
+-                             std::string(first_account_info.GetEmail()),
 -                             /*allow_account_from_other_profile=*/true)
 -                  .IsOk());
 -}

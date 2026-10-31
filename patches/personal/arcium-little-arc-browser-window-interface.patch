@@ -1,0 +1,254 @@
+Index: src/chrome/browser/ui/helium/helium_little_arc.cc
+===================================================================
+--- src.orig/chrome/browser/ui/helium/helium_little_arc.cc
++++ src/chrome/browser/ui/helium/helium_little_arc.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/helium/helium_little_arc.h"
+ 
++#include "chrome/browser/ui/browser_window/public/create_browser_window.h"
++
+ #include <algorithm>
+ #include <vector>
+ 
+@@ -54,14 +56,14 @@ class LittleArcTracker {
+     return *instance;
+   }
+ 
+-  void Mark(Browser* browser) {
++  void Mark(BrowserWindowInterface* browser) {
+     Prune();
+-    browsers_.push_back(browser->AsWeakPtr());
++    browsers_.push_back(browser->GetWeakPtr());
+   }
+ 
+-  bool Contains(const Browser* browser) {
++  bool Contains(const BrowserWindowInterface* browser) {
+     Prune();
+-    for (const base::WeakPtr<Browser>& weak : browsers_) {
++    for (const base::WeakPtr<BrowserWindowInterface>& weak : browsers_) {
+       if (weak.get() == browser) {
+         return true;
+       }
+@@ -76,10 +78,10 @@ class LittleArcTracker {
+ 
+   void Prune() {
+     std::erase_if(browsers_,
+-                  [](const base::WeakPtr<Browser>& weak) { return !weak; });
++                  [](const base::WeakPtr<BrowserWindowInterface>& weak) { return !weak; });
+   }
+ 
+-  std::vector<base::WeakPtr<Browser>> browsers_;
++  std::vector<base::WeakPtr<BrowserWindowInterface>> browsers_;
+ };
+ 
+ gfx::Rect CalculateLittleArcBounds() {
+@@ -100,14 +102,14 @@ gfx::Rect CalculateLittleArcBounds() {
+                    height);
+ }
+ 
+-Browser* FindPromotionTarget(Profile* profile, Browser* source) {
+-  Browser* target = nullptr;
++BrowserWindowInterface* FindPromotionTarget(Profile* profile, BrowserWindowInterface* source) {
++  BrowserWindowInterface* target = nullptr;
+   HeliumSpaceService* space_service =
+       HeliumSpaceServiceFactory::GetForProfile(profile);
+   ProfileBrowserCollection::GetForProfile(profile)->ForEach(
+       [&, space_service](BrowserWindowInterface* window) {
+-        Browser* candidate = window->GetBrowserForMigrationOnly();
+-        if (candidate == source || !candidate->is_type_normal()) {
++        BrowserWindowInterface* candidate = window;
++        if (candidate == source || (candidate->GetType() != BrowserWindowInterface::TYPE_NORMAL)) {
+           return true;
+         }
+         if (space_service &&
+@@ -127,24 +129,27 @@ Browser* FindPromotionTarget(Profile* pr
+     HeliumSpace* active_space = space_service->GetActiveSpace();
+     BrowserWindowInterface* window =
+         active_space ? active_space->ActivateOrCreatePrimaryWindow() : nullptr;
+-    return window ? window->GetBrowserForMigrationOnly() : nullptr;
++    return window;
+   }
+ 
+   if (BrowserWindowInterface* tabbed =
+           ProfileBrowserCollection::GetForProfile(profile)
+               ->FindTabbedBrowser()) {
+-    return tabbed->GetBrowserForMigrationOnly();
++    return tabbed;
+   }
+ 
+-  if (Browser::GetCreationStatusForProfile(profile) !=
+-      Browser::CreationStatus::kOk) {
++  if (GetBrowserWindowCreationStatusForProfile(*profile) !=
++      BrowserWindowInterface::CreationStatus::kOk) {
+     return nullptr;
+   }
+ 
+-  Browser::CreateParams params(Browser::TYPE_NORMAL, profile, true);
++  BrowserWindowCreateParams params(BrowserWindowInterface::TYPE_NORMAL, profile, true);
+   params.should_trigger_session_restore = false;
+-  Browser* created = Browser::Create(params);
+-  created->window()->Show();
++  BrowserWindowInterface* created = CreateBrowserWindow(std::move(params));
++  if (!created) {
++    return nullptr;
++  }
++  created->GetWindow()->Show();
+   return created;
+ }
+ 
+@@ -169,32 +174,32 @@ bool ShouldOpenExternalLinksInLittleArc(
+   return prefs && prefs->GetBoolean(prefs::kHeliumLittleArcExternalLinks);
+ }
+ 
+-bool IsLittleArcBrowser(const Browser* browser) {
++bool IsLittleArcBrowser(const BrowserWindowInterface* browser) {
+   return browser && LittleArcTracker::GetInstance().Contains(browser);
+ }
+ 
+ bool CanOpenUrlInLittleArc(Profile* profile, const GURL& url) {
+   return profile && url.is_valid() && url.SchemeIsHTTPOrHTTPS() &&
+-         Browser::GetCreationStatusForProfile(profile) ==
+-             Browser::CreationStatus::kOk;
++         GetBrowserWindowCreationStatusForProfile(*profile) ==
++             BrowserWindowInterface::CreationStatus::kOk;
+ }
+ 
+-Browser* OpenUrlInLittleArc(Profile* profile,
++BrowserWindowInterface* OpenUrlInLittleArc(Profile* profile,
+                             const content::OpenURLParams& open_url_params) {
+   if (!CanOpenUrlInLittleArc(profile, open_url_params.url)) {
+     return nullptr;
+   }
+ 
+-  Browser::CreateParams params(Browser::TYPE_POPUP, profile, true);
++  BrowserWindowCreateParams params(BrowserWindowInterface::TYPE_POPUP, profile, true);
+   params.omit_from_session_restore = true;
+   params.should_trigger_session_restore = false;
+   params.initial_bounds = CalculateLittleArcBounds();
+-  params.initial_origin_specified = Browser::ValueSpecified::kSpecified;
++  params.initial_origin_specified = BrowserWindowCreateParams::ValueSpecified::kSpecified;
+   params.initial_show_state = ui::mojom::WindowShowState::kNormal;
+   params.can_maximize = true;
+   params.can_fullscreen = true;
+ 
+-  Browser* browser = Browser::Create(params);
++  BrowserWindowInterface* browser = CreateBrowserWindow(std::move(params));
+   if (!browser) {
+     return nullptr;
+   }
+@@ -207,10 +212,10 @@ Browser* OpenUrlInLittleArc(Profile* pro
+   base::WeakPtr<content::NavigationHandle> navigation = Navigate(&nav);
+   content::WebContents* contents = nav.navigated_or_inserted_contents;
+   if (!navigation || !contents || !nav.browser ||
+-      nav.browser->GetBrowserForMigrationOnly() != browser ||
+-      browser->tab_strip_model()->GetIndexOfWebContents(contents) ==
++      nav.browser != browser ||
++      browser->GetTabStripModel()->GetIndexOfWebContents(contents) ==
+           TabStripModel::kNoTab) {
+-    browser->window()->Close();
++    browser->GetWindow()->Close();
+     return nullptr;
+   }
+ 
+@@ -221,11 +226,11 @@ Browser* OpenUrlInLittleArc(Profile* pro
+       toolbar->AddLittleArcOpenInTabButton();
+     }
+   }
+-  browser->window()->Show();
++  browser->GetWindow()->Show();
+   return browser;
+ }
+ 
+-Browser* OpenUrlsInLittleArc(Profile* profile, const std::vector<GURL>& urls) {
++BrowserWindowInterface* OpenUrlsInLittleArc(Profile* profile, const std::vector<GURL>& urls) {
+   if (urls.size() != 1u) {
+     return nullptr;
+   }
+@@ -236,29 +241,29 @@ Browser* OpenUrlsInLittleArc(Profile* pr
+   return OpenUrlInLittleArc(profile, params);
+ }
+ 
+-bool PromoteLittleArcToTab(Browser* browser) {
++bool PromoteLittleArcToTab(BrowserWindowInterface* browser) {
+   if (!IsLittleArcBrowser(browser)) {
+     return false;
+   }
+ 
+-  TabStripModel* model = browser->tab_strip_model();
++  TabStripModel* model = browser->GetTabStripModel();
+   if (!model || model->empty()) {
+-    browser->window()->Close();
++    browser->GetWindow()->Close();
+     return true;
+   }
+ 
+-  Browser* target = FindPromotionTarget(browser->profile(), browser);
++  BrowserWindowInterface* target = FindPromotionTarget(browser->GetProfile(), browser);
+   if (!target) {
+     return false;
+   }
+ 
+-  TabStripModel* target_model = target->tab_strip_model();
++  TabStripModel* target_model = target->GetTabStripModel();
+   content::WebContents* disposable_ntp = nullptr;
+   if (target_model && target_model->count() == 1) {
+     content::WebContents* contents = target_model->GetActiveWebContents();
+     if (contents && !contents->GetController().CanGoBack() &&
+         search::IsNTPOrRelatedURL(contents->GetLastCommittedURL(),
+-                                  target->profile())) {
++                                  target->GetProfile())) {
+       disposable_ntp = contents;
+     }
+   }
+@@ -274,7 +279,7 @@ bool PromoteLittleArcToTab(Browser* brow
+       target_model->CloseWebContentsAt(ntp_index, TabCloseTypes::CLOSE_NONE);
+     }
+   }
+-  target->window()->Show();
++  target->GetWindow()->Show();
+   return true;
+ }
+ 
+Index: src/chrome/browser/ui/helium/helium_little_arc.h
+===================================================================
+--- src.orig/chrome/browser/ui/helium/helium_little_arc.h
++++ src/chrome/browser/ui/helium/helium_little_arc.h
+@@ -7,7 +7,7 @@
+ 
+ #include <vector>
+ 
+-class Browser;
++class BrowserWindowInterface;
+ class GURL;
+ class Profile;
+ 
+@@ -24,7 +24,7 @@ void InitializeLittleArc();
+ // left alone. ⌘O promotes the peek into a normal tab.
+ bool ShouldOpenExternalLinksInLittleArc(Profile* profile);
+ 
+-bool IsLittleArcBrowser(const Browser* browser);
++bool IsLittleArcBrowser(const BrowserWindowInterface* browser);
+ 
+ // Returns true when |profile| may create a Little Arc popup for |url|. The
+ // exact profile, including an off-the-record profile, owns the new popup.
+@@ -32,16 +32,16 @@ bool CanOpenUrlInLittleArc(Profile* prof
+ 
+ // Opens |urls| in a new Little Arc popup for |profile|. Returns the popup, or
+ // nullptr if creation failed.
+-Browser* OpenUrlsInLittleArc(Profile* profile, const std::vector<GURL>& urls);
++BrowserWindowInterface* OpenUrlsInLittleArc(Profile* profile, const std::vector<GURL>& urls);
+ 
+ // Opens one link while retaining Chromium's referrer, initiator, and context
+ // menu navigation state.
+-Browser* OpenUrlInLittleArc(Profile* profile,
++BrowserWindowInterface* OpenUrlInLittleArc(Profile* profile,
+                             const content::OpenURLParams& params);
+ 
+ // Moves the Little Arc contents into the profile's last tabbed window and
+ // closes the popup. Returns false if |browser| is not a Little Arc window.
+-bool PromoteLittleArcToTab(Browser* browser);
++bool PromoteLittleArcToTab(BrowserWindowInterface* browser);
+ 
+ }  // namespace helium
+ 

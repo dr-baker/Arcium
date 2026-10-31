@@ -12,16 +12,32 @@ Index: src/components/helium_onboarding/helium_onboarding_strings.grdp
  <message name="IDS_HELIUM_ONBOARDING_BUTTON_LETS_GO" desc="Button label that finishes onboarding and opens the browser.">
    Let's go!
  </message>
-@@ -168,7 +171,7 @@
-   Take your stuff with you
+@@ -168,13 +171,13 @@
+   Import from other browsers
  </message>
  <message name="IDS_HELIUM_ONBOARDING_DATA_IMPORT_SUBTITLE" desc="Subtitle of the onboarding screen for importing browser data.">
--  Transfer your most important bookmarks, history, and extensions from other browsers.
+-  Transfer your bookmarks, history, and extensions from other browsers.
 +  Bring bookmarks and history from other browsers. Arc's sidebar comes over as Spaces and Pins.
+ </message>
+ <message name="IDS_HELIUM_ONBOARDING_DATA_IMPORT_PROMPT_TITLE" desc="Title of the prompt asking to look for other browsers before showing import options.">
+   Find browsers to import from
+ </message>
+ <message name="IDS_HELIUM_ONBOARDING_DATA_IMPORT_PROMPT_PERMISSION" desc="Explanation asking for permission to look for other browsers before choosing data to import.">
+-  Allow Helium to look for other browsers on this device so you can choose what to transfer.
++  Allow Arcium to look for other browsers on this device so you can choose what to transfer.
+ </message>
+ <message name="IDS_HELIUM_ONBOARDING_DATA_IMPORT_ALLOW" desc="Button that allows Helium to look for browsers to import data from.">
+   Allow
+@@ -192,7 +195,7 @@
+   Don't see your previous browser?
+ </message>
+ <message name="IDS_HELIUM_ONBOARDING_DATA_IMPORT_MAC_NOTICE_BODY" desc="Explanation of macOS browser detection permissions. Keep the BEGIN/END placeholder pair around the System Settings link, but move it as needed for a natural translation.">
+-  macOS protects some browsers from being automatically detected. To see more options, allow Helium to access them in <ph name="BEGIN_LINK_SETTINGS">$1</ph>System Settings<ph name="END_LINK_SETTINGS">$2</ph>.
++  macOS protects some browsers from being automatically detected. To see more options, allow Arcium to access them in <ph name="BEGIN_LINK_SETTINGS">$1</ph>System Settings<ph name="END_LINK_SETTINGS">$2</ph>.
  </message>
  <message name="IDS_HELIUM_ONBOARDING_DATA_IMPORT_BOOKMARKS" desc="Label for bookmarks as an importable data type.">
    Bookmarks
-@@ -179,6 +182,12 @@
+@@ -203,6 +206,12 @@
  <message name="IDS_HELIUM_ONBOARDING_DATA_IMPORT_EXTENSIONS" desc="Label for extensions as an importable data type.">
    Extensions
  </message>
@@ -38,22 +54,7 @@ Index: src/components/helium_onboarding/src/components/PageNavigation.svelte
 ===================================================================
 --- src.orig/components/helium_onboarding/src/components/PageNavigation.svelte
 +++ src/components/helium_onboarding/src/components/PageNavigation.svelte
-@@ -7,7 +7,13 @@
-     } from "@imput/helium-prism";
-     import { s } from "../lib/strings";
-     import { SvelteSet } from "svelte/reactivity";
--    import { acceptLatestSchema, askToBeDefault, importProfile, setPref } from "../lib/browser";
-+    import {
-+        acceptLatestSchema,
-+        askToBeDefault,
-+        importableProfiles,
-+        importProfile,
-+        setPref,
-+    } from "../lib/browser";
-     import {
-         nextPage,
-         previousPage,
-@@ -15,6 +21,7 @@
+@@ -22,6 +22,7 @@
          userChoseHeliumAsDefault,
          selectedProfiles,
          previouslyImportedProfiles,
@@ -61,52 +62,66 @@ Index: src/components/helium_onboarding/src/components/PageNavigation.svelte
      } from "../lib/onboarding-flow";
  
      const visible = $derived(
-@@ -22,8 +29,10 @@
+@@ -29,6 +30,7 @@
      );
  
      let working = $state(false);
 +    let stepFailed = $state(false);
  
+     // "Next" is disabled while profiles are importing or refreshing. Importing
+     // may show a browser-level error, such as a request to close the other
+@@ -38,7 +40,7 @@
+         working || ($currentPage === "DataImport" && $importDiscovery.refreshing)
+     );
+ 
 -    const doNext = async () => {
-+    // Returns false to stay on the current page.
 +    const doNext = async (): Promise<boolean> => {
          switch ($currentPage) {
          case "HeliumServices":
              // if the user pressed "next" on the HeliumServices page,
-@@ -38,41 +47,75 @@
+@@ -53,41 +55,85 @@
              }
              break;
  
 -        case "DataImport":
 -            // FIXME: handle errors
 -            await Promise.allSettled(
--                [...$selectedProfiles].map(
--                    index => importProfile(index, {
+-                $importableProfiles
+-                    .filter(profile => $selectedProfiles.has(profile.id))
+-                    .map(profile => importProfile(profile.index, {
 -                        bookmarks: true,
 -                        history: true,
 -                        extensions: true
--                    })
--                )
+-                    }))
 +        case "DataImport": {
-+            const byIndex = new Map(
-+                $importableProfiles.map(profile => [profile.index, profile])
++            const profiles = $importableProfiles.filter(
++                profile => $selectedProfiles.has(profile.id)
+             );
++            const idByIndex = new Map(
++                profiles.map(profile => [profile.index, profile.id])
 +            );
 +            // importProfile runs one job at a time and resolves each job with
 +            // its own result. Extensions are never requested here.
 +            const results = await Promise.all(
-+                [...$selectedProfiles].map(index => importProfile(
-+                    index,
-+                    byIndex.get(index)?.isArc
++                profiles.map(profile => importProfile(
++                    profile.index,
++                    profile.isArc
 +                        ? { bookmarks: true, arcSidebarAsPins: true }
 +                        : { bookmarks: true, history: true }
 +                ))
-             );
++            );
 +            const succeeded = results
 +                .filter(result => result.status === "succeeded")
-+                .map(result => result.index);
++                .flatMap(result => {
++                    const id = idByIndex.get(result.index);
++                    return id === undefined ? [] : [id];
++                });
 +            const failed = results
 +                .filter(result => result.status === "failed")
-+                .map(result => result.index);
++                .flatMap(result => {
++                    const id = idByIndex.get(result.index);
++                    return id === undefined ? [] : [id];
++                });
  
              $previouslyImportedProfiles = new SvelteSet([
                  ...$previouslyImportedProfiles,
@@ -114,7 +129,7 @@ Index: src/components/helium_onboarding/src/components/PageNavigation.svelte
 +                ...succeeded,
              ]);
 -            $selectedProfiles.clear();
-+            succeeded.forEach(index => $selectedProfiles.delete(index));
++            succeeded.forEach(id => $selectedProfiles.delete(id));
 +            // Failed profiles stay selected. Next retries them; deselecting
 +            // one skips it.
 +            $failedProfiles = new SvelteSet(failed);
@@ -129,7 +144,8 @@ Index: src/components/helium_onboarding/src/components/PageNavigation.svelte
  
 -    const next = () => {
 +    const next = async () => {
-+        if (working) {
++        if (working || ($currentPage === "DataImport" &&
++                        $importDiscovery.refreshing)) {
 +            return;
 +        }
          working = true;
@@ -169,7 +185,7 @@ Index: src/components/helium_onboarding/src/components/PageNavigation.svelte
              <IconArrowLeft />
              {s.button.back}
          </Button>
-@@ -111,6 +154,15 @@
+@@ -126,6 +172,15 @@
          }
      }
  
@@ -199,16 +215,16 @@ Index: src/components/helium_onboarding/src/components/ProfileImportOption.svelt
      type Props = {
 @@ -15,21 +16,27 @@
  
-     const selected = $derived($selectedProfiles.has(profile.index));
-     const disabled = $derived($previouslyImportedProfiles.has(profile.index));
-+    const failed = $derived($failedProfiles.has(profile.index));
+     const selected = $derived($selectedProfiles.has(profile.id));
+     const disabled = $derived($previouslyImportedProfiles.has(profile.id));
++    const failed = $derived($failedProfiles.has(profile.id));
  
      const toggle = () => {
          if (!selected) {
-             $selectedProfiles.add(profile.index);
+             $selectedProfiles.add(profile.id);
          } else {
-             $selectedProfiles.delete(profile.index);
-+            $failedProfiles.delete(profile.index);
+             $selectedProfiles.delete(profile.id);
++            $failedProfiles.delete(profile.id);
          }
      };
  
@@ -238,7 +254,7 @@ Index: src/components/helium_onboarding/src/components/ProfileImportOption.svelt
      </div>
  </Checkbox>
  
-@@ -87,4 +97,8 @@
+@@ -88,4 +98,8 @@
          color: var(--primary);
          font-size: 17px;
      }
@@ -251,20 +267,28 @@ Index: src/components/helium_onboarding/src/lib/browser/importer.ts
 ===================================================================
 --- src.orig/components/helium_onboarding/src/lib/browser/importer.ts
 +++ src/components/helium_onboarding/src/lib/browser/importer.ts
-@@ -1,4 +1,4 @@
--import { derived, writable } from "svelte/store";
-+import { derived, get, writable } from "svelte/store";
- import * as cr from "../cr";
- 
- const browser = cr.ImportDataBrowserProxyImpl.getInstance();
-@@ -17,73 +17,137 @@ export type HeliumImportType = _HeliumIm
+@@ -24,10 +24,6 @@ export const HeliumImportType = {
+ export type HeliumImportType = _HeliumImportType | cr.ImportType;
  export type HeliumImportTypes = Record<HeliumImportType, boolean>;
  
- export const setup = () => {
--    browser.initializeImportDialog().then(
--        profiles => importableProfilesRaw.set(profiles)
--    );
-+    refreshProfiles();
+-type Action = () => void;
+-// The import in progress stays at the front until it finishes.
+-const queue: [number, HeliumImportTypes, Action, Action][] = [];
+-
+ const fetchProfiles = async () => {
+     importableProfilesRaw.set(await browser.initializeImportDialog());
+ }
+@@ -50,7 +46,7 @@ export const loadImportableProfiles = as
+ // are queued or running, since they reference profiles by index; the queue
+ // refreshes the list itself once it drains.
+ export const refreshImportableProfiles = async () => {
+-    if (get(importDiscovery).refreshing || queue.length) {
++    if (get(importDiscovery).refreshing || running || queue.length) {
+         return;
+     }
+ 
+@@ -61,66 +57,121 @@ export const refreshImportableProfiles =
+     importDiscovery.update(d => ({ ...d, refreshing: false }));
  }
  
 -const convertTasks = (tasks: WhatToImport): HeliumImportTypes => {
@@ -292,9 +316,7 @@ Index: src/components/helium_onboarding/src/lib/browser/importer.ts
 +    tasks: WhatToImport,
 +    resolve: (result: ImportResult) => void,
 +};
- 
--type Action = () => void;
--let queue: [number, HeliumImportTypes, Action, Action][] = [];
++
 +// The handler emits one global, unkeyed status event and keeps one writer, so
 +// exactly one job may run at a time. `running` is separate from the queue so a
 +// request made while a job runs waits instead of starting another job.
@@ -313,19 +335,6 @@ Index: src/components/helium_onboarding/src/lib/browser/importer.ts
 +    // block every other category behind a lock dialog or network access.
 +    import_dialog_extensions: false,
 +});
-+
-+const refreshProfiles = () => {
-+    // Refreshing the picker is best effort; it must not leave an unhandled
-+    // rejection after a completed import or prevent a later retry.
-+    try {
-+        void browser.initializeImportDialog().then(
-+            profiles => importableProfilesRaw.set(profiles),
-+            () => {}
-+        );
-+    } catch {
-+        // Keep the last successfully discovered profiles.
-+    }
-+};
  
  const runNext = () => {
 -    if (queue.length === 0) {
@@ -334,14 +343,14 @@ Index: src/components/helium_onboarding/src/lib/browser/importer.ts
      }
 +    const job = queue.shift();
 +    if (!job) {
-+        refreshProfiles();
++        void refreshImportableProfiles();
 +        return;
 +    }
 +    running = true;
 +    let settled = false;
 +    let listener: ReturnType<typeof cr.addWebUiListener> | undefined;
  
--    const [ index, tasks, resolve, reject ] = queue.pop()!;
+-    const [ index, tasks, resolve, reject ] = queue[0];
 -
 -    const me = cr.addWebUiListener('import-data-status-changed', (status: cr.ImportDataStatus) => {
 -        if (status === cr.ImportDataStatus.FAILED)
@@ -354,11 +363,12 @@ Index: src/components/helium_onboarding/src/lib/browser/importer.ts
              return;
 -
 -        cr.removeWebUiListener(me);
+-        queue.shift();
 -
 -        if (queue.length) {
 -            runNext();
 -        } else {
--            browser.initializeImportDialog().then(importableProfilesRaw.set);
+-            refreshImportableProfiles();
          }
 -    });
 +        settled = true;
@@ -449,7 +459,7 @@ Index: src/components/helium_onboarding/src/lib/cr/import_data_browser_proxy.ts
 ===================================================================
 --- src.orig/components/helium_onboarding/src/lib/cr/import_data_browser_proxy.ts
 +++ src/components/helium_onboarding/src/lib/cr/import_data_browser_proxy.ts
-@@ -14,6 +14,7 @@ export interface BrowserProfile {
+@@ -15,6 +15,7 @@ export interface BrowserProfile {
    name: string;
    index: number;
    profileName: string;
@@ -457,7 +467,7 @@ Index: src/components/helium_onboarding/src/lib/cr/import_data_browser_proxy.ts
    history: boolean;
    favorites: boolean;
    passwords: boolean;
-@@ -55,8 +56,11 @@ export interface ImportDataBrowserProxy
+@@ -56,8 +57,11 @@ export interface ImportDataBrowserProxy
     * Starts importing data for the specified source browser profile. The C++
     * responds with the 'import-data-status-changed' WebUIListener event.
     * @param types Which types of data to import.
@@ -470,7 +480,7 @@ Index: src/components/helium_onboarding/src/lib/cr/import_data_browser_proxy.ts
  
    /**
     * Prompts the user to choose a bookmarks file to import bookmarks from.
-@@ -69,8 +73,11 @@ export class ImportDataBrowserProxyImpl
+@@ -70,8 +74,11 @@ export class ImportDataBrowserProxyImpl
      return sendWithPromise<BrowserProfile[]>('initializeImportDialog');
    }
  
@@ -488,7 +498,7 @@ Index: src/components/helium_onboarding/src/lib/onboarding-flow.ts
 ===================================================================
 --- src.orig/components/helium_onboarding/src/lib/onboarding-flow.ts
 +++ src/components/helium_onboarding/src/lib/onboarding-flow.ts
-@@ -70,3 +70,4 @@ export const markIntroSeen = () => {
+@@ -75,3 +75,4 @@ export const markIntroSeen = () => {
  export const userChoseHeliumAsDefault = writable(true);
  export const selectedProfiles = writable(new SvelteSet<number>());
  export const previouslyImportedProfiles = writable(new SvelteSet<number>());
@@ -497,7 +507,7 @@ Index: src/components/helium_onboarding/tests/import-navigation.test.mjs
 ===================================================================
 --- /dev/null
 +++ src/components/helium_onboarding/tests/import-navigation.test.mjs
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,199 @@
 +import assert from 'node:assert/strict';
 +import {readFileSync} from 'node:fs';
 +import {createRequire} from 'node:module';
@@ -508,7 +518,7 @@ Index: src/components/helium_onboarding/tests/import-navigation.test.mjs
 +const require = createRequire(import.meta.url);
 +const ts = require('typescript');
 +const tick = () => new Promise(resolve => setImmediate(resolve));
-+const profile = (index, extra = {}) => ({index, name: 'Browser', profileName: 'Test', history: true, favorites: true, passwords: true, search: true, autofillFormData: true, extensions: true, ...extra});
++const profile = (index, extra = {}) => ({id: index + 100, index, name: 'Browser', profileName: 'Test', history: true, favorites: true, passwords: true, search: true, autofillFormData: true, extensions: true, ...extra});
 +const transpile = (source, stripImports = false) => {
 +    if (stripImports) {
 +        const parsed = ts.createSourceFile('navigation.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -555,7 +565,7 @@ Index: src/components/helium_onboarding/tests/import-navigation.test.mjs
 +    const exports = {};
 +    const context = vm.createContext({exports, require: name => name === 'svelte/store' ? stores : name === '../cr' ? bridge : assert.fail(name), queueMicrotask});
 +    vm.runInContext(transpile(readFileSync('src/lib/browser/importer.ts', 'utf8')), context);
-+    exports.setup();
++    await exports.loadImportableProfiles();
 +    await tick();
 +    return {api: exports, calls, listeners, status: status => [...listeners.values()].forEach(callback => callback(status))};
 +}
@@ -567,7 +577,8 @@ Index: src/components/helium_onboarding/tests/import-navigation.test.mjs
 +    const context = vm.createContext({
 +        exports: {}, $derived: value => value, $state: value => value, SvelteSet: Set,
 +        $currentPage: 'DataImport', $userChoseHeliumAsDefault: false,
-+        $importableProfiles: [profile(1), profile(2)], $selectedProfiles: new Set([1, 2]),
++        $importableProfiles: [profile(1), profile(2)], $selectedProfiles: new Set([101, 102]),
++        $importDiscovery: {refreshing: false},
 +        $previouslyImportedProfiles: new Set(), $failedProfiles: new Set(),
 +        importProfile: importerHarness?.api.importProfile,
 +        nextPage: () => advances++, previousPage: () => {},
@@ -682,9 +693,9 @@ Index: src/components/helium_onboarding/tests/import-navigation.test.mjs
 +    const pending = n.next();
 +    h.status('succeeded'); await tick(); h.status('failed'); await pending;
 +    assert.equal(n.advances(), 0);
-+    assert.deepEqual([...n.context.$previouslyImportedProfiles], [1]);
-+    assert.deepEqual([...n.context.$selectedProfiles], [2]);
-+    assert.deepEqual([...n.context.$failedProfiles], [2]);
++    assert.deepEqual([...n.context.$previouslyImportedProfiles], [101]);
++    assert.deepEqual([...n.context.$selectedProfiles], [102]);
++    assert.deepEqual([...n.context.$failedProfiles], [102]);
 +    const retry = n.next(); assert.deepEqual(h.calls.map(c => c.index), [1, 2, 2]);
 +    h.status('succeeded'); await retry;
 +    assert.equal(n.advances(), 1); assert.equal(n.context.$selectedProfiles.size, 0); assert.equal(n.context.$failedProfiles.size, 0);

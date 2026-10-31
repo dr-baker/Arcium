@@ -1,6 +1,6 @@
 --- a/chrome/browser/ui/views/tabs/common/BUILD.gn
 +++ b/chrome/browser/ui/views/tabs/common/BUILD.gn
-@@ -44,6 +44,7 @@ source_set("common") {
+@@ -51,6 +51,7 @@ source_set("common") {
  source_set("impl") {
    sources = [
      "dragged_tabs_container.cc",
@@ -227,7 +227,7 @@
      flags.setAntiAlias(true);
 -    flags.setColor(tab_style_->GetCurrentTabBackgroundColor(
 -        selection_state, hovered, hovered ? 1.0f : 0.0f, IsFrameActive(),
--        GetColorProvider()));
+-        /*frame_glass=*/false, GetColorProvider()));
 -    canvas->DrawRoundRect(gfx::RectF(GetLocalBounds()),
 -                          arcium::GetChromeLayoutConstant(
 -                              this, LayoutConstant::kVerticalTabCornerRadius),
@@ -236,11 +236,11 @@
 +      const SkColor active_background =
 +          tab_style_->GetCurrentTabBackgroundColor(
 +              TabStyle::TabSelectionState::kActive, hovered, hover_progress,
-+              IsFrameActive(), GetColorProvider());
++              IsFrameActive(), /*frame_glass=*/false, GetColorProvider());
 +      const SkColor inactive_background =
 +          tab_style_->GetCurrentTabBackgroundColor(
 +              TabStyle::TabSelectionState::kInactive, hovered, hover_progress,
-+              IsFrameActive(), GetColorProvider());
++              IsFrameActive(), /*frame_glass=*/false, GetColorProvider());
 +      const SkColor idle_inactive_background =
 +          SkColorSetA(inactive_background, 0x24);
 +      const SkColor hovered_inactive_background = color_utils::AlphaBlend(
@@ -256,7 +256,7 @@
 +                    : TabStyle::TabSelectionState::kInactive;
 +      flags.setColor(tab_style_->GetCurrentTabBackgroundColor(
 +          selection_state, hovered, hover_progress, IsFrameActive(),
-+          GetColorProvider()));
++          /*frame_glass=*/false, GetColorProvider()));
 +    }
 +    const gfx::RectF bounds(GetLocalBounds());
 +    canvas->DrawRoundRect(bounds, corner_radius, flags);
@@ -360,7 +360,7 @@
 +  const SkColor neutral_outline = colors.foreground_color;
 +  const SkColor selected_background = tab_style_->GetCurrentTabBackgroundColor(
 +      TabStyle::TabSelectionState::kActive, false, 0.0, IsFrameActive(),
-+      GetColorProvider());
++      /*frame_glass=*/false, GetColorProvider());
 +  outline_color_ = helium::favorite_favicon::EnsureContrast(
 +      favicon_accent_color_.value_or(SK_ColorTRANSPARENT),
 +      selected_background, neutral_outline);
@@ -552,7 +552,7 @@
  TEST_F(PersistentTabViewTest, FallsBackToGeneratedMonogramWithoutCachedIcon) {
 --- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
 +++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
-@@ -46,6 +46,9 @@
+@@ -49,6 +49,9 @@
  
  namespace {
  constexpr int kTabPadding = 4;
@@ -562,9 +562,43 @@
  
  void CollectFavoriteLinks(const std::vector<helium::PersistentNode>& nodes,
                            std::vector<helium::PersistentLink>* links) {
-@@ -123,15 +126,85 @@ views::ProposedLayout PinnedTabContainer
-     return visible;
-   }();
+@@ -172,6 +175,16 @@ gfx::Size PinnedTabContainerView::GetMin
+   auto collapse_state = GetTabStripCollapseState();
+   const int num_children = std::ranges::count_if(
+       children(), [](const views::View* child) { return child->GetVisible(); });
++  if (UsesFavoriteGridLayout() &&
++      collapse_state == tabs::VerticalTabStripCollapseState::kExpanded) {
++    const float min_rows = std::min(1.0f, static_cast<float>(num_children));
++    const int min_height =
++        base::ClampCeil(arcium::ScaleChromeDip(this, kFavoriteTileHeight) *
++                        min_rows) +
++        (num_children > 1 ? arcium::ScaleChromeDip(this, kTabPadding) : 0);
++    return gfx::Size(arcium::ScaleChromeDip(this, kFavoriteTileMinWidth),
++                     min_height);
++  }
+   const float min_rows = std::min(
+       (collapse_state != tabs::VerticalTabStripCollapseState::kExpanded ? 1.5f
+                                                                         : 1.0f),
+@@ -207,8 +220,14 @@ bool PinnedTabContainerView::ShouldAnima
+       collection_node_->orientation() == TabStripOrientation::kHorizontal) {
+     return false;
+   }
+-  // Only animate opacity for tab views.
+-  return views::IsViewClass<TabView>(&child_view);
++  if (views::IsViewClass<TabView>(&child_view)) {
++    return true;
++  }
++  if (const auto* tile = views::AsViewClass<PersistentTabView>(&child_view)) {
++    return tile->presentation_mode() ==
++           PersistentTabView::PresentationMode::kCompactGrid;
++  }
++  return false;
+ }
+ 
+ bool PinnedTabContainerView::ShouldSnapToTarget(
+@@ -457,15 +476,85 @@ views::ProposedLayout PinnedTabContainer
+   int total_width = 0;
+   int total_height = 0;
  
 -  int x = 0;
 -  int y = 0;
@@ -653,41 +687,7 @@
    // Child width will be uniform and match the largest child's width.
    const int tab_padding = arcium::ScaleChromeDip(this, kTabPadding);
    const int minimum_child_width = arcium::GetChromeLayoutConstant(
-@@ -232,6 +305,16 @@ gfx::Size PinnedTabContainerView::GetMin
-   auto collapse_state = GetTabStripCollapseState();
-   const int num_children = std::ranges::count_if(
-       children(), [](const views::View* child) { return child->GetVisible(); });
-+  if (UsesFavoriteGridLayout() &&
-+      collapse_state == tabs::VerticalTabStripCollapseState::kExpanded) {
-+    const float min_rows = std::min(1.0f, static_cast<float>(num_children));
-+    const int min_height =
-+        base::ClampCeil(arcium::ScaleChromeDip(this, kFavoriteTileHeight) *
-+                        min_rows) +
-+        (num_children > 1 ? arcium::ScaleChromeDip(this, kTabPadding) : 0);
-+    return gfx::Size(arcium::ScaleChromeDip(this, kFavoriteTileMinWidth),
-+                     min_height);
-+  }
-   const float min_rows = std::min(
-       (collapse_state != tabs::VerticalTabStripCollapseState::kExpanded ? 1.5f
-                                                                         : 1.0f),
-@@ -263,8 +346,14 @@ bool PinnedTabContainerView::IsViewDragg
- 
- bool PinnedTabContainerView::ShouldAnimateOpacityForAddAndRemove(
-     const views::View& child_view) const {
--  // Only animate opacity for tab views.
--  return views::IsViewClass<TabView>(&child_view);
-+  if (views::IsViewClass<TabView>(&child_view)) {
-+    return true;
-+  }
-+  if (const auto* tile = views::AsViewClass<PersistentTabView>(&child_view)) {
-+    return tile->presentation_mode() ==
-+           PersistentTabView::PresentationMode::kCompactGrid;
-+  }
-+  return false;
- }
- 
- bool PinnedTabContainerView::ShouldSnapToTarget(
-@@ -463,6 +552,37 @@ void PinnedTabContainerView::HideIfPersi
+@@ -594,6 +683,37 @@ void PinnedTabContainerView::HideIfPersi
    }
  }
  
@@ -725,7 +725,7 @@
  void PinnedTabContainerView::OnPersistentItemsChanged(
      const helium::PersistentItemChange& change) {
    if (!collection_node_ || !collection_node_->GetController()) {
-@@ -513,6 +633,7 @@ void PinnedTabContainerView::ReconcileFa
+@@ -644,6 +764,7 @@ void PinnedTabContainerView::ReconcileFa
    std::set<std::string, std::less<>> desired_ids;
    std::vector<helium::PersistentGridSlot> slots;
    std::map<std::string, raw_ptr<views::View>, std::less<>> live_views;
@@ -733,7 +733,7 @@
    views::View* replacement_native_row = nullptr;
    slots.reserve(tiles.size());
    for (const FavoriteTileSpec& spec : tiles) {
-@@ -552,6 +673,7 @@ void PinnedTabContainerView::ReconcileFa
+@@ -683,6 +804,7 @@ void PinnedTabContainerView::ReconcileFa
      if (live_tab_view) {
        live_tab_view->SetVisible(true);
        live_views.emplace(spec.id, live_tab_view);
@@ -741,7 +741,7 @@
      }
      slots.push_back({.id = spec.id, .live = live_tab_view != nullptr});
      if (pending_replacement_id_ == spec.id && live_tab_view) {
-@@ -559,6 +681,12 @@ void PinnedTabContainerView::ReconcileFa
+@@ -690,6 +812,12 @@ void PinnedTabContainerView::ReconcileFa
      }
    }
  
@@ -754,7 +754,7 @@
    size_t target_index = 0;
    for (const helium::PersistentGridChild& child :
         helium::PackPersistentGridChildren(slots)) {
-@@ -579,13 +707,20 @@ void PinnedTabContainerView::ReconcileFa
+@@ -710,13 +838,20 @@ void PinnedTabContainerView::ReconcileFa
        ++it;
        continue;
      }
@@ -781,7 +781,7 @@
  
 --- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
 +++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
-@@ -74,6 +74,8 @@ class PinnedTabContainerView
+@@ -75,6 +75,8 @@ class PinnedTabContainerView
    void AttachCollectionChild(std::unique_ptr<views::View> child,
                               const gfx::Rect& previous_bounds_in_screen);
    void HideIfPersistentFavorite(views::View* child);
@@ -790,81 +790,51 @@
    void OnPersistentItemsChanged(
        const helium::PersistentItemChange& change);
    void ScheduleReconcileFavorites();
-@@ -103,6 +105,7 @@ class PinnedTabContainerView
+@@ -114,6 +116,7 @@ class PinnedTabContainerView
    std::map<std::string, raw_ptr<views::View>, std::less<>> favorite_tiles_;
    std::optional<std::string> pending_replacement_id_;
    bool reconcile_scheduled_ = false;
 +  bool has_reconciled_favorites_ = false;
-   base::CallbackListSubscription node_destroyed_subscription_;
    base::CallbackListSubscription items_changed_subscription_;
-   base::WeakPtrFactory<PinnedTabContainerView> weak_ptr_factory_{this};
+   base::CallbackListSubscription node_destroyed_subscription_;
+   base::CallbackListSubscription collapsed_state_changed_subscription_;
 --- a/chrome/browser/ui/views/tabs/common/tab_view.cc
 +++ b/chrome/browser/ui/views/tabs/common/tab_view.cc
-@@ -4,14 +4,17 @@
+@@ -4,6 +4,14 @@
  
  #include "chrome/browser/ui/views/tabs/common/tab_view.h"
  
 +#include <algorithm>
++#include "base/functional/bind.h"
++#include "base/task/thread_pool.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "ui/base/resource/resource_scale_factor.h"
++#include "ui/gfx/animation/animation.h"
++#include "ui/gfx/image/image_skia_rep.h"
++
  #include <optional>
  #include <string>
  
- #include "base/command_line.h"
-+#include "base/functional/bind.h"
- #include "base/functional/callback_helpers.h"
- #include "base/metrics/histogram_functions.h"
- #include "base/metrics/user_metrics.h"
- #include "base/metrics/user_metrics_action.h"
-+#include "base/task/thread_pool.h"
- #include "base/time/time.h"
- #include "chrome/browser/glic/browser_ui/tab_underline_controller.h"
- #include "chrome/browser/glic/browser_ui/tab_underline_view.h"
-@@ -36,6 +39,7 @@
+@@ -38,6 +46,7 @@
  #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
  #include "chrome/browser/ui/views/helium/arcium_chrome_ui_scale.h"
  #include "chrome/browser/ui/views/helium/native_frame_materials.h"
 +#include "chrome/browser/ui/views/tabs/common/favorite_favicon_style.h"
  #include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
  #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
- #include "chrome/browser/ui/views/tabs/common/tab_drag_handler.h"
-@@ -56,23 +60,27 @@
- #include "components/contextual_tasks/public/features.h"
- #include "components/tabs/public/tab_alert.h"
- #include "components/tabs/public/tab_interface.h"
-+#include "third_party/skia/include/core/SkBitmap.h"
- #include "third_party/skia/include/core/SkPathBuilder.h"
- #include "third_party/skia/include/core/SkRRect.h"
- #include "ui/accessibility/ax_enums.mojom-shared.h"
- #include "ui/base/l10n/l10n_util.h"
- #include "ui/base/metadata/metadata_impl_macros.h"
- #include "ui/base/models/list_selection_model.h"
-+#include "ui/base/resource/resource_scale_factor.h"
- #include "ui/base/theme_provider.h"
- #include "ui/compositor/layer.h"
- #include "ui/events/keycodes/keyboard_codes.h"
- #include "ui/events/types/event_type.h"
- #include "ui/gfx/color_utils.h"
-+#include "ui/gfx/animation/animation.h"
- #include "ui/gfx/geometry/insets.h"
- #include "ui/gfx/geometry/rect.h"
- #include "ui/gfx/geometry/rounded_corners_f.h"
- #include "ui/gfx/geometry/size.h"
- #include "ui/gfx/geometry/skia_conversions.h"
- #include "ui/gfx/geometry/transform.h"
-+#include "ui/gfx/image/image_skia_rep.h"
- #include "ui/views/accessibility/view_accessibility.h"
- #include "ui/views/animation/animation_builder.h"
- #include "ui/views/background.h"
-@@ -94,6 +102,9 @@ constexpr int kTitleMinWidth = 10;
- constexpr int kHorizontalInset = 7;
- constexpr int kDefaultPadding = 4;
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_z_order_manager.h"
+@@ -103,6 +112,10 @@
+ 
+ namespace {
  constexpr int kFocusRingInset = 0.0f;
 +constexpr int kFavoriteIconDesignWidth = 24;
++constexpr int kIconDesignWidth = 16;
 +constexpr int kFavoriteTileHeight = 44;
 +constexpr int kFavoriteCornerRadius = 8;
  
  class TabHighlightPathGenerator : public views::HighlightPathGenerator {
   public:
-@@ -145,11 +156,16 @@ TabView::TabView(TabCollectionNode* coll
+@@ -335,11 +348,16 @@ TabView::TabView(TabCollectionNode* coll
                                base::Unretained(this)),
            // TODO(crbug.com/467733947): Hook up metrics logging callback.
            base::DoNothingAs<void(views::View*, const ui::MouseEvent&)>()))),
@@ -880,8 +850,8 @@
 +
    tabs::TabInterface* tab = const_cast<tabs::TabInterface*>(GetTabInterface());
    BrowserWindowInterface* browser_window = tab->GetBrowserWindowInterface();
-   if (browser_window &&
-@@ -275,6 +291,52 @@ void TabView::UpdateHovered(bool hovered
+ 
+@@ -514,6 +532,44 @@ void TabView::UpdateHovered(bool hovered
    InvalidateLayout();
  }
  
@@ -897,14 +867,6 @@
 +  favorite_favicon_accent_color_.reset();
 +  icon_->SetFaviconSize(is_favorite ? kFavoriteIconDesignWidth
 +                                    : kIconDesignWidth);
-+
-+  for (TabChildConfig& config : tab_children_configs_) {
-+    if (config.view == icon_) {
-+      config.min_width =
-+          is_favorite ? kFavoriteIconDesignWidth : kIconDesignWidth;
-+      break;
-+    }
-+  }
 +
 +  const bool selected =
 +      GetSelectionState() != TabStyle::TabSelectionState::kInactive;
@@ -934,20 +896,16 @@
  bool TabView::IsHoverAnimationActive() const {
    if (split_) {
      auto* split_view = views::AsViewClass<SplitTabView>(parent());
-@@ -555,7 +617,10 @@ void TabView::OnPaint(gfx::Canvas* canva
+@@ -847,9 +903,85 @@ void TabView::OnPaint(gfx::Canvas* canva
      return;
    }
  
--  if (active_tab_fill_id_.has_value() || inactive_tab_fill_id_.has_value()) {
+-  tab_styling()->PaintTab(canvas);
 +  if (favorite_presentation_) {
 +    PaintFavoriteBackground(canvas);
-+  } else if (active_tab_fill_id_.has_value() ||
-+             inactive_tab_fill_id_.has_value()) {
-     PaintTabBackgroundWithImages(canvas, active_tab_fill_id_,
-                                  inactive_tab_fill_id_);
-   } else {
-@@ -564,6 +629,75 @@ void TabView::OnPaint(gfx::Canvas* canva
-   }
++  } else {
++    tab_styling()->PaintTab(canvas);
++  }
  
    views::View::OnPaint(canvas);
 +  if (favorite_presentation_) {
@@ -956,17 +914,20 @@
 +}
 +
 +void TabView::PaintFavoriteBackground(gfx::Canvas* canvas) {
++  const auto* controller =
++      collection_node() ? collection_node()->GetController() : nullptr;
++  const bool frame_glass = controller && controller->IsGlassFrame();
 +  const bool hovered = IsHoverAnimationActive();
 +  const float hover_progress = static_cast<float>(GetHoverAnimationValue());
 +  const float selection_progress = static_cast<float>(
 +      favorite_selection_animation_.GetCurrentValue());
-+  const SkColor active_background = tab_style_->GetCurrentTabBackgroundColor(
++  const SkColor active_background = tab_styling()->tab_style()->GetCurrentTabBackgroundColor(
 +      TabStyle::TabSelectionState::kActive, hovered, hover_progress,
-+      IsFrameActive(), GetColorProvider());
++      IsFrameActive(), frame_glass, GetColorProvider());
 +  const SkColor inactive_background =
-+      tab_style_->GetCurrentTabBackgroundColor(
++      tab_styling()->tab_style()->GetCurrentTabBackgroundColor(
 +          TabStyle::TabSelectionState::kInactive, hovered, hover_progress,
-+          IsFrameActive(), GetColorProvider());
++          IsFrameActive(), frame_glass, GetColorProvider());
 +  const SkColor idle_inactive_background =
 +      SkColorSetA(inactive_background, 0x24);
 +  const SkColor hovered_inactive_background = color_utils::AlphaBlend(
@@ -1021,8 +982,8 @@
 +      outline_flags);
  }
  
- void TabView::PaintTabBackgroundWithImages(
-@@ -679,6 +813,17 @@ void TabView::RemovedFromWidget() {
+ void TabView::AddedToWidget() {
+@@ -874,6 +1006,17 @@ void TabView::RemovedFromWidget() {
    UpdateHovered(false);
  }
  
@@ -1040,59 +1001,7 @@
  void TabView::OnFocus() {
    views::View::OnFocus();
  
-@@ -792,6 +937,9 @@ gfx::Rect TabView::GetChildBounds(const
- bool TabView::IsChildVisible(const views::View* child_view,
-                              const int width) const {
-   if (child_view == title_) {
-+    if (favorite_presentation_) {
-+      return false;
-+    }
-     // Pinned titles should be visible in the expand on hover state when the
-     // width is sufficient to show the title.
-     return !pinned_ || IsInExpandOnHover(width);
-@@ -844,19 +992,36 @@ views::ProposedLayout TabView::Calculate
-     const views::SizeBounds& size_bounds) const {
-   const int width = size_bounds.width().value_or(arcium::ScaleChromeDip(
-       this, VerticalTabStripRegionView::kUncollapsedMaxWidth));
--  const int height = arcium::GetChromeLayoutConstant(
--      this, pinned_ ? LayoutConstant::kVerticalTabPinnedHeight
--                    : LayoutConstant::kVerticalTabHeight);
-+  const int height = favorite_presentation_
-+                         ? arcium::ScaleChromeDip(this, kFavoriteTileHeight)
-+                         : arcium::GetChromeLayoutConstant(
-+                               this, pinned_
-+                                         ? LayoutConstant::kVerticalTabPinnedHeight
-+                                         : LayoutConstant::kVerticalTabHeight);
-   views::ProposedLayout layouts;
-   layouts.host_size = gfx::Size(width, height);
- 
-   gfx::Rect bounds_remaining = gfx::Rect(0, 0, width, height);
--  const int horizontal_inset = arcium::ScaleChromeDip(this, kHorizontalInset);
-+  const int default_horizontal_inset =
-+      arcium::ScaleChromeDip(this, kHorizontalInset);
-+  // TabIcon's preferred width includes its attention/discard insets. In the
-+  // collapsed Favorite rail, preserve the 24 DIP favicon instead of letting
-+  // the ordinary 7 DIP inset leave too little room for the complete view.
-+  const int horizontal_inset = favorite_presentation_
-+                                   ? std::min(
-+                                         default_horizontal_inset,
-+                                         std::max(
-+                                             0, (width -
-+                                                 icon_->GetPreferredSize().width()) /
-+                                                    2))
-+                                   : default_horizontal_inset;
-   bounds_remaining.Inset(gfx::Insets::VH(0, horizontal_inset));
- 
-   // If the tab is collapsed but animating with a wider width then we shouldn't
-   // center the contents.
--  const bool is_centered = (pinned_ || collapsed_) && !IsInExpandOnHover(width);
-+  const bool is_centered =
-+      favorite_presentation_ ||
-+      ((pinned_ || collapsed_) && !IsInExpandOnHover(width));
- 
-   int placed_children = 0;
-   for (const auto& child : tab_children_configs_) {
-@@ -1058,6 +1223,9 @@ void TabView::OnCollapseStateChanged(
+@@ -1128,6 +1271,9 @@ void TabView::OnCollapseStateChanged(
  void TabView::OnTabStateChanged() {
    CHECK(collection_node_);
  
@@ -1102,7 +1011,7 @@
    tabs::TabInterface* tab = const_cast<tabs::TabInterface*>(GetTabInterface());
    CHECK(tab);
  
-@@ -1069,18 +1237,41 @@ void TabView::OnTabStateChanged() {
+@@ -1139,9 +1285,20 @@ void TabView::OnTabStateChanged() {
    active_ = tab_strip_model->IsTabInForeground(index);
    split_ = tab->IsSplit();
    pinned_ = tab->IsPinned();
@@ -1111,8 +1020,7 @@
 +  }
  
    SetSelection(tab->IsSelected());
-   UpdateTabData(tab);
- 
+   UpdateTabData(tab_data_observer_->tab_data());
 +  if (favorite_presentation_) {
 +    const bool is_favorite_selected =
 +        GetSelectionState() != TabStyle::TabSelectionState::kInactive;
@@ -1121,9 +1029,19 @@
 +                           : favorite_selection_animation_.Hide();
 +    }
 +  }
-+
-   UpdateColors();
-   InvalidateLayout();
+ 
+   UpdateFocusFreezing();
+ 
+@@ -1161,7 +1318,6 @@ void TabView::UpdateZOrder() {
+   } else if (hovered_ || HasFocus()) {
+     target_z = ZOrderLevel::kHovered;
+   }
+-
+   if (GetProperty(kTabZOrderKey) != target_z) {
+     SetProperty(kTabZOrderKey, target_z);
+     if (auto* container =
+@@ -1171,6 +1327,14 @@ void TabView::UpdateZOrder() {
+   }
  }
  
 +void TabView::AnimationProgressed(const gfx::Animation*) {
@@ -1137,17 +1055,20 @@
  void TabView::OnTabDataChanged(TabChangeType change_type,
                                 const tabs::TabData& data) {
    CHECK(collection_node_);
-   UpdateTabData(GetTabInterface());
+@@ -1189,6 +1353,9 @@ void TabView::OnTabDataChanged(TabChange
+     layout_manager()->OnShouldDisplayFaviconChanged();
+   }
+   UpdateTabData(data);
 +  if (favorite_presentation_) {
 +    UpdateColors();
 +  }
  }
  
  void TabView::SetSelection(bool selected) {
-@@ -1101,6 +1292,15 @@ void TabView::UpdateTabData(const tabs::
-       parent()->InvalidateLayout();
-     }
-   }
+@@ -1203,6 +1370,17 @@ void TabView::SetSelection(bool selected
+ void TabView::UpdateTabData(const tabs::TabData& data) {
+   tabs::TabData old_data = std::move(tab_data_);
+   tab_data_ = data;
 +  const bool favorite_favicon_changed =
 +      old_data.favicon != tab_data_.favicon ||
 +      old_data.visible_url != tab_data_.visible_url ||
@@ -1157,10 +1078,12 @@
 +    ++favorite_favicon_generation_;
 +    favorite_favicon_accent_color_.reset();
 +  }
- 
-   if (tabs::ShouldUpdateAccessibleName(old_data, tab_data_)) {
-     UpdateAccessibleName();
-@@ -1115,6 +1315,53 @@ void TabView::UpdateTabData(const tabs::
++
++
+   if (old_data.is_temporary != tab_data_.is_temporary) {
+     SetVisible(!tab_data_.is_temporary);
+     if (parent()) {
+@@ -1225,6 +1403,53 @@ void TabView::UpdateTabData(const tabs::
    UpdateTitle(tab_data_.title, tab_data_.should_render_loading_title);
    alert_indicator_->TransitionToAlertState(tab_data_.alert_state);
    SetHoverCardDataFrom(tab_data_);
@@ -1213,8 +1136,8 @@
 +  }
  }
  
- void TabView::UpdateTitle(std::u16string title,
-@@ -1178,6 +1425,11 @@ void TabView::UpdateTitle(std::u16string
+ void TabView::SetDataForTesting(const tabs::TabData& data) {
+@@ -1292,6 +1517,10 @@ void TabView::UpdateTitle(std::u16string
  }
  
  void TabView::UpdateBorder() {
@@ -1222,11 +1145,10 @@
 +    SetBorder(nullptr);
 +    return;
 +  }
-+
-   if (pinned_) {
-     if (split_) {
-       // Insets for border handled by the `SplitTabView`.
-@@ -1238,6 +1490,9 @@ void TabView::UpdateThemeColors() {
+   if (orientation_ == TabStripOrientation::kHorizontal) {
+     SetBorder(views::CreateEmptyBorder(tab_styling()->GetContentsInsets()));
+     return;
+@@ -1318,6 +1547,9 @@ void TabView::UpdateBorder() {
  }
  
  void TabView::UpdateColors() {
@@ -1234,9 +1156,9 @@
 +    return;
 +  }
    UpdateContrastRatioValues();
-   TabStyle::TabColors colors = tab_style_->CalculateTargetColors(
-       GetSelectionState(), IsApparentlyActive(), hovered_, IsFrameActive(),
-@@ -1246,12 +1501,31 @@ void TabView::UpdateColors() {
+   if (auto* theme_provider = GetThemeProvider()) {
+     should_fill_background_tab_color_ = theme_provider->GetDisplayProperty(
+@@ -1331,12 +1563,34 @@ void TabView::UpdateColors() {
    close_button_->SetColors(colors);
    alert_indicator_->OnParentTabButtonColorChanged();
  
@@ -1248,18 +1170,21 @@
  }
  
 +void TabView::UpdateFavoriteOutlineColor() {
++  const auto* controller =
++      collection_node() ? collection_node()->GetController() : nullptr;
++  const bool frame_glass = controller && controller->IsGlassFrame();
 +  if (!favorite_presentation_ || !GetColorProvider()) {
 +    favorite_outline_color_ = SK_ColorTRANSPARENT;
 +    return;
 +  }
 +
-+  const TabStyle::TabColors colors = tab_style_->CalculateTargetColors(
-+      GetSelectionState(), IsApparentlyActive(), hovered_, IsFrameActive(),
++  const TabStyle::TabColors colors = tab_styling()->tab_style()->CalculateTargetColors(
++      GetSelectionState(), tab_styling()->IsApparentlyActive(), hovered_, IsFrameActive(),
 +      GetColorProvider());
 +  const SkColor neutral_outline = colors.foreground_color;
-+  const SkColor selected_background = tab_style_->GetCurrentTabBackgroundColor(
++  const SkColor selected_background = tab_styling()->tab_style()->GetCurrentTabBackgroundColor(
 +      TabStyle::TabSelectionState::kActive, false, 0.0, IsFrameActive(),
-+      GetColorProvider());
++      frame_glass, GetColorProvider());
 +  favorite_outline_color_ = helium::favorite_favicon::EnsureContrast(
 +      favorite_favicon_accent_color_.value_or(SK_ColorTRANSPARENT),
 +      selected_background, neutral_outline);
@@ -1267,8 +1192,8 @@
 +
  void TabView::UpdateContrastRatioValues() {
    auto [hover_opacity_min, hover_opacity_max, radial_highlight_opacity, _] =
-       tab_style_->GetContrastRatioValues(IsFrameActive(), GetColorProvider());
-@@ -1401,6 +1675,9 @@ void TabView::UpdateHoverCard(HoverCardA
+       tab_styling()->tab_style()->GetContrastRatioValues(IsFrameActive(),
+@@ -1508,6 +1762,9 @@ void TabView::UpdateHoverCard(HoverCardA
  }
  
  SkScalar TabView::GetCornerRadius() const {
@@ -1280,15 +1205,15 @@
                         (split_ ? GetInsets().height() : 0));
 --- a/chrome/browser/ui/views/tabs/common/tab_view.h
 +++ b/chrome/browser/ui/views/tabs/common/tab_view.h
-@@ -5,6 +5,7 @@
- #ifndef CHROME_BROWSER_UI_VIEWS_TABS_COMMON_TAB_VIEW_H_
+@@ -6,6 +6,7 @@
  #define CHROME_BROWSER_UI_VIEWS_TABS_COMMON_TAB_VIEW_H_
  
+ #include <memory>
 +#include <cstdint>
  #include <optional>
  #include <vector>
  
-@@ -20,8 +21,11 @@
+@@ -22,14 +23,18 @@
  #include "chrome/common/buildflags.h"
  #include "components/performance_manager/public/freezing/freezing.h"
  #include "components/tabs/public/tab_interface.h"
@@ -1299,8 +1224,7 @@
 +#include "ui/gfx/animation/slide_animation.h"
  #include "ui/gfx/canvas.h"
  #include "ui/views/context_menu_controller.h"
- #include "ui/views/layout/delegating_layout_manager.h"
-@@ -29,6 +33,7 @@
+ #include "ui/views/layout/layout_manager_base.h"
  #include "ui/views/masked_targeter_delegate.h"
  #include "ui/views/view.h"
  #include "ui/views/view_observer.h"
@@ -1308,7 +1232,7 @@
  
  class GlowHoverController;
  class TabCloseButton;
-@@ -55,7 +60,8 @@ class TabView : public views::View,
+@@ -56,7 +61,8 @@ class TabView : public views::View,
                  public AlertIndicatorButton::Delegate,
                  public views::ContextMenuController,
                  public HoverCardAnchorTarget,
@@ -1316,9 +1240,9 @@
 +                public views::ViewObserver,
 +                public gfx::AnimationDelegate {
    METADATA_HEADER(TabView, views::View)
+   friend class TabStyleViewDelegateImpl;
  
-  public:
-@@ -76,6 +82,10 @@ class TabView : public views::View,
+@@ -95,6 +101,10 @@ class TabView : public views::View,
    void UpdateHovered(bool hovered);
    bool IsHoverAnimationActive() const;
  
@@ -1329,7 +1253,7 @@
    std::optional<SkColor> GetBackgroundColor();
    SkPath GetPath() const;
  
-@@ -112,6 +122,12 @@ class TabView : public views::View,
+@@ -148,6 +158,12 @@ class TabView : public views::View,
    void OnBlur() override;
    void OnBoundsChanged(const gfx::Rect& previous_bounds) override;
    void OnThemeChanged() override;
@@ -1342,8 +1266,8 @@
    void UpdateParentLayer() override;
  
    // views::ViewObserver:
-@@ -187,6 +203,13 @@ class TabView : public views::View,
-   void UpdateThemeColors();
+@@ -185,6 +201,13 @@ class TabView : public views::View,
+   void UpdateBorder();
    void UpdateColors();
    void UpdateContrastRatioValues();
 +  void PaintFavoriteBackground(gfx::Canvas* canvas);
@@ -1356,7 +1280,7 @@
  
    void CloseButtonPressed(const ui::Event& event);
    void RecordMousePressedInTab();
-@@ -243,9 +266,16 @@ class TabView : public views::View,
+@@ -242,10 +265,17 @@ class TabView : public views::View,
    bool split_ = false;
    bool collapsed_ = false;
    bool pinned_ = false;
@@ -1364,6 +1288,7 @@
 +  bool favorite_presentation_initialized_ = false;
    bool shift_pressed_on_mouse_down_ = false;
    bool showing_return_home_title_ = false;
+   bool should_fill_background_tab_color_ = false;
  
 +  std::optional<SkColor> favorite_favicon_accent_color_;
 +  SkColor favorite_outline_color_ = SK_ColorTRANSPARENT;
@@ -1375,18 +1300,18 @@
    float hover_opacity_max_;
 --- a/chrome/browser/ui/views/tabs/tab/tab_icon.cc
 +++ b/chrome/browser/ui/views/tabs/tab/tab_icon.cc
-@@ -58,10 +58,6 @@ namespace {
- constexpr int kAttentionIndicatorRadius = 3;
+@@ -57,10 +57,6 @@ constexpr float kDiscardedFaviconDarkMod
+ constexpr float kDiscardedFaviconOpacity = 0.5f;
  constexpr int kLoadingAnimationStrokeWidthDp = 2;
  
 -int FaviconSize(const views::View* view) {
 -  return arcium::ScaleChromeDip(view, gfx::kFaviconSize);
 -}
 -
- bool NetworkStateIsAnimated(tabs::TabNetworkState network_state) {
-   return network_state != tabs::TabNetworkState::kNone &&
-          network_state != tabs::TabNetworkState::kError;
-@@ -140,7 +136,7 @@ TabIcon::TabIcon()
+ bool NetworkStateIsAnimated(tabs::TabNetworkState) {
+   return false;
+ }
+@@ -109,7 +105,7 @@ TabIcon::TabIcon()
    SetBorder(views::CreateEmptyBorder(
        arcium::ScaleChromeDip(this, kAttentionIndicatorRadius)));
  
@@ -1395,7 +1320,7 @@
    SetPreferredSize(gfx::Size(preferred_width, preferred_width));
  
    // Initial state (before any data) should not be animating.
-@@ -158,6 +154,22 @@ TabIcon::TabIcon()
+@@ -127,6 +123,22 @@ TabIcon::TabIcon()
  
  TabIcon::~TabIcon() = default;
  
@@ -1418,16 +1343,7 @@
  void TabIcon::SetData(const tabs::TabData& data) {
    const bool was_showing_load = GetShowingLoadingAnimation();
  
-@@ -241,7 +253,7 @@ void TabIcon::StepLoadingAnimation(const
- }
- 
- void TabIcon::ResizeDiscardIndicatorRadiusForWidth(int width) {
--  const int favicon_size = FaviconSize(this);
-+  const int favicon_size = GetFaviconSize();
-   const int increased_radius =
-       arcium::ScaleChromeDip(this, kIncreasedDiscardIndicatorRadiusDp);
-   increased_discard_indicator_radius_ =
-@@ -278,7 +290,7 @@ void TabIcon::OnPaint(gfx::Canvas* canva
+@@ -230,7 +242,7 @@ void TabIcon::OnPaint(gfx::Canvas* canva
      return;
    }
  
@@ -1436,7 +1352,7 @@
    gfx::Rect icon_bounds(
        GetMirroredXWithWidthInView(contents_bounds.x(), favicon_size),
        contents_bounds.y() +
-@@ -326,7 +338,7 @@ void TabIcon::OnThemeChanged() {
+@@ -266,7 +278,7 @@ void TabIcon::OnThemeChanged() {
    views::View::OnThemeChanged();
    SetBorder(views::CreateEmptyBorder(
        arcium::ScaleChromeDip(this, kAttentionIndicatorRadius)));
@@ -1445,7 +1361,7 @@
    SetPreferredSize(gfx::Size(preferred_width, preferred_width));
    increased_discard_indicator_radius_ =
        arcium::ScaleChromeDip(this, kIncreasedDiscardIndicatorRadiusDp);
-@@ -351,7 +363,7 @@ void TabIcon::PaintAttentionIndicatorAnd
+@@ -290,7 +302,7 @@ void TabIcon::PaintAttentionIndicatorAnd
                                               const gfx::Rect& bounds) {
    TRACE_EVENT0("views", "TabIcon::PaintAttentionIndicatorAndIcon");
  
@@ -1454,7 +1370,7 @@
    gfx::Point circle_center(
        bounds.x() + (base::i18n::IsRTL() ? 0 : favicon_size),
        bounds.y() + favicon_size);
-@@ -470,7 +482,7 @@ void TabIcon::MaybePaintFavicon(gfx::Can
+@@ -424,7 +436,7 @@ void TabIcon::MaybePaintFavicon(gfx::Can
      const float initial_favicon_inset_dp =
          arcium::ScaleChromeDip(this, 1) +
          arcium::ScaleChromeDip(this, kLoadingAnimationStrokeWidthDp);
@@ -1463,26 +1379,17 @@
      const float initial_favicon_diameter_dp =
          favicon_size - 2 * initial_favicon_inset_dp +
          (was_discard_indicator_shown_ ? 2 * increased_discard_indicator_radius_
-@@ -660,7 +672,7 @@ void TabIcon::UpdateThrobber() {
-     CHECK(throbber_view_);
- 
-     // Calculate and update the icon's visual bounds.
--    const int favicon_size = FaviconSize(this);
-+    const int favicon_size = GetFaviconSize();
-     gfx::Rect icon_bounds(
-         GetMirroredXWithWidthInView(contents_bounds.x(), favicon_size),
-         contents_bounds.y() +
 --- a/chrome/browser/ui/views/tabs/tab/tab_icon.h
 +++ b/chrome/browser/ui/views/tabs/tab/tab_icon.h
-@@ -17,6 +17,7 @@
- #include "ui/compositor/layer_delegate.h"
+@@ -16,6 +16,7 @@
+ #include "ui/base/models/image_model.h"
  #include "ui/gfx/animation/linear_animation.h"
  #include "ui/gfx/animation/slide_animation.h"
 +#include "ui/gfx/favicon_size.h"
  #include "ui/gfx/image/image_skia.h"
  #include "ui/gfx/paint_throbber.h"
  #include "ui/views/animation/animation_delegate_views.h"
-@@ -64,6 +65,10 @@ class TabIcon : public views::View, publ
+@@ -63,6 +64,10 @@ class TabIcon : public views::View, publ
    // Sets whether this tab is currently active.
    void SetActiveState(bool is_active);
  
@@ -1493,16 +1400,15 @@
    // Enables or disables the given attention type. The attention indicator
    // will be shown as long as any of the types are enabled.
    void SetAttention(AttentionType type, bool enabled);
-@@ -150,6 +155,8 @@ class TabIcon : public views::View, publ
+@@ -146,6 +151,7 @@ class TabIcon : public views::View, publ
+   // Sets whether the tab should paint as crashed or not.
    void SetCrashed(bool crashed);
    bool GetCrashed() const;
- 
 +  int GetFaviconSize() const;
-+
-   // Creates or destroys the throbber according to the current animation state
-   // and whether a layer can be used. Unlike the base TabIcon layer (which
-   // merely reduces composition overhead), this compositor-driven throbber
-@@ -171,6 +178,7 @@ class TabIcon : public views::View, publ
+ 
+   // Creates or destroys the layer according to the current animation state and
+   // whether a layer can be used.
+@@ -157,6 +163,7 @@ class TabIcon : public views::View, publ
    raw_ptr<const base::TickClock> clock_;
  
    ui::ImageModel favicon_;
@@ -1510,3 +1416,64 @@
    bool should_themify_favicon_ = false;
    tabs::TabNetworkState network_state_ = tabs::TabNetworkState::kNone;
    bool crashed_ = false;
+--- a/chrome/browser/ui/views/tabs/common/tab_view_vertical_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view_vertical_layout.cc
+@@ -19,6 +19,7 @@
+ #include "chrome/browser/ui/views/tabs/tab_style_views.h"
+ 
+ namespace {
++constexpr int kFavoriteTileHeight = 44;
+ constexpr int kIconDesignWidth = 16;
+ constexpr int kTitleMinWidth = 10;
+ constexpr int kHorizontalInset = 7;
+@@ -51,22 +52,35 @@ views::ProposedLayout TabViewVerticalLay
+     const views::SizeBounds& size_bounds) const {
+   const int width = size_bounds.width().value_or(
+       arcium::ScaleChromeDip(host_view(), VerticalTabStripRegionView::kUncollapsedMaxWidth));
+-  const int height = arcium::GetChromeLayoutConstant(host_view(),
++  const int height = TabView().favorite_presentation_ ?
++      arcium::ScaleChromeDip(host_view(), kFavoriteTileHeight) :
++      arcium::GetChromeLayoutConstant(host_view(),
+       TabView().pinned_ ? LayoutConstant::kVerticalTabPinnedHeight
+                         : LayoutConstant::kVerticalTabHeight);
+   views::ProposedLayout layouts;
+   layouts.host_size = gfx::Size(width, height);
+ 
+   gfx::Rect bounds_remaining = gfx::Rect(layouts.host_size);
+-  bounds_remaining.Inset(TabView().tab_styling()->GetContentsInsets());
++  gfx::Insets insets = TabView().tab_styling()->GetContentsInsets();
++  if (TabView().favorite_presentation_) {
++    const int horizontal_inset = std::min(
++        insets.left(), std::max(0, (width -
++            TabView().icon_->GetPreferredSize().width()) / 2));
++    insets = gfx::Insets::VH(0, horizontal_inset);
++  }
++  bounds_remaining.Inset(insets);
+ 
+   // If the tab is collapsed but animating with a wider width then we shouldn't
+   // center the contents.
+-  const bool is_centered = (TabView().pinned_ || TabView().collapsed_) &&
+-                           !TabView().IsInExpandOnHover(width);
++  const bool is_centered = TabView().favorite_presentation_ ||
++      ((TabView().pinned_ || TabView().collapsed_) &&
++       !TabView().IsInExpandOnHover(width));
+ 
+   int placed_children = 0;
+-  for (const auto& child : tab_children_configs_) {
++  for (auto child : tab_children_configs_) {
++    if (child.view == TabView().icon_) {
++      child.min_width = TabView().favorite_presentation_ ? 24 : kIconDesignWidth;
++    }
+     const bool can_render_child =
+         is_centered
+             ? (placed_children == 0)
+@@ -147,6 +161,9 @@ gfx::Rect TabViewVerticalLayout::GetChil
+ bool TabViewVerticalLayout::IsChildVisible(const views::View* child_view,
+                                            const int width) const {
+   if (child_view == TabView().title_) {
++    if (TabView().favorite_presentation_) {
++      return false;
++    }
+     // Pinned titles should be visible in the expand on hover state when the
+     // width is sufficient to show the title.
+     return !TabView().pinned_ || TabView().IsInExpandOnHover(width);

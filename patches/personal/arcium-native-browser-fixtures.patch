@@ -15,19 +15,19 @@
 +#include "base/command_line.h"
 +#include "base/feature_list.h"
  #include "base/functional/callback_helpers.h"
+ #include "base/i18n/test/scoped_rtl_for_testing.h"
  #include "base/run_loop.h"
- #include "base/test/metrics/histogram_tester.h"
-@@ -14,7 +20,8 @@
- #include "base/test/run_until.h"
+@@ -16,7 +22,8 @@
  #include "base/time/time.h"
+ #include "build/build_config.h"
  #include "chrome/browser/media/webrtc/media_capture_devices_dispatcher.h"
 -#include "chrome/browser/performance_manager/public/user_tuning/user_performance_tuning_manager.h"
 +#include "chrome/browser/performance_manager/policies/page_discarding_helper.h"
 +#include "chrome/browser/profiles/profile.h"
  #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
  #include "chrome/browser/ui/animation/browser_animation_controller.h"
- #include "chrome/browser/ui/browser.h"
-@@ -30,6 +37,7 @@
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+@@ -36,6 +43,7 @@
  #include "chrome/browser/ui/views/animations/tab_strip_animations.h"
  #include "chrome/browser/ui/views/frame/browser_view.h"
  #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
@@ -35,7 +35,7 @@
  #include "chrome/browser/ui/views/interaction/browser_elements_views.h"
  #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
  #include "chrome/browser/ui/views/tabs/common/persistent_tab_view.h"
-@@ -45,6 +53,8 @@
+@@ -54,6 +62,8 @@
  #include "chrome/test/base/in_process_browser_test.h"
  #include "chrome/test/base/ui_test_utils.h"
  #include "components/data_sharing/public/features.h"
@@ -44,16 +44,16 @@
  #include "components/tabs/public/tab_alert.h"
  #include "content/public/browser/web_contents.h"
  #include "content/public/browser/web_contents_observer.h"
-@@ -58,6 +68,8 @@
- #include "ui/events/types/event_type.h"
+@@ -71,6 +81,8 @@
  #include "ui/views/controls/button/button_controller.h"
  #include "ui/views/controls/label.h"
+ #include "ui/views/test/mock_activation_controller.h"
 +#include "ui/views/view.h"
 +#include "ui/views/widget/widget.h"
  #include "ui/views/widget/widget_utils.h"
  
  class TestWebContentsObserver : public content::WebContentsObserver {
-@@ -104,11 +116,15 @@ class NewTabTitleObserver : public TabSt
+@@ -117,11 +129,15 @@ class NewTabTitleObserver : public TabSt
      if (change.type() == TabStripModelChange::kInserted) {
        const auto& insert = *change.GetInsert();
        const auto& content = insert.contents[0];
@@ -70,10 +70,10 @@
        views::PropertyChangedCallback callback =
            base::BindRepeating(
                [](views::Label* title) { return title->GetText(); }, title)
-@@ -131,6 +147,66 @@ class TabViewTest : public VerticalTabsB
-   void WaitForLayout(views::View* view) {
-     ASSERT_TRUE(base::test::RunUntil([&]() { return !view->needs_layout(); }));
+@@ -174,6 +190,63 @@ class TabViewTest : public VerticalTabsB
+         region_view->GetTabAnchorView(tab->GetHandle()));
    }
+ 
 +
 +  void EnsureExpandedLayout() {
 +    auto* controller = vertical_tab_strip_state_controller();
@@ -85,9 +85,7 @@
 +      return !animations->IsAnimating(TabStripAnimations::kVerticalTabStrip);
 +    }));
 +    RunScheduledLayouts();
-+    auto* region = browser()
-+                       ->GetBrowserView()
-+                       .vertical_tab_strip_region_view_for_testing();
++    auto* region = BrowserView::GetBrowserViewForBrowser(browser())->vertical_tab_strip_region_view_for_testing();
 +    ASSERT_TRUE(region);
 +    ASSERT_EQ(tabs::VerticalTabStripCollapseState::kExpanded,
 +              controller->GetCollapseState());
@@ -97,9 +95,7 @@
 +
 +  std::string DescribeTabGeometry(TabView* tab_view,
 +                                  AlertIndicatorButton* alert = nullptr) {
-+    auto* region = browser()
-+                       ->GetBrowserView()
-+                       .vertical_tab_strip_region_view_for_testing();
++    auto* region = BrowserView::GetBrowserViewForBrowser(browser())->vertical_tab_strip_region_view_for_testing();
 +    auto* close = tab_view->close_button_for_testing();
 +    testing::Message message;
 +    message << "collapse="
@@ -134,17 +130,27 @@
 +    }
 +    return message.GetString();
 +  }
- };
- 
- class HeliumPersistentTabViewTest : public TabViewTest {
-@@ -155,43 +231,105 @@ class HeliumPersistentTabViewTest : publ
++
+  private:
+ #if defined(USE_MOCK_ACTIVATION_CONTROLLER)
+   // Emulates widget activation in-process via RAII so parallel browser_tests
+@@ -194,7 +267,7 @@ class HeliumPersistentTabViewTest : publ
+     TabViewTest::SetUpOnMainThread();
+     helium::HeliumSpaceService* service =
+         helium::HeliumSpaceServiceFactory::GetForProfile(
+-            browser()->profile());
++            browser()->GetProfile());
+     ASSERT_TRUE(service);
+     helium::HeliumSpace* default_space = service->GetDefaultSpace();
+     ASSERT_TRUE(default_space);
+@@ -204,43 +277,105 @@ class HeliumPersistentTabViewTest : publ
    // Check actual rendered rows, including retiring native views. Checking only
    // collection nodes would miss a stale Favorite still parented in the UI.
    testing::AssertionResult SidebarMatchesModel() {
 -    std::map<std::string, int> persistent_rows;
 -    int native_rows = 0;
 +    auto* service =
-+        helium::HeliumSpaceServiceFactory::GetForProfile(browser()->profile());
++        helium::HeliumSpaceServiceFactory::GetForProfile(browser()->GetProfile());
 +    if (!service) {
 +      return testing::AssertionFailure() << "missing Spaces service";
 +    }
@@ -268,7 +274,7 @@
               << "; persistent rows=" << testing::PrintToString(persistent_rows)
               << " expected=" << testing::PrintToString(expected_persistent);
      }
-@@ -205,6 +343,67 @@ class HeliumPersistentTabViewTest : publ
+@@ -254,6 +389,67 @@ class HeliumPersistentTabViewTest : publ
  
  };
  
@@ -280,10 +286,10 @@
 +  ASSERT_TRUE(initial);
 +  EXPECT_DOUBLE_EQ(1.0, arcium::GetChromeUIScale(initial));
 +
-+  PrefService* prefs = browser()->profile()->GetPrefs();
++  PrefService* prefs = browser()->GetProfile()->GetPrefs();
 +  prefs->SetInteger(arcium::kChromeUIScalePref, 115);
 +  EXPECT_DOUBLE_EQ(1.15, arcium::GetChromeUIScale(initial));
-+  Browser* second_browser = CreateBrowser(browser()->profile());
++  BrowserWindowInterface* second_browser = CreateBrowser(browser()->GetProfile());
 +  BrowserView* second =
 +      BrowserView::GetBrowserViewForBrowser(second_browser);
 +  ASSERT_TRUE(second);
@@ -336,7 +342,7 @@
  IN_PROC_BROWSER_TEST_F(TabViewTest, IconDataChanged) {
    ASSERT_TRUE(embedded_test_server()->Start());
  
-@@ -231,6 +430,9 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Icon
+@@ -280,6 +476,9 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Icon
    run_loop.Run();
    EXPECT_TRUE(icon->GetShowingLoadingAnimation());
  
@@ -346,7 +352,7 @@
    // After setting the tab as blocked, expect the attention indicator to not be
    // showing because the tab is active.
    tab_strip_model()->SetTabBlocked(0, true);
-@@ -254,8 +456,19 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Icon
+@@ -303,8 +502,19 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Icon
  
    // After discarding the tab, the icon should show the discard indicator.
    tabs::TabInterface* tab = tab_strip_model()->GetTabAtIndex(0);
@@ -368,7 +374,7 @@
    EXPECT_TRUE(base::test::RunUntil(
        [&]() { return icon->GetShowingDiscardIndicator(); }));
  }
-@@ -348,8 +561,7 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Aler
+@@ -397,8 +607,7 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Aler
    EXPECT_EQ(tabs::TabAlert::kAudioMuting,
              alert_indicator->showing_alert_state());
  
@@ -378,7 +384,7 @@
    scoped_closure_runner.RunAndReset();
    // There is a 2 second hysteresis for the audible state, controlled by
    // RecentlyAudibleHelper. Fire the timer manually to remove the tab alert.
-@@ -360,13 +572,24 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Aler
+@@ -409,13 +618,24 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Aler
    tab_strip_model()->NotifyTabChanged(tab_strip_model()->GetActiveTab(),
                                        TabChangeType::kAll);
    WaitForLayout(tab_view);
@@ -407,7 +413,7 @@
    TabCollectionNode* tab_node = unpinned_collection_node()->children()[0].get();
    TabView* tab_view = views::AsViewClass<TabView>(tab_node->view());
    auto* alert_indicator =
-@@ -397,6 +620,9 @@ class TabViewTabMutingEnabledTest : publ
+@@ -446,6 +666,9 @@ class TabViewTabMutingEnabledTest : publ
  };
  
  IN_PROC_BROWSER_TEST_F(TabViewTabMutingEnabledTest, AlertIndicatorMuteEnabled) {
@@ -417,24 +423,26 @@
    TabCollectionNode* tab_node = unpinned_collection_node()->children()[0].get();
    TabView* tab_view = views::AsViewClass<TabView>(tab_node->view());
    auto* alert_indicator =
-@@ -421,24 +647,43 @@ IN_PROC_BROWSER_TEST_F(TabViewTabMutingE
+@@ -470,24 +693,43 @@ IN_PROC_BROWSER_TEST_F(TabViewTabMutingE
  
    // Initially the audio playing indicator should be visible and enabled.
    set_tab_width(kEnabledWidth);
 -  ASSERT_TRUE(alert_indicator->GetVisible());
 -  ASSERT_TRUE(alert_indicator->GetEnabled());
+-
+-  // Add a second tab. The alert indicator should still be enabled.
+-  AppendTab();
+-  EXPECT_TRUE(alert_indicator->GetVisible());
+-  EXPECT_TRUE(alert_indicator->GetEnabled());
 +  ASSERT_EQ(kEnabledWidth, tab_view->width());
 +  ASSERT_TRUE(alert_indicator->GetVisible())
 +      << DescribeTabGeometry(tab_view, alert_indicator);
 +  ASSERT_TRUE(alert_indicator->GetEnabled())
 +      << DescribeTabGeometry(tab_view, alert_indicator);
- 
--  // Add a second tab. The alert indicator should still be enabled.
++
 +  // Settle the collection's insertion animation before restoring the explicit
 +  // row width. The container owns that width during layout.
-   AppendTab();
--  EXPECT_TRUE(alert_indicator->GetVisible());
--  EXPECT_TRUE(alert_indicator->GetEnabled());
++  AppendTab();
 +  RunScheduledLayouts();
 +  auto* layout_manager = static_cast<TabCollectionAnimatingLayoutManager*>(
 +      unpinned_collection_node()->view()->GetLayoutManager());
@@ -470,7 +478,7 @@
  }
  
  IN_PROC_BROWSER_TEST_F(TabViewTabMutingEnabledTest, AlertIndicatorMuteToggle) {
-@@ -490,18 +735,22 @@ IN_PROC_BROWSER_TEST_F(TabViewTabMutingE
+@@ -539,18 +781,22 @@ IN_PROC_BROWSER_TEST_F(TabViewTabMutingE
  }
  
  IN_PROC_BROWSER_TEST_F(TabViewTest, CloseButtonVisibilityActiveTab) {
@@ -496,7 +504,7 @@
  }
  
  IN_PROC_BROWSER_TEST_F(TabViewTest, CloseButtonVisibilityHover) {
-@@ -587,11 +836,17 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Clos
+@@ -638,11 +884,17 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Clos
    // Add a second tab.
    AppendTab();
  
@@ -515,7 +523,34 @@
  
    // Expect there to be two tabs initially.
    ASSERT_EQ(2, tab_strip_model()->count());
-@@ -808,11 +1063,12 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Logs
+@@ -745,7 +997,7 @@ IN_PROC_BROWSER_TEST_F(HeliumPersistentT
+   } observer(model);
+ 
+   auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(
+-      browser()->profile());
++      browser()->GetProfile());
+   ASSERT_TRUE(service);
+   ASSERT_TRUE(service->AddPinFromTab(tab));
+   const int pin_index = model->GetIndexOfTab(tab);
+@@ -773,7 +1025,7 @@ IN_PROC_BROWSER_TEST_F(HeliumPersistentT
+ 
+   helium::HeliumSpaceService* service =
+       helium::HeliumSpaceServiceFactory::GetForProfile(
+-          browser()->profile());
++          browser()->GetProfile());
+   ASSERT_TRUE(service);
+   helium::HeliumSpace* space = service->GetDefaultSpace();
+   ASSERT_TRUE(space);
+@@ -814,7 +1066,7 @@ IN_PROC_BROWSER_TEST_F(HeliumPersistentT
+   content::WebContents* favorite_contents = favorite_tab->GetContents();
+   helium::HeliumSpaceService* service =
+       helium::HeliumSpaceServiceFactory::GetForProfile(
+-          browser()->profile());
++          browser()->GetProfile());
+   ASSERT_TRUE(service);
+ 
+   auto* pinned_view = views::AsViewClass<PinnedTabContainerView>(
+@@ -859,11 +1111,12 @@ IN_PROC_BROWSER_TEST_F(TabViewTest, Logs
    base::UserActionTester user_action_tester;
  
    AppendTab();
@@ -531,3 +566,21 @@
  
    close_button->button_controller()->NotifyClick();
  
+@@ -1786,7 +2039,7 @@ IN_PROC_BROWSER_TEST_F(HeliumPersistentT
+   auto* favorite = tab_strip_model()->GetActiveTab();
+   content::WebContents* contents = favorite->GetContents();
+   auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(
+-      browser()->profile());
++      browser()->GetProfile());
+   ASSERT_TRUE(service->AddFavoriteFromTab(favorite));
+   ASSERT_NO_FATAL_FAILURE(WaitForSidebarAgreement());
+   ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), away_url));
+@@ -1872,7 +2125,7 @@ IN_PROC_BROWSER_TEST_F(HeliumPersistentT
+         "document.getElementById('unsaved').value = 'keep this';"));
+   }
+   auto* service = helium::HeliumSpaceServiceFactory::GetForProfile(
+-      browser()->profile());
++      browser()->GetProfile());
+   for (int round = 0; round < 6; ++round) {
+     for (size_t index = 0; index < tabs.size(); ++index) {
+       auto* target = tabs[index];

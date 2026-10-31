@@ -297,7 +297,7 @@
  }  // namespace browser_shortcuts::prefs
 --- a/chrome/browser/ui/BUILD.gn
 +++ b/chrome/browser/ui/BUILD.gn
-@@ -1497,6 +1497,12 @@ static_library("ui") {
+@@ -2389,6 +2389,12 @@ static_library("ui") {
        # that //chrome/browser:browser has no remaining sources. It registers
        # WebUI interface binders for desktop, which need this target's headers.
        "//chrome/browser/chrome_browser_interface_binders_webui_parts_desktop.cc",
@@ -310,26 +310,28 @@
        "browser_shortcuts/browser_shortcut_metadata.cc",
        "browser_shortcuts/browser_shortcut_metadata.h",
        "browser_shortcuts/browser_shortcut_prefs.cc",
---- a/chrome/test/BUILD.gn
-+++ b/chrome/test/BUILD.gn
-@@ -6775,6 +6775,7 @@ test("unit_tests") {
-       "../browser/renderer_host/chrome_render_widget_host_view_mac_history_swiper_unittest.mm",
-       "../browser/shell_integration_mac_unittest.mm",
-       "../browser/ui/accelerator_table_unittest_mac.mm",
-+      "../browser/ui/browser_shortcuts/browser_shortcut_platform_mac_unittest.mm",
-       "../browser/ui/cocoa/applescript/apple_event_util_unittest.mm",
-       "../browser/ui/cocoa/bookmarks/bookmark_menu_bridge_unittest.mm",
-       "../browser/ui/cocoa/bookmarks/bookmark_menu_cocoa_controller_unittest.mm",
-@@ -7198,6 +7199,9 @@ test("unit_tests") {
-       "../browser/safe_browsing/generated_security_settings_bundle_pref_unittest.cc",
-       "../browser/signin/signin_promo_unittest.cc",
-       "../browser/ui/accelerator_table_unittest.cc",
-+      "../browser/ui/browser_shortcuts/arcium_shortcut_presets_unittest.cc",
-+    "../browser/ui/browser_shortcuts/arcium_shortcut_commands_unittest.cc",
-+    "../browser/ui/browser_shortcuts/arcium_shortcut_tab_actions_unittest.cc",
-       "../browser/ui/browser_command_controller_unittest.cc",
-       "../browser/ui/browser_manager_service_factory_unittest.cc",
-       "../browser/ui/browser_unittest.cc",
+@@ -5482,6 +5488,9 @@ source_set("unit_tests") {
+   if (!is_android) {
+     sources += [
+       "accelerator_table_unittest.cc",
++      "browser_shortcuts/arcium_shortcut_presets_unittest.cc",
++      "browser_shortcuts/arcium_shortcut_commands_unittest.cc",
++      "browser_shortcuts/arcium_shortcut_tab_actions_unittest.cc",
+       "browser_manager_service_factory_unittest.cc",
+       "browser_unittest.cc",
+       "browser_window_state_unittest.cc",
+@@ -5507,7 +5516,10 @@ source_set("unit_tests") {
+   }
+ 
+   if (is_mac) {
+-    sources += [ "accelerator_table_unittest_mac.mm" ]
++    sources += [
++      "accelerator_table_unittest_mac.mm",
++      "browser_shortcuts/browser_shortcut_platform_mac_unittest.mm",
++    ]
+     deps += [ "//chrome/browser:global_keyboard_shortcuts_mac" ]
+   }
+ 
 --- /dev/null
 +++ b/chrome/browser/ui/browser_shortcuts/arcium_shortcut_presets.h
 @@ -0,0 +1,69 @@
@@ -1100,7 +1102,7 @@
 +}  // namespace browser_shortcuts::arcium
 --- a/chrome/app/generated_resources.grd
 +++ b/chrome/app/generated_resources.grd
-@@ -1964,6 +1964,45 @@ are declared in tools/grit/grit_args.gni
+@@ -2000,6 +2000,45 @@ are declared in tools/grit/grit_args.gni
        <message name="IDS_SHORTCUT_COMMAND_TOGGLE_VERTICAL_TABS" desc="Command name shown on the Settings shortcuts page for toggling vertical tabs with the Ctrl+S shortcut when vertical layout is active.">
          Toggle vertical tabs
        </message>
@@ -1148,8 +1150,8 @@
        </message>
 --- a/chrome/browser/ui/browser_command_controller.cc
 +++ b/chrome/browser/ui/browser_command_controller.cc
-@@ -58,6 +58,8 @@
- #include "chrome/browser/ui/browser.h"
+@@ -59,6 +59,8 @@
+ #include "chrome/browser/ui/actions/command_action_updater.h"
  #include "chrome/browser/ui/browser_actions.h"
  #include "chrome/browser/ui/browser_commands.h"
 +#include "chrome/browser/ui/browser_shortcuts/arcium_shortcut_commands.h"
@@ -1157,26 +1159,25 @@
  #include "chrome/browser/ui/browser_element_identifiers.h"
  #include "chrome/browser/ui/browser_select_file_dialog_controller.h"
  #include "chrome/browser/ui/browser_window.h"
-@@ -262,11 +264,15 @@ actions::ActionItem* FindAction(actions:
-   return actions::ActionManager::Get().FindAction(action_id, root_action_item);
+@@ -290,10 +292,14 @@ bool IsLockedForOnTask(BrowserWindowInte
  }
+ #endif  // BUILDFLAG(IS_CHROMEOS)
  
 +bool IsVerticalSidebarLayout(PrefService* prefs) {
 +  return prefs->GetInteger(prefs::kHeliumLayout) ==
-+             std::to_underlying(HeliumLayoutType::kVertical);
++         std::to_underlying(HeliumLayoutType::kVertical);
 +}
 +
  bool ShouldToggleVerticalCollapse(PrefService* prefs) {
-   return tabs::IsVerticalTabsFeatureEnabled() &&
--         prefs->GetBoolean(prefs::kVerticalCollapseShortcut) &&
+-  return prefs->GetBoolean(prefs::kVerticalCollapseShortcut) &&
 -         prefs->GetInteger(prefs::kHeliumLayout) ==
 -             std::to_underlying(HeliumLayoutType::kVertical);
-+         IsVerticalSidebarLayout(prefs) &&
++  return IsVerticalSidebarLayout(prefs) &&
 +         prefs->GetBoolean(prefs::kVerticalCollapseShortcut);
  }
  
  }  // namespace
-@@ -704,6 +710,17 @@ void BrowserCommandController::HandleCom
+@@ -731,6 +737,17 @@ void BrowserCommandController::HandleCom
        ToggleVerticalTabs(browser_);
        break;
      case IDC_TOGGLE_VERTICAL_TABS_COLLAPSE:
@@ -1194,7 +1195,7 @@
  #if !BUILDFLAG(IS_MAC)
        // On Mac, the logging for both the keyboard shortcut and the view menu
        // is handled in BrowserNativeWidgetMac::ExecuteCommand to correctly
-@@ -817,6 +834,60 @@ void BrowserCommandController::HandleCom
+@@ -877,6 +894,60 @@ void BrowserCommandController::HandleCom
      case IDC_MOVE_TAB_TO_NEW_WINDOW:
        MoveActiveTabToNewWindow(browser_);
        break;
@@ -1255,7 +1256,7 @@
      case IDC_NEW_SPLIT_TAB:
        if (!browser_->tab_strip_model()->GetActiveTab()->IsSplit()) {
          NewSplitTab(browser_, split_tabs::SplitTabLayout::kSideBySide,
-@@ -2057,6 +2128,12 @@ void BrowserCommandController::InitComma
+@@ -2109,6 +2180,12 @@ void BrowserCommandController::InitComma
  
    command_updater_->UpdateCommandEnabled(IDC_WINDOW_MUTE_SITE, normal_window);
    command_updater_->UpdateCommandEnabled(IDC_WINDOW_PIN_TAB, normal_window);
@@ -1268,7 +1269,7 @@
    command_updater_->UpdateCommandEnabled(IDC_WINDOW_GROUP_TAB, normal_window);
    command_updater_->UpdateCommandEnabled(IDC_WINDOW_CLOSE_TABS_TO_RIGHT,
                                           normal_window);
-@@ -2239,6 +2316,12 @@ void BrowserCommandController::UpdateCom
+@@ -2308,6 +2385,12 @@ void BrowserCommandController::UpdateCom
                                           !is_app && CanDuplicateTab(browser_));
    command_updater_->UpdateCommandEnabled(IDC_WINDOW_MUTE_SITE, !is_app);
    command_updater_->UpdateCommandEnabled(IDC_WINDOW_PIN_TAB, is_normal);
@@ -1283,7 +1284,7 @@
    // Page-related commands
 --- a/chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.cc
 +++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.cc
-@@ -79,6 +79,50 @@ std::optional<BrowserShortcutCommandLabe
+@@ -78,6 +78,50 @@ std::optional<BrowserShortcutCommandLabe
    }
  
    switch (command_id) {
@@ -1334,7 +1335,7 @@
      case IDC_BACK:
        return Label(IDS_SHORTCUT_COMMAND_BACK);
      case IDC_FORWARD:
-@@ -168,7 +212,7 @@ std::optional<BrowserShortcutCommandLabe
+@@ -207,7 +251,7 @@ std::optional<BrowserShortcutCommandLabe
                         ? IDS_SHORTCUT_COMMAND_TOGGLE_VERTICAL_TABS
                         : IDS_SAVE_PAGE);
      case IDC_TOGGLE_VERTICAL_TABS_COLLAPSE:
@@ -1343,7 +1344,7 @@
      case IDC_PRINT:
        return Label(IDS_CONTENT_CONTEXT_PRINT);
      case IDC_BASIC_PRINT:
-@@ -248,13 +292,38 @@ std::optional<BrowserShortcutCommandLabe
+@@ -305,13 +349,38 @@ std::optional<BrowserShortcutCommandLabe
  std::vector<int> GetBrowserShortcutCommandsWithoutDefault(
      const PrefService* prefs) {
    std::vector<int> commands;
@@ -1385,11 +1386,11 @@
 +  commands.push_back(IDC_COPY_URL);
 +  commands.push_back(IDC_DEV_TOOLS_INSPECT);
    commands.push_back(IDC_FORCE_PASTE);
-   return commands;
- }
+   commands.push_back(IDC_DUPLICATE_TAB);
+ #if !BUILDFLAG(IS_MAC)
 --- a/chrome/app/chrome_command_ids.h
 +++ b/chrome/app/chrome_command_ids.h
-@@ -129,6 +129,31 @@
+@@ -133,6 +133,31 @@
  #define IDC_ADD_NEW_TAB_RECENT_GROUP  34107
  #define IDC_UNFOCUS_TAB_GROUP         34108
  
@@ -3024,7 +3025,7 @@
 +}  // namespace browser_shortcuts
 --- a/chrome/browser/ui/tabs/tab_strip_model.cc
 +++ b/chrome/browser/ui/tabs/tab_strip_model.cc
-@@ -2049,6 +2049,16 @@ void TabStripModel::SelectPreviousTab(Ta
+@@ -2058,6 +2058,16 @@ void TabStripModel::SelectPreviousTab(Ta
    SelectRelativeTabCycle(TabRelativeDirection::kPrevious, detail);
  }
  
@@ -3039,11 +3040,11 @@
 +}
 +
  void TabStripModel::SelectLastTab(TabStripUserGestureDetails detail) {
-   ActivateTabAt(count() - 1, detail);
- }
+   if (!empty()) {
+     ActivateTab(*rbegin(), detail);
 --- a/chrome/browser/ui/tabs/tab_strip_model.h
 +++ b/chrome/browser/ui/tabs/tab_strip_model.h
-@@ -619,6 +619,21 @@ class TabStripModel {
+@@ -637,6 +637,21 @@ class TabStripModel {
  
    enum class TabRelativeDirection { kNext, kPrevious };
  
@@ -3067,7 +3068,7 @@
    void PreviewMRUTab(TabRelativeDirection direction,
 --- a/chrome/browser/ui/tabs/tab_strip_model_unittest.cc
 +++ b/chrome/browser/ui/tabs/tab_strip_model_unittest.cc
-@@ -901,6 +901,28 @@ TEST_F(MRUTabCyclingTest, OrdinaryMRUCom
+@@ -964,6 +964,28 @@ TEST_F(MRUTabCyclingTest, OrdinaryMRUCom
    EXPECT_EQ(1, tabstrip()->active_index());
  }
  
@@ -3098,28 +3099,28 @@
    tabstrip()->SelectNextTab();
 --- a/chrome/browser/ui/views/frame/browser_view.cc
 +++ b/chrome/browser/ui/views/frame/browser_view.cc
-@@ -6285,14 +6285,20 @@ bool BrowserView::AcceleratorPressed(con
+@@ -6490,14 +6490,20 @@ bool BrowserView::AcceleratorPressed(con
  
    // Only Ctrl+Tab holds a pending selection until Control is released. Menu,
    // wheel, and other next/previous-tab shortcuts must activate immediately.
 -  const bool next_tab = command_id == IDC_SELECT_NEXT_TAB;
 -  const bool previous_tab = command_id == IDC_SELECT_PREVIOUS_TAB;
 +  const bool explicit_recent = command_id == IDC_ARCIUM_SELECT_RECENT_TAB ||
-+                               command_id == IDC_ARCIUM_SELECT_PREVIOUS_RECENT_TAB;
++      command_id == IDC_ARCIUM_SELECT_PREVIOUS_RECENT_TAB;
 +  const bool next_tab = command_id == IDC_SELECT_NEXT_TAB ||
-+                        command_id == IDC_ARCIUM_SELECT_RECENT_TAB;
++      command_id == IDC_ARCIUM_SELECT_RECENT_TAB;
 +  const bool previous_tab = command_id == IDC_SELECT_PREVIOUS_TAB ||
-+                            command_id == IDC_ARCIUM_SELECT_PREVIOUS_RECENT_TAB;
++      command_id == IDC_ARCIUM_SELECT_PREVIOUS_RECENT_TAB;
    const bool global_mru =
 -      next_tab && base::FeatureList::IsEnabled(features::kCtrlTabMru) &&
 +      !explicit_recent && next_tab &&
 +      base::FeatureList::IsEnabled(features::kCtrlTabMru) &&
-       browser_->profile()->GetPrefs()->GetBoolean(prefs::kCtrlTabMru);
+       browser_->GetProfile()->GetPrefs()->GetBoolean(prefs::kCtrlTabMru);
    if ((next_tab || previous_tab) && !global_mru &&
        accelerator.key_code() == ui::VKEY_TAB && accelerator.IsCtrlDown() &&
--      browser_->profile()->GetPrefs()->GetBoolean(prefs::kTabCyclingMRU) &&
+-      browser_->GetProfile()->GetPrefs()->GetBoolean(prefs::kTabCyclingMRU) &&
 +      (explicit_recent ||
-+       browser_->profile()->GetPrefs()->GetBoolean(prefs::kTabCyclingMRU)) &&
++       browser_->GetProfile()->GetPrefs()->GetBoolean(prefs::kTabCyclingMRU)) &&
        chrome::IsCommandEnabled(browser_.get(), command_id)) {
-     browser_->tab_strip_model()->PreviewMRUTab(
+     browser_->GetTabStripModel()->PreviewMRUTab(
          next_tab ? TabStripModel::TabRelativeDirection::kNext

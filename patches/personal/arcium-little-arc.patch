@@ -2,9 +2,9 @@ Index: src/chrome/app/settings_strings.grdp
 ===================================================================
 --- src.orig/chrome/app/settings_strings.grdp
 +++ src/chrome/app/settings_strings.grdp
-@@ -310,6 +310,15 @@
-     <message name="IDS_SETTINGS_MINIMAL_LOCATION_BAR" desc="Label for the toggle that enables the minimal address bar.">
-       Minimal address bar
+@@ -316,6 +316,15 @@
+     <message name="IDS_SETTINGS_SHOW_PROGRESS_BAR" desc="Label for the toggle that shows loading progress in the address bar.">
+       Show loading progress in the address bar
      </message>
 +    <message name="IDS_SETTINGS_LITTLE_ARC_EXTERNAL_LINKS" desc="Label for the toggle that opens external web links in a temporary Little Arc window.">
 +      Open links from other apps in Little Arc
@@ -22,7 +22,7 @@ Index: src/chrome/browser/extensions/api/settings_private/prefs_util.cc
 ===================================================================
 --- src.orig/chrome/browser/extensions/api/settings_private/prefs_util.cc
 +++ src/chrome/browser/extensions/api/settings_private/prefs_util.cc
-@@ -301,6 +301,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+@@ -322,6 +322,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
        settings_api::PrefType::kBoolean;
    (*s_allowlist)[::prefs::kShiftRightClickContextMenu] =
        settings_api::PrefType::kBoolean;
@@ -35,7 +35,7 @@ Index: src/chrome/browser/extensions/api/settings_private/prefs_util_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/extensions/api/settings_private/prefs_util_unittest.cc
 +++ src/chrome/browser/extensions/api/settings_private/prefs_util_unittest.cc
-@@ -66,6 +66,22 @@ TEST_F(PrefsUtilTest, SetAllowlistedPref
+@@ -71,6 +71,22 @@ TEST_F(PrefsUtilTest, SetAllowlistedPref
    EXPECT_FALSE(profile_->GetPrefs()->GetBoolean(::prefs::kShowHomeButton));
  }
  
@@ -73,13 +73,13 @@ Index: src/chrome/browser/resources/settings/appearance_page/appearance_behavior
 +  </settings-toggle-button>
 +
    <settings-toggle-button class="hr" id="shiftRightClickContextMenu"
-       pref="{{prefs.helium.browser.shift_right_click_context_menu}}"
+       pref-key="helium.browser.shift_right_click_context_menu"
        label="$i18n{shiftRightClickContextMenu}">
 Index: src/chrome/browser/ui/BUILD.gn
 ===================================================================
 --- src.orig/chrome/browser/ui/BUILD.gn
 +++ src/chrome/browser/ui/BUILD.gn
-@@ -360,6 +360,19 @@ if (!is_android) {
+@@ -1538,6 +1538,19 @@ if (!is_android) {
    }
  }
  
@@ -99,20 +99,20 @@ Index: src/chrome/browser/ui/BUILD.gn
  executable("arcium_optional_navigation_tests") {
    testonly = true
    sources = [
-@@ -431,6 +444,8 @@ static_library("ui") {
-     "helium/helium_space_service.h",
-     "helium/helium_space_service_factory.cc",
-     "helium/helium_space_service_factory.h",
-+    "helium/helium_little_arc.cc",
-+    "helium/helium_little_arc.h",
-     "idle_bubble.h",
-     "managed_ui.cc",
-     "managed_ui.h",
+@@ -2354,6 +2367,8 @@ static_library("ui") {
+       "helium/helium_space_service.h",
+       "helium/helium_space_service_factory.cc",
+       "helium/helium_space_service_factory.h",
++      "helium/helium_little_arc.cc",
++      "helium/helium_little_arc.h",
+       # This file physically lives in //chrome/browser but is compiled here so
+       # that //chrome/browser:browser has no remaining sources. It registers
+       # WebUI interface binders for desktop, which need this target's headers.
 Index: src/chrome/browser/ui/browser_command_controller.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/browser_command_controller.cc
 +++ src/chrome/browser/ui/browser_command_controller.cc
-@@ -70,6 +70,7 @@
+@@ -71,6 +71,7 @@
  #include "chrome/browser/ui/dialogs/browser_dialogs.h"
  #include "chrome/browser/ui/fullscreen/browser_window_fullscreen_controller.h"
  #include "chrome/browser/ui/helium/helium_layout_state_controller.h"
@@ -120,25 +120,24 @@ Index: src/chrome/browser/ui/browser_command_controller.cc
  #include "chrome/browser/ui/lens/lens_overlay_controller.h"
  #include "chrome/browser/ui/managed_ui.h"
  #include "chrome/browser/ui/navigator/browser_navigator.h"
-@@ -1131,6 +1132,11 @@ void BrowserCommandController::HandleCom
+@@ -1178,6 +1179,10 @@ void BrowserCommandController::HandleCom
          browser_view->peek_controller()->OpenInTab();
          break;
        }
-+      // Little Arc remaps ⌘O from Open File to "promote peek into a tab".
 +      if (helium::IsLittleArcBrowser(browser_)) {
 +        helium::PromoteLittleArcToTab(browser_);
 +        break;
 +      }
-       browser_->GetFeatures()
-           .browser_select_file_dialog_controller()
-           ->OpenFile();
+       BrowserSelectFileDialogController::From(browser_)->OpenFile();
+       break;
+     case IDC_CREATE_SHORTCUT:
 Index: src/chrome/browser/ui/browser_ui_prefs.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/browser_ui_prefs.cc
 +++ src/chrome/browser/ui/browser_ui_prefs.cc
-@@ -136,6 +136,8 @@ void RegisterBrowserUserPrefs(user_prefs
+@@ -144,6 +144,8 @@ void RegisterBrowserUserPrefs(user_prefs
  
-   registry->RegisterBooleanPref(prefs::kHeliumMinimalLocationBar, false);
+   registry->RegisterBooleanPref(prefs::kHeliumShowProgressBar, true);
  
 +  registry->RegisterBooleanPref(prefs::kHeliumLittleArcExternalLinks, false);
 +
@@ -488,15 +487,15 @@ Index: src/chrome/browser/ui/views/toolbar/toolbar_view.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/toolbar/toolbar_view.cc
 +++ src/chrome/browser/ui/views/toolbar/toolbar_view.cc
-@@ -23,6 +23,7 @@
+@@ -24,6 +24,7 @@
  #include "base/trace_event/trace_event.h"
  #include "build/build_config.h"
  #include "chrome/app/chrome_command_ids.h"
 +#include "chrome/app/vector_icons/vector_icons.h"
  #include "chrome/browser/actor/ui/actor_ui_metrics.h"
- #include "chrome/browser/actor/ui/task_list_bubble/actor_task_list_bubble_controller.h"
  #include "chrome/browser/command_updater.h"
-@@ -827,6 +828,28 @@ void ToolbarView::Init() {
+ #include "chrome/browser/glic/browser_ui/activity_list_bubble/glic_activity_list_bubble.h"
+@@ -939,6 +940,28 @@ void ToolbarView::Init() {
    initialized_ = true;
  }
  
@@ -529,7 +528,7 @@ Index: src/chrome/browser/ui/views/toolbar/toolbar_view.h
 ===================================================================
 --- src.orig/chrome/browser/ui/views/toolbar/toolbar_view.h
 +++ src/chrome/browser/ui/views/toolbar/toolbar_view.h
-@@ -182,6 +182,9 @@ class ToolbarView : public views::Access
+@@ -193,6 +193,9 @@ class ToolbarView : public views::Access
    // Updates the vertical tabs collapse button visibility and icon.
    void UpdateVerticalTabsCollapseButton();
  
@@ -537,9 +536,9 @@ Index: src/chrome/browser/ui/views/toolbar/toolbar_view.h
 +  void AddLittleArcOpenInTabButton();
 +
    // Accessors.
-   Browser* browser() const { return browser_; }
+   BrowserWindowInterface* browser() const { return browser_; }
    views::Button* GetChromeLabsButton() const;
-@@ -521,6 +524,8 @@ class ToolbarView : public views::Access
+@@ -574,6 +577,8 @@ class ToolbarView : public views::Access
    // `toolbar_controller_`.
    raw_ptr<OverflowButton> overflow_button_ = nullptr;
  
@@ -552,21 +551,21 @@ Index: src/chrome/browser/ui/webui/settings/settings_localized_strings_provider.
 ===================================================================
 --- src.orig/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
 +++ src/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
-@@ -585,6 +585,9 @@ void AddAppearanceStrings(content::WebUI
+@@ -624,6 +624,9 @@ void AddAppearanceStrings(content::WebUI
        {"centeredLocationBar", IDS_SETTINGS_CENTERED_LOCATION_BAR},
        {"verticalCollapseShortcut", IDS_SETTINGS_VERTICAL_COLLAPSE_SHORTCUT},
        {"minimalLocationBar", IDS_SETTINGS_MINIMAL_LOCATION_BAR},
 +      {"littleArcExternalLinks", IDS_SETTINGS_LITTLE_ARC_EXTERNAL_LINKS},
 +      {"littleArcExternalLinksDescription",
 +       IDS_SETTINGS_LITTLE_ARC_EXTERNAL_LINKS_DESCRIPTION},
+       {"showProgressBar", IDS_SETTINGS_SHOW_PROGRESS_BAR},
        {"shiftRightClickContextMenu",
         IDS_SETTINGS_SHIFT_RIGHT_CLICK_CONTEXT_MENU},
-       {"showZoomIndicator", IDS_SETTINGS_SHOW_ZOOM_INDICATOR},
 Index: src/chrome/common/pref_names.h
 ===================================================================
 --- src.orig/chrome/common/pref_names.h
 +++ src/chrome/common/pref_names.h
-@@ -650,6 +650,11 @@ inline constexpr char kHeliumZenModeTopC
+@@ -653,6 +653,11 @@ inline constexpr char kHeliumZenModeTopC
  inline constexpr char kHeliumCenteredLocationBar[] =
      "helium.browser.centered_location_bar";
  
@@ -582,19 +581,19 @@ Index: src/chrome/app/chrome_command_ids.h
 ===================================================================
 --- src.orig/chrome/app/chrome_command_ids.h
 +++ src/chrome/app/chrome_command_ids.h
-@@ -377,6 +377,7 @@
+@@ -332,6 +332,7 @@
  #define IDC_CONTENT_CONTEXT_COPYLINKTEXT 50107
  #define IDC_CONTENT_CONTEXT_OPENLINKINPROFILE 50108
  #define IDC_CONTENT_CONTEXT_OPENLINKBOOKMARKAPP 50109
 +#define IDC_CONTENT_CONTEXT_OPENLINKLITTLEARC 50110
  #define IDC_CONTENT_CONTEXT_OPENLINKSPLITVIEW 50111
  #define IDC_CONTENT_CONTEXT_ADD_LINK_TO_READING_LIST 50112
- // Image items.
+ #define IDC_CONTENT_CONTEXT_OPENLINK_ISOLATED 50113
 Index: src/chrome/app/generated_resources.grd
 ===================================================================
 --- src.orig/chrome/app/generated_resources.grd
 +++ src/chrome/app/generated_resources.grd
-@@ -732,6 +732,9 @@ are declared in tools/grit/grit_args.gni
+@@ -830,6 +830,9 @@ are declared in tools/grit/grit_args.gni
            <message name="IDS_CONTENT_CONTEXT_OPENLINKPEEK" desc="The name of the command that opens a link in an attached Peek preview">
              Open link in Peek
            </message>
@@ -604,7 +603,7 @@ Index: src/chrome/app/generated_resources.grd
            <message name="IDS_CONTENT_CONTEXT_OPENLINKNEWWINDOW" desc="The name of the Open Link in New Window command in the content area context menu">
              Open link in new &amp;window
            </message>
-@@ -1082,6 +1085,9 @@ are declared in tools/grit/grit_args.gni
+@@ -1190,6 +1193,9 @@ are declared in tools/grit/grit_args.gni
            <message name="IDS_CONTENT_CONTEXT_OPENLINKPEEK" desc="In Title Case: The name of the command that opens a link in an attached Peek preview">
              Open Link in Peek
            </message>
@@ -618,7 +617,7 @@ Index: src/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
 ===================================================================
 --- src.orig/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
 +++ src/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
-@@ -257,6 +257,7 @@
+@@ -263,6 +263,7 @@
  #include "chrome/browser/ui/autofill/autofill_client_provider_factory.h"
  #include "chrome/browser/ui/find_bar/find_bar_state_factory.h"
  #include "chrome/browser/ui/hats/hats_service_factory.h"
@@ -626,7 +625,7 @@ Index: src/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
  #include "chrome/browser/ui/helium/helium_space_service_factory.h"
  #include "chrome/browser/ui/prefs/prefs_tab_helper.h"
  #include "chrome/browser/ui/safety_hub/menu_notification_service_factory.h"
-@@ -1303,6 +1304,7 @@ void ChromeBrowserMainExtraPartsProfiles
+@@ -1312,6 +1313,7 @@ void ChromeBrowserMainExtraPartsProfiles
    PersonalContextServiceFactory::GetInstance();
  #if !BUILDFLAG(IS_ANDROID)
    PinnedTabServiceFactory::GetInstance();
@@ -638,7 +637,7 @@ Index: src/chrome/browser/renderer_context_menu/render_view_context_menu.cc
 ===================================================================
 --- src.orig/chrome/browser/renderer_context_menu/render_view_context_menu.cc
 +++ src/chrome/browser/renderer_context_menu/render_view_context_menu.cc
-@@ -113,6 +113,7 @@
+@@ -115,6 +115,7 @@
  #include "chrome/browser/ui/chrome_pages.h"
  #include "chrome/browser/ui/exclusive_access/exclusive_access_manager.h"
  #include "chrome/browser/ui/exclusive_access/keyboard_lock_controller.h"
@@ -646,23 +645,23 @@ Index: src/chrome/browser/renderer_context_menu/render_view_context_menu.cc
  #include "chrome/browser/ui/lens/lens_overlay_entry_point_controller.h"
  #include "chrome/browser/ui/lens/lens_search_controller.h"
  #include "chrome/browser/ui/lens/lens_string_utils.h"
-@@ -630,6 +631,7 @@ const std::map<int, int>& GetIdcToUmaMap
-        {IDC_CONTENT_CONTEXT_SAVE_TO_MEMORY_BANKS, 168},
-        {IDC_CONTENT_CONTEXT_FORCE_PASTE, 169},
-        // UMA value 170 is owned by Arcium-macOS system translation.
-+       {IDC_CONTENT_CONTEXT_OPENLINKLITTLEARC, 171},
-        {IDC_CONTENT_CONTEXT_OPENLINKPEEK, 172},
+@@ -673,6 +674,7 @@ int UmaEnumForCommand(int key, UmaEnumId
+        {IDC_CONTENT_CONTEXT_CONTEXTUAL_TASKS_SUBMENU, 171},
+        {IDC_CONTENT_CONTEXT_FORCE_PASTE, 172},
+        // 173 is reserved for macOS translation; 174 for Little Arc.
++       {IDC_CONTENT_CONTEXT_OPENLINKLITTLEARC, 174},
+        {IDC_CONTENT_CONTEXT_OPENLINKPEEK, 175},
         // To add new items:
         //   - Add one more line above this comment block, using the UMA value
-@@ -678,6 +680,7 @@ const std::map<int, int>& GetIdcToUmaMap
-        {IDC_CONTENT_CONTEXT_GLICSHAREIMAGE, 32},
-        {IDC_SPELLCHECK_REMOVE_FROM_DICTIONARY, 33},
-        // UMA value 34 is owned by Arcium-macOS system translation.
-+       {IDC_CONTENT_CONTEXT_OPENLINKLITTLEARC, 35},
-        {IDC_CONTENT_CONTEXT_OPENLINKPEEK, 36},
+@@ -723,6 +725,7 @@ int UmaEnumForCommand(int key, UmaEnumId
+        {IDC_CONTENT_CONTEXT_OPENLINK_ISOLATED, 34},
+        {IDC_CONTENT_CONTEXT_ASK_GOOGLE_ABOUT_THIS_PAGE, 35},
+        // 36 is reserved for macOS translation; 37 for Little Arc.
++       {IDC_CONTENT_CONTEXT_OPENLINKLITTLEARC, 37},
+        {IDC_CONTENT_CONTEXT_OPENLINKPEEK, 38},
         // To add new items:
         //   - Add one more line above this comment block, using the UMA value
-@@ -1905,6 +1908,10 @@ void RenderViewContextMenu::AppendLinkIt
+@@ -1982,6 +1985,10 @@ void RenderViewContextMenu::AppendLinkIt
            IDC_CONTENT_CONTEXT_OPENLINKNEWTAB,
            in_app ? IDS_CONTENT_CONTEXT_OPENLINKNEWTAB_INAPP
                   : IDS_CONTENT_CONTEXT_OPENLINKNEWTAB);
@@ -673,7 +672,7 @@ Index: src/chrome/browser/renderer_context_menu/render_view_context_menu.cc
      }
  
  #if !BUILDFLAG(IS_ANDROID)
-@@ -3314,6 +3321,10 @@ bool RenderViewContextMenu::IsCommandIdE
+@@ -3453,6 +3460,10 @@ bool RenderViewContextMenu::IsCommandIdE
      case IDC_CONTENT_CONTEXT_PARTIAL_TRANSLATE:
        return navigation_allowed;
  
@@ -684,12 +683,10 @@ Index: src/chrome/browser/renderer_context_menu/render_view_context_menu.cc
      case IDC_CONTENT_CONTEXT_OPENLINKBOOKMARKAPP:
      case IDC_CONTENT_CONTEXT_OPENLINKINPROFILE:
      case IDC_CONTENT_CONTEXT_OPENLINKNEWTAB:
-@@ -3687,6 +3698,19 @@ void RenderViewContextMenu::ExecuteComma
-         source_web_contents_->OpenURL(params,
-                                       /*navigation_handle_callback=*/{});
+@@ -3841,6 +3852,19 @@ void RenderViewContextMenu::ExecuteComma
        }
-+      break;
-+    }
+       break;
+     }
 +
 +    case IDC_CONTENT_CONTEXT_OPENLINKLITTLEARC: {
 +      OpenURLParams params = GetOpenURLParamsWithExtraHeaders(
@@ -701,14 +698,16 @@ Index: src/chrome/browser/renderer_context_menu/render_view_context_menu.cc
 +        source_web_contents_->OpenURL(params,
 +                                      /*navigation_handle_callback=*/{});
 +      }
-       break;
-     }
++      break;
++    }
  
+     case IDC_CONTENT_CONTEXT_OPENLINKNEWWINDOW:
+       DCHECK(!IsInProgressiveWebApp());
 Index: src/chrome/browser/renderer_context_menu/render_view_context_menu_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/renderer_context_menu/render_view_context_menu_unittest.cc
 +++ src/chrome/browser/renderer_context_menu/render_view_context_menu_unittest.cc
-@@ -572,6 +572,42 @@ TEST_F(RenderViewContextMenuPrefsTest,
+@@ -597,6 +597,42 @@ TEST_F(RenderViewContextMenuPrefsTest,
  }
  #endif  // BUILDFLAG(ENABLE_PRINT_PREVIEW)
  
@@ -805,19 +804,19 @@ Index: src/tools/metrics/histograms/metadata/ui/enums.xml
 ===================================================================
 --- src.orig/tools/metrics/histograms/metadata/ui/enums.xml
 +++ src/tools/metrics/histograms/metadata/ui/enums.xml
-@@ -79,6 +79,7 @@ chromium-metrics-reviews@google.com.
-   <int value="31" label="Open link in split view"/>
-   <int value="32" label="Create image with Gemini in Chrome"/>
+@@ -81,6 +81,7 @@ chromium-metrics-reviews@google.com.
    <int value="33" label="Remove from dictionary"/>
-+  <int value="35" label="Open link in Little Arc"/>
-   <int value="36" label="Open link in Peek"/>
+   <int value="34" label="Open link in isolated window"/>
+   <int value="35" label="Ask Google about this page"/>
++  <int value="37" label="Open link in Little Arc"/>
+   <int value="38" label="Open link in Peek"/>
  </enum>
  
-@@ -373,6 +374,7 @@ chromium-metrics-reviews@google.com.
-   <int value="167" label="IDC_SPELLCHECK_REMOVE_FROM_DICTIONARY"/>
-   <int value="168" label="IDC_CONTENT_CONTEXT_SAVE_TO_MEMORY_BANKS"/>
-   <int value="169" label="IDC_CONTENT_CONTEXT_FORCE_PASTE"/>
-+  <int value="171" label="IDC_CONTENT_CONTEXT_OPENLINKLITTLEARC"/>
-   <int value="172" label="IDC_CONTENT_CONTEXT_OPENLINKPEEK"/>
+@@ -434,6 +435,7 @@ chromium-metrics-reviews@google.com.
+   <int value="170" label="IDC_CONTENT_CONTEXT_ASK_GOOGLE_ABOUT_THIS_PAGE"/>
+   <int value="171" label="IDC_CONTENT_CONTEXT_CONTEXTUAL_TASKS_SUBMENU"/>
+   <int value="172" label="IDC_CONTENT_CONTEXT_FORCE_PASTE"/>
++  <int value="174" label="IDC_CONTENT_CONTEXT_OPENLINKLITTLEARC"/>
+   <int value="175" label="IDC_CONTENT_CONTEXT_OPENLINKPEEK"/>
  </enum>
  
