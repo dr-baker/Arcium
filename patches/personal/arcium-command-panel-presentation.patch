@@ -8,7 +8,7 @@
  import("//build/config/buildflags_paint_preview.gni")
  import("//build/config/compiler/compiler.gni")
  import("//build/config/features.gni")
-@@ -4364,10 +4365,7 @@
+@@ -4367,10 +4368,7 @@ static_library("ui") {
        "views/omnibox/omnibox_popup_webui_base_content.h",
        "views/omnibox/omnibox_popup_webui_content.cc",
        "views/omnibox/omnibox_popup_webui_content.h",
@@ -30,7 +30,7 @@
  #include "chrome/browser/ui/views/omnibox/omnibox_popup_closer.h"
  #include "chrome/browser/ui/views/omnibox/omnibox_popup_view_browser_view.h"
  #include "chrome/browser/ui/views/omnibox/omnibox_view_views.h"
-@@ -4031,56 +4032,27 @@
+@@ -4031,56 +4032,27 @@ bool BrowserView::ShowArciumCommandBar(b
  }
  
  bool BrowserView::IsArciumCommandBarNewTab() const {
@@ -96,7 +96,7 @@
  }
  
  void BrowserView::SetFocusToLocationBar(bool is_user_initiated) {
-@@ -5964,10 +5936,7 @@
+@@ -5964,10 +5936,7 @@ void BrowserView::OnWidgetActivationChan
  
  void BrowserView::OnWidgetBoundsChanged(views::Widget* widget,
                                          const gfx::Rect& new_bounds) {
@@ -340,7 +340,7 @@
  }
 --- /dev/null
 +++ b/chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.cc
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,264 @@
 +// Copyright 2026 The Arcium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +#include "chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.h"
@@ -430,7 +430,7 @@
 +  if (widget_) {
 +    panel_->SetInvocation(new_tab);
 +    if (!life || !widget_) return true;
-+    widget_->Activate();
++    if (widget_->IsVisible()) widget_->Activate();
 +    return true;
 +  }
 +  const auto started = base::TimeTicks::Now();
@@ -482,8 +482,21 @@
 +  auto panel_changed = options_.panel_changed;
 +  if (panel_changed) panel_changed.Run(panel_);
 +  if (!life || !widget_ || !panel_ || closing_) return true;
++  panel_->SetInitialResultsReadyCallback(base::BindOnce(
++      &CommandPanelPresentation::ShowPreparedPopup, weak_factory_.GetWeakPtr(), started));
++  return true;
++}
++void CommandPanelPresentation::ShowPreparedPopup(base::TimeTicks started) {
++  if (!widget_ || !panel_ || closing_ || destroying_) return;
++  const auto life = weak_factory_.GetWeakPtr();
++  // Posted initial results can replace the taller empty layout. Establish the
++  // complete frame while hidden, before installing animated resize handling.
++  widget_->SetBounds(PopupBounds(AnchorBounds(), options_.scale.Run(),
++      panel_->GetPreferredSize().height(), panel_->GetPreferredSize().width()));
++  widget_->GetRootView()->DeprecatedLayoutImmediately();
++  RefreshMaterial();
 +  widget_->Show();
-+  if (!life || !widget_ || !panel_ || closing_) return true;
++  if (!life || !widget_ || !panel_ || closing_) return;
 +  panel_->SetHeightResizeCallback(base::BindRepeating(
 +      [](base::WeakPtr<CommandPanelPresentation> owner, std::optional<int> height,
 +         base::TimeDelta duration) {
@@ -492,7 +505,6 @@
 +  panel_->FocusInput();
 +  auto opened = options_.opened;
 +  if (opened) opened.Run(widget_.get(), started);
-+  return true;
 +}
 +void CommandPanelPresentation::RefreshMaterial() {
 +  if (material_) material_->Refresh();
@@ -549,6 +561,7 @@
 +  if (notify && panel_ && will_close) will_close.Run(panel_);
 +  if (!closing_life) return;
 +  if (panel_) {
++    panel_->SetInitialResultsReadyCallback({});
 +    panel_->SetGeometryChangedCallback({});
 +    panel_->SetHeightResizeCallback({});
 +  }
@@ -594,7 +607,7 @@
 +}  // namespace arcium
 --- /dev/null
 +++ b/chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.h
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,98 @@
 +// Copyright 2026 The Arcium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +#ifndef CHROME_BROWSER_UI_VIEWS_OMNIBOX_ARCIUM_COMMAND_PANEL_PRESENTATION_H_
@@ -674,6 +687,7 @@
 +  void ScheduleDestruction();
 +  void DestroyPopup(bool reopen_pending, bool notify);
 +  void RefreshMaterial();
++  void ShowPreparedPopup(base::TimeTicks started);
 +  Options options_;
 +  raw_ptr<views::View> owner_ = nullptr;
 +  raw_ptr<views::Widget> parent_ = nullptr;
@@ -717,7 +731,7 @@
 +]
 --- a/chrome/browser/ui/helium/helium_space.cc
 +++ b/chrome/browser/ui/helium/helium_space.cc
-@@ -202,14 +202,7 @@
+@@ -202,14 +202,7 @@ base::DictValue SpaceTheme::ToDict() con
    return dict;
  }
  
@@ -1189,7 +1203,20 @@
 +}  // namespace helium
 --- a/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +++ b/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
-@@ -1074,6 +1074,18 @@
+@@ -778,6 +778,12 @@ CommandPanelView::~CommandPanelView() {
+ void CommandPanelView::FocusInput() {
+   input_->RequestFocus();
+ }
++void CommandPanelView::SetInitialResultsReadyCallback(base::OnceClosure callback) {
++  initial_results_ready_ = std::move(callback);
++  if (publication_ && publication_->done && initial_results_ready_) {
++    std::move(initial_results_ready_).Run();
++  }
++}
+ void CommandPanelView::SetInvocation(bool new_tab) {
+   height_resize_timer_.Stop();
+   requested_height_.reset();
+@@ -1074,6 +1080,18 @@ void CommandPanelView::RestoreInputState
    selection_explicit_ = state.explicit_selection;
    selection_missing_ = state.missing_selection;
  }
@@ -1208,9 +1235,19 @@
  void CommandPanelView::RebuildResults(bool resolve_menu) {
    const std::u16string query(ClampInputForQuery());
    if (actions_visible_) {
+@@ -1167,6 +1185,9 @@ void CommandPanelView::ApplyPublication(
+   } else {
+     Select(selected_, false, true);
+   }
++  if (publication_->done && initial_results_ready_) {
++    std::move(initial_results_ready_).Run();
++  }
+ }
+ void CommandPanelView::RebuildPublicationRows(bool preserve_selection) {
+   const std::string selected_key =
 --- a/chrome/browser/ui/views/omnibox/arcium_command_panel.h
 +++ b/chrome/browser/ui/views/omnibox/arcium_command_panel.h
-@@ -64,6 +64,10 @@
+@@ -64,7 +64,13 @@ class CommandPanelView : public views::V
                     base::RepeatingCallback<void(bool)> reopen, bool new_tab = true);
    ~CommandPanelView() override;
    void SetInvocation(bool new_tab);
@@ -1219,5 +1256,125 @@
 +  void RestoreSelectionKey(std::string key);
 +  std::string CaptureSelectionKey() const;
    void FocusInput();
++  // Runs once the initial result layout is complete, including empty results.
++  void SetInitialResultsReadyCallback(base::OnceClosure callback);
    void SetAppearance(CommandPanelAppearance appearance);
    void SetUIScale(float scale);
+   // Embedded presenters let their host lay out the pane, never the window.
+@@ -222,6 +228,7 @@ class CommandPanelView : public views::V
+   base::RepeatingCallback<void(bool)> reopen_;
+   base::RepeatingClosure geometry_changed_;
+   HeightResizeCallback height_resize_;
++  base::OnceClosure initial_results_ready_;
+   base::OneShotTimer height_resize_timer_;
+   std::optional<int> requested_height_;
+   base::RepeatingCallback<int()> available_width_provider_;
+--- a/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
++++ b/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
+@@ -1,6 +1,7 @@
+ // Copyright 2026 The Helium Authors
+ // Use of this source code is governed by the GPL-3.0 license.
+ #include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
++#include "chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.h"
+ 
+ #include <algorithm>
+ #include <map>
+@@ -486,6 +487,98 @@ class ArciumNativePanelTest : public vie
+   int dismissals_ = 0;
+ };
+ 
++class ArciumPanelOpeningTest : public ArciumNativePanelTest {
++ protected:
++  void SetUp() override {
++    ArciumNativePanelTest::SetUp();
++    prefs_.registry()->RegisterDictionaryPref(kCommandPanelLayoutPref);
++    prefs_.registry()->RegisterDictionaryPref(helium::kArciumChromeAppearancePref);
++    widget_ = CreateTestWidget(views::Widget::InitParams::CLIENT_OWNS_WIDGET);
++    widget_->SetBounds(gfx::Rect(100, 100, 1200, 900));
++    CommandPanelPresentation::Options options;
++    options.parent = widget_.get();
++    options.prefs = &prefs_;
++    options.scale = base::BindRepeating([] { return 1.f; });
++    options.create_session = base::BindRepeating(
++        [](std::shared_ptr<FakeState> state) -> std::unique_ptr<CommandSession> {
++          return std::make_unique<FakeSession>(std::move(state));
++        }, state_);
++    options.opened = base::BindLambdaForTesting(
++        [this](views::Widget* popup, base::TimeTicks) {
++          ++openings_;
++          first_bounds_ = popup->GetWindowBoundsInScreen();
++          first_rows_ = presentation_->panel()->row_count_for_testing();
++        });
++    presentation_ = std::make_unique<CommandPanelPresentation>(std::move(options));
++  }
++  void TearDown() override {
++    presentation_.reset();
++    ArciumNativePanelTest::TearDown();
++  }
++  void Complete(bool empty = false) {
++    auto result = std::make_shared<CommandPublication>(*state_->last_publication);
++    result->done = true;
++    if (empty) result->rows.clear();
++    state_->publish.Run(std::move(result));
++  }
++  TestingPrefServiceSimple prefs_;
++  std::unique_ptr<CommandPanelPresentation> presentation_;
++  int openings_ = 0;
++  size_t first_rows_ = 0;
++  gfx::Rect first_bounds_;
++};
++
++TEST_F(ArciumPanelOpeningTest, DeferredResultsSetSizeBeforeFirstShow) {
++  state_->defer_search = true;
++  ASSERT_TRUE(presentation_->Show(true));
++  ASSERT_TRUE(presentation_->widget());
++  EXPECT_FALSE(presentation_->widget()->IsVisible());
++  EXPECT_EQ(0, openings_);
++  Complete();
++  EXPECT_EQ(1, openings_);
++  EXPECT_GT(first_rows_, 0u);
++  EXPECT_EQ(presentation_->panel()->GetPreferredSize().height(),
++            first_bounds_.height());
++}
++
++TEST_F(ArciumPanelOpeningTest, PartialCurrentTabDoesNotShowAnIntermediateHeight) {
++  state_->defer_search = true;
++  ASSERT_TRUE(presentation_->Show(false));
++  auto partial = std::make_shared<CommandPublication>(*state_->last_publication);
++  partial->rows.clear();
++  partial->done = false;
++  state_->publish.Run(partial);
++  EXPECT_FALSE(presentation_->widget()->IsVisible());
++  EXPECT_EQ(0, openings_);
++  Complete();
++  EXPECT_EQ(1, openings_);
++  EXPECT_GT(first_rows_, 1u);
++  EXPECT_EQ(presentation_->panel()->GetPreferredSize().height(),
++            first_bounds_.height());
++}
++
++TEST_F(ArciumPanelOpeningTest, CompletedEmptyResultsStillOpen) {
++  state_->defer_search = true;
++  ASSERT_TRUE(presentation_->Show(true));
++  EXPECT_EQ(0, openings_);
++  Complete(true);
++  EXPECT_EQ(1, openings_);
++  EXPECT_EQ(0u, first_rows_);
++  EXPECT_EQ(presentation_->panel()->GetPreferredSize().height(),
++            first_bounds_.height());
++}
++
++TEST_F(ArciumPanelOpeningTest, CloseBeforeResultsCannotShowThePopup) {
++  state_->defer_search = true;
++  ASSERT_TRUE(presentation_->Show(true));
++  presentation_->Close();
++  Complete();
++  EXPECT_EQ(0, openings_);
++  EXPECT_FALSE(presentation_->widget()->IsVisible());
++  base::RunLoop().RunUntilIdle();
++  EXPECT_FALSE(presentation_->widget());
++}
++
+ class ArciumPanelHeightTest : public ArciumNativePanelTest {
+  protected:
+   ArciumPanelHeightTest()
