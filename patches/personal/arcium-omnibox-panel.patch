@@ -568,7 +568,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
-@@ -0,0 +1,2406 @@
+@@ -0,0 +1,2413 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +
@@ -2882,8 +2882,15 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel.cc
 +      BrowseScopes(false);
 +      Select(result, false);
 +      selection_explicit_ = !rows_.empty();
++      const bool default_shortcut =
++          publication_ && result >= 0 &&
++          result < static_cast<int>(rows_.size()) &&
++          rows_[result].data.is_default &&
++          rows_[result].data.kind == CommandRowKind::kResult &&
++          std::holds_alternative<CommandUrlTarget>(rows_[result].data.target);
 +      if (code == ui::VKEY_RETURN &&
-+          !base::TrimWhitespace(input_->GetText(), base::TRIM_ALL).empty() &&
++          (!base::TrimWhitespace(input_->GetText(), base::TRIM_ALL).empty() ||
++           default_shortcut) &&
 +          !current_context_) {
 +        Activate(result, event.flags());
 +      }
@@ -3413,7 +3420,7 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
-@@ -0,0 +1,2373 @@
+@@ -0,0 +1,2406 @@
 +// Copyright 2026 The Helium Authors
 +// Use of this source code is governed by the GPL-3.0 license.
 +#include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
@@ -4731,6 +4738,39 @@ Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
 +  EXPECT_EQ(
 +      "interface",
 +      panel()->row_for_testing(panel()->selected_for_testing()).selection_key);
++}
++TEST_F(ArciumNativePanelTest, EmptyWebsiteShortcutReturnActivatesDefault) {
++  for (const size_t index : {3u, 4u, 5u}) {
++    for (const char16_t* query : {u"", u"  "}) {
++      for (const bool down_first : {false, true}) {
++        Open();
++        Query(query);
++        state_->executed.clear();
++        views::test::ButtonTestApi(
++            static_cast<views::Button*>(
++                panel()->scope_button_for_testing(index)))
++            .NotifyDefaultMouseClick();
++        const CommandTarget target =
++            CommandUrlTarget{GURL("https://shortcut.test/")};
++        auto update = Update();
++        auto row = Result("shortcut", u"Shortcut", target, true);
++        row.is_default = true;
++        update->rows = {std::move(row)};
++        Publish(update);
++        ASSERT_TRUE(panel()->scopes_focused_for_testing());
++        ASSERT_EQ(0, panel()->selected_for_testing());
++        if (down_first) {
++          Key(ui::VKEY_DOWN);
++          EXPECT_TRUE(state_->executed.empty());
++        }
++        Key(ui::VKEY_RETURN);
++        ASSERT_EQ(1u, state_->executed.size());
++        EXPECT_EQ(target, state_->executed.back().target);
++        EXPECT_FALSE(panel()->scopes_focused_for_testing());
++        Close();
++      }
++    }
++  }
 +}
 +TEST_F(ArciumNativePanelTest, LeavingScopesKeepsTheProviderDefault) {
 +  Open();
