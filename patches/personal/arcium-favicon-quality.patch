@@ -250,7 +250,7 @@
    bool IsFrameActive() const;
 --- a/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
 +++ b/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
-@@ -4,29 +4,63 @@
+@@ -4,29 +4,64 @@
  
  #include "chrome/browser/ui/views/tabs/common/persistent_tab_view.h"
  
@@ -287,6 +287,7 @@
  #include "ui/base/l10n/l10n_util.h"
  #include "ui/events/event.h"
  #include "ui/events/types/event_type.h"
++#include "ui/gfx/canvas.h"
 +#include "ui/gfx/codec/png_codec.h"
  #include "ui/gfx/geometry/point.h"
 +#include "ui/gfx/image/image_skia.h"
@@ -314,10 +315,70 @@
    std::unique_ptr<PersistentTabView> MakeView(
        PersistentTabView::PresentationMode mode,
        views::Button::PressedCallback activate =
-@@ -40,6 +74,31 @@ class PersistentTabViewTest : public Chr
+@@ -40,6 +75,91 @@ class PersistentTabViewTest : public Chr
    TestingProfile profile_;
  };
  
++class DiscardedFaviconTestIcon : public TabIcon {
++ public:
++  void PaintDiscarded(gfx::Canvas* canvas,
++                      const gfx::ImageSkia& image,
++                      const gfx::Rect& bounds) {
++    tab_discard_animation_.Reset(1.0);
++    PaintDiscardedFavicon(canvas, image, bounds);
++  }
++};
++
++TEST_F(PersistentTabViewTest, DiscardedFaviconKeepsFullImageAtScaledSizes) {
++  DiscardedFaviconTestIcon icon;
++  constexpr SkColor colors[] = {
++      SkColorSetRGB(64, 64, 64), SkColorSetRGB(128, 128, 128),
++      SkColorSetRGB(192, 192, 192), SK_ColorWHITE};
++  for (const int source_size : {16, 24, 32}) {
++    for (const float device_scale : {1.0f, 2.0f}) {
++      SCOPED_TRACE(testing::Message() << "source=" << source_size
++                                     << " device_scale=" << device_scale);
++      const int pixel_size = source_size * device_scale;
++      SkBitmap source;
++      source.allocN32Pixels(pixel_size, pixel_size);
++      for (int y = 0; y < pixel_size; ++y) {
++        for (int x = 0; x < pixel_size; ++x) {
++          const bool corner_x = x < pixel_size / 4 || x >= 3 * pixel_size / 4;
++          const bool corner_y = y < pixel_size / 4 || y >= 3 * pixel_size / 4;
++          *source.getAddr32(x, y) =
++              corner_x && corner_y
++                  ? colors[(y >= pixel_size / 2 ? 2 : 0) +
++                           (x >= pixel_size / 2 ? 1 : 0)]
++                  : SK_ColorBLACK;
++        }
++      }
++      const gfx::ImageSkia image =
++          gfx::ImageSkia::CreateFromBitmap(source, device_scale);
++      for (const int destination_size : {16, 18, 20, 24, 26, 30}) {
++        SCOPED_TRACE(destination_size);
++        const gfx::Rect bounds(3, 5, destination_size, destination_size);
++        gfx::Canvas canvas(gfx::Size(bounds.right() + 3, bounds.bottom() + 3),
++                           device_scale, /*is_opaque=*/false);
++        icon.PaintDiscarded(&canvas, image, bounds);
++        const SkBitmap painted = canvas.GetBitmap();
++        for (int quadrant = 0; quadrant < 4; ++quadrant) {
++          const int sample_x = quadrant % 2 == 0 ? 1 : destination_size - 2;
++          const int sample_y = quadrant < 2 ? 1 : destination_size - 2;
++          const SkColor actual = painted.getColor(
++              (bounds.x() + sample_x) * device_scale,
++              (bounds.y() + sample_y) * device_scale);
++          EXPECT_NEAR(128, SkColorGetA(actual), 1) << quadrant;
++          EXPECT_NEAR(SkColorGetR(colors[quadrant]), SkColorGetR(actual), 2)
++              << quadrant;
++          EXPECT_EQ(SkColorGetR(actual), SkColorGetG(actual));
++          EXPECT_EQ(SkColorGetR(actual), SkColorGetB(actual));
++        }
++        EXPECT_EQ(SK_ColorTRANSPARENT, painted.getColor(0, 0));
++      }
++    }
++  }
++}
++
 +namespace {
 +
 +favicon_base::FaviconRawBitmapResult MakeCachedFaviconResult(
@@ -346,7 +407,7 @@
  class TestPersistentTabDragDelegate : public PersistentTabDragDelegate {
   public:
    bool BeginPersistentTabDrag(PersistentTabView&,
-@@ -276,6 +335,140 @@ TEST_F(PersistentTabViewTest, FallsBackT
+@@ -276,6 +396,140 @@ TEST_F(PersistentTabViewTest, FallsBackT
              row->favicon_state_for_testing());
  }
  
@@ -783,6 +844,15 @@
                           bounds.x(), bounds.y(), bounds.width(),
                           bounds.height(), false);
      cc::PaintFlags clear_flags;
+@@ -366,7 +394,7 @@ void TabIcon::PaintDiscardedFavicon(gfx:
+   color_matrix.getRowMajor(matrix_data);
+   flags.setColorFilter(cc::ColorFilter::MakeMatrix(matrix_data));
+ 
+-  canvas->DrawImageInt(icon, 0, 0, bounds.width(), bounds.height(), bounds.x(),
++  canvas->DrawImageInt(icon, 0, 0, icon.width(), icon.height(), bounds.x(),
+                        bounds.y(), bounds.width(), bounds.height(),
+                        /*filter=*/true, flags);
+ 
 @@ -472,7 +500,7 @@ void TabIcon::MaybePaintFavicon(gfx::Can
      canvas->Translate(gfx::Vector2d(-bounds.x(), -bounds.y()));
    }
