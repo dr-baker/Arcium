@@ -94,7 +94,7 @@ Index: src/chrome/browser/ui/profiles/profile_picker_unittest.cc
  #include "components/signin/public/identity_manager/identity_manager.h"
  #include "components/signin/public/identity_manager/identity_test_utils.h"
  #include "components/sync/service/sync_service.h"
-@@ -270,71 +269,55 @@ TEST_F(ProfilePickerParamsTest, CanReuse
+@@ -270,71 +269,57 @@ TEST_F(ProfilePickerParamsTest, CanReuse
    EXPECT_FALSE(glic_manager_params.CanReusePickerWindow(params));
  }
  
@@ -117,9 +117,13 @@ Index: src/chrome/browser/ui/profiles/profile_picker_unittest.cc
 -TEST_F(ProfilePickerTest, ComputeFirstRunSkipReasonProfileAlreadySetUp) {
 +TEST_F(ProfilePickerTest, ComputeFirstRunProductPolicyProfileAlreadySetUp) {
    TestingProfile& profile = CreateTestingProfileWithSyncService();
-   signin::MakePrimaryAccountAvailable(&GetIdentityManager(profile),
-                                       "user@gmail.com",
-                                       signin::ConsentLevel::kSignin);
+-  signin::MakePrimaryAccountAvailable(&GetIdentityManager(profile),
+-                                      "user@gmail.com",
+-                                      signin::ConsentLevel::kSignin);
++  signin::SetPrimaryAccount(&GetIdentityManager(profile), "user@gmail.com",
++                            signin::ConsentLevel::kSignin);
++  ASSERT_TRUE(GetIdentityManager(profile).HasPrimaryAccount(
++      signin::ConsentLevel::kSignin));
    EXPECT_EQ(ProfilePicker::ComputeFirstRunSkipReason(profile),
 -            ProfilePicker::FirstRunFinishReason::kProfileAlreadySetUp);
 +            ProfilePicker::FirstRunFinishReason::kFinishedFlow);
@@ -165,10 +169,14 @@ Index: src/chrome/browser/ui/profiles/profile_picker_unittest.cc
  
 -  // Both signed in and policy disabled: already set up should take precedence
 -  // over policy skip.
+-  signin::MakePrimaryAccountAvailable(&GetIdentityManager(profile),
+-                                      "user@gmail.com",
+-                                      signin::ConsentLevel::kSignin);
 +  // Product policy finishes first run for signed-in and managed profiles.
-   signin::MakePrimaryAccountAvailable(&GetIdentityManager(profile),
-                                       "user@gmail.com",
-                                       signin::ConsentLevel::kSignin);
++  signin::SetPrimaryAccount(&GetIdentityManager(profile), "user@gmail.com",
++                            signin::ConsentLevel::kSignin);
++  ASSERT_TRUE(GetIdentityManager(profile).HasPrimaryAccount(
++      signin::ConsentLevel::kSignin));
    GetSyncService(profile).SetAllowedByEnterprisePolicy(false);
    ASSERT_EQ(ProfilePicker::ComputeFirstRunSkipReason(profile),
 -            ProfilePicker::FirstRunFinishReason::kProfileAlreadySetUp);
@@ -185,11 +193,15 @@ Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
 +++ src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
-@@ -2,11 +2,27 @@
+@@ -2,11 +2,31 @@
  // Use of this source code is governed by a BSD-style license that can be
  // found in the LICENSE file.
  
 -#include "chrome/browser/ui/views/frame/test_with_browser_view.h"
++#include "chrome/browser/bookmarks/bookmark_merged_surface_service.h"
++#include "chrome/browser/bookmarks/bookmark_merged_surface_service_factory.h"
++#include "chrome/browser/bookmarks/managed_bookmark_service_factory.h"
++#include "chrome/browser/bookmarks/bookmark_model_factory.h"
 +#include "extensions/browser/load_error_reporter.h"
 +#include "components/signin/public/base/list_accounts_test_utils.h"
 +#include "components/omnibox/browser/test_scheme_classifier.h"
@@ -214,7 +226,7 @@ Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
  #include "chrome/browser/ui/omnibox/arcium_command_example_session.h"
  #include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
  #include "chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.h"
-@@ -61,10 +77,59 @@
+@@ -61,10 +81,68 @@
  #include "ui/views/controls/label.h"
  #include "ui/views/view_class_properties.h"
  
@@ -264,11 +276,20 @@ Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
 +    extensions::LoadErrorReporter::Init(/*enable_noisy_errors=*/false);
 +    extensions::extension_action_test_util::CreateToolbarModelForProfile(profile);
 +    signin::SetListAccountsResponseHttpNotFound(test_url_loader_factory());
++    BookmarkMergedSurfaceServiceFactory::GetForProfile(profile)
++        ->LoadForTesting({});
 +    return profile;
 +  }
    TestingProfile::TestingFactories GetTestingFactories() override {
 -    auto factories = TestWithBrowserView::GetTestingFactories();
 +    auto factories = BrowserWithTestWindowTest::GetTestingFactories();
++    factories.emplace_back(BookmarkModelFactory::GetInstance(),
++                           BookmarkModelFactory::GetDefaultFactory());
++    factories.emplace_back(ManagedBookmarkServiceFactory::GetInstance(),
++                           ManagedBookmarkServiceFactory::GetDefaultFactory());
++    factories.emplace_back(
++        BookmarkMergedSurfaceServiceFactory::GetInstance(),
++        BookmarkMergedSurfaceServiceFactory::GetDefaultFactory());
 +    factories.emplace_back(
 +        ChromeSigninClientFactory::GetInstance(),
 +        base::BindRepeating(&BuildChromeSigninClientWithURLLoader,
@@ -276,7 +297,7 @@ Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
      factories.emplace_back(
          PinnedToolbarActionsModelFactory::GetInstance(),
          base::BindRepeating([](content::BrowserContext* context)
-@@ -83,8 +148,8 @@ class ArciumBrowserChromeTest : public T
+@@ -83,8 +161,8 @@ class ArciumBrowserChromeTest : public T
    }
  
    void SetUp() override {
@@ -287,7 +308,7 @@ Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
      // Use the production color pipeline before asserting cached view colors.
      ui::ColorProviderManager::Get().AppendColorProviderInitializer(
          base::BindRepeating(color::AddComponentsColorMixers));
-@@ -105,12 +170,21 @@ class ArciumBrowserChromeTest : public T
+@@ -105,12 +183,21 @@ class ArciumBrowserChromeTest : public T
    }
  
    void TearDown() override {
@@ -369,10 +390,11 @@ Index: src/chrome/test/BUILD.gn
        ":test_interfaces",
        ":test_support",
        ":test_support_unit",
-@@ -9935,6 +9936,16 @@ if (!is_android && toolkit_views) {
+@@ -9935,6 +9936,17 @@ if (!is_android && toolkit_views) {
      ]
  
      deps = [
++      "//chrome/browser/bookmarks",
 +      "//chrome/test/base:chrome_render_view_host_test_harness",
 +      "//components/enterprise/net/core:test_support",
 +      "//components/send_tab_to_self:test_support",
