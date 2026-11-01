@@ -1,0 +1,508 @@
+Index: src/chrome/browser/ui/browser_shortcuts/arcium_shortcut_presets_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_shortcuts/arcium_shortcut_presets_unittest.cc
++++ src/chrome/browser/ui/browser_shortcuts/arcium_shortcut_presets_unittest.cc
+@@ -316,9 +316,6 @@ TEST(ArciumShortcutPresetsTest, AssignsS
+ 
+ TEST(ArciumShortcutPresetsTest,
+      ReportsArcCommandsAndDedicatedSidebarEquivalents) {
+-  base::test::ScopedFeatureList feature_list;
+-  feature_list.InitWithFeatures(
+-      {}, {tabs::kVerticalTabs, tabs::kVerticalTabsLaunch});
+   TestingPrefServiceSimple pref_service;
+   RegisterPrefs(&pref_service);
+   UseVerticalSidebar(&pref_service);
+@@ -375,9 +372,6 @@ TEST(ArciumShortcutPresetsTest, ReportsS
+ 
+ TEST(ArciumShortcutPresetsTest,
+      AppliesSavePageAndSidebarWithDedicatedCommands) {
+-  base::test::ScopedFeatureList feature_list;
+-  feature_list.InitWithFeatures(
+-      {}, {tabs::kVerticalTabs, tabs::kVerticalTabsLaunch});
+   TestingPrefServiceSimple pref_service;
+   RegisterPrefs(&pref_service);
+   UseVerticalSidebar(&pref_service);
+Index: src/chrome/browser/ui/helium/helium_space_service_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/helium/helium_space_service_unittest.cc
++++ src/chrome/browser/ui/helium/helium_space_service_unittest.cc
+@@ -2696,7 +2696,7 @@ TEST_F(HeliumSpaceServiceTest,
+   // cleanup.
+   constexpr char kRetiringProfile[] = "space-shutdown";
+   TestingProfile* retiring_profile = CreateProfile(kRetiringProfile);
+-  auto retiring_profile_weak = retiring_profile->AsWeakPtr();
++  auto retiring_profile_weak = retiring_profile->GetWeakPtr();
+   auto* retiring_service =
+       HeliumSpaceServiceFactory::GetInstance()->SetTestingSubclassFactoryAndUse(
+           retiring_profile,
+Index: src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
+@@ -1,6 +1,7 @@
+ // Copyright 2026 The Helium Authors
+ // Use of this source code is governed by the GPL-3.0 license.
+ 
++#include "chrome/browser/ui/browser_active_state_manager/browser_active_state_manager.h"
+ #include "chrome/browser/ui/omnibox/arcium_command_action_router.h"
+ 
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+@@ -227,7 +228,7 @@ TEST_F(ArciumCommandEntryRoutingTest, Ne
+   auto* source = browser()->GetTabStripModel()->GetActiveWebContents();
+   const int count = browser()->GetTabStripModel()->count();
+   auto* action = actions::ActionManager::Get().FindAction(
+-      kActionNewTab, browser()->GetActions()->root_action_item());
++      kActionNewTab, BrowserActions::From(browser())->root_action_item());
+   ASSERT_TRUE(action);
+   action->InvokeAction();
+   EXPECT_EQ((std::vector<bool>{true}), recording_window()->invocations);
+@@ -1590,8 +1591,10 @@ TEST_F(ArciumCommandActionRouterTest,
+   spaces_->SetSpaceForBrowser(browser(), imported->id());
+   space_ = spaces_->GetOrCreateSpace("local-space", u"Local");
+   BrowserWindowInterface* unrelated = AddSecondaryBrowser();
+-  unrelated->DidBecomeInactive();
+-  unrelated->DidBecomeActive();
++  auto* active_state = BrowserActiveStateManager::From(unrelated);
++  ASSERT_TRUE(active_state);
++  active_state->DidBecomeInactive();
++  active_state->DidBecomeActive();
+   ASSERT_EQ(unrelated, ProfileBrowserCollection::GetForProfile(profile())
+                            ->GetLastActiveBrowser());
+   ASSERT_TRUE(PersistentItemCodec::FindLink(
+Index: src/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
++++ src/chrome/browser/ui/omnibox/arcium_command_session_unittest.cc
+@@ -958,7 +958,7 @@ class FakeOmniboxAction final : public O
+ };
+ 
+ TEST(ArciumCommandNativeMatchTest, SuppressesFeaturedSearchAndMessageTypes) {
+-  constexpr AutocompleteMatchType::Type types[] = {
++  constexpr omnibox::AutocompleteMatchType types[] = {
+       omnibox::AutocompleteMatchType::kStarterPack,
+       omnibox::AutocompleteMatchType::kFeaturedEnterpriseSearch,
+       omnibox::AutocompleteMatchType::kNullResultMessage};
+Index: src/chrome/browser/ui/profiles/profile_picker_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/profiles/profile_picker_unittest.cc
++++ src/chrome/browser/ui/profiles/profile_picker_unittest.cc
+@@ -32,7 +32,6 @@
+ #include "components/keyed_service/core/keyed_service.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/signin/public/base/consent_level.h"
+-#include "components/signin/public/base/signin_pref_names.h"
+ #include "components/signin/public/identity_manager/identity_manager.h"
+ #include "components/signin/public/identity_manager/identity_test_utils.h"
+ #include "components/sync/service/sync_service.h"
+@@ -270,71 +269,57 @@ TEST_F(ProfilePickerParamsTest, CanReuse
+   EXPECT_FALSE(glic_manager_params.CanReusePickerWindow(params));
+ }
+ 
+-TEST_F(ProfilePickerTest, ComputeFirstRunSkipReasonDefault) {
++TEST_F(ProfilePickerTest, ComputeFirstRunProductPolicyDefault) {
+   TestingProfile& profile = CreateTestingProfileWithSyncService();
+-  EXPECT_EQ(ProfilePicker::ComputeFirstRunSkipReason(profile), std::nullopt);
++  EXPECT_EQ(ProfilePicker::ComputeFirstRunSkipReason(profile), ProfilePicker::FirstRunFinishReason::kFinishedFlow);
+ }
+ 
+-TEST_F(ProfilePickerTest, ComputeFirstRunSkipReasonForceSignin) {
++TEST_F(ProfilePickerTest, ComputeFirstRunProductPolicyForceSignin) {
+   TestingProfile& profile = CreateTestingProfileWithSyncService();
+   signin_util::ScopedForceSigninSetterForTesting scoped_force_signin(true);
+   EXPECT_EQ(ProfilePicker::ComputeFirstRunSkipReason(profile),
+-            ProfilePicker::FirstRunFinishReason::kForceSignin);
++            ProfilePicker::FirstRunFinishReason::kFinishedFlow);
+ }
+ 
+-TEST_F(ProfilePickerTest, ComputeFirstRunSkipReasonProfileAlreadySetUp) {
++TEST_F(ProfilePickerTest, ComputeFirstRunProductPolicyProfileAlreadySetUp) {
+   TestingProfile& profile = CreateTestingProfileWithSyncService();
+-  signin::MakePrimaryAccountAvailable(&GetIdentityManager(profile),
+-                                      "user@gmail.com",
+-                                      signin::ConsentLevel::kSignin);
++  signin::SetPrimaryAccount(&GetIdentityManager(profile), "user@gmail.com",
++                            signin::ConsentLevel::kSignin);
++  ASSERT_TRUE(GetIdentityManager(profile).HasPrimaryAccount(
++      signin::ConsentLevel::kSignin));
+   EXPECT_EQ(ProfilePicker::ComputeFirstRunSkipReason(profile),
+-            ProfilePicker::FirstRunFinishReason::kProfileAlreadySetUp);
++            ProfilePicker::FirstRunFinishReason::kFinishedFlow);
+ }
+ 
+-TEST_F(ProfilePickerTest, ComputeFirstRunSkipReasonPromotionsDisabled) {
++TEST_F(ProfilePickerTest, ComputeFirstRunProductPolicyPromotionsDisabled) {
+   TestingProfile& profile = CreateTestingProfileWithSyncService();
+   local_state().SetBoolean(prefs::kPromotionsEnabled, false);
+   EXPECT_EQ(ProfilePicker::ComputeFirstRunSkipReason(profile),
+-            ProfilePicker::FirstRunFinishReason::kSkippedByPolicies);
++            ProfilePicker::FirstRunFinishReason::kFinishedFlow);
+   local_state().ClearPref(prefs::kPromotionsEnabled);
+ }
+ 
+-TEST_F(ProfilePickerTest, ComputeFirstRunSkipReasonSyncDisabled) {
++TEST_F(ProfilePickerTest, ComputeFirstRunProductPolicySyncDisabled) {
+   TestingProfile& profile = CreateTestingProfileWithSyncService();
+   GetSyncService(profile).SetAllowedByEnterprisePolicy(false);
+   EXPECT_EQ(ProfilePicker::ComputeFirstRunSkipReason(profile),
+-            ProfilePicker::FirstRunFinishReason::kSkippedByPolicies);
++            ProfilePicker::FirstRunFinishReason::kFinishedFlow);
+ }
+ 
+-TEST_F(ProfilePickerTest, ComputeFirstRunSkipReasonSigninDisallowed) {
+-  TestingProfile& profile = CreateTestingProfileWithSyncService();
+-  profile.GetPrefs()->SetBoolean(prefs::kSigninAllowed, false);
+-  EXPECT_EQ(ProfilePicker::ComputeFirstRunSkipReason(profile),
+-            ProfilePicker::FirstRunFinishReason::kSkippedByPolicies);
+-}
+-
+-TEST_F(ProfilePickerTest,
+-       ComputeFirstRunSkipReasonSigninDisallowedOnNextStartup) {
+-  TestingProfile& profile = CreateTestingProfileWithSyncService();
+-  profile.GetPrefs()->SetBoolean(prefs::kSigninAllowedOnNextStartup, false);
+-  EXPECT_EQ(ProfilePicker::ComputeFirstRunSkipReason(profile),
+-            ProfilePicker::FirstRunFinishReason::kSkippedByPolicies);
+-}
+-
+-TEST_F(ProfilePickerTest, ComputeFirstRunSkipReasonPrecedence) {
++TEST_F(ProfilePickerTest, ComputeFirstRunProductPolicyPrecedence) {
+   TestingProfile& profile = CreateTestingProfileWithSyncService();
+ 
+-  // Both signed in and policy disabled: already set up should take precedence
+-  // over policy skip.
+-  signin::MakePrimaryAccountAvailable(&GetIdentityManager(profile),
+-                                      "user@gmail.com",
+-                                      signin::ConsentLevel::kSignin);
++  // Product policy finishes first run for signed-in and managed profiles.
++  signin::SetPrimaryAccount(&GetIdentityManager(profile), "user@gmail.com",
++                            signin::ConsentLevel::kSignin);
++  ASSERT_TRUE(GetIdentityManager(profile).HasPrimaryAccount(
++      signin::ConsentLevel::kSignin));
+   GetSyncService(profile).SetAllowedByEnterprisePolicy(false);
+   ASSERT_EQ(ProfilePicker::ComputeFirstRunSkipReason(profile),
+-            ProfilePicker::FirstRunFinishReason::kProfileAlreadySetUp);
++            ProfilePicker::FirstRunFinishReason::kFinishedFlow);
+ 
+-  // Force signin should take precedence over already set up.
++  // Forced sign-in also leaves the product first-run flow finished.
+   signin_util::ScopedForceSigninSetterForTesting scoped_force_signin(true);
+   EXPECT_EQ(ProfilePicker::ComputeFirstRunSkipReason(profile),
+-            ProfilePicker::FirstRunFinishReason::kForceSignin);
++            ProfilePicker::FirstRunFinishReason::kFinishedFlow);
+ }
+Index: src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
++++ src/chrome/browser/ui/views/frame/arcium_browser_chrome_unittest.cc
+@@ -2,11 +2,31 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#include "chrome/browser/ui/views/frame/test_with_browser_view.h"
++#include "chrome/browser/bookmarks/bookmark_merged_surface_service.h"
++#include "chrome/browser/bookmarks/bookmark_merged_surface_service_factory.h"
++#include "chrome/browser/bookmarks/managed_bookmark_service_factory.h"
++#include "chrome/browser/bookmarks/bookmark_model_factory.h"
++#include "extensions/browser/load_error_reporter.h"
++#include "components/signin/public/base/list_accounts_test_utils.h"
++#include "components/omnibox/browser/test_scheme_classifier.h"
++#include "components/omnibox/browser/autocomplete_controller_config.h"
++#include "components/omnibox/browser/autocomplete_controller.h"
++#include "components/omnibox/browser/autocomplete_classifier.h"
++#include "chrome/browser/signin/chrome_signin_client_test_util.h"
++#include "chrome/browser/signin/chrome_signin_client_factory.h"
++#include "chrome/browser/search_engines/template_url_service_test_util.h"
++#include "chrome/browser/search_engines/template_url_service_factory.h"
++#include "chrome/browser/media/router/media_router_feature.h"
++#include "chrome/browser/extensions/extension_action_test_util.h"
++#include "chrome/browser/autocomplete/chrome_autocomplete_provider_client.h"
++#include "chrome/browser/autocomplete/autocomplete_classifier_factory.h"
++#include "base/test/scoped_feature_list.h"
++#include "chrome/test/base/browser_with_test_window_test.h"
+ 
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ 
+ #include <memory>
++#include <vector>
+ #include "chrome/browser/ui/omnibox/arcium_command_example_session.h"
+ #include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
+ #include "chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.h"
+@@ -61,10 +81,68 @@
+ #include "ui/views/controls/label.h"
+ #include "ui/views/view_class_properties.h"
+ 
+-class ArciumBrowserChromeTest : public TestWithBrowserView {
++class ArciumBrowserChromeTest : public BrowserWithTestWindowTest {
++ public:
++  ArciumBrowserChromeTest() {
++    feature_list_.InitAndDisableFeature(media_router::kMediaRouter);
++  }
++
+  protected:
++  std::unique_ptr<BrowserWindow> CreateBrowserWindow() override {
++    return nullptr;
++  }
++
++  BrowserView* browser_view() {
++    return BrowserView::GetBrowserViewForBrowser(browser());
++  }
++
++  BrowserWindowInterface* CreateBrowserWithBrowserView(
++      Profile* profile, BrowserWindowInterface::Type type) {
++    additional_browsers_.push_back(
++        CreateBrowser(profile, type, /*hosted_app=*/false,
++                      /*browser_window=*/nullptr));
++    return additional_browsers_.back().get();
++  }
++
++  TestingProfile* CreateProfile(const std::string& profile_name) override {
++    TestingProfile* profile =
++        BrowserWithTestWindowTest::CreateProfile(profile_name);
++    TemplateURLServiceFactory::GetInstance()->SetTestingFactory(
++        profile,
++        TemplateURLServiceTestUtil::GetTemplateURLServiceTestingFactory());
++    AutocompleteClassifierFactory::GetInstance()->SetTestingFactory(
++        profile,
++        base::BindRepeating([](content::BrowserContext* context)
++                               -> std::unique_ptr<KeyedService> {
++          return std::make_unique<AutocompleteClassifier>(
++              std::make_unique<AutocompleteController>(
++                  std::make_unique<ChromeAutocompleteProviderClient>(
++                      Profile::FromBrowserContext(context)),
++                  AutocompleteControllerConfig{
++                      .provider_types =
++                          AutocompleteClassifier::DefaultOmniboxProviders()}),
++              std::make_unique<TestSchemeClassifier>());
++        }));
++    extensions::LoadErrorReporter::Init(/*enable_noisy_errors=*/false);
++    extensions::extension_action_test_util::CreateToolbarModelForProfile(profile);
++    signin::SetListAccountsResponseHttpNotFound(test_url_loader_factory());
++    BookmarkMergedSurfaceServiceFactory::GetForProfile(profile)
++        ->LoadForTesting({});
++    return profile;
++  }
+   TestingProfile::TestingFactories GetTestingFactories() override {
+-    auto factories = TestWithBrowserView::GetTestingFactories();
++    auto factories = BrowserWithTestWindowTest::GetTestingFactories();
++    factories.emplace_back(BookmarkModelFactory::GetInstance(),
++                           BookmarkModelFactory::GetDefaultFactory());
++    factories.emplace_back(ManagedBookmarkServiceFactory::GetInstance(),
++                           ManagedBookmarkServiceFactory::GetDefaultFactory());
++    factories.emplace_back(
++        BookmarkMergedSurfaceServiceFactory::GetInstance(),
++        BookmarkMergedSurfaceServiceFactory::GetDefaultFactory());
++    factories.emplace_back(
++        ChromeSigninClientFactory::GetInstance(),
++        base::BindRepeating(&BuildChromeSigninClientWithURLLoader,
++                            test_url_loader_factory()));
+     factories.emplace_back(
+         PinnedToolbarActionsModelFactory::GetInstance(),
+         base::BindRepeating([](content::BrowserContext* context)
+@@ -83,8 +161,8 @@ class ArciumBrowserChromeTest : public T
+   }
+ 
+   void SetUp() override {
+-    TestWithBrowserView::SetUp();
+-    // TestWithBrowserView omits ChromeViewsTestBase's mixer registration.
++    BrowserWithTestWindowTest::SetUp();
++    // BrowserWithTestWindowTest omits ChromeViewsTestBase's mixer registration.
+     // Use the production color pipeline before asserting cached view colors.
+     ui::ColorProviderManager::Get().AppendColorProviderInitializer(
+         base::BindRepeating(color::AddComponentsColorMixers));
+@@ -105,12 +183,23 @@ class ArciumBrowserChromeTest : public T
+   }
+ 
+   void TearDown() override {
+-    TestWithBrowserView::TearDown();
++    for (auto& additional_browser : additional_browsers_) {
++      additional_browser->GetTabStripModel()->CloseAllTabs();
++      additional_browser.reset();
++    }
++    additional_browsers_.clear();
++    browser()->GetTabStripModel()->CloseAllTabs();
++    release_browser().reset();
++    BrowserWithTestWindowTest::TearDown();
+     ui::ColorProviderManager::ResetForTesting();
+   }
+ 
+   PrefService* prefs() { return browser()->GetProfile()->GetPrefs(); }
+   void Layout() { browser_view()->GetWidget()->LayoutRootViewIfNecessary(); }
++
++ private:
++  base::test::ScopedFeatureList feature_list_;
++  std::vector<std::unique_ptr<BrowserWindowInterface>> additional_browsers_;
+ };
+ 
+ namespace {
+Index: src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
++++ src/chrome/browser/ui/views/omnibox/arcium_command_panel_unittest.cc
+@@ -1,5 +1,6 @@
+ // Copyright 2026 The Helium Authors
+ // Use of this source code is governed by the GPL-3.0 license.
++#include "ui/compositor/layer_test_api.h"
+ #include "chrome/browser/ui/views/omnibox/arcium_command_panel.h"
+ #include "chrome/browser/ui/views/omnibox/arcium_command_panel_presentation.h"
+ 
+@@ -3153,9 +3154,9 @@ TEST_F(ArciumNativePanelTest, LiveDesign
+   panel()->SetGeometryChangedCallback(base::BindLambdaForTesting([&] { ++geometry_notifications; }));
+   auto apply = [&](CommandPanelAppearance appearance) {
+     results->layer()->SendDamagedRects();
+-    ASSERT_TRUE(results->layer()->damaged_region().IsEmpty());
++    ASSERT_TRUE(ui::LayerTestApi(results->layer()).damaged_region().IsEmpty());
+     panel()->SetAppearance(appearance);
+-    EXPECT_FALSE(results->layer()->damaged_region().IsEmpty());
++    EXPECT_FALSE(ui::LayerTestApi(results->layer()).damaged_region().IsEmpty());
+     EXPECT_EQ(row, results->children()[0].get());
+     EXPECT_EQ(epoch, state_->epoch);
+     EXPECT_EQ(0, geometry_notifications);
+Index: src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
++++ src/chrome/browser/ui/views/tabs/common/persistent_tab_view_unittest.cc
+@@ -2,6 +2,7 @@
+ // You can use, redistribute, and/or modify this source code under
+ // the terms of the GPL-3.0 license that can be found in the LICENSE file.
+ 
++#include "base/i18n/test/scoped_rtl_for_testing.h"
+ #include "chrome/browser/ui/views/tabs/common/persistent_tab_view.h"
+ 
+ #include <cmath>
+@@ -1010,10 +1011,7 @@ TEST_F(PersistentTabViewTest, LateSplitF
+ }
+ 
+ TEST_F(PersistentTabViewTest, SplitDividerMirrorsWithLiveCloseButton) {
+-  const bool was_rtl = base::i18n::IsRTL();
+-  base::ScopedClosureRunner restore_direction(
+-      base::BindOnce(&base::i18n::SetRTLForTesting, was_rtl));
+-  base::i18n::SetRTLForTesting(true);
++  base::i18n::ScopedRTLForTesting rtl(true);
+   auto row = MakeView(PersistentTabView::PresentationMode::kFullRow);
+   PersistentTabView::PresentationState state;
+   state.live = true;
+Index: src/chrome/test/BUILD.gn
+===================================================================
+--- src.orig/chrome/test/BUILD.gn
++++ src/chrome/test/BUILD.gn
+@@ -89,6 +89,7 @@ if (!is_android && toolkit_views) {
+       "../browser/ui/omnibox/arcium_omnibox_post_navigation_unittest.cc",
+     ]
+     deps = [
++      "//chrome/browser/ui/browser_active_state_manager",
+       ":test_interfaces",
+       ":test_support",
+       ":test_support_unit",
+@@ -9935,6 +9936,17 @@ if (!is_android && toolkit_views) {
+     ]
+ 
+     deps = [
++      "//chrome/browser/bookmarks",
++      "//chrome/test/base:chrome_render_view_host_test_harness",
++      "//components/enterprise/net/core:test_support",
++      "//components/send_tab_to_self:test_support",
++      "//chrome/browser/autocomplete",
++      "//chrome/browser/media/router:media_router_feature",
++      "//chrome/browser/search_engines:test_support",
++      "//chrome/browser/signin",
++      "//chrome/browser/signin:test_support",
++      "//components/signin/public/base:test_support",
++      "//components/omnibox/browser:test_support",
+       ":test_interfaces",
+       ":test_support",
+       ":test_support_unit",
+Index: src/chrome/test/base/testing_browser_process.h
+===================================================================
+--- src.orig/chrome/test/base/testing_browser_process.h
++++ src/chrome/test/base/testing_browser_process.h
+@@ -206,7 +206,7 @@ class TestingBrowserProcess
+   void set_usb_system_tray_icon_for_test(
+       std::unique_ptr<UsbSystemTrayIcon> icon) override;
+   speech::SpeechRecognitionSmallExpertModelInstaller*
+-  speech_recognition_small_expert_model_installer() override;
++  speech_recognition_small_expert_model_installer();
+ #endif
+   os_crypt_async::OSCryptAsync* os_crypt_async() override;
+   void set_additional_os_crypt_async_provider_for_test(
+Index: src/components/omnibox/browser/arcium_command_search_unittest.cc
+===================================================================
+--- src.orig/components/omnibox/browser/arcium_command_search_unittest.cc
++++ src/components/omnibox/browser/arcium_command_search_unittest.cc
+@@ -1,6 +1,7 @@
+ // Copyright 2026 The Helium Authors
+ // Use of this source code is governed by the GPL-3.0 license.
+ 
++#include "components/omnibox/browser/autocomplete_match_type.h"
+ #include "components/omnibox/browser/arcium_command_search.h"
+ 
+ #include <algorithm>
+@@ -265,11 +266,11 @@ TEST(PersistentItemRelevanceTest, Bounds
+ TEST(CommandSearchIndexTest, PublishedNativeOrderAndDefaultArePreserved) {
+   AutocompleteResult result;
+   AutocompleteMatch first(nullptr, 200, false,
+-                          AutocompleteMatchType::SEARCH_SUGGEST);
++                          omnibox::AutocompleteMatchType::kSearchSuggest);
+   first.contents = u"semantic suggestion without literal query";
+   first.allowed_to_be_default_match = true;
+   AutocompleteMatch second(nullptr, 9000, false,
+-                           AutocompleteMatchType::HISTORY_URL);
++                           omnibox::AutocompleteMatchType::kHistoryUrl);
+   second.contents = u"exact literal match";
+   second.allowed_to_be_default_match = false;
+   result.AppendMatches({first, second});
+Index: src/components/omnibox/browser/autocomplete_result_unittest.cc
+===================================================================
+--- src.orig/components/omnibox/browser/autocomplete_result_unittest.cc
++++ src/components/omnibox/browser/autocomplete_result_unittest.cc
+@@ -448,11 +448,11 @@ TEST_F(AutocompleteResultTest,
+   AutocompleteInput input(u"atlas", OmniboxEventProto::NTP_REALBOX,
+                           TestSchemeClassifier());
+   AutocompleteMatch search(nullptr, 9000, false,
+-                           AutocompleteMatchType::SEARCH_WHAT_YOU_TYPED);
++                           AutocompleteMatchType::kSearchWhatYouTyped);
+   search.destination_url = GURL("https://search.example/?q=atlas");
+   search.allowed_to_be_default_match = true;
+   AutocompleteMatch saved(nullptr, 4100, false,
+-                          AutocompleteMatchType::BOOKMARK_TITLE);
++                          AutocompleteMatchType::kBookmarkTitle);
+   saved.destination_url = GURL("https://saved.example/atlas");
+   saved.allowed_to_be_default_match = true;
+   saved.arcium_item = ArciumOmniboxItem();
+@@ -471,7 +471,7 @@ TEST_F(AutocompleteResultTest, ArciumDup
+   AutocompleteInput input(u"atlas", OmniboxEventProto::OTHER,
+                           TestSchemeClassifier());
+   AutocompleteMatch first(nullptr, 4100, false,
+-                          AutocompleteMatchType::BOOKMARK_TITLE);
++                          AutocompleteMatchType::kBookmarkTitle);
+   first.destination_url = GURL("https://saved.example/same");
+   first.allowed_to_be_default_match = true;
+   first.arcium_item = ArciumOmniboxItem();
+@@ -492,7 +492,7 @@ TEST_F(AutocompleteResultTest, ArciumCom
+   AutocompleteInput input(u"atlas", OmniboxEventProto::OTHER,
+                           TestSchemeClassifier());
+   AutocompleteMatch search(nullptr, 1300, false,
+-                           AutocompleteMatchType::SEARCH_WHAT_YOU_TYPED);
++                           AutocompleteMatchType::kSearchWhatYouTyped);
+   search.destination_url = GURL("https://search.example/?q=atlas");
+   search.allowed_to_be_default_match = true;
+   auto command = search;
+Index: src/components/omnibox/browser/bookmark_provider_unittest.cc
+===================================================================
+--- src.orig/components/omnibox/browser/bookmark_provider_unittest.cc
++++ src/components/omnibox/browser/bookmark_provider_unittest.cc
+@@ -2,6 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include "components/omnibox/browser/autocomplete_match_type.h"
+ #include "components/omnibox/browser/bookmark_provider.h"
+ 
+ #include <stddef.h>
+@@ -514,7 +515,7 @@ TEST_F(BookmarkProviderTest, ArciumMoveC
+   EXPECT_EQ(
+       u"Action, Move pin to Research, https://atlas.test/ · Pin · Work → "
+       u"Research, Change Space",
+-      AutocompleteMatchType::ToAccessibilityLabel(match, u"", match.contents));
++      omnibox::AutocompleteMatchToAccessibilityLabel(match, u"", match.contents));
+   EXPECT_FALSE(match.allowed_to_be_default_match);
+   EXPECT_FALSE(match.deletable);
+   move.command_target_title = u"Renamed tab";

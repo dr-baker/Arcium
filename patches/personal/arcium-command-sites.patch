@@ -1,0 +1,2247 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -2416,6 +2416,8 @@ static_library("ui") {
+       "omnibox/arcium_command_native_result.h",
+       "omnibox/arcium_command_providers.cc",
+       "omnibox/arcium_command_providers.h",
++      "omnibox/arcium_command_sites.cc",
++      "omnibox/arcium_command_sites.h",
+       "omnibox/arcium_command_session.cc",
+       "omnibox/arcium_command_session.h",
+       "helium/arcium_appearance_prefs.h",
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -145,6 +145,7 @@ void RegisterBrowserUserPrefs(user_prefs
+ 
+   registry->RegisterBooleanPref(prefs::kHeliumRoundedFrame, true);
+   registry->RegisterDictionaryPref(arcium::kCommandPanelLayoutPref);
++  registry->RegisterDictionaryPref(arcium::kCommandSitesPref);
+   registry->RegisterIntegerPref(arcium::kCommandBarAppearancePref,
+                                 arcium::kCommandBarAppearanceAutomatic);
+ 
+--- a/chrome/browser/ui/helium/arcium_appearance_prefs.h
++++ b/chrome/browser/ui/helium/arcium_appearance_prefs.h
+@@ -10,6 +10,8 @@ inline constexpr char kCommandBarAppeara
+     "arcium.appearance.command_bar";
+ inline constexpr char kCommandPanelLayoutPref[] =
+     "arcium.appearance.command_panel_layout";
++// Sparse website-scope overrides; see arcium_command_sites.h.
++inline constexpr char kCommandSitesPref[] = "arcium.command_bar.sites";
+ inline constexpr int kCommandBarAppearanceSolid = 0;
+ inline constexpr int kCommandBarAppearanceGlass = 1;
+ // Follows the profile's surface set (helium::kArciumSurfaceSetPref).
+--- /dev/null
++++ b/chrome/browser/ui/helium/arcium_command_sites_settings_unittest.cc
+@@ -0,0 +1,125 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license found in the LICENSE file.
++
++#include <string>
++
++#include "base/functional/callback_helpers.h"
++#include "base/json/json_reader.h"
++#include "base/test/bind.h"
++#include "base/values.h"
++#include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
++#include "chrome/browser/ui/helium/arcium_settings_model.h"
++#include "chrome/test/base/browser_with_test_window_test.h"
++#include "chrome/test/base/testing_profile.h"
++#include "components/prefs/pref_service.h"
++#include "components/sync_preferences/testing_pref_service_syncable.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace arcium_settings {
++namespace {
++
++base::DictValue Json(std::string_view json) {
++  auto value = base::JSONReader::ReadDict(json, base::JSON_PARSE_RFC);
++  CHECK(value) << json;
++  return std::move(*value);
++}
++
++using ArciumCommandSitesSettingsTest = BrowserWithTestWindowTest;
++
++TEST_F(ArciumCommandSitesSettingsTest, EditorSeesSparseValueAndBuiltins) {
++  ArciumSettingsModel model(profile(), base::DoNothing(), base::DoNothing());
++  const auto state = model.GetCommandSites();
++  ASSERT_TRUE(state.FindDict("sites"));
++  EXPECT_TRUE(state.FindDict("sites")->empty());
++  const auto* builtins = state.FindList("builtins");
++  ASSERT_TRUE(builtins);
++  ASSERT_EQ(3u, builtins->size());
++  const auto& youtube = (*builtins)[0].GetDict();
++  EXPECT_EQ("youtube", *youtube.FindString("id"));
++  EXPECT_EQ("YouTube", *youtube.FindString("label"));
++  EXPECT_EQ("#e34b49", *youtube.FindString("tint"));
++  EXPECT_EQ("https://www.youtube.com/results?search_query=%s",
++            *youtube.FindString("search"));
++  EXPECT_EQ(3u, youtube.FindList("shortcuts")->size());
++
++  ASSERT_TRUE(model.SetCommandSites(Json(R"({"hidden": ["x"]})")));
++  // Hidden built-ins stay editable, and the saved value is returned as written.
++  EXPECT_EQ(3u, model.GetCommandSites().FindList("builtins")->size());
++  EXPECT_EQ(Json(R"({"hidden": ["x"]})"),
++            *model.GetCommandSites().FindDict("sites"));
++}
++
++TEST_F(ArciumCommandSitesSettingsTest, WritesAreStrictAndResettable) {
++  int changes = 0;
++  ArciumSettingsModel model(profile(),
++                            base::BindLambdaForTesting([&] { ++changes; }),
++                            base::DoNothing());
++  auto* prefs = profile()->GetPrefs();
++  EXPECT_FALSE(model.SetCommandSites(Json(
++      R"({"sites": {"youtube": {"search": "https://evil.test/?q=%s"}}})")));
++  EXPECT_FALSE(model.SetCommandSites(Json(R"({"hidden": ["missing"]})")));
++  EXPECT_FALSE(prefs->HasPrefPath(arcium::kCommandSitesPref));
++  EXPECT_EQ(0, changes);
++
++  const auto valid = Json(R"({"order": ["chatgpt"], "hidden": ["x"]})");
++  ASSERT_TRUE(model.SetCommandSites(valid));
++  EXPECT_EQ(valid, prefs->GetDict(arcium::kCommandSitesPref));
++  EXPECT_GT(changes, 0);
++
++  ASSERT_TRUE(model.SetCommandSites(base::DictValue()));
++  EXPECT_FALSE(prefs->HasPrefPath(arcium::kCommandSitesPref));
++}
++
++TEST_F(ArciumCommandSitesSettingsTest, AddMintsIdsAndAppendsToOrder) {
++  ArciumSettingsModel model(profile(), base::DoNothing(), base::DoNothing());
++  auto* prefs = profile()->GetPrefs();
++  ASSERT_TRUE(model.SetCommandSites(Json(R"({"order": ["chatgpt"]})")));
++  const auto site = Json(R"({"label": "Docs", "domains": ["docs.rs"]})");
++  const std::string first = model.AddCommandSite(site);
++  const std::string second = model.AddCommandSite(site);
++  ASSERT_FALSE(first.empty());
++  ASSERT_FALSE(second.empty());
++  EXPECT_NE(first, second);
++  EXPECT_TRUE(first.starts_with("site-"));
++  const auto& saved = prefs->GetDict(arcium::kCommandSitesPref);
++  const auto* order = saved.FindList("order");
++  ASSERT_TRUE(order);
++  ASSERT_EQ(3u, order->size());
++  EXPECT_EQ(first, (*order)[1].GetString());
++  EXPECT_EQ(second, (*order)[2].GetString());
++  EXPECT_EQ(site, *saved.FindDict("sites")->FindDict(first));
++
++  const auto before = saved.Clone();
++  EXPECT_TRUE(model.AddCommandSite(
++                       Json(R"({"label": "Bad", "search": "javascript:%s"})"))
++                  .empty());
++  EXPECT_TRUE(model.AddCommandSite(Json(R"({"label": "Nowhere"})")).empty());
++  EXPECT_EQ(before, prefs->GetDict(arcium::kCommandSitesPref));
++}
++
++TEST_F(ArciumCommandSitesSettingsTest, ManagedPreferenceRejectsWrites) {
++  profile()->GetTestingPrefService()->SetManagedPref(
++      arcium::kCommandSitesPref, Json(R"({"hidden": ["x"]})"));
++  ArciumSettingsModel model(profile(), base::DoNothing(), base::DoNothing());
++  EXPECT_TRUE(model.IsManaged(arcium::kCommandSitesPref));
++  EXPECT_FALSE(model.SetCommandSites(base::DictValue()));
++  EXPECT_TRUE(
++      model.AddCommandSite(Json(R"({"label": "Docs", "domains": ["docs.rs"]})"))
++          .empty());
++  EXPECT_EQ(Json(R"({"hidden": ["x"]})"),
++            profile()->GetPrefs()->GetDict(arcium::kCommandSitesPref));
++}
++
++TEST_F(ArciumCommandSitesSettingsTest, ShutdownRejectsWrites) {
++  ArciumSettingsModel model(profile(), base::DoNothing(), base::DoNothing());
++  model.Shutdown();
++  EXPECT_FALSE(model.SetCommandSites(Json(R"({"hidden": ["x"]})")));
++  EXPECT_TRUE(
++      model.AddCommandSite(Json(R"({"label": "Docs", "domains": ["docs.rs"]})"))
++          .empty());
++  EXPECT_FALSE(profile()->GetPrefs()->HasPrefPath(arcium::kCommandSitesPref));
++}
++
++}  // namespace
++}  // namespace arcium_settings
+--- a/chrome/browser/ui/helium/arcium_settings_model.cc
++++ b/chrome/browser/ui/helium/arcium_settings_model.cc
+@@ -14,6 +14,8 @@
+ 
+ #include "base/auto_reset.h"
+ #include "base/functional/bind.h"
++#include "base/rand_util.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "build/build_config.h"
+@@ -29,6 +31,7 @@
+ #include "chrome/browser/ui/helium/space_palette.h"
+ #include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
+ #include "chrome/browser/ui/omnibox/arcium_command_design.h"
++#include "chrome/browser/ui/omnibox/arcium_command_sites.h"
+ #include "chrome/browser/ui/helium/arcium_settings_prefs.h"
+ #include "chrome/browser/ui/helium/helium_space.h"
+ #include "chrome/browser/ui/helium/helium_space_service.h"
+@@ -56,7 +59,7 @@ constexpr char kSharedPaletteDarkChromeC
+ constexpr char kSharedPaletteControlColorIDKey[] = "controlColorID";
+ constexpr size_t kSharedPaletteConfigurationKeyCount = 13;
+ 
+-constexpr std::array<std::string_view, 43> kProfilePreferences = {
++constexpr std::array<std::string_view, 44> kProfilePreferences = {
+     prefs::kRestoreOnStartup,
+     prefs::kPromptForDownload,
+     prefs::kHeliumLittleArcExternalLinks,
+@@ -73,6 +76,7 @@ constexpr std::array<std::string_view, 4
+     arcium::kShowToolbarPref,
+     arcium::kCommandBarAppearancePref,
+     arcium::kCommandPanelLayoutPref,
++    arcium::kCommandSitesPref,
+     helium::kArciumSurfaceSetPref,
+     helium::kArciumSurfaceTuningPref,
+     arcium::kArcSidebarNavigationEnabledPref,
+@@ -582,6 +586,54 @@ bool ArciumSettingsModel::SetCommandPane
+   return true;
+ }
+ 
++base::DictValue ArciumSettingsModel::GetCommandSites() const {
++  base::ListValue builtins;
++  for (const auto& site : arcium::CommandSiteCatalog::BuiltinSites()) {
++    builtins.Append(site.ToValue().Set("id", site.id));
++  }
++  return base::DictValue()
++      .Set("sites", prefs_ && HasPreference(arcium::kCommandSitesPref)
++                        ? prefs_->GetDict(arcium::kCommandSitesPref).Clone()
++                        : base::DictValue())
++      .Set("builtins", std::move(builtins));
++}
++
++bool ArciumSettingsModel::SetCommandSites(const base::DictValue& sites) {
++  if (shutting_down_ || !prefs_ || !HasPreference(arcium::kCommandSitesPref) ||
++      !prefs_->IsUserModifiablePreference(arcium::kCommandSitesPref) ||
++      !arcium::CommandSiteCatalog::IsValidPref(sites)) {
++    return false;
++  }
++  if (sites.empty()) {
++    prefs_->ClearPref(arcium::kCommandSitesPref);
++  } else {
++    prefs_->SetDict(arcium::kCommandSitesPref, sites.Clone());
++  }
++  return true;
++}
++
++std::string ArciumSettingsModel::AddCommandSite(const base::DictValue& site) {
++  if (shutting_down_ || !prefs_ || !HasPreference(arcium::kCommandSitesPref) ||
++      !prefs_->IsUserModifiablePreference(arcium::kCommandSitesPref)) {
++    return std::string();
++  }
++  auto sites = prefs_->GetDict(arcium::kCommandSitesPref).Clone();
++  auto* entries = sites.EnsureDict("sites");
++  std::string id;
++  for (int attempt = 0; attempt < 8 && (id.empty() || entries->contains(id));
++       ++attempt) {
++    id = "site-" + base::HexEncodeLower(base::RandBytesAsVector(4));
++  }
++  if (entries->contains(id)) {
++    return std::string();
++  }
++  entries->Set(id, site.Clone());
++  if (auto* order = sites.FindList("order")) {
++    order->Append(id);
++  }
++  return SetCommandSites(sites) ? id : std::string();
++}
++
+ helium::HeliumSpace* ArciumSettingsModel::GetAppearanceSpace() const {
+   return !shutting_down_ && space_service_
+              ? space_service_->GetSpaceById(appearance_space_id_) : nullptr;
+--- a/chrome/browser/ui/helium/arcium_settings_model.h
++++ b/chrome/browser/ui/helium/arcium_settings_model.h
+@@ -81,6 +81,17 @@ class ArciumSettingsModel final
+   base::DictValue GetCommandPanelLayout() const;
+   bool SetCommandPanelLayout(const base::DictValue& layout);
+ 
++  // Command bar website scopes. "sites" is the saved sparse preference, kept
++  // as written; "builtins" lists every code-owned default, including hidden
++  // ones, so an editor never writes resolved defaults back.
++  base::DictValue GetCommandSites() const;
++  // Accepts only a strictly valid sparse value. An empty value restores the
++  // built-in sites. Managed or unavailable preferences reject every write.
++  bool SetCommandSites(const base::DictValue& sites);
++  // Adds one custom site under a newly minted ID, appended to any saved order.
++  // Returns the ID, or an empty string if the resulting value is invalid.
++  std::string AddCommandSite(const base::DictValue& site);
++
+   // The profile's surface set name. Unknown values are rejected and leave the
+   // saved choice unchanged.
+   std::string GetSurfaceSet() const;
+--- a/chrome/browser/ui/omnibox/arcium_command_action_router.cc
++++ b/chrome/browser/ui/omnibox/arcium_command_action_router.cc
+@@ -9,7 +9,6 @@
+ #include <vector>
+ 
+ #include "base/i18n/case_conversion.h"
+-#include "base/strings/escape.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_split.h"
+@@ -714,33 +713,6 @@ CommandExecutionResult RevealFolder(base
+ 
+ }  // namespace
+ 
+-std::optional<GURL> BuildCommandSearchUrl(std::string_view scope_id,
+-                                          std::u16string_view query) {
+-  if (query.size() > CommandSession::kMaxQueryLength) {
+-    return std::nullopt;
+-  }
+-  const std::u16string trimmed(base::TrimWhitespace(query, base::TRIM_ALL));
+-  if (trimmed.empty()) {
+-    return std::nullopt;
+-  }
+-  const std::string escaped =
+-      base::EscapeQueryParamValue(base::UTF16ToUTF8(trimmed), false);
+-  if (scope_id == kYouTubeScope) {
+-    return GURL(base::StrCat(
+-        {"https://www.youtube.com/results?search_query=", escaped}));
+-  }
+-  if (scope_id == kXScope) {
+-    return GURL(
+-        base::StrCat({"https://x.com/search?q=", escaped, "&src=typed_query"}));
+-  }
+-  if (scope_id == kChatGPTScope) {
+-    // The web integration opens ChatGPT with a populated query. Sending the
+-    // query remains a decision on that site's page.
+-    return GURL(base::StrCat({"https://chatgpt.com/?q=", escaped}));
+-  }
+-  return std::nullopt;
+-}
+-
+ struct ArciumCommandActionRouter::ResolvedTarget {
+   bool valid = false;
+   bool url_copy_safe = true;
+--- a/chrome/browser/ui/omnibox/arcium_command_action_router.h
++++ b/chrome/browser/ui/omnibox/arcium_command_action_router.h
+@@ -17,11 +17,6 @@ class Browser;
+ 
+ namespace arcium {
+ 
+-// Launches a site's search page. Web search is accepted from the retained
+-// native AutocompleteMatch rather than reconstructed from a template here.
+-std::optional<GURL> BuildCommandSearchUrl(std::string_view scope_id,
+-                                          std::u16string_view query);
+-
+ // Builtin action IDs remain namespaced even when another provider supplies a
+ // result or appends its own late actions.
+ namespace command_action {
+--- a/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
++++ b/chrome/browser/ui/omnibox/arcium_command_action_router_unittest.cc
+@@ -11,10 +11,12 @@
+ #include <vector>
+ 
+ #include "base/functional/bind.h"
++#include "base/json/json_reader.h"
+ #include "base/location.h"
+ #include "base/run_loop.h"
+ #include "chrome/browser/ui/omnibox/arcium_command_providers.h"
+ #include "chrome/browser/ui/omnibox/arcium_command_corpus.h"
++#include "chrome/browser/ui/omnibox/arcium_command_sites.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/test/bind.h"
+ #include "base/test/scoped_run_loop_timeout.h"
+@@ -876,7 +878,7 @@ TEST_F(ArciumCommandActionRouterTest,
+        ChatGPTCurrentTabQueryNavigatesToRootInsteadOfExistingConversation) {
+   auto* source = AddOrdinaryTab("https://chatgpt.com/c/existing-conversation");
+   Capture(source);
+-  const auto url = BuildCommandSearchUrl(kChatGPTScope, u"  a fresh question  ");
++  const auto url = CommandSiteCatalog::Builtin()->BuildSearchUrl(kChatGPTScope, u"  a fresh question  ");
+   ASSERT_TRUE(url);
+   ASSERT_TRUE(router_->Execute(Intent(CommandUrlTarget{.url = *url})).success);
+ 
+@@ -896,7 +898,7 @@ TEST_F(ArciumCommandActionRouterTest,
+   auto* source = AddOrdinaryTab("https://chatgpt.com/c/existing-conversation");
+   content::WebContents* original = source->GetContents();
+   Capture(source, CommandInvocationMode::kNewTab);
+-  const auto url = BuildCommandSearchUrl(kChatGPTScope, u"a fresh question");
++  const auto url = CommandSiteCatalog::Builtin()->BuildSearchUrl(kChatGPTScope, u"a fresh question");
+   ASSERT_TRUE(url);
+   ASSERT_TRUE(router_->Execute(Intent(CommandUrlTarget{.url = *url})).success);
+ 
+@@ -954,7 +956,7 @@ TEST_F(ArciumCommandActionRouterTest,
+     EXPECT_EQ(1, std::ranges::count_if(rows, [](const CommandRow& row) {
+       return row.is_default;
+     }));
+-    const auto expected_url = BuildCommandSearchUrl(item.scope, u"scope-default");
++    const auto expected_url = CommandSiteCatalog::Builtin()->BuildSearchUrl(item.scope, u"scope-default");
+     ASSERT_TRUE(expected_url);
+     EXPECT_EQ(CommandTarget(CommandUrlTarget{.url = *expected_url}),
+               typed->target);
+@@ -976,6 +978,232 @@ TEST_F(ArciumCommandActionRouterTest,
+   }
+ }
+ 
++// The session keeps the callback until the next search, so later
++// republications must not write into this function's stack.
++std::shared_ptr<const CommandPublication> SearchAndSettle(
++    CommandSession& session,
++    std::string_view scope,
++    std::u16string query) {
++  auto latest = std::make_shared<std::shared_ptr<const CommandPublication>>();
++  session.Search(
++      std::string(scope), std::move(query),
++      base::BindRepeating(
++          [](std::shared_ptr<std::shared_ptr<const CommandPublication>> latest,
++             std::shared_ptr<const CommandPublication> update) {
++            *latest = std::move(update);
++          },
++          latest));
++  base::RunLoop().RunUntilIdle();
++  return *latest;
++}
++
++std::vector<GURL> ShortcutUrls(const CommandPublication& publication) {
++  std::vector<GURL> urls;
++  for (const auto& row : publication.rows) {
++    if (row.category == u"Shortcut") {
++      urls.push_back(std::get<CommandUrlTarget>(row.target).url);
++    }
++  }
++  return urls;
++}
++
++bool HasScope(const CommandPublication& publication, std::string_view id) {
++  return std::ranges::any_of(publication.scopes,
++                             [id](const CommandScopeDescriptor& scope) {
++                               return scope.id == id;
++                             });
++}
++
++TEST_F(ArciumCommandActionRouterTest, ProductionEmptySiteScopesOfferShortcuts) {
++  auto session = CreateCommandSession(browser());
++  session->SetInvocation(CommandInvocationMode::kNewTab);
++  const auto catalog = CommandSiteCatalog::Builtin();
++  for (const char* scope : {kYouTubeScope, kXScope, kChatGPTScope}) {
++    SCOPED_TRACE(scope);
++    const auto* site = catalog->Find(scope);
++    ASSERT_TRUE(site);
++    for (const char16_t* query : {u"", u"  "}) {
++      const auto publication = SearchAndSettle(*session, scope, query);
++      ASSERT_TRUE(publication);
++      ASSERT_EQ(site->shortcuts.size(), publication->rows.size());
++      for (size_t i = 0; i < publication->rows.size(); ++i) {
++        const auto& row = publication->rows[i];
++        const auto& shortcut = site->shortcuts[i];
++        EXPECT_EQ(shortcut.title, row.title);
++        EXPECT_EQ(site->label, row.detail);
++        EXPECT_EQ(CommandTarget(CommandUrlTarget{.url = shortcut.url}),
++                  row.target);
++        EXPECT_EQ(kBuiltinCommandProvider, row.provider_id);
++        EXPECT_EQ("shortcut:" + std::string(scope) + ":" + shortcut.url.spec(),
++                  row.selection_key);
++        EXPECT_TRUE(row.has_actions);
++        EXPECT_FALSE(row.icon.isNull());
++        EXPECT_EQ(i == 0, row.is_default);
++      }
++    }
++  }
++  const auto saved = SearchAndSettle(*session, kSavedScope, u"");
++  ASSERT_TRUE(saved);
++  EXPECT_TRUE(ShortcutUrls(*saved).empty());
++  // A query searches the site; shortcuts do not compete with it.
++  const auto typed = SearchAndSettle(*session, kYouTubeScope, u"subscriptions");
++  ASSERT_TRUE(typed);
++  EXPECT_TRUE(ShortcutUrls(*typed).empty());
++  ASSERT_FALSE(typed->rows.empty());
++  EXPECT_EQ(CommandRowKind::kTypedSearch, typed->rows.back().kind);
++  EXPECT_TRUE(typed->rows.back().is_default);
++  session->Cancel();
++  session.reset();
++  base::RunLoop().RunUntilIdle();
++}
++
++TEST_F(ArciumCommandActionRouterTest,
++       ProductionShortcutsFollowLocalResultsWithoutDuplicates) {
++  auto* subscriptions =
++      AddOrdinaryTab("https://www.youtube.com/feed/subscriptions");
++  auto* video = AddOrdinaryTab("https://www.youtube.com/watch?v=shortcut-local");
++  auto session = CreateCommandSession(browser());
++  session->SetInvocation(CommandInvocationMode::kNewTab);
++  auto publication = SearchAndSettle(*session, kYouTubeScope, u"");
++  ASSERT_TRUE(publication);
++  ASSERT_EQ(4u, publication->rows.size());
++  const std::vector<CommandTarget> locals = {publication->rows[0].target,
++                                             publication->rows[1].target};
++  EXPECT_TRUE(std::ranges::contains(locals, CommandTarget(Live(subscriptions))));
++  EXPECT_TRUE(std::ranges::contains(locals, CommandTarget(Live(video))));
++  EXPECT_TRUE(publication->rows[0].is_default);
++  EXPECT_EQ((std::vector<GURL>{GURL("https://www.youtube.com/playlist?list=WL"),
++                               GURL("https://www.youtube.com/feed/history")}),
++            ShortcutUrls(*publication));
++
++  session->SetResultLimit(3);
++  publication = SearchAndSettle(*session, kYouTubeScope, u"");
++  ASSERT_TRUE(publication);
++  ASSERT_EQ(3u, publication->rows.size());
++  EXPECT_EQ(
++      (std::vector<GURL>{GURL("https://www.youtube.com/playlist?list=WL")}),
++      ShortcutUrls(*publication));
++  session->Cancel();
++  session.reset();
++  base::RunLoop().RunUntilIdle();
++}
++
++TEST_F(ArciumCommandActionRouterTest,
++       ProductionSitePreferenceChangesRebuildScopesAndMemberships) {
++  auto* docs = AddOrdinaryTab("https://docs.rs/serde");
++  auto session = CreateCommandSession(browser());
++  session->SetInvocation(CommandInvocationMode::kNewTab);
++  std::vector<std::shared_ptr<const CommandPublication>> publications;
++  session->Search(
++      kXScope, u"",
++      base::BindLambdaForTesting(
++          [&publications](std::shared_ptr<const CommandPublication> update) {
++            publications.push_back(std::move(update));
++          }));
++  base::RunLoop().RunUntilIdle();
++  ASSERT_FALSE(publications.empty());
++  EXPECT_TRUE(HasScope(*publications.back(), kXScope));
++  EXPECT_FALSE(HasScope(*publications.back(), "docs"));
++  EXPECT_FALSE(publications.back()->rows.empty());
++
++  publications.clear();
++  profile()->GetPrefs()->SetDict(
++      kCommandSitesPref,
++      *base::JSONReader::ReadDict(R"({
++        "hidden": ["x"],
++        "sites": {"docs": {
++          "label": "Docs", "domains": ["docs.rs"],
++          "search": "https://docs.rs/releases/search?query=%s",
++          "shortcuts": [{"title": "Releases",
++                         "url": "https://docs.rs/releases"}]}}
++      })",
++                                  base::JSON_PARSE_RFC));
++  base::RunLoop().RunUntilIdle();
++  // The open session republishes from the rebuilt catalog and corpus.
++  ASSERT_FALSE(publications.empty());
++  EXPECT_FALSE(HasScope(*publications.back(), kXScope));
++  EXPECT_TRUE(HasScope(*publications.back(), "docs"));
++  EXPECT_TRUE(publications.back()->rows.empty());
++
++  const auto empty = SearchAndSettle(*session, "docs", u"");
++  ASSERT_TRUE(empty);
++  ASSERT_EQ(2u, empty->rows.size());
++  EXPECT_EQ(CommandTarget(Live(docs)), empty->rows[0].target);
++  EXPECT_EQ(u"Releases", empty->rows[1].title);
++  const auto typed = SearchAndSettle(*session, "docs", u"serde json");
++  ASSERT_TRUE(typed);
++  ASSERT_FALSE(typed->rows.empty());
++  const auto& search = typed->rows.back();
++  EXPECT_EQ(CommandRowKind::kTypedSearch, search.kind);
++  EXPECT_TRUE(search.is_default);
++  EXPECT_EQ(u"Search", search.primary_verb);
++  EXPECT_EQ(CommandTarget(CommandUrlTarget{
++                .url = GURL("https://docs.rs/releases/search?query=serde%20json")}),
++            search.target);
++
++  profile()->GetPrefs()->ClearPref(kCommandSitesPref);
++  base::RunLoop().RunUntilIdle();
++  const auto restored = SearchAndSettle(*session, kXScope, u"");
++  ASSERT_TRUE(restored);
++  EXPECT_TRUE(HasScope(*restored, kXScope));
++  EXPECT_FALSE(HasScope(*restored, "docs"));
++  session->Cancel();
++  session.reset();
++  base::RunLoop().RunUntilIdle();
++}
++
++TEST_F(ArciumCommandActionRouterTest, DormantCorpusAppliesSiteChangesOnReopen) {
++  AddOrdinaryTab("https://docs.rs/serde");
++  std::shared_ptr<CommandSessionContext> context;
++  auto session = CreateCommandSession(browser(), context);
++  session->SetInvocation(CommandInvocationMode::kNewTab);
++  ASSERT_TRUE(SearchAndSettle(*session, kYouTubeScope, u""));
++  session->Cancel();
++  session.reset();
++  base::RunLoop().RunUntilIdle();
++
++  profile()->GetPrefs()->SetDict(
++      kCommandSitesPref,
++      *base::JSONReader::ReadDict(
++          R"({"order": ["docs"], "sites": {"docs": {
++              "label": "Docs", "domains": ["docs.rs"]}}})",
++          base::JSON_PARSE_RFC));
++  base::RunLoop().RunUntilIdle();
++  session = CreateCommandSession(browser(), context);
++  session->SetInvocation(CommandInvocationMode::kNewTab);
++  const auto publication = SearchAndSettle(*session, "docs", u"");
++  ASSERT_TRUE(publication);
++  ASSERT_FALSE(publication->scopes.empty());
++  EXPECT_TRUE(HasScope(*publication, "docs"));
++  ASSERT_EQ(1u, publication->rows.size());
++  EXPECT_EQ(u"Tab", publication->rows[0].category);
++  session->Cancel();
++  session.reset();
++  base::RunLoop().RunUntilIdle();
++}
++
++TEST_F(ArciumCommandActionRouterTest, ShortcutsOpenWithTheCapturedInvocation) {
++  const GURL destination =
++      CommandSiteCatalog::Builtin()->Find(kChatGPTScope)->shortcuts[1].url;
++  auto* source = AddOrdinaryTab("https://chatgpt.com/c/existing-conversation");
++  content::WebContents* original = source->GetContents();
++  Capture(source, CommandInvocationMode::kNewTab);
++  ASSERT_TRUE(
++      router_->Execute(Intent(CommandUrlTarget{.url = destination})).success);
++  ASSERT_EQ(2, browser()->GetTabStripModel()->count());
++  auto* opened = browser()->GetTabStripModel()->GetActiveWebContents();
++  ASSERT_NE(original, opened);
++  ASSERT_TRUE(opened->GetController().GetPendingEntry());
++  EXPECT_EQ(destination, opened->GetController().GetPendingEntry()->GetURL());
++
++  Capture(source);
++  ASSERT_TRUE(
++      router_->Execute(Intent(CommandUrlTarget{.url = destination})).success);
++  ASSERT_EQ(2, browser()->GetTabStripModel()->count());
++  ASSERT_TRUE(original->GetController().GetPendingEntry());
++  EXPECT_EQ(destination, original->GetController().GetPendingEntry()->GetURL());
++}
++
+ TEST_F(ArciumCommandActionRouterTest, ClosedLiveIdentityNeverNavigatesItsUrl) {
+   auto* target = AddOrdinaryTab("https://target.test/");
+   const CommandLiveTarget identity = Live(target);
+@@ -1665,31 +1893,5 @@ TEST_F(ArciumCommandActionRouterTest, Am
+   EXPECT_EQ(0, native_accepts_);
+ }
+ 
+-TEST(CommandSearchUrlTest, SiteQueriesAreEncodedAndKeepTheirHttpsOrigin) {
+-  const std::u16string query = u"  café & + ? / 東京  ";
+-  const std::string encoded =
+-      "caf%C3%A9%20%26%20%2B%20%3F%20%2F%20%E6%9D%B1%E4%BA%AC";
+-  const auto youtube = BuildCommandSearchUrl(kYouTubeScope, query);
+-  const auto x = BuildCommandSearchUrl(kXScope, query);
+-  const auto chatgpt = BuildCommandSearchUrl(kChatGPTScope, query);
+-  ASSERT_TRUE(youtube);
+-  ASSERT_TRUE(x);
+-  ASSERT_TRUE(chatgpt);
+-  EXPECT_EQ("https://www.youtube.com/results?search_query=" + encoded,
+-            youtube->spec());
+-  EXPECT_EQ("https://x.com/search?q=" + encoded + "&src=typed_query",
+-            x->spec());
+-  EXPECT_EQ("https://chatgpt.com/?q=" + encoded, chatgpt->spec());
+-}
+-
+-TEST(CommandSearchUrlTest, RejectsEmptyUnknownAndOversizeQueries) {
+-  EXPECT_FALSE(BuildCommandSearchUrl(kYouTubeScope, u" \t\n"));
+-  EXPECT_FALSE(BuildCommandSearchUrl("unknown-provider", u"query"));
+-  EXPECT_FALSE(BuildCommandSearchUrl(kWebScope, u"query"));
+-  EXPECT_FALSE(BuildCommandSearchUrl(
+-      kYouTubeScope,
+-      std::u16string(CommandSession::kMaxQueryLength + 1, u'x')));
+-}
+-
+ }  // namespace
+ }  // namespace arcium
+--- a/chrome/browser/ui/omnibox/arcium_command_corpus.cc
++++ b/chrome/browser/ui/omnibox/arcium_command_corpus.cc
+@@ -37,6 +37,8 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "components/favicon/content/content_favicon_driver.h"
+ #include "components/omnibox/browser/arcium_persistent_item_rank.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "components/prefs/pref_service.h"
+ #include "components/sessions/content/session_tab_helper.h"
+ #include "components/sessions/core/session_id.h"
+ #include "components/tabs/public/tab_interface.h"
+@@ -66,20 +68,21 @@ std::string LiveIdentity(const CommandLi
+          base::NumberToString(target.tab_session_id);
+ }
+ 
+-void AddSiteScope(CommandRecord& record, const GURL& url) {
+-  if (!url.is_valid()) {
+-    return;
+-  }
+-  // DomainIs requires an exact host or a subdomain separated by a dot.
+-  if (url.DomainIs("youtube.com") || url.DomainIs("youtu.be")) {
+-    record.scope_ids.emplace_back(kYouTubeScope);
+-  } else if (url.DomainIs("x.com") || url.DomainIs("twitter.com")) {
+-    record.scope_ids.emplace_back(kXScope);
+-  } else if (url.DomainIs("chatgpt.com") || url.DomainIs("chat.openai.com")) {
+-    record.scope_ids.emplace_back(kChatGPTScope);
++void AddSiteScopes(const CommandSiteCatalog& sites,
++                   CommandRecord& record,
++                   const GURL& url) {
++  // Overlapping sites all receive the record, so rail order never moves it.
++  for (auto& scope : sites.ScopesForUrl(url)) {
++    record.scope_ids.push_back(std::move(scope));
+   }
+ }
+ 
++scoped_refptr<const CommandSiteCatalog> LoadSites(const PrefService* prefs) {
++  return prefs && prefs->FindPreference(kCommandSitesPref)
++             ? CommandSiteCatalog::FromPref(prefs->GetDict(kCommandSitesPref))
++             : CommandSiteCatalog::Builtin();
++}
++
+ std::u16string AppendBreadcrumb(std::u16string context,
+                                 const std::u16string& title) {
+   if (!context.empty()) {
+@@ -196,11 +199,21 @@ class CommandLocalCorpus::Impl final : p
+   explicit Impl(Browser* browser, bool initially_active)
+       : index_(
+             std::make_unique<CommandSearchIndex>(std::vector<CommandRecord>(),
+-                                                 1)) {
++                                                 1)),
++        sites_(CommandSiteCatalog::Builtin()) {
+     if (!browser) {
+       return;
+     }
+     owner_ = browser->GetWeakPtr();
++    // Off-the-record profiles read the original profile's user preferences.
++    prefs_ = browser->GetProfile()->GetPrefs();
++    sites_ = LoadSites(prefs_);
++    if (prefs_->FindPreference(kCommandSitesPref)) {
++      site_prefs_.Init(prefs_);
++      site_prefs_.Add(kCommandSitesPref,
++                      base::BindRepeating(&Impl::OnSitesChanged,
++                                          base::Unretained(this)));
++    }
+     browsers_ = ProfileBrowserCollection::GetForProfile(browser->profile());
+     if (SavedItemsEligible(browser)) {
+       service_ =
+@@ -236,12 +249,15 @@ class CommandLocalCorpus::Impl final : p
+   bool ready() const { return !dirty_; }
+ 
+   ~Impl() override {
++    site_prefs_.RemoveAll();
+     weak_factory_.InvalidateWeakPtrs();
+     collection_observation_.Reset();
+     TabStripModelObserver::StopObservingAll(this);
+   }
+ 
+   const CommandSearchIndex& index() const { return *index_; }
++  const CommandSiteCatalog& sites() const { return *sites_; }
++  uint64_t sites_generation() const { return sites_generation_; }
+ 
+   std::optional<CommandLocalMetadata> Get(CommandRecordRef ref) const {
+     if (!index_->Get(ref)) {
+@@ -455,6 +471,14 @@ class CommandLocalCorpus::Impl final : p
+     ScheduleRefresh();
+   }
+ 
++  // Parse once per change. Scope descriptors follow the new catalog at once;
++  // local rows wait for the refresh that rebuilds memberships with it.
++  void OnSitesChanged() {
++    sites_ = LoadSites(prefs_);
++    ++sites_generation_;
++    ScheduleRefresh();
++  }
++
+   void ScheduleRefresh() {
+     dirty_ = true;
+     if (!active_ || refresh_posted_) {
+@@ -466,6 +490,7 @@ class CommandLocalCorpus::Impl final : p
+   }
+ 
+   void AddItem(const helium::PersistentOmniboxItem& item,
++               const CommandSiteCatalog& sites,
+                base::Time now,
+                std::vector<CommandRecord>& records,
+                std::vector<CommandLocalMetadata>& metadata) {
+@@ -482,7 +507,7 @@ class CommandLocalCorpus::Impl final : p
+     record.category = pin ? u"Pin" : u"Favorite";
+     record.primary_scope_id = kSavedScope;
+     record.scope_ids = {kSavedScope};
+-    AddSiteScope(record, item.url);
++    AddSiteScopes(sites, record, item.url);
+     record.source_relevance =
+         PersistentItemRelevance(ItemTierBase(item.tier), 0, item.use_count,
+                                 item.last_used_internal_value, now);
+@@ -557,6 +582,7 @@ class CommandLocalCorpus::Impl final : p
+     std::vector<LiveItem> live_items;
+     std::map<std::string, std::u16string> space_names;
+     std::map<std::string, GURL> saved_homes;
++    const auto sites = sites_;
+     auto* browser = OwnerBrowser();
+     const bool saved_enabled = service_ && SavedItemsEligible(browser);
+     if (saved_enabled) {
+@@ -566,7 +592,7 @@ class CommandLocalCorpus::Impl final : p
+       native_items.reserve(items.size());
+       for (const auto& item : items) {
+         native_items.push_back(NativeItem(item));
+-        AddItem(item, now, records, metadata);
++        AddItem(item, *sites, now, records, metadata);
+         saved_homes.emplace(records.back().id, item.url);
+       }
+       // GetSpaces() returns borrowed pointers. Copy each projection during this
+@@ -643,7 +669,7 @@ class CommandLocalCorpus::Impl final : p
+           record.context = context;
+           record.category = u"Tab";
+           record.primary_scope_id = kOmniScope;
+-          AddSiteScope(record, url);
++          AddSiteScopes(*sites, record, url);
+           record.source_relevance = kLiveTabRelevance;
+           record.suggested = true;
+           CommandLocalMetadata local;
+@@ -671,7 +697,11 @@ class CommandLocalCorpus::Impl final : p
+   base::WeakPtr<BrowserWindowInterface> owner_;
+   raw_ptr<ProfileBrowserCollection> browsers_ = nullptr;
+   raw_ptr<helium::HeliumSpaceService> service_ = nullptr;
++  raw_ptr<PrefService> prefs_ = nullptr;
++  PrefChangeRegistrar site_prefs_;
+   std::unique_ptr<CommandSearchIndex> index_;
++  scoped_refptr<const CommandSiteCatalog> sites_;
++  uint64_t sites_generation_ = 0;
+   std::vector<CommandLocalMetadata> metadata_;
+   std::vector<ArciumOmniboxItem> native_items_;
+   std::vector<LiveItem> live_items_;
+@@ -699,6 +729,14 @@ const CommandSearchIndex& CommandLocalCo
+   return impl_->index();
+ }
+ 
++const CommandSiteCatalog& CommandLocalCorpus::sites() const {
++  return impl_->sites();
++}
++
++uint64_t CommandLocalCorpus::sites_generation() const {
++  return impl_->sites_generation();
++}
++
+ std::optional<CommandLocalMetadata> CommandLocalCorpus::Get(
+     CommandRecordRef ref) const {
+   return impl_->Get(ref);
+--- a/chrome/browser/ui/omnibox/arcium_command_corpus.h
++++ b/chrome/browser/ui/omnibox/arcium_command_corpus.h
+@@ -11,6 +11,7 @@
+ 
+ #include "base/callback_list.h"
+ #include "chrome/browser/ui/omnibox/arcium_command_providers.h"
++#include "chrome/browser/ui/omnibox/arcium_command_sites.h"
+ #include "components/omnibox/browser/arcium_command_search.h"
+ #include "components/omnibox/browser/arcium_omnibox_item.h"
+ 
+@@ -53,6 +54,12 @@ class CommandLocalCorpus {
+   ~CommandLocalCorpus();
+ 
+   const CommandSearchIndex& index() const;
++  // The current site catalog. A site preference change replaces it and marks
++  // the corpus dirty, so ready() implies index() memberships match it.
++  const CommandSiteCatalog& sites() const;
++  // Increments whenever sites() is replaced; providers that project catalog
++  // data into queued results drop deliveries from an older generation.
++  uint64_t sites_generation() const;
+   std::optional<CommandLocalMetadata> Get(CommandRecordRef ref) const;
+   std::vector<ArciumOmniboxItem> GetNativeItems() const;
+   std::vector<CommandLiveTarget> FindLiveTargets(const GURL& url) const;
+--- a/chrome/browser/ui/omnibox/arcium_command_providers.cc
++++ b/chrome/browser/ui/omnibox/arcium_command_providers.cc
+@@ -4,6 +4,8 @@
+ #include "chrome/browser/ui/omnibox/arcium_command_providers.h"
+ 
+ #include <algorithm>
++#include <set>
++#include <string>
+ #include <utility>
+ 
+ #include "base/check.h"
+@@ -17,6 +19,7 @@
+ #include "base/memory/weak_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/cancelable_task_tracker.h"
+ #include "base/task/sequenced_task_runner.h"
+@@ -39,6 +42,7 @@
+ #include "chrome/browser/ui/omnibox/arcium_command_corpus.h"
+ #include "chrome/browser/ui/omnibox/arcium_command_icon_cache.h"
+ #include "chrome/browser/ui/omnibox/arcium_command_native_result.h"
++#include "chrome/browser/ui/omnibox/arcium_command_sites.h"
+ #include "chrome/browser/ui/omnibox/omnibox_controller.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/common/pref_names.h"
+@@ -77,40 +81,16 @@ namespace arcium {
+ namespace {
+ constexpr SkColor kOmniTint = SkColorSetRGB(0x54, 0x88, 0xbd);
+ constexpr SkColor kSavedTint = SkColorSetRGB(0xb3, 0x91, 0x65);
++// Built-in artwork colors. Site tints come from the site catalog.
+ constexpr SkColor kYouTubeTint = SkColorSetRGB(0xe3, 0x4b, 0x49);
+-constexpr SkColor kXTint = SkColorSetRGB(0x74, 0x8c, 0xa6);
+ constexpr SkColor kChatGPTTint = SkColorSetRGB(0x53, 0xa9, 0x8c);
+ 
+ SkColor ScopeTint(std::string_view scope_id) {
+-  if (scope_id == kSavedScope) {
+-    return kSavedTint;
+-  }
+-  if (scope_id == kYouTubeScope) {
+-    return kYouTubeTint;
+-  }
+-  if (scope_id == kXScope) {
+-    return kXTint;
+-  }
+-  if (scope_id == kChatGPTScope) {
+-    return kChatGPTTint;
+-  }
+-  return kOmniTint;
++  return scope_id == kSavedScope ? kSavedTint : kOmniTint;
+ }
+ 
+-SkColor WebsiteTint(const GURL& url) {
+-  if (!url.is_valid()) {
+-    return kOmniTint;
+-  }
+-  if (url.DomainIs("youtube.com") || url.DomainIs("youtu.be")) {
+-    return kYouTubeTint;
+-  }
+-  if (url.DomainIs("x.com") || url.DomainIs("twitter.com")) {
+-    return kXTint;
+-  }
+-  if (url.DomainIs("chatgpt.com") || url.DomainIs("chat.openai.com")) {
+-    return kChatGPTTint;
+-  }
+-  return kOmniTint;
++SkColor WebsiteTint(const CommandSiteCatalog& sites, const GURL& url) {
++  return sites.TintForUrl(url).value_or(kOmniTint);
+ }
+ 
+ class BrandedScopeIcon final : public gfx::CanvasImageSource {
+@@ -169,28 +149,44 @@ class BrandedScopeIcon final : public gf
+   Kind kind_;
+ };
+ 
++gfx::ImageSkia BrandedIcon(BrandedScopeIcon::Kind kind) {
++  return gfx::ImageSkia(std::make_unique<BrandedScopeIcon>(kind),
++                        gfx::Size(16, 16));
++}
++
+ gfx::ImageSkia ScopeIcon(std::string_view scope_id) {
+-  if (scope_id == kYouTubeScope || scope_id == kXScope) {
+-    return gfx::ImageSkia(
+-        std::make_unique<BrandedScopeIcon>(
+-            scope_id == kYouTubeScope ? BrandedScopeIcon::Kind::kYouTube
+-                                      : BrandedScopeIcon::Kind::kX),
+-        gfx::Size(16, 16));
+-  }
+   if (scope_id == kSavedScope) {
+     return gfx::CreateVectorIcon(kKeepIcon, 16, kSavedTint);
+   }
+-  if (scope_id == kChatGPTScope) {
+-    return gfx::ImageSkia(
+-        std::make_unique<BrandedScopeIcon>(BrandedScopeIcon::Kind::kChat),
+-        gfx::Size(16, 16));
+-  }
+   if (scope_id == kOmniScope) {
+     return gfx::CreateVectorIcon(omnibox::kSparkIcon, 16, kOmniTint);
+   }
+   return gfx::CreateVectorIcon(vector_icons::kGlobeIcon, 16, kOmniTint);
+ }
+ 
++// Built-in sites keep their artwork. Other sites use their home page favicon
++// once cached, with a tinted globe until then or when none exists.
++gfx::ImageSkia SiteIcon(const CommandSite& site,
++                        CommandIconCache& icons,
++                        base::RepeatingClosure refreshed) {
++  switch (site.artwork) {
++    case CommandSiteArtwork::kYouTube:
++      return BrandedIcon(BrandedScopeIcon::Kind::kYouTube);
++    case CommandSiteArtwork::kX:
++      return BrandedIcon(BrandedScopeIcon::Kind::kX);
++    case CommandSiteArtwork::kChatGPT:
++      return BrandedIcon(BrandedScopeIcon::Kind::kChat);
++    case CommandSiteArtwork::kFavicon:
++      break;
++  }
++  const GURL home = site.HomeUrl();
++  auto icon = home.is_valid() ? icons.GetPageIcon(home, std::move(refreshed))
++                              : gfx::ImageSkia();
++  return icon.isNull()
++             ? gfx::CreateVectorIcon(vector_icons::kGlobeIcon, 16, site.tint)
++             : icon;
++}
++
+ class FaviconFetcher {
+  public:
+   explicit FaviconFetcher(Profile* profile)
+@@ -637,7 +633,8 @@ class NativeQueryProvider final : public
+     row.has_actions = match.destination_url.is_valid();
+     row.tint = AutocompleteMatch::IsSearchType(match.type)
+                    ? kOmniTint
+-                   : WebsiteTint(match.destination_url);
++                   : WebsiteTint(context_->corpus.sites(),
++                                 match.destination_url);
+     if (match.arcium_item && !match.arcium_item->IsCommand()) {
+       const auto& item = *match.arcium_item;
+       const bool pin = item.kind == ArciumOmniboxItem::Kind::kPin;
+@@ -748,17 +745,23 @@ class NativeQueryProvider final : public
+         base::BindOnce(
+             [](base::WeakPtr<NativeQueryProvider> owner, uint64_t generation,
+                uint64_t epoch, base::UnguessableToken revision,
++               uint64_t sites_generation,
+                CommandProviderPublishCallback callback,
+                CommandProviderResults results) {
++              // Rows carry catalog tints. A site change restarts the native
++              // query through the corpus refresh, which reprojects them.
+               if (!owner || generation != owner->query_generation_ ||
+                   epoch != owner->query_.epoch || owner->publish_.is_null() ||
+-                  revision != owner->lease_.revision()) {
++                  revision != owner->lease_.revision() ||
++                  sites_generation !=
++                      owner->context_->corpus.sites_generation()) {
+                 return;
+               }
+               callback.Run(std::move(results));
+             },
+             weak_factory_.GetWeakPtr(), query_generation_, query_.epoch,
+-            lease_.revision(), std::move(callback), std::move(results)));
++            lease_.revision(), context_->corpus.sites_generation(),
++            std::move(callback), std::move(results)));
+   }
+ 
+   std::shared_ptr<CommandSessionContext> context_;
+@@ -794,18 +797,18 @@ class LocalQueryProvider final : public
+            CommandQueryProvider::SupportsScope(scope_id);
+   }
+   std::vector<CommandScopeDescriptor> GetScopes() const override {
+-    return {
++    std::vector<CommandScopeDescriptor> scopes = {
+         {kSavedScope, kBuiltinCommandProvider, u"Saved", ScopeIcon(kSavedScope),
+          kSavedTint, u"Search Pins, Favorites and folders",
+-         u"Search saved items", u"Search saved Pins, Favorites and folders"},
+-        {kYouTubeScope, kBuiltinCommandProvider, u"YouTube",
+-         ScopeIcon(kYouTubeScope), kYouTubeTint, u"Search YouTube",
+-         u"Search YouTube", u"Search YouTube"},
+-        {kXScope, kBuiltinCommandProvider, u"X", ScopeIcon(kXScope), kXTint,
+-         u"Search X", u"Search X", u"Search X posts and accounts"},
+-        {kChatGPTScope, kBuiltinCommandProvider, u"ChatGPT",
+-         ScopeIcon(kChatGPTScope), kChatGPTTint, u"Ask ChatGPT", u"Ask ChatGPT",
+-         u"Open a prompt in ChatGPT"}};
++         u"Search saved items", u"Search saved Pins, Favorites and folders"}};
++    // Descriptors come from the catalog that produced the corpus memberships.
++    for (const auto& site : context_->corpus.sites().sites()) {
++      const std::u16string action = site.VerbLabel() + u" " + site.label;
++      scopes.push_back({site.id, kBuiltinCommandProvider, site.label,
++                        Icon(site), site.tint, action, action,
++                        site.accessibility_description});
++    }
++    return scopes;
+   }
+   void Start(CommandQuery query,
+              CommandProviderPublishCallback publish) override {
+@@ -830,6 +833,7 @@ class LocalQueryProvider final : public
+       return;
+     }
+     const auto& index = context_->corpus.index();
++    const auto& sites = context_->corpus.sites();
+     if (!context_->corpus.ready()) {
+       CommandProviderResults loading;
+       loading.done = false;
+@@ -841,21 +845,27 @@ class LocalQueryProvider final : public
+       PostResults({}, index.revision());
+       return;
+     }
+-    const auto search_url =
+-        query_.text.empty()
+-            ? std::optional<GURL>()
+-            : BuildCommandSearchUrl(query_.scope_id, query_.text);
++    const CommandSite* site = sites.Find(query_.scope_id);
++    // Whitespace-only input is an empty query: it searches nothing and keeps
++    // the site's shortcuts.
++    const bool empty_query =
++        base::TrimWhitespace(query_.text, base::TRIM_ALL).empty();
++    const auto search_url = site && !empty_query
++                                ? site->BuildSearchUrl(query_.text)
++                                : std::optional<GURL>();
+     const size_t limit = std::min(query_.limit, CommandSession::kMaxRows);
+     const auto matches = index.Search(query_.text, query_.scope_id,
+                                       search_url && limit ? limit - 1 : limit);
+     CommandProviderResults results;
+     results.rows.reserve(matches.size() + 1);
++    std::set<std::string> shown_urls;
+     for (const auto& match : matches) {
+       const auto* record = index.Get(match.record);
+       auto metadata = context_->corpus.Get(match.record);
+       if (!record || !metadata) {
+         continue;
+       }
++      shown_urls.insert(GURL(base::UTF16ToUTF8(record->url)).spec());
+       CommandRow row;
+       row.provider_id = kBuiltinCommandProvider;
+       row.target = std::move(metadata->target);
+@@ -864,7 +874,7 @@ class LocalQueryProvider final : public
+       row.detail = record->context.empty() ? record->url : record->context;
+       row.category = record->category;
+       row.tint = record->primary_scope_id == kOmniScope
+-                     ? WebsiteTint(GURL(base::UTF16ToUTF8(record->url)))
++                     ? WebsiteTint(sites, GURL(base::UTF16ToUTF8(record->url)))
+                      : ScopeTint(record->primary_scope_id);
+       row.primary_verb = metadata->primary_verb;
+       row.primary_icon = metadata->primary_icon;
+@@ -890,23 +900,19 @@ class LocalQueryProvider final : public
+       typed.target = CommandUrlTarget{*search_url};
+       typed.selection_key = "typed:" + query_.scope_id;
+       typed.title = query_.text;
+-      const auto scopes = GetScopes();
+-      for (const auto& scope : scopes) {
+-        if (scope.id == query_.scope_id) {
+-          typed.detail = scope.search_verb;
+-          typed.icon = scope.icon;
+-          typed.tint = scope.tint;
+-          break;
+-        }
+-      }
+-      typed.primary_verb =
+-          query_.scope_id == kChatGPTScope ? u"Ask" : u"Search";
++      typed.detail = site->VerbLabel() + u" " + site->label;
++      typed.icon = Icon(*site);
++      typed.tint = site->tint;
++      typed.primary_verb = site->VerbLabel();
+       typed.has_actions = true;
+       // A query in a website scope means a new search or conversation.
+       // Existing matches stay available for an explicit selection.
+       typed.is_default = true;
+       results.rows.push_back(std::move(typed));
+     }
++    if (site && empty_query) {
++      AddShortcuts(*site, limit, shown_urls, results.rows);
++    }
+     if (!results.rows.empty() &&
+         !std::ranges::any_of(results.rows,
+                             [](const CommandRow& row) { return row.is_default; })) {
+@@ -914,6 +920,45 @@ class LocalQueryProvider final : public
+     }
+     PostResults(std::move(results), index.revision());
+   }
++  gfx::ImageSkia Icon(const CommandSite& site) const {
++    return SiteIcon(site, context_->icons,
++                    base::BindRepeating(&LocalQueryProvider::Publish,
++                                        weak_factory_.GetWeakPtr()));
++  }
++  // Fixed destinations fill the rows local results leave, so an empty site
++  // scope still offers somewhere to go. Open tabs and saved items come first.
++  void AddShortcuts(const CommandSite& site,
++                    size_t limit,
++                    std::set<std::string>& shown_urls,
++                    std::vector<CommandRow>& rows) {
++    for (const auto& shortcut : site.shortcuts) {
++      if (rows.size() >= limit) {
++        return;
++      }
++      if (!shown_urls.insert(shortcut.url.spec()).second) {
++        continue;
++      }
++      CommandRow row;
++      row.provider_id = kBuiltinCommandProvider;
++      row.target = CommandUrlTarget{shortcut.url};
++      // URL identity keeps a selection on its destination across edits.
++      row.selection_key = "shortcut:" + site.id + ":" + shortcut.url.spec();
++      row.title = shortcut.title;
++      row.detail = site.label;
++      row.category = u"Shortcut";
++      row.tint = site.tint;
++      row.primary_verb = u"Open";
++      row.primary_icon = CommandPrimaryIcon::kGo;
++      row.has_actions = true;
++      row.icon = context_->icons.GetPageIcon(
++          shortcut.url, base::BindRepeating(&LocalQueryProvider::Publish,
++                                            weak_factory_.GetWeakPtr()));
++      if (row.icon.isNull()) {
++        row.icon = Icon(site);
++      }
++      rows.push_back(std::move(row));
++    }
++  }
+   void PostResults(CommandProviderResults results, uint64_t corpus_revision) {
+     auto callback = publish_;
+     base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+@@ -940,7 +985,7 @@ class LocalQueryProvider final : public
+   CommandQuery query_;
+   CommandProviderPublishCallback publish_;
+   uint64_t generation_ = 0;
+-  base::WeakPtrFactory<LocalQueryProvider> weak_factory_{this};
++  mutable base::WeakPtrFactory<LocalQueryProvider> weak_factory_{this};
+ };
+ 
+ class RouterActionDelegate final : public CommandActionDelegate {
+--- /dev/null
++++ b/chrome/browser/ui/omnibox/arcium_command_sites.cc
+@@ -0,0 +1,639 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by the GPL-3.0 license.
++
++#include "chrome/browser/ui/omnibox/arcium_command_sites.h"
++
++#include <algorithm>
++#include <array>
++#include <map>
++#include <set>
++#include <utility>
++
++#include "base/hash/hash.h"
++#include "base/no_destructor.h"
++#include "base/strings/escape.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
++#include "base/strings/utf_string_conversions.h"
++#include "url/origin.h"
++
++namespace arcium {
++namespace {
++
++constexpr char kOrderKey[] = "order";
++constexpr char kHiddenKey[] = "hidden";
++constexpr char kSitesKey[] = "sites";
++constexpr char kLabelKey[] = "label";
++constexpr char kDomainsKey[] = "domains";
++constexpr char kSearchKey[] = "search";
++constexpr char kVerbKey[] = "verb";
++constexpr char kTintKey[] = "tint";
++constexpr char kShortcutsKey[] = "shortcuts";
++constexpr char kTitleKey[] = "title";
++constexpr char kUrlKey[] = "url";
++constexpr char kPlaceholder[] = "%s";
++// Stands in for the query while a template is parsed. Letters only, so URL
++// canonicalization leaves it intact wherever it appears.
++constexpr char kProbe[] = "arciumcommandsitequery";
++constexpr size_t kMaxIdLength = 32;
++constexpr size_t kMaxDomainLength = 253;
++
++constexpr std::array<SkColor, 6> kCustomTints = {
++    SkColorSetRGB(0x8a, 0x7f, 0xd1), SkColorSetRGB(0xd1, 0x87, 0x4e),
++    SkColorSetRGB(0x4f, 0xa3, 0xb8), SkColorSetRGB(0xc4, 0x6a, 0x9b),
++    SkColorSetRGB(0x7d, 0x9a, 0x4f), SkColorSetRGB(0xb8, 0x8f, 0x3e)};
++
++CommandSite MakeBuiltin(std::string_view id,
++                        std::u16string_view label,
++                        std::vector<std::string> domains,
++                        std::string_view search,
++                        CommandSiteVerb verb,
++                        SkColor tint,
++                        CommandSiteArtwork artwork,
++                        std::u16string_view accessibility_description,
++                        std::vector<CommandSiteShortcut> shortcuts) {
++  CommandSite site;
++  site.id = std::string(id);
++  site.label = std::u16string(label);
++  site.domains = std::move(domains);
++  site.search_template = std::string(search);
++  site.verb = verb;
++  site.tint = tint;
++  site.artwork = artwork;
++  site.accessibility_description = std::u16string(accessibility_description);
++  site.shortcuts = std::move(shortcuts);
++  site.builtin = true;
++  return site;
++}
++
++const std::vector<CommandSite>& Builtins() {
++  static const base::NoDestructor<std::vector<CommandSite>> builtins([] {
++    std::vector<CommandSite> sites;
++    sites.push_back(MakeBuiltin(
++        kYouTubeScope, u"YouTube", {"youtube.com", "youtu.be"},
++        "https://www.youtube.com/results?search_query=%s",
++        CommandSiteVerb::kSearch, SkColorSetRGB(0xe3, 0x4b, 0x49),
++        CommandSiteArtwork::kYouTube, u"Search YouTube",
++        {{u"Subscriptions", GURL("https://www.youtube.com/feed/subscriptions")},
++         {u"Watch later", GURL("https://www.youtube.com/playlist?list=WL")},
++         {u"History", GURL("https://www.youtube.com/feed/history")}}));
++    sites.push_back(MakeBuiltin(
++        kXScope, u"X", {"x.com", "twitter.com"},
++        "https://x.com/search?q=%s&src=typed_query", CommandSiteVerb::kSearch,
++        SkColorSetRGB(0x74, 0x8c, 0xa6), CommandSiteArtwork::kX,
++        u"Search X posts and accounts",
++        {{u"Home", GURL("https://x.com/home")},
++         {u"Notifications", GURL("https://x.com/notifications")},
++         {u"Bookmarks", GURL("https://x.com/i/bookmarks")},
++         {u"Messages", GURL("https://x.com/messages")}}));
++    // The web integration opens ChatGPT with a populated query. Sending the
++    // query remains a decision on that site's page.
++    sites.push_back(MakeBuiltin(
++        kChatGPTScope, u"ChatGPT", {"chatgpt.com", "chat.openai.com"},
++        "https://chatgpt.com/?q=%s", CommandSiteVerb::kAsk,
++        SkColorSetRGB(0x53, 0xa9, 0x8c), CommandSiteArtwork::kChatGPT,
++        u"Open a prompt in ChatGPT",
++        {{u"New chat", GURL("https://chatgpt.com/")},
++         {u"Temporary chat", GURL("https://chatgpt.com/?temporary-chat=true")}}));
++    return sites;
++  }());
++  return *builtins;
++}
++
++const CommandSite* FindBuiltin(std::string_view id) {
++  for (const auto& site : Builtins()) {
++    if (site.id == id) {
++      return &site;
++    }
++  }
++  return nullptr;
++}
++
++bool IsReservedId(std::string_view id) {
++  return id == kOmniScope || id == kWebScope || id == kSavedScope;
++}
++
++std::optional<std::u16string> ParseLabel(const base::Value* value) {
++  if (!value || !value->is_string()) {
++    return std::nullopt;
++  }
++  std::u16string label;
++  base::TrimWhitespace(base::UTF8ToUTF16(value->GetString()), base::TRIM_ALL,
++                       &label);
++  if (label.empty() || label.size() > CommandSiteCatalog::kMaxLabelLength) {
++    return std::nullopt;
++  }
++  return label;
++}
++
++std::optional<SkColor> ParseTint(const base::Value* value) {
++  if (!value || !value->is_string()) {
++    return std::nullopt;
++  }
++  const std::string& text = value->GetString();
++  uint32_t rgb = 0;
++  if (text.size() != 7 || text[0] != '#' ||
++      !std::all_of(text.begin() + 1, text.end(), base::IsHexDigit<char>) ||
++      !base::HexStringToUInt(std::string_view(text).substr(1), &rgb)) {
++    return std::nullopt;
++  }
++  return SkColorSetRGB((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
++}
++
++bool IsWebUrl(const GURL& url) {
++  return url.is_valid() && url.SchemeIsHTTPOrHTTPS() && url.has_host() &&
++         !url.has_username() && !url.has_password();
++}
++
++// Stored templates and shortcuts are bounded; generated searches follow the
++// session's query-length contract instead, since encoding expands queries.
++bool IsValidDestination(const GURL& url) {
++  return IsWebUrl(url) &&
++         url.spec().size() <= CommandSiteCatalog::kMaxUrlLength;
++}
++
++std::optional<std::string> ParseDomain(const base::Value& value) {
++  if (!value.is_string()) {
++    return std::nullopt;
++  }
++  const std::string& domain = value.GetString();
++  if (domain.empty() || domain.size() > kMaxDomainLength ||
++      domain.find('.') == std::string::npos || domain.front() == '.' ||
++      domain.back() == '.') {
++    return std::nullopt;
++  }
++  // Only canonical hostnames: no scheme, port, path, credentials or case.
++  const GURL url("https://" + domain + "/");
++  if (!url.is_valid() || url.host() != domain || url.HostIsIPAddress() ||
++      url.has_port()) {
++    return std::nullopt;
++  }
++  return domain;
++}
++
++GURL ProbeTemplate(std::string_view search_template) {
++  std::string probe(search_template);
++  const size_t position = probe.find(kPlaceholder);
++  if (position == std::string::npos) {
++    return GURL();
++  }
++  probe.replace(position, 2, kProbe);
++  return GURL(probe);
++}
++
++// One literal %s, inside a query value, on an HTTP(S) URL without credentials.
++bool IsValidTemplate(std::string_view search_template) {
++  if (search_template.empty() ||
++      search_template.size() > CommandSiteCatalog::kMaxUrlLength ||
++      search_template.find(kProbe) != std::string_view::npos) {
++    return false;
++  }
++  const size_t first = search_template.find(kPlaceholder);
++  if (first == std::string_view::npos ||
++      search_template.find(kPlaceholder, first + 2) != std::string_view::npos) {
++    return false;
++  }
++  const GURL url = ProbeTemplate(search_template);
++  if (!IsValidDestination(url) || url.HostIsIPAddress()) {
++    return false;
++  }
++  const std::string_view query = url.query();
++  const size_t position = query.find(kProbe);
++  return url.host().find(kProbe) == std::string_view::npos &&
++         url.path().find(kProbe) == std::string_view::npos &&
++         url.ref().find(kProbe) == std::string_view::npos &&
++         position != std::string_view::npos && position > 0 &&
++         query[position - 1] == '=';
++}
++
++// Lenient parsing drops an invalid shortcut; strict parsing rejects the list.
++std::optional<std::vector<CommandSiteShortcut>> ParseShortcuts(
++    const base::Value& value,
++    bool strict) {
++  if (!value.is_list()) {
++    return std::nullopt;
++  }
++  std::vector<CommandSiteShortcut> shortcuts;
++  std::set<std::string> urls;
++  for (const auto& entry : value.GetList()) {
++    const auto* dict = entry.GetIfDict();
++    std::optional<std::u16string> title;
++    GURL url;
++    bool valid = dict && (!strict || dict->size() == 2);
++    if (valid) {
++      title = ParseLabel(dict->Find(kTitleKey));
++      const auto* spec = dict->FindString(kUrlKey);
++      url = spec ? GURL(*spec) : GURL();
++      valid = title && IsValidDestination(url) && !urls.contains(url.spec());
++    }
++    if (!valid || shortcuts.size() == CommandSiteCatalog::kMaxShortcuts) {
++      if (strict) {
++        return std::nullopt;
++      }
++      continue;
++    }
++    urls.insert(url.spec());
++    shortcuts.push_back({std::move(*title), std::move(url)});
++  }
++  return shortcuts;
++}
++
++bool HasOnlyKeys(const base::DictValue& dict,
++                 std::initializer_list<std::string_view> keys) {
++  return std::ranges::all_of(dict, [keys](const auto& entry) {
++    return std::ranges::contains(keys, std::string_view(entry.first));
++  });
++}
++
++// Applies a built-in override. Strict parsing requires every field to be valid.
++bool ApplyOverride(const base::DictValue& dict, bool strict, CommandSite& site) {
++  if (strict && !HasOnlyKeys(dict, {kLabelKey, kTintKey, kShortcutsKey})) {
++    return false;
++  }
++  if (const auto* value = dict.Find(kLabelKey)) {
++    if (auto label = ParseLabel(value)) {
++      if (*label != site.label) {
++        site.label = std::move(*label);
++        site.accessibility_description = site.VerbLabel() + u" " + site.label;
++      }
++    } else if (strict) {
++      return false;
++    }
++  }
++  if (const auto* value = dict.Find(kTintKey)) {
++    if (auto tint = ParseTint(value)) {
++      site.tint = *tint;
++    } else if (strict) {
++      return false;
++    }
++  }
++  if (const auto* value = dict.Find(kShortcutsKey)) {
++    if (auto shortcuts = ParseShortcuts(*value, strict)) {
++      site.shortcuts = std::move(*shortcuts);
++    } else if (strict) {
++      return false;
++    }
++  }
++  return true;
++}
++
++std::optional<CommandSite> ParseCustom(std::string_view id,
++                                       const base::DictValue& dict,
++                                       bool strict) {
++  if (strict && !HasOnlyKeys(dict, {kLabelKey, kDomainsKey, kSearchKey,
++                                    kVerbKey, kTintKey, kShortcutsKey})) {
++    return std::nullopt;
++  }
++  CommandSite site;
++  site.id = std::string(id);
++  auto label = ParseLabel(dict.Find(kLabelKey));
++  if (!label) {
++    return std::nullopt;
++  }
++  site.label = std::move(*label);
++  if (const auto* value = dict.Find(kDomainsKey)) {
++    if (!value->is_list()) {
++      if (strict) {
++        return std::nullopt;
++      }
++    } else {
++      for (const auto& entry : value->GetList()) {
++        auto domain = ParseDomain(entry);
++        const bool duplicate =
++            domain && std::ranges::contains(site.domains, *domain);
++        if (!domain || duplicate ||
++            site.domains.size() == CommandSiteCatalog::kMaxDomains) {
++          if (strict) {
++            return std::nullopt;
++          }
++          continue;
++        }
++        site.domains.push_back(std::move(*domain));
++      }
++    }
++  }
++  if (const auto* value = dict.Find(kSearchKey)) {
++    if (value->is_string() && IsValidTemplate(value->GetString())) {
++      site.search_template = value->GetString();
++    } else if (strict) {
++      return std::nullopt;
++    }
++  }
++  if (const auto* value = dict.Find(kVerbKey)) {
++    if (value->is_string() && value->GetString() == "ask") {
++      site.verb = CommandSiteVerb::kAsk;
++    } else if (!value->is_string() || value->GetString() != "search") {
++      if (strict) {
++        return std::nullopt;
++      }
++    }
++  }
++  site.tint = kCustomTints[base::PersistentHash(id) % kCustomTints.size()];
++  if (const auto* value = dict.Find(kTintKey)) {
++    if (auto tint = ParseTint(value)) {
++      site.tint = *tint;
++    } else if (strict) {
++      return std::nullopt;
++    }
++  }
++  if (const auto* value = dict.Find(kShortcutsKey)) {
++    if (auto shortcuts = ParseShortcuts(*value, strict)) {
++      site.shortcuts = std::move(*shortcuts);
++    } else if (strict) {
++      return std::nullopt;
++    }
++  }
++  if (site.domains.empty() && site.search_template.empty()) {
++    return std::nullopt;
++  }
++  site.accessibility_description = site.VerbLabel() + u" " + site.label;
++  return site;
++}
++
++// Returns IDs from a list; strict parsing rejects non-strings and duplicates.
++std::optional<std::vector<std::string>> ParseIds(const base::DictValue& pref,
++                                                 std::string_view key,
++                                                 bool strict) {
++  const auto* value = pref.Find(key);
++  if (!value) {
++    return std::vector<std::string>();
++  }
++  if (!value->is_list()) {
++    if (strict) {
++      return std::nullopt;
++    }
++    return std::vector<std::string>();
++  }
++  std::vector<std::string> ids;
++  for (const auto& entry : value->GetList()) {
++    if (!entry.is_string() || std::ranges::contains(ids, entry.GetString())) {
++      if (strict) {
++        return std::nullopt;
++      }
++      continue;
++    }
++    ids.push_back(entry.GetString());
++  }
++  return ids;
++}
++
++// Produces the visible, ordered sites. Returns false only for strict failures.
++bool ParseCatalog(const base::DictValue& pref,
++                  bool strict,
++                  std::vector<CommandSite>* visible) {
++  if (strict && !HasOnlyKeys(pref, {kOrderKey, kHiddenKey, kSitesKey})) {
++    return false;
++  }
++  std::vector<CommandSite> builtins = Builtins();
++  std::map<std::string, CommandSite> customs;
++  const auto* sites_value = pref.Find(kSitesKey);
++  if (sites_value && !sites_value->is_dict() && strict) {
++    return false;
++  }
++  if (sites_value && sites_value->is_dict()) {
++    for (const auto [id, value] : sites_value->GetDict()) {
++      const auto* dict = value.GetIfDict();
++      auto builtin = std::ranges::find(builtins, id, &CommandSite::id);
++      if (builtin != builtins.end()) {
++        if (!dict || !ApplyOverride(*dict, strict, *builtin)) {
++          if (strict) {
++            return false;
++          }
++        }
++        continue;
++      }
++      std::optional<CommandSite> custom;
++      if (dict && CommandSiteCatalog::IsValidCustomId(id)) {
++        custom = ParseCustom(id, *dict, strict);
++      }
++      if (!custom) {
++        if (strict) {
++          return false;
++        }
++        continue;
++      }
++      customs.emplace(id, std::move(*custom));
++    }
++  }
++  if (customs.size() > CommandSiteCatalog::kMaxCustomSites) {
++    if (strict) {
++      return false;
++    }
++    customs.erase(std::next(customs.begin(),
++                            CommandSiteCatalog::kMaxCustomSites),
++                  customs.end());
++  }
++  auto known = [&](const std::string& id) {
++    return CommandSiteCatalog::IsBuiltinId(id) || customs.contains(id);
++  };
++  const auto order = ParseIds(pref, kOrderKey, strict);
++  const auto hidden = ParseIds(pref, kHiddenKey, strict);
++  if (!order || !hidden) {
++    return false;
++  }
++  if (strict && (!std::ranges::all_of(*order, known) ||
++                 !std::ranges::all_of(*hidden, known))) {
++    return false;
++  }
++  // Explicit order first; unlisted built-ins keep their default order, so new
++  // built-ins appear for existing profiles, then unlisted custom sites by ID.
++  std::vector<std::string> ids;
++  for (const auto& id : *order) {
++    if (known(id)) {
++      ids.push_back(id);
++    }
++  }
++  for (const auto& site : builtins) {
++    if (!std::ranges::contains(ids, site.id)) {
++      ids.push_back(site.id);
++    }
++  }
++  for (const auto& [id, site] : customs) {
++    if (!std::ranges::contains(ids, id)) {
++      ids.push_back(id);
++    }
++  }
++  visible->clear();
++  for (const auto& id : ids) {
++    if (std::ranges::contains(*hidden, id)) {
++      continue;
++    }
++    if (visible->size() == CommandSiteCatalog::kMaxSites) {
++      if (strict) {
++        return false;
++      }
++      break;
++    }
++    auto builtin = std::ranges::find(builtins, id, &CommandSite::id);
++    visible->push_back(builtin != builtins.end() ? std::move(*builtin)
++                                                 : std::move(customs.at(id)));
++  }
++  return true;
++}
++
++}  // namespace
++
++CommandSite::CommandSite() = default;
++CommandSite::CommandSite(const CommandSite&) = default;
++CommandSite& CommandSite::operator=(const CommandSite&) = default;
++CommandSite::CommandSite(CommandSite&&) = default;
++CommandSite& CommandSite::operator=(CommandSite&&) = default;
++CommandSite::~CommandSite() = default;
++
++bool CommandSite::MatchesUrl(const GURL& url) const {
++  if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS()) {
++    return false;
++  }
++  // DomainIs requires an exact host or a subdomain separated by a dot.
++  return std::ranges::any_of(
++      domains, [&url](const std::string& domain) { return url.DomainIs(domain); });
++}
++
++std::optional<GURL> CommandSite::BuildSearchUrl(
++    std::u16string_view query) const {
++  if (search_template.empty() || query.size() > CommandSession::kMaxQueryLength) {
++    return std::nullopt;
++  }
++  const std::u16string trimmed(base::TrimWhitespace(query, base::TRIM_ALL));
++  if (trimmed.empty()) {
++    return std::nullopt;
++  }
++  std::string spec = search_template;
++  const size_t position = spec.find(kPlaceholder);
++  if (position == std::string::npos) {
++    return std::nullopt;
++  }
++  // Substitution is literal; the template is never a format string.
++  spec.replace(position, 2,
++               base::EscapeQueryParamValue(base::UTF16ToUTF8(trimmed), false));
++  GURL url(spec);
++  if (!IsWebUrl(url) ||
++      !url::Origin::Create(url).IsSameOriginWith(
++          url::Origin::Create(ProbeTemplate(search_template)))) {
++    return std::nullopt;
++  }
++  return url;
++}
++
++GURL CommandSite::HomeUrl() const {
++  if (!domains.empty()) {
++    return GURL("https://" + domains.front() + "/");
++  }
++  const GURL probe = ProbeTemplate(search_template);
++  return probe.is_valid() ? probe.GetWithEmptyPath() : GURL();
++}
++
++std::u16string CommandSite::VerbLabel() const {
++  return verb == CommandSiteVerb::kAsk ? u"Ask" : u"Search";
++}
++
++base::DictValue CommandSite::ToValue() const {
++  base::ListValue domain_values;
++  for (const auto& domain : domains) {
++    domain_values.Append(domain);
++  }
++  base::ListValue shortcut_values;
++  for (const auto& shortcut : shortcuts) {
++    shortcut_values.Append(base::DictValue()
++                               .Set(kTitleKey, shortcut.title)
++                               .Set(kUrlKey, shortcut.url.spec()));
++  }
++  return base::DictValue()
++      .Set(kLabelKey, label)
++      .Set(kDomainsKey, std::move(domain_values))
++      .Set(kSearchKey, search_template)
++      .Set(kVerbKey, verb == CommandSiteVerb::kAsk ? "ask" : "search")
++      .Set(kTintKey, base::StringPrintf("#%02x%02x%02x", SkColorGetR(tint),
++                                        SkColorGetG(tint), SkColorGetB(tint)))
++      .Set(kShortcutsKey, std::move(shortcut_values));
++}
++
++CommandSiteCatalog::CommandSiteCatalog(std::vector<CommandSite> sites)
++    : sites_(std::move(sites)) {}
++CommandSiteCatalog::~CommandSiteCatalog() = default;
++
++// static
++scoped_refptr<const CommandSiteCatalog> CommandSiteCatalog::Builtin() {
++  return base::WrapRefCounted(new CommandSiteCatalog(Builtins()));
++}
++
++// static
++scoped_refptr<const CommandSiteCatalog> CommandSiteCatalog::FromPref(
++    const base::DictValue& pref) {
++  if (pref.empty()) {
++    return Builtin();
++  }
++  std::vector<CommandSite> sites;
++  ParseCatalog(pref, /*strict=*/false, &sites);
++  return base::WrapRefCounted(new CommandSiteCatalog(std::move(sites)));
++}
++
++// static
++bool CommandSiteCatalog::IsValidPref(const base::DictValue& pref) {
++  std::vector<CommandSite> sites;
++  return ParseCatalog(pref, /*strict=*/true, &sites);
++}
++
++// static
++std::vector<CommandSite> CommandSiteCatalog::BuiltinSites() {
++  return Builtins();
++}
++
++// static
++bool CommandSiteCatalog::IsBuiltinId(std::string_view id) {
++  return FindBuiltin(id) != nullptr;
++}
++
++// static
++bool CommandSiteCatalog::IsValidCustomId(std::string_view id) {
++  return !id.empty() && id.size() <= kMaxIdLength && !IsBuiltinId(id) &&
++         !IsReservedId(id) &&
++         std::ranges::all_of(id, [](char c) {
++           return base::IsAsciiLower(c) || base::IsAsciiDigit(c) || c == '-';
++         });
++}
++
++const CommandSite* CommandSiteCatalog::Find(std::string_view id) const {
++  const auto site = std::ranges::find(sites_, id, &CommandSite::id);
++  return site == sites_.end() ? nullptr : &*site;
++}
++
++std::vector<CommandScopeId> CommandSiteCatalog::ScopesForUrl(
++    const GURL& url) const {
++  std::vector<CommandScopeId> scopes;
++  for (const auto& site : sites_) {
++    if (site.MatchesUrl(url)) {
++      scopes.push_back(site.id);
++    }
++  }
++  return scopes;
++}
++
++std::optional<SkColor> CommandSiteCatalog::TintForUrl(const GURL& url) const {
++  if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS()) {
++    return std::nullopt;
++  }
++  const CommandSite* best = nullptr;
++  size_t best_length = 0;
++  for (const auto& site : sites_) {
++    for (const auto& domain : site.domains) {
++      if (url.DomainIs(domain) &&
++          (!best || domain.size() > best_length ||
++           (domain.size() == best_length && site.id < best->id))) {
++        best = &site;
++        best_length = domain.size();
++      }
++    }
++  }
++  return best ? std::make_optional(best->tint) : std::nullopt;
++}
++
++std::optional<GURL> CommandSiteCatalog::BuildSearchUrl(
++    std::string_view scope_id,
++    std::u16string_view query) const {
++  const auto* site = Find(scope_id);
++  return site ? site->BuildSearchUrl(query) : std::nullopt;
++}
++
++}  // namespace arcium
+--- /dev/null
++++ b/chrome/browser/ui/omnibox/arcium_command_sites.h
+@@ -0,0 +1,130 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by the GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_UI_OMNIBOX_ARCIUM_COMMAND_SITES_H_
++#define CHROME_BROWSER_UI_OMNIBOX_ARCIUM_COMMAND_SITES_H_
++
++#include <cstddef>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/memory/ref_counted.h"
++#include "base/values.h"
++#include "chrome/browser/ui/helium/arcium_appearance_prefs.h"
++#include "chrome/browser/ui/omnibox/arcium_command_session.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "url/gurl.h"
++
++namespace arcium {
++
++// kCommandSitesPref stores sparse overrides of the built-in website scopes
++// plus user-added sites. An unset preference means the built-in catalog.
++//
++// {
++//   "order": ["chatgpt", "youtube", "docs"],
++//   "hidden": ["x"],
++//   "sites": {
++//     "youtube": {"label": "...", "tint": "#rrggbb", "shortcuts": [...]},
++//     "docs": {"label": "Docs", "domains": ["docs.rs"],
++//              "search": "https://docs.rs/releases/search?query=%s",
++//              "verb": "search", "tint": "#6b8fd6",
++//              "shortcuts": [{"title": "Releases",
++//                             "url": "https://docs.rs/releases"}]}
++//   }
++// }
++//
++// Built-in overrides may set only label, tint and shortcuts; their domains and
++// search page stay code-owned. A shortcut list replaces the site's list.
++
++enum class CommandSiteArtwork { kFavicon, kYouTube, kX, kChatGPT };
++enum class CommandSiteVerb { kSearch, kAsk };
++
++struct CommandSiteShortcut {
++  std::u16string title;
++  GURL url;
++  friend bool operator==(const CommandSiteShortcut&,
++                         const CommandSiteShortcut&) = default;
++};
++
++struct CommandSite {
++  CommandSite();
++  CommandSite(const CommandSite&);
++  CommandSite& operator=(const CommandSite&);
++  CommandSite(CommandSite&&);
++  CommandSite& operator=(CommandSite&&);
++  ~CommandSite();
++
++  // Exact or dot-separated subdomain match against any domain.
++  bool MatchesUrl(const GURL& url) const;
++  // Trims, length-checks and percent-encodes the query into the template's
++  // single query-value placeholder. The result keeps the template's origin.
++  std::optional<GURL> BuildSearchUrl(std::u16string_view query) const;
++  // The page whose favicon represents a site without built-in artwork.
++  GURL HomeUrl() const;
++  std::u16string VerbLabel() const;
++  // The preference representation of this site's editable fields.
++  base::DictValue ToValue() const;
++
++  CommandScopeId id;
++  std::u16string label;
++  std::vector<std::string> domains;
++  // Empty when the site offers no typed search.
++  std::string search_template;
++  CommandSiteVerb verb = CommandSiteVerb::kSearch;
++  SkColor tint = SK_ColorTRANSPARENT;
++  CommandSiteArtwork artwork = CommandSiteArtwork::kFavicon;
++  std::u16string accessibility_description;
++  std::vector<CommandSiteShortcut> shortcuts;
++  bool builtin = false;
++};
++
++// Immutable, ordered snapshot of the visible sites. Parsing happens once per
++// preference change; queries, paint and input read this snapshot directly.
++class CommandSiteCatalog final
++    : public base::RefCountedThreadSafe<CommandSiteCatalog> {
++ public:
++  static constexpr size_t kMaxSites = 8;
++  static constexpr size_t kMaxCustomSites = 8;
++  static constexpr size_t kMaxShortcuts = 8;
++  static constexpr size_t kMaxDomains = 4;
++  static constexpr size_t kMaxLabelLength = 40;
++  static constexpr size_t kMaxUrlLength = 2048;
++
++  // Built-in sites in their default order, ignoring every preference.
++  static scoped_refptr<const CommandSiteCatalog> Builtin();
++  // Lenient read: an invalid site, field or shortcut is dropped on its own.
++  static scoped_refptr<const CommandSiteCatalog> FromPref(
++      const base::DictValue& pref);
++  // Strict write validation: every key and value must be valid.
++  static bool IsValidPref(const base::DictValue& pref);
++  // Built-in definitions for an editor, including hidden sites.
++  static std::vector<CommandSite> BuiltinSites();
++  static bool IsBuiltinId(std::string_view id);
++  static bool IsValidCustomId(std::string_view id);
++
++  CommandSiteCatalog(const CommandSiteCatalog&) = delete;
++  CommandSiteCatalog& operator=(const CommandSiteCatalog&) = delete;
++
++  const std::vector<CommandSite>& sites() const { return sites_; }
++  const CommandSite* Find(std::string_view id) const;
++  // Every matching site, independent of rail order.
++  std::vector<CommandScopeId> ScopesForUrl(const GURL& url) const;
++  // The most specific matching domain decides a row's tint; ties prefer the
++  // smaller ID so reordering never recolors rows.
++  std::optional<SkColor> TintForUrl(const GURL& url) const;
++  std::optional<GURL> BuildSearchUrl(std::string_view scope_id,
++                                     std::u16string_view query) const;
++
++ private:
++  friend class base::RefCountedThreadSafe<CommandSiteCatalog>;
++  explicit CommandSiteCatalog(std::vector<CommandSite> sites);
++  ~CommandSiteCatalog();
++
++  const std::vector<CommandSite> sites_;
++};
++
++}  // namespace arcium
++
++#endif  // CHROME_BROWSER_UI_OMNIBOX_ARCIUM_COMMAND_SITES_H_
+--- /dev/null
++++ b/chrome/browser/ui/omnibox/arcium_command_sites_unittest.cc
+@@ -0,0 +1,295 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by the GPL-3.0 license.
++
++#include "chrome/browser/ui/omnibox/arcium_command_sites.h"
++
++#include <string>
++#include <vector>
++
++#include "base/check.h"
++#include "base/json/json_reader.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/values.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace arcium {
++namespace {
++
++base::DictValue Json(std::string_view json) {
++  auto value = base::JSONReader::ReadDict(json, base::JSON_PARSE_RFC);
++  CHECK(value) << json;
++  return std::move(*value);
++}
++
++std::vector<std::string> Ids(const CommandSiteCatalog& catalog) {
++  std::vector<std::string> ids;
++  for (const auto& site : catalog.sites()) {
++    ids.push_back(site.id);
++  }
++  return ids;
++}
++
++base::DictValue Custom(std::string_view id, std::string_view site_json) {
++  return Json(std::string("{\"sites\": {\"") + std::string(id) + "\": " +
++              std::string(site_json) + "}}");
++}
++
++TEST(CommandSiteCatalogTest, BuiltinsKeepTheirOrderSearchAndShortcuts) {
++  const auto catalog = CommandSiteCatalog::FromPref(base::DictValue());
++  EXPECT_EQ((std::vector<std::string>{kYouTubeScope, kXScope, kChatGPTScope}),
++            Ids(*catalog));
++  const auto* chatgpt = catalog->Find(kChatGPTScope);
++  ASSERT_TRUE(chatgpt);
++  EXPECT_EQ(u"Ask", chatgpt->VerbLabel());
++  EXPECT_EQ(u"Open a prompt in ChatGPT", chatgpt->accessibility_description);
++  ASSERT_EQ(2u, chatgpt->shortcuts.size());
++  EXPECT_EQ(u"New chat", chatgpt->shortcuts[0].title);
++  EXPECT_EQ(GURL("https://chatgpt.com/"), chatgpt->shortcuts[0].url);
++  for (const auto& site : catalog->sites()) {
++    EXPECT_TRUE(site.builtin);
++    EXPECT_FALSE(site.shortcuts.empty()) << site.id;
++    EXPECT_NE(CommandSiteArtwork::kFavicon, site.artwork) << site.id;
++  }
++}
++
++TEST(CommandSiteCatalogTest, SiteQueriesAreEncodedAndKeepTheirHttpsOrigin) {
++  const auto catalog = CommandSiteCatalog::Builtin();
++  const std::u16string query = u"  café & + ? / 東京  ";
++  const std::string encoded =
++      "caf%C3%A9%20%26%20%2B%20%3F%20%2F%20%E6%9D%B1%E4%BA%AC";
++  const auto youtube = catalog->BuildSearchUrl(kYouTubeScope, query);
++  const auto x = catalog->BuildSearchUrl(kXScope, query);
++  const auto chatgpt = catalog->BuildSearchUrl(kChatGPTScope, query);
++  ASSERT_TRUE(youtube);
++  ASSERT_TRUE(x);
++  ASSERT_TRUE(chatgpt);
++  EXPECT_EQ("https://www.youtube.com/results?search_query=" + encoded,
++            youtube->spec());
++  EXPECT_EQ("https://x.com/search?q=" + encoded + "&src=typed_query",
++            x->spec());
++  EXPECT_EQ("https://chatgpt.com/?q=" + encoded, chatgpt->spec());
++}
++
++TEST(CommandSiteCatalogTest, EncodedQueriesMayExceedTheStoredUrlLimit) {
++  // 230 characters fit the session limit; encoding expands each to 9 bytes.
++  const std::u16string query(230, u'東');
++  ASSERT_LE(query.size(), CommandSession::kMaxQueryLength);
++  const auto url = CommandSiteCatalog::Builtin()->BuildSearchUrl(kYouTubeScope, query);
++  ASSERT_TRUE(url);
++  EXPECT_GT(url->spec().size(), CommandSiteCatalog::kMaxUrlLength);
++  EXPECT_EQ("www.youtube.com", url->host());
++}
++
++TEST(CommandSiteCatalogTest, RejectsEmptyUnknownAndOversizeQueries) {
++  const auto catalog = CommandSiteCatalog::Builtin();
++  EXPECT_FALSE(catalog->BuildSearchUrl(kYouTubeScope, u" \t\n"));
++  EXPECT_FALSE(catalog->BuildSearchUrl("unknown-provider", u"query"));
++  EXPECT_FALSE(catalog->BuildSearchUrl(kWebScope, u"query"));
++  EXPECT_FALSE(catalog->BuildSearchUrl(
++      kYouTubeScope,
++      std::u16string(CommandSession::kMaxQueryLength + 1, u'x')));
++}
++
++TEST(CommandSiteCatalogTest, OrderHiddenAndOverridesApply) {
++  const auto catalog = CommandSiteCatalog::FromPref(Json(R"({
++    "order": ["chatgpt", "docs"],
++    "hidden": ["x"],
++    "sites": {
++      "youtube": {"label": "Videos", "tint": "#102030",
++                  "shortcuts": [{"title": "Later",
++                                 "url": "https://www.youtube.com/playlist?list=WL"}]},
++      "docs": {"label": "Docs", "domains": ["docs.rs"],
++               "search": "https://docs.rs/releases/search?query=%s"}
++    }
++  })"));
++  // Unlisted built-ins follow the explicit order; hidden sites disappear.
++  EXPECT_EQ((std::vector<std::string>{kChatGPTScope, "docs", kYouTubeScope}),
++            Ids(*catalog));
++  const auto* youtube = catalog->Find(kYouTubeScope);
++  ASSERT_TRUE(youtube);
++  EXPECT_EQ(u"Videos", youtube->label);
++  EXPECT_EQ(u"Search Videos", youtube->accessibility_description);
++  EXPECT_EQ(SkColorSetRGB(0x10, 0x20, 0x30), youtube->tint);
++  ASSERT_EQ(1u, youtube->shortcuts.size());
++  EXPECT_EQ(u"Later", youtube->shortcuts[0].title);
++  // Built-in search stays code-owned.
++  EXPECT_EQ("https://www.youtube.com/results?search_query=a",
++            catalog->BuildSearchUrl(kYouTubeScope, u"a")->spec());
++  EXPECT_EQ("https://docs.rs/releases/search?query=serde%20json",
++            catalog->BuildSearchUrl("docs", u"serde json")->spec());
++  EXPECT_FALSE(catalog->Find(kXScope));
++}
++
++TEST(CommandSiteCatalogTest, BuiltinOverridesCannotRedirectSearchOrDomains) {
++  const auto pref = Json(R"({"sites": {"youtube": {
++    "search": "https://evil.test/?q=%s", "domains": ["evil.test"]}}})");
++  EXPECT_FALSE(CommandSiteCatalog::IsValidPref(pref));
++  const auto catalog = CommandSiteCatalog::FromPref(pref);
++  EXPECT_EQ("https://www.youtube.com/results?search_query=a",
++            catalog->BuildSearchUrl(kYouTubeScope, u"a")->spec());
++  EXPECT_TRUE(catalog->ScopesForUrl(GURL("https://evil.test/")).empty());
++}
++
++TEST(CommandSiteCatalogTest, TemplatesNeedOneQueryValuePlaceholder) {
++  for (const char* search :
++       {"https://%s.example.test/", "https://example.test/%s",
++        "https://example.test/?q=x#%s", "https://user:pw@example.test/?q=%s",
++        "javascript:alert(%s)", "data:text/html,%s", "file:///tmp/?q=%s",
++        "https://example.test/?a=%s&b=%s", "https://example.test/?q=",
++        "https://example.test/?%s", "https://127.0.0.1/?q=%s",
++        "https://example.test/?q=arciumcommandsitequery&r=%s"}) {
++    SCOPED_TRACE(search);
++    const auto pref = Custom(
++        "custom",
++        std::string(R"({"label": "Custom", "search": ")") + search + "\"}");
++    EXPECT_FALSE(CommandSiteCatalog::IsValidPref(pref));
++    EXPECT_FALSE(CommandSiteCatalog::FromPref(pref)->Find("custom"));
++  }
++  const auto pref = Custom(
++      "custom",
++      R"({"label": "Custom", "search": "http://example.test/s?x=1&q=%s#top"})");
++  EXPECT_TRUE(CommandSiteCatalog::IsValidPref(pref));
++  const auto url =
++      CommandSiteCatalog::FromPref(pref)->BuildSearchUrl("custom", u"a#b&c");
++  ASSERT_TRUE(url);
++  EXPECT_EQ("http://example.test/s?x=1&q=a%23b%26c#top", url->spec());
++}
++
++TEST(CommandSiteCatalogTest, ShortcutsMustBeWebDestinations) {
++  for (const char* url :
++       {"javascript:alert(1)", "file:///etc/hosts", "chrome://settings",
++        "https://user@example.test/", "not a url"}) {
++    SCOPED_TRACE(url);
++    const auto pref = Json(std::string(R"({"sites": {"x": {"shortcuts": [
++        {"title": "Bad", "url": ")") + url + R"("},
++        {"title": "Good", "url": "https://x.com/home"}]}}})");
++    EXPECT_FALSE(CommandSiteCatalog::IsValidPref(pref));
++    const auto catalog = CommandSiteCatalog::FromPref(pref);
++    const auto* x = catalog->Find(kXScope);
++    ASSERT_TRUE(x);
++    ASSERT_EQ(1u, x->shortcuts.size());
++    EXPECT_EQ(u"Good", x->shortcuts[0].title);
++  }
++}
++
++TEST(CommandSiteCatalogTest, DuplicateShortcutUrlsAreRejected) {
++  const auto pref = Json(R"({"sites": {"x": {"shortcuts": [
++      {"title": "Home", "url": "https://x.com/home"},
++      {"title": "Again", "url": "https://x.com/home"},
++      {"title": "Fragment", "url": "https://x.com/home#top"}]}}})");
++  EXPECT_FALSE(CommandSiteCatalog::IsValidPref(pref));
++  const auto catalog = CommandSiteCatalog::FromPref(pref);
++  const auto* x = catalog->Find(kXScope);
++  ASSERT_TRUE(x);
++  ASSERT_EQ(2u, x->shortcuts.size());
++  EXPECT_EQ(GURL("https://x.com/home#top"), x->shortcuts[1].url);
++}
++
++TEST(CommandSiteCatalogTest, EmptyShortcutListRemovesBuiltinShortcuts) {
++  const auto pref = Json(R"({"sites": {"chatgpt": {"shortcuts": []}}})");
++  EXPECT_TRUE(CommandSiteCatalog::IsValidPref(pref));
++  const auto catalog = CommandSiteCatalog::FromPref(pref);
++  ASSERT_TRUE(catalog->Find(kChatGPTScope));
++  EXPECT_TRUE(catalog->Find(kChatGPTScope)->shortcuts.empty());
++}
++
++TEST(CommandSiteCatalogTest, InvalidEntriesDropAloneOnRead) {
++  const auto catalog = CommandSiteCatalog::FromPref(Json(R"({
++    "order": "chatgpt",
++    "hidden": [3, "youtube", "youtube"],
++    "sites": {
++      "omni": {"label": "Taken", "domains": ["omni.test"]},
++      "Bad ID": {"label": "Bad", "domains": ["bad.test"]},
++      "nolabel": {"domains": ["nolabel.test"]},
++      "nothing": {"label": "Nothing"},
++      "ok": {"label": "OK", "domains": ["ok.test", "Bad.Test", "ok.test"],
++             "verb": "shout", "tint": "red"},
++      "x": {"label": ""}
++    }
++  })"));
++  EXPECT_EQ((std::vector<std::string>{kXScope, kChatGPTScope, "ok"}),
++            Ids(*catalog));
++  const auto* ok = catalog->Find("ok");
++  ASSERT_TRUE(ok);
++  EXPECT_EQ((std::vector<std::string>{"ok.test"}), ok->domains);
++  EXPECT_EQ(CommandSiteVerb::kSearch, ok->verb);
++  EXPECT_NE(SK_ColorTRANSPARENT, ok->tint);
++  EXPECT_EQ(u"X", catalog->Find(kXScope)->label);
++}
++
++TEST(CommandSiteCatalogTest, StrictValidationRejectsUnknownKeysAndIds) {
++  EXPECT_TRUE(CommandSiteCatalog::IsValidPref(base::DictValue()));
++  EXPECT_TRUE(CommandSiteCatalog::IsValidPref(
++      Json(R"({"order": ["x", "youtube"], "hidden": ["chatgpt"]})")));
++  for (const char* json : {
++           R"({"extra": true})",
++           R"({"order": ["x", "x"]})",
++           R"({"order": ["missing"]})",
++           R"({"hidden": ["missing"]})",
++           R"({"sites": {"x": {"label": "X", "color": "#000000"}}})",
++           R"({"sites": {"custom": {"label": "C", "domains": ["c.test"],
++                                     "extra": 1}}})",
++           R"({"sites": {"web": {"label": "Web", "domains": ["w.test"]}}})",
++       }) {
++    SCOPED_TRACE(json);
++    EXPECT_FALSE(CommandSiteCatalog::IsValidPref(Json(json)));
++  }
++}
++
++TEST(CommandSiteCatalogTest, CapsCustomAndVisibleSites) {
++  base::DictValue sites;
++  for (int i = 0; i < 9; ++i) {
++    const std::string id = "site-" + base::NumberToString(i);
++    sites.Set(id, base::DictValue()
++                      .Set("label", id)
++                      .Set("domains", base::ListValue().Append(id + ".test")));
++  }
++  auto pref = base::DictValue().Set("sites", sites.Clone());
++  EXPECT_FALSE(CommandSiteCatalog::IsValidPref(pref));
++  EXPECT_EQ(CommandSiteCatalog::kMaxSites,
++            CommandSiteCatalog::FromPref(pref)->sites().size());
++  sites.Remove("site-8");
++  pref = base::DictValue().Set("sites", sites.Clone());
++  // Eight custom sites plus three built-ins exceed the visible rail.
++  EXPECT_FALSE(CommandSiteCatalog::IsValidPref(pref));
++  pref.Set("hidden",
++           base::ListValue().Append("youtube").Append("x").Append("chatgpt"));
++  EXPECT_TRUE(CommandSiteCatalog::IsValidPref(pref));
++}
++
++TEST(CommandSiteCatalogTest, OverlappingDomainsJoinEveryMatchingScope) {
++  const auto pref = Json(R"({
++    "order": ["music", "youtube"],
++    "sites": {"music": {"label": "Music", "domains": ["music.youtube.com"],
++                        "tint": "#010203"}}
++  })");
++  const auto catalog = CommandSiteCatalog::FromPref(pref);
++  const GURL music("https://music.youtube.com/watch?v=1");
++  EXPECT_EQ((std::vector<std::string>{"music", kYouTubeScope}),
++            catalog->ScopesForUrl(music));
++  EXPECT_EQ((std::vector<std::string>{kYouTubeScope}),
++            catalog->ScopesForUrl(GURL("https://www.youtube.com/")));
++  // The most specific domain colors the row regardless of rail order.
++  EXPECT_EQ(SkColorSetRGB(1, 2, 3), catalog->TintForUrl(music));
++  auto reordered = pref.Clone();
++  reordered.Set("order", base::ListValue().Append("youtube").Append("music"));
++  EXPECT_EQ(SkColorSetRGB(1, 2, 3),
++            CommandSiteCatalog::FromPref(reordered)->TintForUrl(music));
++  EXPECT_FALSE(catalog->TintForUrl(GURL("https://notyoutube.com/")));
++  EXPECT_FALSE(catalog->TintForUrl(GURL("ftp://youtube.com/")));
++}
++
++TEST(CommandSiteCatalogTest, SearchOnlySitesUseTheirSearchOrigin) {
++  const auto catalog = CommandSiteCatalog::FromPref(Custom(
++      "lookup",
++      R"({"label": "Lookup", "search": "https://lookup.test/find?q=%s",
++          "verb": "ask"})"));
++  const auto* site = catalog->Find("lookup");
++  ASSERT_TRUE(site);
++  EXPECT_EQ(GURL("https://lookup.test/"), site->HomeUrl());
++  EXPECT_EQ(u"Ask Lookup", site->accessibility_description);
++  EXPECT_TRUE(catalog->ScopesForUrl(GURL("https://lookup.test/")).empty());
++}
++
++}  // namespace
++}  // namespace arcium
+--- a/chrome/test/BUILD.gn
++++ b/chrome/test/BUILD.gn
+@@ -84,6 +84,7 @@ if (!is_android && toolkit_views) {
+       "//components/omnibox/browser/bookmark_provider_unittest.cc",
+       "../browser/ui/omnibox/arcium_command_action_router_unittest.cc",
+       "../browser/ui/omnibox/arcium_command_session_unittest.cc",
++      "../browser/ui/omnibox/arcium_command_sites_unittest.cc",
+       "../browser/ui/omnibox/arcium_command_split_unittest.cc",
+       "../browser/ui/omnibox/arcium_omnibox_post_navigation_unittest.cc",
+     ]
+@@ -9924,6 +9925,7 @@ if (!is_android && toolkit_views) {
+       "../browser/ui/profiles/profile_picker_unittest.cc",
+       "../browser/ui/views/frame/arcium_browser_chrome_unittest.cc",
+     "../browser/ui/helium/arcium_space_icon_unittest.cc",
++      "../browser/ui/helium/arcium_command_sites_settings_unittest.cc",
+     ]
+ 
+     data = [
