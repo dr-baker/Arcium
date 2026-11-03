@@ -1,0 +1,2256 @@
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -12381,6 +12381,12 @@ Check your passwords anytime in <ph name
+       <message name="IDS_PICTURE_IN_PICTURE_FORWARD_10_TEXT" desc="Text label of the forward 10 seconds button. The button appears when the user hovers over the Picture-in-Picture window.">
+         Forward 10 seconds
+       </message>
++      <message name="IDS_PICTURE_IN_PICTURE_REPLAY_15_TEXT" desc="Tooltip and accessible name for rewinding Picture-in-Picture video by fifteen seconds.">
++        Rewind 15 seconds
++      </message>
++      <message name="IDS_PICTURE_IN_PICTURE_FORWARD_15_TEXT" desc="Tooltip and accessible name for advancing Picture-in-Picture video by fifteen seconds.">
++        Forward 15 seconds
++      </message>
+       <message name="IDS_PICTURE_IN_PICTURE_RESIZE_HANDLE_TEXT" desc="Text label of the resize handle. The button appears when the user hovers over the Picture-in-Picture window.">
+         Resize
+       </message>
+--- a/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_helper.cc
++++ b/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_helper.cc
+@@ -22,9 +22,11 @@
+ #include "chrome/browser/picture_in_picture/picture_in_picture_window_manager.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/recently_audible_helper.h"
++#include "chrome/common/pref_names.h"
+ #include "components/content_settings/browser/page_specific_content_settings.h"
+ #include "components/content_settings/core/browser/host_content_settings_map.h"
+ #include "components/permissions/permission_decision_auto_blocker.h"
++#include "components/prefs/pref_service.h"
+ #include "content/public/browser/media_session.h"
+ #include "content/public/browser/media_session_service.h"
+ #include "content/public/browser/render_frame_host.h"
+@@ -664,6 +666,15 @@ void AutoPictureInPictureTabHelper::Mayb
+ 
+ bool AutoPictureInPictureTabHelper::IsEligibleForAutoPictureInPicture(
+     bool should_record_blocking_metrics) {
++  const bool browser_initiated_auto_pip = base::FeatureList::IsEnabled(
++      blink::features::kBrowserInitiatedAutomaticPictureInPicture);
++  if (browser_initiated_auto_pip &&
++      !Profile::FromBrowserContext(web_contents()->GetBrowserContext())
++           ->GetPrefs()
++           ->GetBoolean(prefs::kArciumAutoPictureInPictureEnabled)) {
++    return false;
++  }
++
+   // Don't try to autopip if picture-in-picture is currently disabled.
+   if (PictureInPictureWindowManager::GetInstance()
+           ->IsPictureInPictureDisabled()) {
+@@ -687,9 +698,9 @@ bool AutoPictureInPictureTabHelper::IsEl
+ 
+   // Browser-initiated auto-PiP can select the active video directly. Keep the
+   // registration requirement for the website-driven path.
+-  if (!base::FeatureList::IsEnabled(
+-          blink::features::kBrowserInitiatedAutomaticPictureInPicture) &&
+-      !is_enter_auto_picture_in_picture_available_) {
++  if (!is_enter_auto_picture_in_picture_available_ &&
++      !(browser_initiated_auto_pip &&
++        CanEnterBrowserInitiatedAutoPictureInPicture())) {
+     return false;
+   }
+ 
+@@ -736,11 +747,13 @@ bool AutoPictureInPictureTabHelper::IsEl
+ }
+ 
+ bool AutoPictureInPictureTabHelper::MeetsVideoPlaybackConditions() const {
+-  const bool browser_initiated_auto_pip = base::FeatureList::IsEnabled(
+-      blink::features::kBrowserInitiatedAutomaticPictureInPicture);
++  if (base::FeatureList::IsEnabled(
++          blink::features::kBrowserInitiatedAutomaticPictureInPicture) &&
++      has_safe_url_ && CanEnterBrowserInitiatedAutoPictureInPicture()) {
++    return true;
++  }
+   return has_audio_focus_ && is_playing_ && WasRecentlyAudible() &&
+-         has_safe_url_ &&
+-         (browser_initiated_auto_pip || MeetsMediaEngagementConditions());
++         has_safe_url_ && MeetsMediaEngagementConditions();
+ }
+ 
+ bool AutoPictureInPictureTabHelper::IsUsingCameraOrMicrophone() const {
+@@ -887,17 +900,16 @@ AutoPictureInPictureTabHelper::GetPrimar
+ 
+   auto* rfh = media_session->GetRoutedFrame();
+ 
+-  // Default to using the WebContents primary main frame for browser initiated
+-  // auto picture in picture, where the MediaSession routed frame may not exist
+-  // (a MediaSession routed frame is guaranteed to exist if the user manually
+-  // registered a MediaSession `enterpictureinpicture` action handler). This is
+-  // in line with the current requirement of only allowing auto picture in
+-  // picture from the top frame.
+-  if ((base::FeatureList::IsEnabled(
+-           blink::features::kBrowserInitiatedAutomaticPictureInPicture) ||
+-       base::FeatureList::IsEnabled(
+-           media::kBrowserInitiatedAutomaticPictureInPictureDryRun)) &&
+-      rfh == nullptr) {
++  // Browser-owned video is selected from the primary frame, independently of
++  // an unrelated frame's MediaSession service. Website-owned PiP retains its
++  // routed-frame requirement.
++  if (base::FeatureList::IsEnabled(
++          blink::features::kBrowserInitiatedAutomaticPictureInPicture) &&
++      CanEnterBrowserInitiatedAutoPictureInPicture()) {
++    rfh = web_contents()->GetPrimaryMainFrame();
++  } else if (!rfh &&
++             base::FeatureList::IsEnabled(
++                 media::kBrowserInitiatedAutomaticPictureInPictureDryRun)) {
+     rfh = web_contents()->GetPrimaryMainFrame();
+   }
+ 
+@@ -926,12 +938,8 @@ AutoPictureInPictureTabHelper::GetAutoPi
+     return media::PictureInPictureEventsInfo::AutoPipReason::kVideoConferencing;
+   }
+ 
+-  // Note that order matters here since
+-  // `CanEnterBrowserInitiatedAutoPictureInPicture` and
+-  // `MeetsVideoPlaybackConditions` can both be true at the same time. The
+-  // disambiguating condition is that browser initiated
+-  // automatic-picture-in-picture can only be true when there is no action
+-  // handler registered for the media session enterpictureinpicture action.
++  // Prefer browser-owned video PiP when it is available, including pages that
++  // also register an enterpictureinpicture action handler.
+   if (CanEnterBrowserInitiatedAutoPictureInPicture()) {
+     return media::PictureInPictureEventsInfo::AutoPipReason::kBrowserInitiated;
+   }
+@@ -1009,6 +1017,18 @@ AutoPictureInPictureTabHelper::CreateOve
+     return nullptr;
+   }
+ 
++  // Browser-owned video PiP follows the profile preference. Keep site-owned
++  // automatic PiP and explicit site blocks under the permission helper.
++  if (base::FeatureList::IsEnabled(
++          blink::features::kBrowserInitiatedAutomaticPictureInPicture) &&
++      auto_pip_trigger_reason_ ==
++          media::PictureInPictureEventsInfo::AutoPipReason::kBrowserInitiated &&
++      GetCurrentContentSetting() == CONTENT_SETTING_ASK &&
++      !Profile::FromBrowserContext(web_contents()->GetBrowserContext())
++           ->IsIncognitoProfile()) {
++    return nullptr;
++  }
++
+   // If we don't have a setting helper associated with this session (site) yet,
+   // then create one.
+   EnsureAutoPipSettingHelper();
+--- a/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_helper_browsertest.cc
++++ b/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_helper_browsertest.cc
+@@ -6,6 +6,10 @@
+ 
+ #include <memory>
+ 
++#include "base/task/single_thread_task_runner.h"
++#include "base/test/run_until.h"
++#include "chrome/common/pref_names.h"
++#include "components/prefs/pref_service.h"
+ #include "base/path_service.h"
+ #include "base/scoped_observation.h"
+ #include "base/test/scoped_feature_list.h"
+@@ -1217,6 +1221,53 @@ class BrowserInitiatedAutoPictureInPictu
+   }
+ };
+ 
++class ArciumAutomaticPictureInPictureBrowserTest
++    : public AutoPictureInPictureWithVideoPlaybackBrowserTest {
++ public:
++  std::vector<base::test::FeatureRef> GetDisabledFeatures() override {
++    return {};
++  }
++
++  void ExpectNoPipAfterPendingChecks(content::WebContents* contents) {
++    base::RunLoop run_loop;
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE, run_loop.QuitClosure(), base::Seconds(4));
++    run_loop.Run();
++    EXPECT_FALSE(contents->HasPictureInPictureVideo());
++    EXPECT_FALSE(contents->HasPictureInPictureDocument());
++  }
++
++  void PrepareRegisteredDocumentPipInLocalIframe() {
++    LoadAutoDocumentPipPage(browser());
++    auto* contents = browser()->GetTabStripModel()->GetActiveWebContents();
++    ASSERT_TRUE(ExecJs(contents, R"(
++      const iframe = document.createElement("iframe");
++      iframe.style.width = "100%";
++      iframe.style.height = "100%";
++      iframe.style.position = "absolute";
++      document.body.appendChild(iframe);
++      iframe.contentDocument.body.appendChild(video);
++    )"));
++    PlayVideo(contents);
++    WaitForAudioFocusGained();
++    WaitForMediaSessionPlaying(contents);
++    WaitForWasRecentlyAudible(contents);
++    SetExpectedHasHighEngagement(true);
++    SetContentSetting(contents, CONTENT_SETTING_ASK);
++  }
++
++  void PrepareVideo() {
++    LoadNotRegisteredPage(browser());
++    auto* contents = browser()->GetTabStripModel()->GetActiveWebContents();
++    PlayVideo(contents);
++    WaitForAudioFocusGained();
++    WaitForMediaSessionPlaying(contents);
++    WaitForWasRecentlyAudible(contents);
++    SetExpectedHasHighEngagement(false);
++    SetContentSetting(contents, CONTENT_SETTING_ASK);
++  }
++};
++
+ }  // namespace
+ 
+ IN_PROC_BROWSER_TEST_F(AutoPictureInPictureWithVideoPlaybackBrowserTest,
+@@ -1551,7 +1602,7 @@ IN_PROC_BROWSER_TEST_F(AutoPictureInPict
+ 
+   // Entering Auto Picture-in-Picture does not grant user activation, so the
+   // popup attempt is blocked by the popup blocker (tab count remains 2).
+-  EXPECT_EQ(2, browser()->tab_strip_model()->count());
++  EXPECT_EQ(2, browser()->GetTabStripModel()->count());
+   EXPECT_FALSE(
+       opener_contents->GetPrimaryMainFrame()->HasTransientUserActivation());
+   EXPECT_EQ(false, content::EvalJs(opener_contents,
+@@ -1579,7 +1630,7 @@ IN_PROC_BROWSER_TEST_F(AutoPictureInPict
+ 
+   // Entering Auto Picture-in-Picture does not grant user activation, so the
+   // popup attempt is blocked by the popup blocker (tab count remains 2).
+-  EXPECT_EQ(2, browser()->tab_strip_model()->count());
++  EXPECT_EQ(2, browser()->GetTabStripModel()->count());
+   EXPECT_FALSE(
+       opener_contents->GetPrimaryMainFrame()->HasTransientUserActivation());
+   EXPECT_EQ(false, content::EvalJs(opener_contents,
+@@ -1622,7 +1673,7 @@ IN_PROC_BROWSER_TEST_F(AutoPictureInPict
+ 
+   // Entering Auto Picture-in-Picture does not grant user activation, so the
+   // popup attempt is blocked by the popup blocker (tab count remains 2).
+-  EXPECT_EQ(2, browser()->tab_strip_model()->count());
++  EXPECT_EQ(2, browser()->GetTabStripModel()->count());
+   EXPECT_FALSE(
+       opener_contents->GetPrimaryMainFrame()->HasTransientUserActivation());
+   EXPECT_EQ(false, content::EvalJs(opener_contents,
+@@ -3592,7 +3643,7 @@ IN_PROC_BROWSER_TEST_F(BrowserInitiatedA
+ }
+ 
+ IN_PROC_BROWSER_TEST_F(BrowserInitiatedAutoPictureInPictureBrowserTest,
+-                       DoesNotBrowserAutopip_NotRecentlyAudible) {
++                       MutedPlaybackStillEntersBrowserAutopip) {
+   // Load a page that does not register for autopip and start video playback.
+   LoadNotRegisteredPage(browser());
+   auto* web_contents = browser()->GetTabStripModel()->GetActiveWebContents();
+@@ -3607,7 +3658,13 @@ IN_PROC_BROWSER_TEST_F(BrowserInitiatedA
+   MuteVideo(web_contents);
+   WaitForWasRecentlyAudible(web_contents, /*expected_recently_audible=*/false);
+ 
+-  SwitchToNewTabAndDontExpectAutopip();
++  SwitchToNewTabAndWaitForAutoPip();
++  EXPECT_TRUE(web_contents->HasPictureInPictureVideo());
++  EXPECT_TRUE(EvalJs(web_contents, "video.muted").ExtractBool());
++  EXPECT_FALSE(EvalJs(web_contents, "video.paused").ExtractBool());
++  SwitchBackToOpenerAndWaitForPipToClose();
++  EXPECT_TRUE(EvalJs(web_contents, "video.muted").ExtractBool());
++  EXPECT_FALSE(EvalJs(web_contents, "video.paused").ExtractBool());
+ }
+ 
+ IN_PROC_BROWSER_TEST_F(BrowserInitiatedAutoPictureInPictureBrowserTest,
+@@ -3720,45 +3777,210 @@ IN_PROC_BROWSER_TEST_F(BrowserInitiatedA
+                                         /*should_document_pip=*/false);
+ }
+ 
+-IN_PROC_BROWSER_TEST_F(BrowserInitiatedAutoPictureInPictureBrowserTest,
+-                       PromptResultRecorded_BrowserInitiatedAllowOnce) {
+-  // Load a page that does not register for autopip and start video playback.
+-  ASSERT_TRUE(embedded_https_test_server().Start());
+-  GURL test_page_url = embedded_https_test_server().GetURL(
+-      "a.com", base::FilePath(FILE_PATH_LITERAL("/"))
+-                   .Append(kNotRegisteredPage)
+-                   .MaybeAsASCII());
+-  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), test_page_url));
+-
+-  auto* web_contents = browser()->GetTabStripModel()->GetActiveWebContents();
+-  PlayVideo(web_contents);
+-  WaitForAudioFocusGained();
+-  WaitForMediaSessionPlaying(web_contents);
+-  WaitForWasRecentlyAudible(web_contents);
+-  SetExpectedHasHighEngagement(true);
+-
+-  // Set content setting to CONTENT_SETTING_ASK to show the prompt.
+-  SetContentSetting(web_contents, CONTENT_SETTING_ASK);
++IN_PROC_BROWSER_TEST_F(ArciumAutomaticPictureInPictureBrowserTest,
++                       DefaultEnabledLowEngagementNeedsNoPermissionOverlay) {
++  EXPECT_TRUE(base::FeatureList::IsEnabled(
++      blink::features::kBrowserInitiatedAutomaticPictureInPicture));
++  EXPECT_FALSE(base::FeatureList::GetStateIfOverridden(
++                   blink::features::kBrowserInitiatedAutomaticPictureInPicture)
++                   .has_value());
++  PrepareVideo();
++  auto* contents = browser()->GetTabStripModel()->GetActiveWebContents();
+ 
+   base::HistogramTester histograms;
+   SwitchToNewTabAndWaitForAutoPip();
+-  EXPECT_TRUE(web_contents->HasPictureInPictureVideo());
++  EXPECT_TRUE(contents->HasPictureInPictureVideo());
++  EXPECT_EQ(nullptr, GetOverlayViewFromVideoPipWindow());
++  EXPECT_FALSE(EvalJs(contents, "video.paused").ExtractBool());
++  histograms.ExpectTotalCount(kBrowserInitiatedHistogram, 0);
+ 
+-  auto* const overlay_view = GetOverlayViewFromVideoPipWindow();
+-  ASSERT_TRUE(overlay_view);
+-  overlay_view->get_view_for_testing()->simulate_button_press_for_testing(
++  SwitchBackToOpenerAndWaitForPipToClose();
++  EXPECT_FALSE(EvalJs(contents, "video.paused").ExtractBool());
++}
++
++IN_PROC_BROWSER_TEST_F(ArciumAutomaticPictureInPictureBrowserTest,
++                       RegisteredDocumentPipFallbackPreservesAskOverlay) {
++  PrepareRegisteredDocumentPipInLocalIframe();
++  auto* contents = browser()->GetTabStripModel()->GetActiveWebContents();
++  SwitchToNewTabAndWaitForAutoPip();
++  EXPECT_TRUE(contents->HasPictureInPictureDocument());
++  EXPECT_FALSE(contents->HasPictureInPictureVideo());
++  auto* overlay = GetOverlayViewFromDocumentPipWindow();
++  ASSERT_TRUE(overlay);
++  overlay->get_view_for_testing()->simulate_button_press_for_testing(
+       AutoPipSettingView::UiResult::kAllowOnce);
++  SwitchBackToOpenerAndWaitForPipToClose();
++}
+ 
+-  metrics::SubprocessMetricsProvider::MergeHistogramDeltasForTesting();
+-  auto samples =
+-      histograms.GetHistogramSamplesSinceCreation(kBrowserInitiatedHistogram);
++IN_PROC_BROWSER_TEST_F(ArciumAutomaticPictureInPictureBrowserTest,
++                       DisabledPreferencePreventsRegisteredDocumentFallback) {
++  PrepareRegisteredDocumentPipInLocalIframe();
++  auto* contents = browser()->GetTabStripModel()->GetActiveWebContents();
++  browser()->GetProfile()->GetPrefs()->SetBoolean(
++      prefs::kArciumAutoPictureInPictureEnabled, false);
++  SwitchToNewTabAndDontExpectAutopip();
++  ExpectNoPipAfterPendingChecks(contents);
++}
+ 
+-  // Verify metrics.
+-  EXPECT_EQ(1, samples->TotalCount());
+-  EXPECT_EQ(1, samples->GetCount(static_cast<int>(PromptResult::kAllowOnce)));
+-  CheckPromptResultUkmRecorded(web_contents->GetLastCommittedURL(),
+-                               UkmEntry::kBrowserInitiatedName,
+-                               PromptResult::kAllowOnce);
++IN_PROC_BROWSER_TEST_F(ArciumAutomaticPictureInPictureBrowserTest,
++                       DisabledPreferencePreservesExistingAndManualPip) {
++  PrepareVideo();
++  auto* contents = browser()->GetTabStripModel()->GetActiveWebContents();
++  SwitchToNewTabAndWaitForAutoPip();
++
++  browser()->GetProfile()->GetPrefs()->SetBoolean(
++      prefs::kArciumAutoPictureInPictureEnabled, false);
++  EXPECT_TRUE(contents->HasPictureInPictureVideo());
++  SwitchBackToOpenerAndWaitForPipToClose();
++  SwitchToNewTabAndDontExpectAutopip(/*expect_preconditions_unmet=*/false);
++  ExpectNoPipAfterPendingChecks(contents);
++  SwitchToExistingTab(contents);
++
++  content::MediaStartStopObserver entered(
++      contents, content::MediaStartStopObserver::Type::kEnterPictureInPicture);
++  ASSERT_TRUE(ExecJs(contents, "video.requestPictureInPicture()"));
++  entered.Wait();
++  OpenNewTab(browser());
++  EXPECT_TRUE(contents->HasPictureInPictureVideo());
++  SwitchToExistingTab(contents);
++  EXPECT_TRUE(contents->HasPictureInPictureVideo());
++
++  content::MediaStartStopObserver exited(
++      contents, content::MediaStartStopObserver::Type::kExitPictureInPicture);
++  ASSERT_TRUE(ExecJs(contents, "document.exitPictureInPicture()"));
++  exited.Wait();
++}
++
++IN_PROC_BROWSER_TEST_F(ArciumAutomaticPictureInPictureBrowserTest,
++                       MutedFromFirstPlaybackEntersAndReturnsInline) {
++  LoadNotRegisteredPage(browser());
++  auto* contents = browser()->GetTabStripModel()->GetActiveWebContents();
++  ASSERT_TRUE(ExecJs(contents, "video.muted = true"));
++  content::MediaStartStopObserver started(
++      contents, content::MediaStartStopObserver::Type::kStart);
++  PlayVideo(contents);
++  started.Wait();
++  ASSERT_TRUE(EvalJs(contents, R"JS(
++    new Promise(resolve => {
++      const check = () => video.currentTime > 0 ? resolve(true) :
++          requestAnimationFrame(check);
++      check();
++    })
++  )JS")
++                  .ExtractBool());
++  SetContentSetting(contents, CONTENT_SETTING_ASK);
++  ASSERT_TRUE(base::test::RunUntil([&] {
++    auto info = content::MediaSession::Get(contents)->GetMediaSessionInfoSync();
++    return info && info->can_enter_browser_initiated_autopip;
++  }));
++
++  SwitchToNewTabAndWaitForAutoPip();
++  EXPECT_TRUE(contents->HasPictureInPictureVideo());
++  EXPECT_EQ(nullptr, GetOverlayViewFromVideoPipWindow());
++  EXPECT_TRUE(EvalJs(contents, "video.muted").ExtractBool());
++  EXPECT_FALSE(EvalJs(contents, "video.paused").ExtractBool());
++  SwitchBackToOpenerAndWaitForPipToClose();
++  EXPECT_TRUE(EvalJs(contents, "video.muted").ExtractBool());
++  EXPECT_FALSE(EvalJs(contents, "video.paused").ExtractBool());
++}
++
++IN_PROC_BROWSER_TEST_F(ArciumAutomaticPictureInPictureBrowserTest,
++                       SilentAutomaticPipDoesNotInterruptAnotherTabsAudio) {
++  LoadNotRegisteredPage(browser());
++  auto* audio_contents = browser()->GetTabStripModel()->GetActiveWebContents();
++  content::MediaStartStopObserver audio_started(
++      audio_contents, content::MediaStartStopObserver::Type::kStart);
++  ASSERT_TRUE(ExecJs(audio_contents, R"JS(
++    video.remove();
++    window.audio = new Audio('../engagement/engagement_valid_audio.webm');
++    audio.loop = true;
++    audio.play();
++  )JS"));
++  audio_started.Wait();
++  WaitForAudioFocusGained();
++  WaitForMediaSessionPlaying(audio_contents);
++  WaitForWasRecentlyAudible(audio_contents);
++
++  OpenNewTab(browser());
++  LoadNotRegisteredPage(browser());
++  auto* contents = browser()->GetTabStripModel()->GetActiveWebContents();
++  ASSERT_TRUE(ExecJs(contents, "video.muted = true"));
++  content::MediaStartStopObserver video_started(
++      contents, content::MediaStartStopObserver::Type::kStart);
++  PlayVideo(contents);
++  video_started.Wait();
++  ASSERT_TRUE(base::test::RunUntil([&] {
++    auto info = content::MediaSession::Get(contents)->GetMediaSessionInfoSync();
++    return info && info->can_enter_browser_initiated_autopip;
++  }));
++
++  SwitchToNewTabAndWaitForAutoPip();
++  EXPECT_FALSE(EvalJs(audio_contents, "audio.paused").ExtractBool());
++  EXPECT_EQ(media_session::mojom::MediaSessionInfo::SessionState::kActive,
++            content::MediaSession::Get(audio_contents)
++                ->GetMediaSessionInfoSync()
++                ->state);
++  SwitchBackToOpenerAndWaitForPipToClose();
++  EXPECT_FALSE(EvalJs(audio_contents, "audio.paused").ExtractBool());
++  EXPECT_EQ(media_session::mojom::MediaSessionInfo::SessionState::kActive,
++            content::MediaSession::Get(audio_contents)
++                ->GetMediaSessionInfoSync()
++                ->state);
++  EXPECT_TRUE(EvalJs(audio_contents, R"JS(
++    new Promise(resolve => audio.addEventListener('timeupdate', () =>
++        resolve(true), {once: true}))
++  )JS")
++                  .ExtractBool());
++}
++
++IN_PROC_BROWSER_TEST_F(ArciumAutomaticPictureInPictureBrowserTest,
++                       PausedMutedVideoDoesNotEnterAutomaticPip) {
++  LoadNotRegisteredPage(browser());
++  auto* contents = browser()->GetTabStripModel()->GetActiveWebContents();
++  ASSERT_TRUE(ExecJs(contents, "video.muted = true"));
++  content::MediaStartStopObserver started(
++      contents, content::MediaStartStopObserver::Type::kStart);
++  PlayVideo(contents);
++  started.Wait();
++  ASSERT_TRUE(EvalJs(contents, R"JS(
++    new Promise(resolve => {
++      const check = () => video.currentTime > 0 ? resolve(true) :
++          requestAnimationFrame(check);
++      check();
++    })
++  )JS")
++                  .ExtractBool());
++  content::MediaStartStopObserver stopped(
++      contents, content::MediaStartStopObserver::Type::kStop);
++  ASSERT_TRUE(ExecJs(contents, "video.pause()"));
++  stopped.Wait();
++  SwitchToNewTabAndDontExpectAutopip();
++  ExpectNoPipAfterPendingChecks(contents);
++}
++
++IN_PROC_BROWSER_TEST_F(ArciumAutomaticPictureInPictureBrowserTest,
++                       ExplicitSiteBlockPreventsAutomaticPip) {
++  PrepareVideo();
++  auto* contents = browser()->GetTabStripModel()->GetActiveWebContents();
++  SetContentSetting(contents, CONTENT_SETTING_BLOCK);
++  SwitchToNewTabAndDontExpectAutopip();
++  ExpectNoPipAfterPendingChecks(contents);
++}
++
++IN_PROC_BROWSER_TEST_F(ArciumAutomaticPictureInPictureBrowserTest,
++                       EmbargoPreventsAutomaticPip) {
++  PrepareVideo();
++  auto* contents = browser()->GetTabStripModel()->GetActiveWebContents();
++  MockAutoBlocker auto_blocker;
++  EXPECT_CALL(auto_blocker,
++              IsEmbargoed(_, ContentSettingsType::AUTO_PICTURE_IN_PICTURE))
++      .Times(AtLeast(1))
++      .WillRepeatedly(Return(true));
++  auto* helper = AutoPictureInPictureTabHelper::FromWebContents(contents);
++  helper->set_auto_blocker_for_testing(&auto_blocker);
++  SwitchToNewTabAndDontExpectAutopip();
++  ExpectNoPipAfterPendingChecks(contents);
++  helper->set_auto_blocker_for_testing(nullptr);
+ }
+ 
+ struct AutoPipSizeTestCase {
+--- a/chrome/browser/ui/views/overlay/overlay_window_image_button.cc
++++ b/chrome/browser/ui/views/overlay/overlay_window_image_button.cc
+@@ -5,6 +5,12 @@
+ #include "chrome/browser/ui/views/overlay/overlay_window_image_button.h"
+ 
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/views/helium/glass_surface.h"
++#include "ui/compositor/layer.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/gfx/geometry/rounded_corners_f.h"
++#include "ui/views/background.h"
++#include "ui/views/border.h"
+ #include "ui/base/cursor/cursor.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/color/color_provider.h"
+@@ -18,7 +24,22 @@ OverlayWindowImageButton::OverlayWindowI
+   SetImageVerticalAlignment(views::ImageButton::ALIGN_MIDDLE);
+ 
+   views::ConfigureVectorImageButton(this);
+-  views::InstallCircleHighlightPathGenerator(this);
++  constexpr int kCornerRadius = 8;
++  views::InstallRoundRectHighlightPathGenerator(this, gfx::Insets(),
++                                               kCornerRadius);
++  SetPaintToLayer();
++  layer()->SetFillsBoundsOpaquely(false);
++  layer()->SetRoundedCornerRadius(gfx::RoundedCornersF(kCornerRadius));
++  layer()->SetIsFastRoundedCorner(true);
++  const bool reduce_transparency = helium::GlassReduceTransparency();
++  layer()->SetBackgroundBlur(reduce_transparency ? 0.f : 16.f);
++  layer()->SetBackdropFilterQuality(0.33f);
++  SetBackground(views::CreateRoundedRectBackground(
++      reduce_transparency ? SkColorSetRGB(45, 45, 48)
++                          : SkColorSetARGB(0x24, 0xFF, 0xFF, 0xFF),
++      kCornerRadius));
++  SetBorder(views::CreateRoundedRectBorder(
++      1, kCornerRadius, SkColorSetARGB(0x30, 0xFF, 0xFF, 0xFF)));
+ 
+   SetInstallFocusRingOnFocus(true);
+ }
+--- a/chrome/browser/ui/views/overlay/playback_image_button.cc
++++ b/chrome/browser/ui/views/overlay/playback_image_button.cc
+@@ -15,7 +15,6 @@
+ #include "ui/color/color_id.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/animation/ink_drop.h"
+-#include "ui/views/background.h"
+ 
+ namespace {
+ 
+@@ -35,7 +34,7 @@ PlaybackImageButton::PlaybackImageButton
+       features::IsRoundedIconsEnabled()
+           ? vector_icons::kPlayArrowFilledFlippableIcon
+           : vector_icons::kPlayArrowOldIcon,
+-      ui::kColorSysOnSecondaryContainer, kPlaybackButtonIconSize);
++      kColorPipWindowForeground, kPlaybackButtonIconSize);
+   pause_image_ = ui::ImageModel::FromVectorIcon(
+       features::IsRoundedIconsEnabled() ? vector_icons::kPauseFilledIcon
+                                         : vector_icons::kPauseOldIcon,
+@@ -68,7 +67,6 @@ void PlaybackImageButton::UpdateImageAnd
+   switch (playback_state_) {
+     case VideoOverlayWindowViews::kPlaying: {
+       SetImageModel(views::Button::STATE_NORMAL, pause_image_);
+-      SetPauseButtonBackground();
+       std::u16string pause_text =
+           l10n_util::GetStringUTF16(IDS_PICTURE_IN_PICTURE_PAUSE_CONTROL_TEXT);
+       SetTooltipText(pause_text);
+@@ -77,7 +75,6 @@ void PlaybackImageButton::UpdateImageAnd
+     }
+     case VideoOverlayWindowViews::kPaused: {
+       SetImageModel(views::Button::STATE_NORMAL, play_image_);
+-      SetPlayButtonBackground();
+       std::u16string play_text =
+           l10n_util::GetStringUTF16(IDS_PICTURE_IN_PICTURE_PLAY_CONTROL_TEXT);
+       SetTooltipText(play_text);
+@@ -86,7 +83,6 @@ void PlaybackImageButton::UpdateImageAnd
+     }
+     case VideoOverlayWindowViews::kEndOfVideo: {
+       SetImageModel(views::Button::STATE_NORMAL, replay_image_);
+-      SetPauseButtonBackground();
+       std::u16string replay_text =
+           l10n_util::GetStringUTF16(IDS_PICTURE_IN_PICTURE_REPLAY_CONTROL_TEXT);
+       SetTooltipText(replay_text);
+@@ -98,14 +94,7 @@ void PlaybackImageButton::UpdateImageAnd
+   SchedulePaint();
+ }
+ 
+-void PlaybackImageButton::SetPlayButtonBackground() {
+-  SetBackground(views::CreatePillBackground(ui::kColorSysSecondaryContainer));
+-}
+ 
+-void PlaybackImageButton::SetPauseButtonBackground() {
+-  SetBackground(
+-      views::CreatePillBackground(SkColorSetARGB(0x33, 0xFF, 0xFF, 0xFF)));
+-}
+ 
+ BEGIN_METADATA(PlaybackImageButton)
+ END_METADATA
+--- a/chrome/browser/ui/views/overlay/playback_image_button.h
++++ b/chrome/browser/ui/views/overlay/playback_image_button.h
+@@ -30,9 +30,6 @@ class PlaybackImageButton : public Overl
+   void UpdateImageAndText();
+   void UpdatePosition();
+ 
+-  void SetPlayButtonBackground();
+-  void SetPauseButtonBackground();
+-
+   VideoOverlayWindowViews::PlaybackState playback_state_ =
+       VideoOverlayWindowViews::PlaybackState::kEndOfVideo;
+ 
+--- a/chrome/browser/ui/views/overlay/video_overlay_window_views.cc
++++ b/chrome/browser/ui/views/overlay/video_overlay_window_views.cc
+@@ -7,6 +7,13 @@
+ #include <memory>
+ #include <string>
+ 
++#include "chrome/browser/themes/theme_service.h"
++#include "chrome/browser/themes/theme_service_factory.h"
++#include "chrome/browser/ui/color/arcium_space_palette_initializer.h"
++#include "chrome/browser/ui/helium/helium_space_service.h"
++#include "chrome/browser/ui/helium/helium_space_service_factory.h"
++#include "chrome/browser/ui/helium/space_palette.h"
++#include "chrome/browser/ui/views/helium/glass_surface_configuration.h"
+ #include "base/check.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+@@ -117,7 +124,7 @@ constexpr gfx::Size kOverlayViewPadding(
+ constexpr gfx::Size kActionButtonSize(28, 28);
+ 
+ // The amount of time the seek buttons next to the play button seek.
+-constexpr base::TimeDelta kSeekTime = base::Seconds(10);
++constexpr base::TimeDelta kSeekTime = base::Seconds(15);
+ 
+ // The size of the view containing the favicon.
+ constexpr gfx::Size kFaviconSize(24, 24);
+@@ -318,6 +325,16 @@ class OverlayWindowWidgetDelegate : publ
+   }
+ };
+ 
++ui::ColorProviderKey VideoOverlayWindowViews::GetColorProviderKey() const {
++  auto key = views::Widget::GetColorProviderKey();
++  if (space_palette_initializer_ &&
++      key.contrast_mode != ui::ColorProviderKey::ContrastMode::kHigh &&
++      key.forced_colors == ui::ColorProviderKey::ForcedColors::kNone) {
++    key.app_controller = space_palette_initializer_;
++  }
++  return key;
++}
++
+ // static
+ std::unique_ptr<VideoOverlayWindowViews> VideoOverlayWindowViews::Create(
+     content::VideoPictureInPictureWindowController* controller) {
+@@ -328,6 +345,25 @@ std::unique_ptr<VideoOverlayWindowViews>
+       base::WrapUnique(new VideoOverlayWindowViews(controller));
+ 
+   overlay_window->SetColorModeOverride(ui::ColorProviderKey::ColorMode::kDark);
++  if (auto* opener =
++          GlobalBrowserCollection::GetInstance()->FindBrowserWithTab(
++              controller->GetWebContents())) {
++    Profile* profile = opener->GetProfile();
++    const auto* theme_service = ThemeServiceFactory::GetForProfile(profile);
++    const auto key = overlay_window->GetColorProviderKey();
++    if (!theme_service->UsingPolicyTheme() &&
++        key.contrast_mode != ui::ColorProviderKey::ContrastMode::kHigh &&
++        key.forced_colors == ui::ColorProviderKey::ForcedColors::kNone) {
++      auto* spaces =
++          helium::HeliumSpaceServiceFactory::GetForProfileIfExists(profile);
++      const auto* theme = spaces ? spaces->GetThemeForBrowser(opener) : nullptr;
++      const auto palette = helium::SpacePaletteKey(
++          theme, helium::ReadGlassSurfaceConfiguration(profile->GetPrefs()));
++      overlay_window->space_palette_initializer_ =
++          arcium::GetSpacePaletteInitializer(palette);
++      overlay_window->SetUserColorOverride(palette.seed);
++    }
++  }
+ 
+   overlay_window->CalculateAndUpdateWindowBounds();
+   overlay_window->SetUpViews();
+@@ -634,12 +670,12 @@ void VideoOverlayWindowViews::OnKeyEvent
+       TogglePlayPause();
+       event->SetHandled();
+     } else if (event->key_code() == ui::VKEY_LEFT &&
+-               replay_10_seconds_button_->IsDrawn()) {
+-      Replay10Seconds();
++               replay_15_seconds_button_->IsDrawn()) {
++      Replay15Seconds();
+       event->SetHandled();
+     } else if (event->key_code() == ui::VKEY_RIGHT &&
+-               forward_10_seconds_button_->IsDrawn()) {
+-      Forward10Seconds();
++               forward_15_seconds_button_->IsDrawn()) {
++      Forward15Seconds();
+       event->SetHandled();
+     }
+   }
+@@ -1018,8 +1054,8 @@ bool VideoOverlayWindowViews::ControlsHi
+       GetCloseControlsBounds().Contains(point) ||
+       GetMinimizeControlsBounds().Contains(point) ||
+       GetPlayPauseControlsBounds().Contains(point) ||
+-      GetReplay10SecondsButtonBounds().Contains(point) ||
+-      GetForward10SecondsButtonBounds().Contains(point) ||
++      GetReplay15SecondsButtonBounds().Contains(point) ||
++      GetForward15SecondsButtonBounds().Contains(point) ||
+       GetNextTrackControlsBounds().Contains(point) ||
+       GetPreviousTrackControlsBounds().Contains(point) ||
+       GetToggleMicrophoneButtonBounds().Contains(point) ||
+@@ -1132,29 +1168,27 @@ void VideoOverlayWindowViews::SetUpViews
+           },
+           base::Unretained(this)));
+ 
+-  auto replay_10_seconds_button =
++  auto replay_15_seconds_button =
+       std::make_unique<SimpleOverlayWindowImageButton>(
+           base::BindRepeating(
+               [](VideoOverlayWindowViews* overlay) {
+-                overlay->Replay10Seconds();
++                overlay->Replay15Seconds();
+               },
+               base::Unretained(this)),
+-          features::IsRoundedIconsEnabled() ? vector_icons::kReplay10Icon
+-                                            : vector_icons::kReplay10OldIcon,
+-          l10n_util::GetStringUTF16(IDS_PICTURE_IN_PICTURE_REPLAY_10_TEXT));
+-  replay_10_seconds_button->SetSize(kActionButtonSize);
++          vector_icons::kReplayIcon,
++          l10n_util::GetStringUTF16(IDS_PICTURE_IN_PICTURE_REPLAY_15_TEXT));
++  replay_15_seconds_button->SetSize(kActionButtonSize);
+ 
+-  auto forward_10_seconds_button =
++  auto forward_15_seconds_button =
+       std::make_unique<SimpleOverlayWindowImageButton>(
+           base::BindRepeating(
+               [](VideoOverlayWindowViews* overlay) {
+-                overlay->Forward10Seconds();
++                overlay->Forward15Seconds();
+               },
+               base::Unretained(this)),
+-          features::IsRoundedIconsEnabled() ? vector_icons::kForward10Icon
+-                                            : vector_icons::kForward10OldIcon,
+-          l10n_util::GetStringUTF16(IDS_PICTURE_IN_PICTURE_FORWARD_10_TEXT));
+-  forward_10_seconds_button->SetSize(kActionButtonSize);
++          vector_icons::kRefreshIcon,
++          l10n_util::GetStringUTF16(IDS_PICTURE_IN_PICTURE_FORWARD_15_TEXT));
++  forward_15_seconds_button->SetSize(kActionButtonSize);
+ 
+   auto previous_track_controls_view =
+       std::make_unique<SimpleOverlayWindowImageButton>(
+@@ -1197,7 +1231,7 @@ void VideoOverlayWindowViews::SetUpViews
+           /*use_squiggly_line=*/false,
+           /*playing_foreground_color_id=*/ui::kColorSysPrimary,
+           /*playing_background_color_id=*/ui::kColorSysStateDisabled,
+-          /*paused_foreground_color_id=*/ui::kColorSysStateDisabled,
++          /*paused_foreground_color_id=*/ui::kColorSysPrimary,
+           /*paused_background_color_id=*/ui::kColorSysStateDisabled,
+           /*focus_ring_color_id=*/ui::kColorSysStateFocusRing,
+           /*drag_state_change_callback=*/
+@@ -1362,12 +1396,12 @@ void VideoOverlayWindowViews::SetUpViews
+   close_controls_view_ =
+       controls_container_view_->AddChildView(std::move(close_controls_view));
+ 
+-  replay_10_seconds_button_ = playback_controls_container_view_->AddChildView(
+-      std::move(replay_10_seconds_button));
++  replay_15_seconds_button_ = playback_controls_container_view_->AddChildView(
++      std::move(replay_15_seconds_button));
+   play_pause_controls_view_ = playback_controls_container_view_->AddChildView(
+       std::move(play_pause_controls_view));
+-  forward_10_seconds_button_ = playback_controls_container_view_->AddChildView(
+-      std::move(forward_10_seconds_button));
++  forward_15_seconds_button_ = playback_controls_container_view_->AddChildView(
++      std::move(forward_15_seconds_button));
+ 
+   previous_track_controls_view_ =
+       playback_controls_container_view_->AddChildView(
+@@ -1415,6 +1449,10 @@ void VideoOverlayWindowViews::OnRootView
+   GetRootView()->SetPaintToLayer(ui::LAYER_TEXTURED);
+   GetRootView()->layer()->SetName("VideoOverlayWindowViews:RootView");
+   GetRootView()->layer()->SetMasksToBounds(true);
++#if !BUILDFLAG(IS_WIN) && !BUILDFLAG(IS_CHROMEOS)
++  GetRootView()->layer()->SetRoundedCornerRadius(gfx::RoundedCornersF(6));
++  GetRootView()->layer()->SetIsFastRoundedCorner(true);
++#endif
+ 
+   views::View* const contents_view = GetContentsView();
+   for (std::unique_ptr<views::View>& child : view_holder_) {
+@@ -1583,21 +1621,25 @@ void VideoOverlayWindowViews::OnUpdateCo
+   gfx::Rect effective_middle_controls_bounds =
+       showing_vc_controls ? vc_middle_controls_bounds : middle_controls_bounds;
+ 
++  // Keep the normal scrubber and bottom row clear in compact windows.
++  const int center_row_y = showing_vc_controls
++                               ? bounds.CenterPoint().y()
++                               : std::min(bounds.CenterPoint().y(),
++                                          bottom_controls_bounds.y() -
++                                              kCenterButtonSize / 2);
++
+   // Positioning of the middle row of controls.
+   const gfx::Point center_control_position(
+       effective_middle_controls_bounds.CenterPoint().x() -
+           kCenterButtonSize / 2,
+-      effective_middle_controls_bounds.CenterPoint().y() -
+-          kCenterButtonSize / 2);
++      center_row_y - kCenterButtonSize / 2);
+   const gfx::Point center_left_control_position(
+       center_control_position.x() - kCenterControlMargin -
+           kActionButtonSize.width(),
+-      effective_middle_controls_bounds.CenterPoint().y() -
+-          kActionButtonSize.height() / 2);
++      center_row_y - kActionButtonSize.height() / 2);
+   const gfx::Point center_right_control_position(
+       center_control_position.x() + kCenterButtonSize + kCenterControlMargin,
+-      effective_middle_controls_bounds.CenterPoint().y() -
+-          kActionButtonSize.height() / 2);
++      center_row_y - kActionButtonSize.height() / 2);
+ 
+   // If any VC control is visible, then we will hide the playback controls
+   // and just show VC controls.
+@@ -1616,8 +1658,8 @@ void VideoOverlayWindowViews::OnUpdateCo
+   vc_controls_container_view_->SetVisible(false);
+ 
+   play_pause_controls_view_->SetPosition(center_control_position);
+-  replay_10_seconds_button_->SetPosition(center_left_control_position);
+-  forward_10_seconds_button_->SetPosition(center_right_control_position);
++  replay_15_seconds_button_->SetPosition(center_left_control_position);
++  forward_15_seconds_button_->SetPosition(center_right_control_position);
+ 
+   // The previous and next track buttons are placed on the top left/right
+   // edges of the bottom controls area.
+@@ -1694,16 +1736,23 @@ void VideoOverlayWindowViews::OnUpdateCo
+       {live_caption_button_bounds.right() - live_caption_dialog_->width(),
+        live_caption_button_bounds.y() - live_caption_dialog_->height()});
+ 
+-  // The play/pause button and replay/forward 10 seconds buttons should not be
++  // The play/pause button and replay/forward 15 seconds buttons should not be
+   // visible while dragging the progress bar or for live media.
+   const bool is_dragging_progress_bar =
+       progress_view_drag_state_ ==
+       global_media_controls::DragState::kDragStarted;
+   play_pause_controls_view_->SetVisible(show_play_pause_button_ &&
+                                         !is_dragging_progress_bar);
+-  replay_10_seconds_button_->SetVisible(!is_dragging_progress_bar && !is_live_);
+-  forward_10_seconds_button_->SetVisible(!is_dragging_progress_bar &&
+-                                         !is_live_);
++  const bool has_room_for_seeking =
++      bounds.width() >= 320 && bounds.height() >= 180;
++  const bool show_seek_buttons =
++      !is_dragging_progress_bar && !is_live_ && has_room_for_seeking;
++  replay_15_seconds_button_->SetVisible(show_seek_buttons);
++  forward_15_seconds_button_->SetVisible(show_seek_buttons);
++  if (show_seek_buttons) {
++    replay_15_seconds_button_->SetSize(kActionButtonSize);
++    forward_15_seconds_button_->SetSize(kActionButtonSize);
++  }
+ }
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+@@ -2084,12 +2133,12 @@ gfx::Rect VideoOverlayWindowViews::GetPl
+   return play_pause_controls_view_->GetMirroredBounds();
+ }
+ 
+-gfx::Rect VideoOverlayWindowViews::GetReplay10SecondsButtonBounds() {
+-  return replay_10_seconds_button_->GetMirroredBounds();
++gfx::Rect VideoOverlayWindowViews::GetReplay15SecondsButtonBounds() {
++  return replay_15_seconds_button_->GetMirroredBounds();
+ }
+ 
+-gfx::Rect VideoOverlayWindowViews::GetForward10SecondsButtonBounds() {
+-  return forward_10_seconds_button_->GetMirroredBounds();
++gfx::Rect VideoOverlayWindowViews::GetForward15SecondsButtonBounds() {
++  return forward_15_seconds_button_->GetMirroredBounds();
+ }
+ 
+ gfx::Rect VideoOverlayWindowViews::GetNextTrackControlsBounds() {
+@@ -2189,12 +2238,12 @@ void VideoOverlayWindowViews::TogglePlay
+   play_pause_controls_view_->SetPlaybackState(is_active ? kPlaying : kPaused);
+ }
+ 
+-void VideoOverlayWindowViews::Replay10Seconds() {
++void VideoOverlayWindowViews::Replay15Seconds() {
+   controller_->SeekTo(
+       std::max(base::Seconds(0), position_.GetPosition() - kSeekTime));
+ }
+ 
+-void VideoOverlayWindowViews::Forward10Seconds() {
++void VideoOverlayWindowViews::Forward15Seconds() {
+   controller_->SeekTo(
+       std::min(position_.GetPosition() + kSeekTime, position_.duration()));
+ }
+@@ -2214,13 +2263,13 @@ VideoOverlayWindowViews::play_pause_cont
+ }
+ 
+ SimpleOverlayWindowImageButton*
+-VideoOverlayWindowViews::replay_10_seconds_button_for_testing() const {
+-  return replay_10_seconds_button_;
++VideoOverlayWindowViews::replay_15_seconds_button_for_testing() const {
++  return replay_15_seconds_button_;
+ }
+ 
+ SimpleOverlayWindowImageButton*
+-VideoOverlayWindowViews::forward_10_seconds_button_for_testing() const {
+-  return forward_10_seconds_button_;
++VideoOverlayWindowViews::forward_15_seconds_button_for_testing() const {
++  return forward_15_seconds_button_;
+ }
+ 
+ SimpleOverlayWindowImageButton*
+@@ -2425,9 +2474,9 @@ void VideoOverlayWindowViews::SetLiveCap
+       minimize_button_.get(),
+       back_to_tab_button_.get(),
+       close_controls_view_.get(),
+-      replay_10_seconds_button_.get(),
++      replay_15_seconds_button_.get(),
+       play_pause_controls_view_.get(),
+-      forward_10_seconds_button_.get(),
++      forward_15_seconds_button_.get(),
+       previous_track_controls_view_.get(),
+       progress_view_.get(),
+       next_track_controls_view_.get(),
+--- a/chrome/browser/ui/views/overlay/video_overlay_window_views.h
++++ b/chrome/browser/ui/views/overlay/video_overlay_window_views.h
+@@ -195,8 +195,8 @@ class VideoOverlayWindowViews : public c
+   gfx::Rect GetCloseControlsBounds();
+   gfx::Rect GetMinimizeControlsBounds();
+   gfx::Rect GetPlayPauseControlsBounds();
+-  gfx::Rect GetReplay10SecondsButtonBounds();
+-  gfx::Rect GetForward10SecondsButtonBounds();
++  gfx::Rect GetReplay15SecondsButtonBounds();
++  gfx::Rect GetForward15SecondsButtonBounds();
+   gfx::Rect GetNextTrackControlsBounds();
+   gfx::Rect GetPreviousTrackControlsBounds();
+   gfx::Rect GetToggleMicrophoneButtonBounds();
+@@ -208,8 +208,8 @@ class VideoOverlayWindowViews : public c
+   gfx::Rect GetToggleMuteButtonBounds();
+ 
+   PlaybackImageButton* play_pause_controls_view_for_testing() const;
+-  SimpleOverlayWindowImageButton* replay_10_seconds_button_for_testing() const;
+-  SimpleOverlayWindowImageButton* forward_10_seconds_button_for_testing() const;
++  SimpleOverlayWindowImageButton* replay_15_seconds_button_for_testing() const;
++  SimpleOverlayWindowImageButton* forward_15_seconds_button_for_testing() const;
+   SimpleOverlayWindowImageButton* next_track_controls_view_for_testing() const;
+   SimpleOverlayWindowImageButton* previous_track_controls_view_for_testing()
+       const;
+@@ -315,9 +315,9 @@ class VideoOverlayWindowViews : public c
+   // state.
+   void TogglePlayPause();
+ 
+-  void Replay10Seconds();
++  void Replay15Seconds();
+ 
+-  void Forward10Seconds();
++  void Forward15Seconds();
+ 
+   // Closes this window and also pauses the underlying video if pausing is
+   // available.
+@@ -491,8 +491,8 @@ class VideoOverlayWindowViews : public c
+   raw_ptr<SimpleOverlayWindowImageButton> previous_track_controls_view_ =
+       nullptr;
+   raw_ptr<PlaybackImageButton> play_pause_controls_view_ = nullptr;
+-  raw_ptr<SimpleOverlayWindowImageButton> replay_10_seconds_button_ = nullptr;
+-  raw_ptr<SimpleOverlayWindowImageButton> forward_10_seconds_button_ = nullptr;
++  raw_ptr<SimpleOverlayWindowImageButton> replay_15_seconds_button_ = nullptr;
++  raw_ptr<SimpleOverlayWindowImageButton> forward_15_seconds_button_ = nullptr;
+   raw_ptr<SimpleOverlayWindowImageButton> next_track_controls_view_ = nullptr;
+   raw_ptr<SkipAdLabelButton> skip_ad_controls_view_ = nullptr;
+   raw_ptr<ResizeHandleButton> resize_handle_view_ = nullptr;
+--- a/chrome/browser/ui/views/overlay/video_overlay_window_views_unittest.cc
++++ b/chrome/browser/ui/views/overlay/video_overlay_window_views_unittest.cc
+@@ -30,6 +30,7 @@
+ #include "chrome/browser/ui/views/overlay/toggle_camera_button.h"
+ #include "chrome/browser/ui/views/overlay/toggle_microphone_button.h"
+ #include "chrome/browser/ui/views/overlay/toggle_mute_button.h"
++#include "chrome/grit/generated_resources.h"
+ #include "chrome/test/base/testing_profile.h"
+ #include "chrome/test/views/chrome_views_test_base.h"
+ #include "components/global_media_controls/public/views/media_progress_view.h"
+@@ -46,6 +47,7 @@
+ #include "media/base/media_switches.h"
+ #include "services/media_session/public/cpp/media_position.h"
+ #include "testing/gmock/include/gmock/gmock.h"
++#include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/models/image_model.h"
+ #include "ui/base/ui_base_features.h"
+ #include "ui/color/color_provider_key.h"
+@@ -133,7 +135,7 @@ class TestVideoPictureInPictureWindowCon
+   }
+   content::WebContents* GetWebContents() override { return web_contents_; }
+   content::WebContents* GetChildWebContents() override { return nullptr; }
+-  bool TogglePlayPause() override { return false; }
++  MOCK_METHOD(bool, TogglePlayPause, (), (override));
+   void Play() override {}
+   void Pause() override {}
+   void SkipAd() override {}
+@@ -839,6 +841,9 @@ TEST_F(VideoOverlayWindowViewsTest, Show
+ }
+ 
+ TEST_F(VideoOverlayWindowViewsTest, ProgressBarSeeksVideo) {
++  overlay_window().SetBounds({100, 100, 400, 240});
++  WaitForMove();
++  overlay_window().OnUpdateControlsBounds();
+   overlay_window().ShowInactive();
+   overlay_window().SetPlayPauseButtonVisibility(true);
+   overlay_window().ForceControlsVisibleForTesting(true);
+@@ -854,16 +859,16 @@ TEST_F(VideoOverlayWindowViewsTest, Prog
+   // Before dragging the progress bar, the center controls should be visible.
+   PlaybackImageButton* play_button =
+       overlay_window().play_pause_controls_view_for_testing();
+-  SimpleOverlayWindowImageButton* replay_10_seconds_button =
+-      overlay_window().replay_10_seconds_button_for_testing();
+-  SimpleOverlayWindowImageButton* forward_10_seconds_button =
+-      overlay_window().forward_10_seconds_button_for_testing();
++  SimpleOverlayWindowImageButton* replay_15_seconds_button =
++      overlay_window().replay_15_seconds_button_for_testing();
++  SimpleOverlayWindowImageButton* forward_15_seconds_button =
++      overlay_window().forward_15_seconds_button_for_testing();
+   ASSERT_NE(nullptr, play_button);
+-  ASSERT_NE(nullptr, replay_10_seconds_button);
+-  ASSERT_NE(nullptr, forward_10_seconds_button);
++  ASSERT_NE(nullptr, replay_15_seconds_button);
++  ASSERT_NE(nullptr, forward_15_seconds_button);
+   EXPECT_TRUE(play_button->IsDrawn());
+-  EXPECT_TRUE(replay_10_seconds_button->IsDrawn());
+-  EXPECT_TRUE(forward_10_seconds_button->IsDrawn());
++  EXPECT_TRUE(replay_15_seconds_button->IsDrawn());
++  EXPECT_TRUE(forward_15_seconds_button->IsDrawn());
+ 
+   gfx::Point point(progress_view->width() / 2, progress_view->height() / 2);
+   ui::MouseEvent pressed_event(ui::EventType::kMousePressed, point, point,
+@@ -878,8 +883,8 @@ TEST_F(VideoOverlayWindowViewsTest, Prog
+ 
+   // While dragging, the center controls should not be visible.
+   EXPECT_FALSE(play_button->IsDrawn());
+-  EXPECT_FALSE(replay_10_seconds_button->IsDrawn());
+-  EXPECT_FALSE(forward_10_seconds_button->IsDrawn());
++  EXPECT_FALSE(replay_15_seconds_button->IsDrawn());
++  EXPECT_FALSE(forward_15_seconds_button->IsDrawn());
+ 
+   ui::MouseEvent released_event = ui::MouseEvent(
+       ui::EventType::kMouseReleased, point, point, ui::EventTimeForNow(),
+@@ -888,8 +893,63 @@ TEST_F(VideoOverlayWindowViewsTest, Prog
+ 
+   // Once the drag ends, the center controls should be visible again.
+   EXPECT_TRUE(play_button->IsDrawn());
+-  EXPECT_TRUE(replay_10_seconds_button->IsDrawn());
+-  EXPECT_TRUE(forward_10_seconds_button->IsDrawn());
++  EXPECT_TRUE(replay_15_seconds_button->IsDrawn());
++  EXPECT_TRUE(forward_15_seconds_button->IsDrawn());
++}
++
++TEST_F(VideoOverlayWindowViewsTest, SeekControlsAdaptToWindowSize) {
++  overlay_window().SetPlayPauseButtonVisibility(true);
++  overlay_window().SetMediaPosition(media_session::MediaPosition(
++      0, base::Seconds(100), base::Seconds(42), false));
++  auto* replay = overlay_window().replay_15_seconds_button_for_testing();
++  auto* forward = overlay_window().forward_15_seconds_button_for_testing();
++  auto* play = overlay_window().play_pause_controls_view_for_testing();
++  for (const auto& [size, show_seeking] :
++       {std::pair(gfx::Size(284, 160), false),
++        std::pair(gfx::Size(400, 240), true),
++        std::pair(gfx::Size(284, 160), false),
++        std::pair(gfx::Size(400, 240), true)}) {
++    overlay_window().SetBounds(gfx::Rect(gfx::Point(100, 100), size));
++    WaitForMove();
++    overlay_window().OnUpdateControlsBounds();
++    overlay_window().ForceControlsVisibleForTesting(true);
++    EXPECT_TRUE(play->IsDrawn());
++    EXPECT_FALSE(play->bounds().IsEmpty());
++    EXPECT_TRUE(gfx::Rect(size).Contains(play->bounds()));
++    const auto progress_bounds =
++        overlay_window().progress_view_for_testing()->bounds();
++    EXPECT_FALSE(play->bounds().Intersects(progress_bounds));
++    EXPECT_TRUE(gfx::Rect(size).Contains(progress_bounds));
++    EXPECT_FALSE(progress_bounds.IsEmpty());
++    EXPECT_EQ(26, progress_bounds.height());
++    EXPECT_EQ(show_seeking, replay->IsDrawn());
++    EXPECT_EQ(show_seeking, forward->IsDrawn());
++    if (show_seeking) {
++      EXPECT_FALSE(replay->bounds().IsEmpty());
++      EXPECT_FALSE(forward->bounds().IsEmpty());
++      EXPECT_TRUE(gfx::Rect(size).Contains(replay->bounds()));
++      EXPECT_TRUE(gfx::Rect(size).Contains(forward->bounds()));
++      EXPECT_FALSE(play->bounds().Intersects(replay->bounds()));
++      EXPECT_FALSE(play->bounds().Intersects(forward->bounds()));
++    }
++  }
++}
++
++TEST_F(VideoOverlayWindowViewsTest, PlayPauseClickDispatchesAndUpdatesAction) {
++  overlay_window().SetPlayPauseButtonVisibility(true);
++  overlay_window().ForceControlsVisibleForTesting(true);
++  auto* play = overlay_window().play_pause_controls_view_for_testing();
++  views::test::ButtonTestApi clicker(play);
++  ui::MouseEvent event(ui::EventType::kMousePressed, gfx::Point(), gfx::Point(),
++                       ui::EventTimeForNow(), 0, 0);
++  EXPECT_CALL(pip_window_controller(), TogglePlayPause()).WillOnce(Return(true));
++  clicker.NotifyClick(event);
++  EXPECT_EQ(l10n_util::GetStringUTF16(IDS_PICTURE_IN_PICTURE_PAUSE_CONTROL_TEXT),
++            play->GetTooltipText());
++  EXPECT_CALL(pip_window_controller(), TogglePlayPause()).WillOnce(Return(false));
++  clicker.NotifyClick(event);
++  EXPECT_EQ(l10n_util::GetStringUTF16(IDS_PICTURE_IN_PICTURE_PLAY_CONTROL_TEXT),
++            play->GetTooltipText());
+ }
+ 
+ TEST_F(VideoOverlayWindowViewsTest, TimestampDisplaysCurrentTime) {
+@@ -906,40 +966,43 @@ TEST_F(VideoOverlayWindowViewsTest, Time
+   EXPECT_EQ(u"0:42 / 1:40", timestamp->GetText());
+ }
+ 
+-TEST_F(VideoOverlayWindowViewsTest, ReplayAndForward10SecondsSeekVideo) {
++TEST_F(VideoOverlayWindowViewsTest, ReplayAndForward15SecondsSeekVideo) {
++  overlay_window().SetBounds({100, 100, 400, 240});
++  WaitForMove();
++  overlay_window().OnUpdateControlsBounds();
+   overlay_window().ForceControlsVisibleForTesting(true);
+   media_session::MediaPosition media_position(/*playback_rate=*/0,
+                                               /*duration=*/base::Seconds(100),
+                                               /*position=*/base::Seconds(42),
+                                               /*end_of_media=*/false);
+   overlay_window().SetMediaPosition(media_position);
+-  SimpleOverlayWindowImageButton* replay_10_seconds_button =
+-      overlay_window().replay_10_seconds_button_for_testing();
+-  SimpleOverlayWindowImageButton* forward_10_seconds_button =
+-      overlay_window().forward_10_seconds_button_for_testing();
+-  ASSERT_NE(nullptr, replay_10_seconds_button);
+-  ASSERT_NE(nullptr, forward_10_seconds_button);
+-  EXPECT_TRUE(replay_10_seconds_button->IsDrawn());
+-  EXPECT_TRUE(forward_10_seconds_button->IsDrawn());
++  SimpleOverlayWindowImageButton* replay_15_seconds_button =
++      overlay_window().replay_15_seconds_button_for_testing();
++  SimpleOverlayWindowImageButton* forward_15_seconds_button =
++      overlay_window().forward_15_seconds_button_for_testing();
++  ASSERT_NE(nullptr, replay_15_seconds_button);
++  ASSERT_NE(nullptr, forward_15_seconds_button);
++  EXPECT_TRUE(replay_15_seconds_button->IsDrawn());
++  EXPECT_TRUE(forward_15_seconds_button->IsDrawn());
+ 
+-  views::test::ButtonTestApi replay_button_clicker(replay_10_seconds_button);
+-  views::test::ButtonTestApi forward_button_clicker(forward_10_seconds_button);
++  views::test::ButtonTestApi replay_button_clicker(replay_15_seconds_button);
++  views::test::ButtonTestApi forward_button_clicker(forward_15_seconds_button);
+   ui::MouseEvent dummy_event(ui::EventType::kMousePressed, gfx::Point(0, 0),
+                              gfx::Point(0, 0), ui::EventTimeForNow(), 0, 0);
+ 
+-  // Clicking the replay 10 seconds button should seek backwards 10 seconds.
++  // Clicking the replay 15 seconds button should seek backwards 15 seconds.
+   PictureInPictureWindowManager::GetInstance()
+       ->set_window_controller_for_testing(&pip_window_controller());
+-  EXPECT_CALL(pip_window_controller(), SeekTo(base::Seconds(32)));
++  EXPECT_CALL(pip_window_controller(), SeekTo(base::Seconds(27)));
+   replay_button_clicker.NotifyClick(dummy_event);
+   testing::Mock::VerifyAndClearExpectations(&pip_window_controller());
+ 
+-  // Clicking the forward 10 seconds button should seek forwards 10 seconds.
+-  EXPECT_CALL(pip_window_controller(), SeekTo(base::Seconds(52)));
++  // Clicking the forward 15 seconds button should seek forwards 15 seconds.
++  EXPECT_CALL(pip_window_controller(), SeekTo(base::Seconds(57)));
+   forward_button_clicker.NotifyClick(dummy_event);
+   testing::Mock::VerifyAndClearExpectations(&pip_window_controller());
+ 
+-  // Clicking the replay 10 seconds button less than 10 seconds into the video
++  // Clicking the replay 15 seconds button less than 15 seconds into the video
+   // should seek to the beginning.
+   media_session::MediaPosition early_media_position(
+       /*playback_rate=*/0,
+@@ -951,7 +1014,7 @@ TEST_F(VideoOverlayWindowViewsTest, Repl
+   replay_button_clicker.NotifyClick(dummy_event);
+   testing::Mock::VerifyAndClearExpectations(&pip_window_controller());
+ 
+-  // Clicking the forward 10 seconds button with less than 10 seconds left in
++  // Clicking the forward 15 seconds button with less than 15 seconds left in
+   // the video should seek to the end.
+   media_session::MediaPosition late_media_position(
+       /*playback_rate=*/0,
+@@ -967,7 +1030,10 @@ TEST_F(VideoOverlayWindowViewsTest, Repl
+ // Gesture events are not supported on Mac.
+ #if !BUILDFLAG(IS_MAC)
+ TEST_F(VideoOverlayWindowViewsTest,
+-       ReplayAndForward10SecondsSeekVideo_GestureTap) {
++       ReplayAndForward15SecondsSeekVideo_GestureTap) {
++  overlay_window().SetBounds({100, 100, 400, 240});
++  WaitForMove();
++  overlay_window().OnUpdateControlsBounds();
+   overlay_window().ShowInactive();
+   overlay_window().SetPlayPauseButtonVisibility(true);
+   overlay_window().ForceControlsVisibleForTesting(true);
+@@ -978,28 +1044,28 @@ TEST_F(VideoOverlayWindowViewsTest,
+   overlay_window().SetMediaPosition(media_position);
+   WaitForLayout();
+ 
+-  SimpleOverlayWindowImageButton* replay_10_seconds_button =
+-      overlay_window().replay_10_seconds_button_for_testing();
+-  SimpleOverlayWindowImageButton* forward_10_seconds_button =
+-      overlay_window().forward_10_seconds_button_for_testing();
+-  ASSERT_NE(nullptr, replay_10_seconds_button);
+-  ASSERT_NE(nullptr, forward_10_seconds_button);
+-  EXPECT_TRUE(replay_10_seconds_button->IsDrawn());
+-  EXPECT_TRUE(forward_10_seconds_button->IsDrawn());
++  SimpleOverlayWindowImageButton* replay_15_seconds_button =
++      overlay_window().replay_15_seconds_button_for_testing();
++  SimpleOverlayWindowImageButton* forward_15_seconds_button =
++      overlay_window().forward_15_seconds_button_for_testing();
++  ASSERT_NE(nullptr, replay_15_seconds_button);
++  ASSERT_NE(nullptr, forward_15_seconds_button);
++  EXPECT_TRUE(replay_15_seconds_button->IsDrawn());
++  EXPECT_TRUE(forward_15_seconds_button->IsDrawn());
+ 
+-  // Tapping the replay 10 seconds button should seek backwards 10 seconds.
++  // Tapping the replay 15 seconds button should seek backwards 15 seconds.
+   PictureInPictureWindowManager::GetInstance()
+       ->set_window_controller_for_testing(&pip_window_controller());
+-  EXPECT_CALL(pip_window_controller(), SeekTo(base::Seconds(32)));
+-  GestureTapOnView(replay_10_seconds_button);
++  EXPECT_CALL(pip_window_controller(), SeekTo(base::Seconds(27)));
++  GestureTapOnView(replay_15_seconds_button);
+   testing::Mock::VerifyAndClearExpectations(&pip_window_controller());
+ 
+-  // Tapping the forward 10 seconds button should seek forwards 10 seconds.
+-  EXPECT_CALL(pip_window_controller(), SeekTo(base::Seconds(52)));
+-  GestureTapOnView(forward_10_seconds_button);
++  // Tapping the forward 15 seconds button should seek forwards 15 seconds.
++  EXPECT_CALL(pip_window_controller(), SeekTo(base::Seconds(57)));
++  GestureTapOnView(forward_15_seconds_button);
+   testing::Mock::VerifyAndClearExpectations(&pip_window_controller());
+ 
+-  // Tapping the replay 10 seconds button less than 10 seconds into the video
++  // Tapping the replay 15 seconds button less than 15 seconds into the video
+   // should seek to the beginning.
+   media_session::MediaPosition early_media_position(
+       /*playback_rate=*/0,
+@@ -1008,10 +1074,10 @@ TEST_F(VideoOverlayWindowViewsTest,
+       /*end_of_media=*/false);
+   overlay_window().SetMediaPosition(early_media_position);
+   EXPECT_CALL(pip_window_controller(), SeekTo(base::Seconds(0)));
+-  GestureTapOnView(replay_10_seconds_button);
++  GestureTapOnView(replay_15_seconds_button);
+   testing::Mock::VerifyAndClearExpectations(&pip_window_controller());
+ 
+-  // Tapping the forward 10 seconds button with less than 10 seconds left in
++  // Tapping the forward 15 seconds button with less than 15 seconds left in
+   // the video should seek to the end.
+   media_session::MediaPosition late_media_position(
+       /*playback_rate=*/0,
+@@ -1020,12 +1086,12 @@ TEST_F(VideoOverlayWindowViewsTest,
+       /*end_of_media=*/false);
+   overlay_window().SetMediaPosition(late_media_position);
+   EXPECT_CALL(pip_window_controller(), SeekTo(base::Seconds(100)));
+-  GestureTapOnView(forward_10_seconds_button);
++  GestureTapOnView(forward_15_seconds_button);
+   testing::Mock::VerifyAndClearExpectations(&pip_window_controller());
+ }
+ #endif  // BUILDFLAG(IS_MAC)
+ 
+-TEST_F(VideoOverlayWindowViewsTest, ReplayAndForward10SecondsOnKeyPress) {
++TEST_F(VideoOverlayWindowViewsTest, ReplayAndForward15SecondsOnKeyPress) {
+   overlay_window().ForceControlsVisibleForTesting(true);
+   media_session::MediaPosition media_position(/*playback_rate=*/0,
+                                               /*duration=*/base::Seconds(100),
+@@ -1038,15 +1104,15 @@ TEST_F(VideoOverlayWindowViewsTest, Repl
+   ui::KeyEvent right_event(ui::EventType::kKeyPressed, ui::VKEY_RIGHT,
+                            ui::EF_NONE);
+ 
+-  // The left arrow key should seek the video backwards 10 seconds.
++  // The left arrow key should seek the video backwards 15 seconds.
+   PictureInPictureWindowManager::GetInstance()
+       ->set_window_controller_for_testing(&pip_window_controller());
+-  EXPECT_CALL(pip_window_controller(), SeekTo(base::Seconds(32)));
++  EXPECT_CALL(pip_window_controller(), SeekTo(base::Seconds(27)));
+   overlay_window().OnKeyEvent(&left_event);
+   testing::Mock::VerifyAndClearExpectations(&pip_window_controller());
+ 
+-  // The right arrow key should seek the video forwards 10 seconds.
+-  EXPECT_CALL(pip_window_controller(), SeekTo(base::Seconds(52)));
++  // The right arrow key should seek the video forwards 15 seconds.
++  EXPECT_CALL(pip_window_controller(), SeekTo(base::Seconds(57)));
+   overlay_window().OnKeyEvent(&right_event);
+   testing::Mock::VerifyAndClearExpectations(&pip_window_controller());
+ }
+@@ -1263,12 +1329,12 @@ TEST_F(VideoOverlayWindowViewsTest, Next
+ TEST_F(VideoOverlayWindowViewsTest,
+        FastForwardAndRewindAreHiddenForLiveVideos) {
+   overlay_window().ForceControlsVisibleForTesting(true);
+-  SimpleOverlayWindowImageButton* replay_10_seconds_button =
+-      overlay_window().replay_10_seconds_button_for_testing();
+-  SimpleOverlayWindowImageButton* forward_10_seconds_button =
+-      overlay_window().forward_10_seconds_button_for_testing();
+-  ASSERT_NE(nullptr, replay_10_seconds_button);
+-  ASSERT_NE(nullptr, forward_10_seconds_button);
++  SimpleOverlayWindowImageButton* replay_15_seconds_button =
++      overlay_window().replay_15_seconds_button_for_testing();
++  SimpleOverlayWindowImageButton* forward_15_seconds_button =
++      overlay_window().forward_15_seconds_button_for_testing();
++  ASSERT_NE(nullptr, replay_15_seconds_button);
++  ASSERT_NE(nullptr, forward_15_seconds_button);
+ 
+   // For live media, the fast-forward and rewind buttons should be hidden.
+   media_session::MediaPosition live_media_position(
+@@ -1277,8 +1343,8 @@ TEST_F(VideoOverlayWindowViewsTest,
+       /*position=*/base::Seconds(42),
+       /*end_of_media=*/false);
+   overlay_window().SetMediaPosition(live_media_position);
+-  EXPECT_FALSE(replay_10_seconds_button->GetVisible());
+-  EXPECT_FALSE(forward_10_seconds_button->GetVisible());
++  EXPECT_FALSE(replay_15_seconds_button->GetVisible());
++  EXPECT_FALSE(forward_15_seconds_button->GetVisible());
+ }
+ 
+ TEST_F(VideoOverlayWindowViewsTest, VideoConferencingUI) {
+@@ -1792,6 +1858,28 @@ class VideoOverlayWindowWithMuteControlT
+ };
+ 
+ // Test fixture with kPictureInPictureMuteControl disabled.
++TEST_F(VideoOverlayWindowWithMuteControlTest,
++       CompactScrubberAvoidsPlaybackAndMuteTargets) {
++  overlay_window().SetPlayPauseButtonVisibility(true);
++  overlay_window().SetMediaPosition(media_session::MediaPosition(
++      0, base::Seconds(100), base::Seconds(42), false));
++  for (const auto& size : {gfx::Size(284, 160), gfx::Size(400, 240)}) {
++    overlay_window().SetBounds(gfx::Rect(gfx::Point(100, 100), size));
++    WaitForMove();
++    overlay_window().OnUpdateControlsBounds();
++    overlay_window().ForceControlsVisibleForTesting(true);
++    auto* mute = overlay_window().toggle_mute_button_for_testing();
++    ASSERT_NE(nullptr, mute);
++    ASSERT_TRUE(mute->IsDrawn());
++    const auto progress = overlay_window().progress_view_for_testing()->bounds();
++    EXPECT_FALSE(progress.IsEmpty());
++    EXPECT_EQ(26, progress.height());
++    EXPECT_FALSE(progress.Intersects(mute->bounds()));
++    EXPECT_FALSE(progress.Intersects(
++        overlay_window().play_pause_controls_view_for_testing()->bounds()));
++  }
++}
++
+ class VideoOverlayWindowWithMuteControlDisabledTest
+     : public VideoOverlayWindowViewsTest {
+  public:
+--- a/chrome/test/BUILD.gn
++++ b/chrome/test/BUILD.gn
+@@ -9913,6 +9913,7 @@ if (toolkit_views) {
+ if (!is_android && toolkit_views) {
+   test("arcium_feature_settings_unit_tests") {
+     sources = [
++      "../browser/ui/views/overlay/video_overlay_window_views_unittest.cc",
+       "../browser/importer/arcium_arc_import_coordinator_unittest.cc",
+       "../browser/importer/arcium_arc_spaces_import_unittest.cc",
+       "../browser/ui/webui/onboarding/onboarding_handler_unittest.cc",
+@@ -9933,6 +9934,14 @@ if (!is_android && toolkit_views) {
+     ]
+ 
+     deps = [
++      "//chrome/browser/picture_in_picture",
++      "//chrome/browser/ui/views:layout_provider",
++      "//components/global_media_controls",
++      "//components/live_caption:constants",
++      "//components/soda:test_support",
++      "//components/vector_icons",
++      "//media",
++      "//ui/display:test_support",
+       ":test_interfaces",
+       ":test_support",
+       ":test_support_unit",
+@@ -10008,6 +10017,7 @@ if (!is_android && toolkit_views) {
+     defines = [ "HAS_OUT_OF_PROC_TEST_RUNNER" ]
+ 
+     sources = [
++      "../browser/picture_in_picture/auto_picture_in_picture_tab_helper_browsertest.cc",
+       "../browser/importer/arcium_arc_import_browsertest.cc",
+       "../browser/ui/views/helium/peek_controller_browsertest.cc",
+       "../browser/ui/views/frame/multi_contents_view_browsertest.cc",
+@@ -10021,6 +10031,13 @@ if (!is_android && toolkit_views) {
+     ]
+ 
+     deps = [
++      "//chrome/browser/media/webrtc:webrtc_browser_tests_base",
++      "//chrome/browser/content_settings:content_settings_factory",
++      "//chrome/browser/picture_in_picture",
++      "//chrome/browser/ui:recently_audible_helper",
++      "//chrome/browser/ui/hats:test_support",
++      "//chrome/browser/ui/views/page_info",
++      "//media",
+       "//chrome/test/base:browser_tests_runner",
+       ":test_support",
+       ":test_support_ui",
+--- a/content/browser/media/media_web_contents_observer.cc
++++ b/content/browser/media/media_web_contents_observer.cc
+@@ -371,6 +371,32 @@ int MediaWebContentsObserver::GetCurrent
+       });
+ }
+ 
++std::optional<MediaPlayerId>
++MediaWebContentsObserver::GetVideoPlayerForAutomaticPictureInPicture() const {
++  std::optional<MediaPlayerId> candidate;
++  for (const auto& [id, info] : player_info_map_) {
++    if (!info->is_playing() || !info->has_video()) {
++      continue;
++    }
++    auto* frame = RenderFrameHostImpl::FromID(id.frame_routing_id);
++    if (!frame || !frame->IsInPrimaryMainFrame() ||
++        !frame->HasStickyUserActivation()) {
++      continue;
++    }
++    auto host = media_player_observer_hosts_.find(id);
++    if (host == media_player_observer_hosts_.end() ||
++        !host->second->is_picture_in_picture_available() ||
++        !media_player_remotes_.contains(id)) {
++      continue;
++    }
++    if (candidate) {
++      return std::nullopt;
++    }
++    candidate = id;
++  }
++  return candidate;
++}
++
+ bool MediaWebContentsObserver::IsPlayerActive(
+     const MediaPlayerId& player_id) const {
+   if (const PlayerInfo* player_info = GetPlayerInfo(player_id))
+@@ -480,6 +506,7 @@ void MediaWebContentsObserver::MediaPlay
+ 
+ void MediaWebContentsObserver::MediaPlayerObserverHostImpl::
+     OnPictureInPictureAvailabilityChanged(bool available) {
++  is_picture_in_picture_available_ = available;
+   media_web_contents_observer_->session_controllers_manager()
+       ->OnPictureInPictureAvailabilityChanged(media_player_id_, available);
+ }
+--- a/content/browser/media/media_web_contents_observer.h
++++ b/content/browser/media/media_web_contents_observer.h
+@@ -152,6 +152,11 @@ class CONTENT_EXPORT MediaWebContentsObs
+   // Returns the number of active players with video content.
+   int GetCurrentlyPlayingVideoCount() const;
+ 
++  // Selects a single playing, user-activated main-frame video independently of
++  // audio focus. Muted videos need not have an audible media session.
++  std::optional<MediaPlayerId> GetVideoPlayerForAutomaticPictureInPicture()
++      const;
++
+   // Returns whether or not the given player id is active.
+   bool IsPlayerActive(const MediaPlayerId& player_id) const;
+ 
+@@ -237,6 +242,10 @@ class CONTENT_EXPORT MediaWebContentsObs
+         mojo::PendingAssociatedReceiver<media::mojom::MediaPlayerObserver>
+             media_player_observer);
+ 
++    bool is_picture_in_picture_available() const {
++      return is_picture_in_picture_available_;
++    }
++
+     // media::mojom::MediaPlayerObserver implementation.
+     void OnMediaPlaying() override;
+     void OnMediaPaused(bool stream_ended) override;
+@@ -276,6 +285,8 @@ class CONTENT_EXPORT MediaWebContentsObs
+     mojo::AssociatedReceiver<media::mojom::MediaPlayerObserver>
+         media_player_observer_receiver_{this};
+ 
++    bool is_picture_in_picture_available_ = false;
++
+     // Helps monitor audio stream when not using AudioService.
+     bool uses_audio_service_ = true;
+     std::unique_ptr<AudioStreamMonitor::AudibleClientRegistration>
+--- a/content/browser/media/session/media_session_controller.cc
++++ b/content/browser/media/session/media_session_controller.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "content/browser/media/session/media_session_controller.h"
+ 
++#include "base/feature_list.h"
+ #include "content/browser/media/media_devices_util.h"
+ #include "content/browser/media/media_web_contents_observer.h"
+ #include "content/browser/media/session/media_session_impl.h"
+@@ -14,6 +15,7 @@
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/render_process_host.h"
+ #include "media/base/media_content_type.h"
++#include "third_party/blink/public/common/features.h"
+ 
+ namespace content {
+ 
+@@ -233,7 +235,12 @@ void MediaSessionController::OnMediaPosi
+ }
+ 
+ void MediaSessionController::OnMediaMutedStatusChanged(bool mute) {
++  is_muted_ = mute;
+   media_session_->OnMediaMutedStatusChanged(mute);
++  if (base::FeatureList::IsEnabled(
++          blink::features::kBrowserInitiatedAutomaticPictureInPicture)) {
++    AddOrRemovePlayer();
++  }
+ }
+ 
+ void MediaSessionController::OnPictureInPictureAvailabilityChanged(
+@@ -271,14 +278,12 @@ void MediaSessionController::OnVideoFram
+ }
+ 
+ bool MediaSessionController::IsMediaSessionNeeded() const {
+-  if (web_contents_->HasPictureInPictureVideo())
+-    return true;
+-
+-  if (!is_playback_in_progress_)
++  const bool in_picture_in_picture = web_contents_->HasPictureInPictureVideo();
++  if (!in_picture_in_picture && !is_playback_in_progress_) {
+     return false;
++  }
+ 
+-  // If the media content has an associated Remote Playback session started, we
+-  // should request audio focus regardless of whether the tab is muted.
++  // Remote playback retains audio focus even when its local player is muted.
+   media_session::mojom::MediaSessionInfoPtr session_info =
+       media_session_->GetMediaSessionInfoSync();
+   if (session_info && session_info->remote_playback_metadata &&
+@@ -286,8 +291,20 @@ bool MediaSessionController::IsMediaSess
+     return true;
+   }
+ 
+-  // We want to make sure we do not request audio focus on a muted tab as it
+-  // would break user expectations by pausing/ducking other playbacks.
++  // Silent floating video must coexist with audio in another tab. Track the
++  // effective mute state because metadata may retain historical audibility.
++  if (base::FeatureList::IsEnabled(
++          blink::features::kBrowserInitiatedAutomaticPictureInPicture) &&
++      (is_muted_ || (in_picture_in_picture &&
++                     (!has_audio_ || web_contents_->IsAudioMuted())))) {
++    return false;
++  }
++
++  if (in_picture_in_picture) {
++    return true;
++  }
++
++  // Muting a tab must not pause or duck another playback.
+   return has_audio_ && !web_contents_->IsAudioMuted();
+ }
+ 
+--- a/content/browser/media/session/media_session_controller.h
++++ b/content/browser/media/session/media_session_controller.h
+@@ -152,6 +152,7 @@ class CONTENT_EXPORT MediaSessionControl
+   const int player_id_ = player_count_++;
+ 
+   bool is_paused_ = true;
++  bool is_muted_ = false;
+   // Playing or paused, but not ended.
+   bool is_playback_in_progress_ = false;
+   bool has_audio_ = false;
+--- a/content/browser/media/session/media_session_controller_unittest.cc
++++ b/content/browser/media/session/media_session_controller_unittest.cc
+@@ -9,6 +9,7 @@
+ #include <tuple>
+ 
+ #include "base/memory/raw_ptr.h"
++#include "base/test/scoped_feature_list.h"
+ #include "base/time/time.h"
+ #include "content/browser/media/media_web_contents_observer.h"
+ #include "content/browser/media/session/audio_focus_delegate.h"
+@@ -24,6 +25,7 @@
+ #include "mojo/public/cpp/bindings/associated_remote.h"
+ #include "mojo/public/cpp/bindings/pending_associated_remote.h"
+ #include "testing/gtest/include/gtest/gtest.h"
++#include "third_party/blink/public/common/features.h"
+ #include "ui/gfx/geometry/size.h"
+ 
+ namespace content {
+@@ -284,6 +286,9 @@ class RequestVisibilityWaiter {
+ class MediaSessionControllerTest : public RenderViewHostImplTestHarness {
+  public:
+   void SetUp() override {
++    feature_list_.InitWithFeatureState(
++        blink::features::kBrowserInitiatedAutomaticPictureInPicture,
++        BrowserAutoPipEnabled());
+     RenderViewHostImplTestHarness::SetUp();
+ 
+     id_ = MediaPlayerId(contents()->GetPrimaryMainFrame()->GetGlobalId(), 0);
+@@ -306,6 +311,9 @@ class MediaSessionControllerTest : publi
+   }
+ 
+  protected:
++  virtual bool BrowserAutoPipEnabled() const { return false; }
++  base::test::ScopedFeatureList feature_list_;
++
+   std::unique_ptr<MediaSessionController> CreateController() {
+     return std::make_unique<MediaSessionController>(id_, contents());
+   }
+@@ -613,6 +621,55 @@ TEST_F(MediaSessionControllerTest, Remov
+   EXPECT_FALSE(media_session()->IsActive());
+ }
+ 
++class MediaSessionControllerSilentPipTest
++    : public MediaSessionControllerTest,
++      public testing::WithParamInterface<bool> {
++ protected:
++  bool BrowserAutoPipEnabled() const override { return GetParam(); }
++};
++
++TEST_P(MediaSessionControllerSilentPipTest,
++       MutedVideoKeepsFocusPolicyAcrossPipAndInline) {
++  controller_->SetMetadata(true, true, media::MediaContentType::kPersistent);
++  ASSERT_TRUE(controller_->OnPlaybackStarted());
++  ASSERT_TRUE(media_session()->IsActive());
++
++  controller_->OnMediaMutedStatusChanged(true);
++  EXPECT_EQ(!GetParam(), media_session()->IsActive());
++  contents()->SetHasPictureInPictureVideo(true);
++  controller_->PictureInPictureStateChanged(true);
++  EXPECT_EQ(!GetParam(), media_session()->IsActive());
++  contents()->SetHasPictureInPictureVideo(false);
++  controller_->PictureInPictureStateChanged(false);
++  EXPECT_EQ(!GetParam(), media_session()->IsActive());
++
++  controller_->OnMediaMutedStatusChanged(false);
++  EXPECT_TRUE(media_session()->IsActive());
++  controller_->OnMediaMutedStatusChanged(true);
++  EXPECT_EQ(!GetParam(), media_session()->IsActive());
++}
++
++TEST_P(MediaSessionControllerSilentPipTest,
++       NeverAudibleVideoDoesNotGainFocusForPip) {
++  controller_->SetMetadata(false, true, media::MediaContentType::kPersistent);
++  ASSERT_TRUE(controller_->OnPlaybackStarted());
++  ASSERT_FALSE(media_session()->IsActive());
++
++  contents()->SetHasPictureInPictureVideo(true);
++  controller_->PictureInPictureStateChanged(true);
++  EXPECT_EQ(!GetParam(), media_session()->IsActive());
++  contents()->SetHasPictureInPictureVideo(false);
++  controller_->PictureInPictureStateChanged(false);
++  EXPECT_FALSE(media_session()->IsActive());
++
++  controller_->SetMetadata(true, true, media::MediaContentType::kPersistent);
++  EXPECT_TRUE(media_session()->IsActive());
++}
++
++INSTANTIATE_TEST_SUITE_P(BrowserAutomaticPip,
++                         MediaSessionControllerSilentPipTest,
++                         testing::Bool());
++
+ TEST_F(MediaSessionControllerTest, EnterLeavePictureInPictureMuted) {
+   contents()->SetAudioMuted(true);
+ 
+--- a/content/browser/media/session/media_session_impl.cc
++++ b/content/browser/media/session/media_session_impl.cc
+@@ -17,6 +17,7 @@
+ #include "components/url_formatter/url_formatter.h"
+ #include "content/browser/back_forward_cache/back_forward_cache_disable.h"
+ #include "content/browser/back_forward_cache/back_forward_cache_impl.h"
++#include "content/browser/media/media_web_contents_observer.h"
+ #include "content/browser/media/session/audio_focus_delegate.h"
+ #include "content/browser/media/session/media_players_callback_aggregator.h"
+ #include "content/browser/media/session/media_session_controller.h"
+@@ -737,9 +738,6 @@ void MediaSessionImpl::Resume(SuspendTyp
+ }
+ 
+ void MediaSessionImpl::Suspend(SuspendType suspend_type) {
+-  if (!IsActive())
+-    return;
+-
+   if (suspend_type == SuspendType::kUI) {
+     // If the site has registered an action handler for pause then we should
+     // pass it to the site and let them handle it.
+@@ -749,6 +747,9 @@ void MediaSessionImpl::Suspend(SuspendTy
+     }
+   }
+ 
++  if (!IsActive())
++    return;
++
+   OnSuspendInternal(suspend_type, State::SUSPENDED);
+ }
+ 
+@@ -1355,8 +1356,16 @@ void MediaSessionImpl::ExitPictureInPict
+ void MediaSessionImpl::EnterAutoPictureInPicture() {
+   if (base::FeatureList::IsEnabled(
+           blink::features::kBrowserInitiatedAutomaticPictureInPicture)) {
+-    MaybeEnterBrowserInitiatedAutomaticPictureInPicture();
+-    return;
++    if (!GetContentClient()
++             ->browser()
++             ->IsBrowserInitiatedAutomaticPictureInPictureEnabled(
++                 *web_contents())) {
++      return;
++    }
++    if (CanEnterBrowserInitiatedAutomaticPictureInPicture()) {
++      MaybeEnterBrowserInitiatedAutomaticPictureInPicture();
++      return;
++    }
+   }
+ 
+   if (!ShouldRouteAction(
+@@ -2326,11 +2335,20 @@ bool MediaSessionImpl::CanEnterBrowserIn
+     return false;
+   }
+ 
+-  if (!IsPictureInPictureAvailable()) {
++  if (IsActivelyUsingCameraOrMicrophone()) {
+     return false;
+   }
+ 
+-  if (IsActivelyUsingCameraOrMicrophone()) {
++  if (normal_players_.empty() &&
++      base::FeatureList::IsEnabled(
++          blink::features::kBrowserInitiatedAutomaticPictureInPicture)) {
++    return static_cast<WebContentsImpl*>(web_contents())
++        ->media_web_contents_observer()
++        ->GetVideoPlayerForAutomaticPictureInPicture()
++        .has_value();
++  }
++
++  if (!IsPictureInPictureAvailable()) {
+     return false;
+   }
+ 
+@@ -2360,7 +2378,11 @@ void MediaSessionImpl::RecordBrowserInit
+     return;
+   }
+ 
+-  ukm::SourceId source_id = GetRoutedFrame()->GetPageUkmSourceId();
++  RenderFrameHost* frame = GetRoutedFrame();
++  if (!frame) {
++    frame = web_contents()->GetPrimaryMainFrame();
++  }
++  ukm::SourceId source_id = frame->GetPageUkmSourceId();
+   if (source_id == ukm::kInvalidSourceId) {
+     return;
+   }
+@@ -2383,6 +2405,21 @@ void MediaSessionImpl::MaybeEnterBrowser
+     return;
+   }
+ 
++  if (normal_players_.empty()) {
++    auto* observer = static_cast<WebContentsImpl*>(web_contents())
++                         ->media_web_contents_observer();
++    const auto player = observer->GetVideoPlayerForAutomaticPictureInPicture();
++    if (!player) {
++      return;
++    }
++    observer->GetMediaPlayerRemote(*player)->RequestEnterPictureInPicture(
++        kBrowserAutoPipMinSize);
++    RecordBrowserInitiatedAutomaticPictureInPictureUkm(false);
++    uma_helper_.RecordEnterPictureInPicture(
++        MediaSessionUmaHelper::EnterPictureInPictureType::kDefaultAutomatic);
++    return;
++  }
++
+   // There should be one and only one player when we could enter browser
+   // initiated automatic picture-in-picture.
+   CHECK_EQ(normal_players_.size(), 1u);
+--- a/content/browser/media/session/media_session_impl_unittest.cc
++++ b/content/browser/media/session/media_session_impl_unittest.cc
+@@ -509,6 +509,28 @@ TEST_F(MediaSessionImplTest, SuspendUI_W
+   observer.WaitForExpectedActions(default_actions());
+ }
+ 
++TEST_F(MediaSessionImplTest, BrowserInitiatedAutoPipPauseWhileSessionInactive) {
++  auto owned_delegate = std::make_unique<MockAudioFocusDelegate>();
++  auto* delegate = owned_delegate.get();
++  SetDelegateForTests(GetMediaSession(), std::move(owned_delegate));
++  mock_media_session_service().EnableAction(MediaSessionAction::kPause);
++  mock_media_session_service().FlushForTesting();
++
++  ASSERT_TRUE(GetMediaSession()->ShouldRouteAction(MediaSessionAction::kPause));
++  ASSERT_EQ(MediaSessionInfo::SessionState::kInactive,
++            GetState(GetMediaSession()));
++  ASSERT_EQ(0, delegate->request_audio_focus_count());
++  EXPECT_CALL(mock_media_session_service().mock_client(),
++              DidReceiveAction(MediaSessionAction::kPause, _));
++
++  GetMediaSession()->Suspend(MediaSession::SuspendType::kUI);
++  mock_media_session_service().FlushForTesting();
++
++  EXPECT_EQ(MediaSessionInfo::SessionState::kInactive,
++            GetState(GetMediaSession()));
++  EXPECT_EQ(0, delegate->request_audio_focus_count());
++}
++
+ TEST_F(MediaSessionImplTest, ResumeUI) {
+   EXPECT_CALL(mock_media_session_service().mock_client(),
+               DidReceiveAction(MediaSessionAction::kPlay, _))
+@@ -1736,6 +1758,79 @@ TEST_F(MediaSessionImplTestWithDryRunOnl
+   mock_media_session_service().FlushForTesting();
+ }
+ 
++TEST_F(MediaSessionImplTest,
++       BrowserInitiatedAutoPipFallsBackToRegisteredHandler) {
++  StartNewPlayer();
++  mock_media_session_service().EnableAction(
++      MediaSessionAction::kEnterPictureInPicture);
++  EXPECT_CALL(mock_media_session_service().mock_client(),
++              DidReceiveAction(
++                  MediaSessionAction::kEnterPictureInPicture,
++                  EnterPictureInPictureReasonEquals(
++                      blink::mojom::MediaSessionEnterPictureInPictureReason::
++                          kContentOccluded)));
++  GetMediaSession()->EnterAutoPictureInPicture();
++  mock_media_session_service().FlushForTesting();
++  EXPECT_EQ(0, player_observer_->received_enter_picture_in_picture_calls());
++}
++
++TEST_F(MediaSessionImplTest,
++       BrowserInitiatedAutoPipRoutesRegisteredHandlerWithCamera) {
++  int player = StartNewPlayer();
++  player_observer_->SetIsPictureInPictureAvailable(player, true);
++  mock_media_session_service().EnableAction(
++      MediaSessionAction::kEnterPictureInPicture);
++  mock_media_session_service().SetCameraState(
++      media_session::mojom::CameraState::kTurnedOn);
++  FlushForTesting(GetMediaSession());
++  EXPECT_CALL(mock_media_session_service().mock_client(),
++              DidReceiveAction(
++                  MediaSessionAction::kEnterPictureInPicture,
++                  EnterPictureInPictureReasonEquals(
++                      blink::mojom::MediaSessionEnterPictureInPictureReason::
++                          kContentOccluded)));
++  GetMediaSession()->EnterAutoPictureInPicture();
++  mock_media_session_service().FlushForTesting();
++  EXPECT_EQ(0, player_observer_->received_enter_picture_in_picture_calls());
++}
++
++TEST_F(MediaSessionImplTest,
++       BrowserInitiatedAutoPipRoutesRegisteredHandlerWithMicrophone) {
++  int player = StartNewPlayer();
++  player_observer_->SetIsPictureInPictureAvailable(player, true);
++  mock_media_session_service().EnableAction(
++      MediaSessionAction::kEnterPictureInPicture);
++  mock_media_session_service().SetMicrophoneState(
++      media_session::mojom::MicrophoneState::kUnmuted);
++  FlushForTesting(GetMediaSession());
++  EXPECT_CALL(mock_media_session_service().mock_client(),
++              DidReceiveAction(
++                  MediaSessionAction::kEnterPictureInPicture,
++                  EnterPictureInPictureReasonEquals(
++                      blink::mojom::MediaSessionEnterPictureInPictureReason::
++                          kContentOccluded)));
++  GetMediaSession()->EnterAutoPictureInPicture();
++  mock_media_session_service().FlushForTesting();
++  EXPECT_EQ(0, player_observer_->received_enter_picture_in_picture_calls());
++}
++
++TEST_F(MediaSessionImplTest,
++       BrowserInitiatedAutoPipPreferenceBlocksRegisteredFallback) {
++  MockContentBrowserClient mock_client;
++  ContentBrowserClient* old_client = SetBrowserClientForTesting(&mock_client);
++  StartNewPlayer();
++  mock_media_session_service().EnableAction(
++      MediaSessionAction::kEnterPictureInPicture);
++  mock_client.browser_initiated_auto_pip_enabled = false;
++  EXPECT_CALL(mock_media_session_service().mock_client(),
++              DidReceiveAction(MediaSessionAction::kEnterPictureInPicture, _))
++      .Times(0);
++  GetMediaSession()->EnterAutoPictureInPicture();
++  mock_media_session_service().FlushForTesting();
++  EXPECT_EQ(0, player_observer_->received_enter_picture_in_picture_calls());
++  SetBrowserClientForTesting(old_client);
++}
++
+ class MediaSessionImplWithMediaSessionClientTest : public MediaSessionImplTest {
+  protected:
+   TestMediaSessionClient client_;
+--- a/content/test/BUILD.gn
++++ b/content/test/BUILD.gn
+@@ -3930,7 +3930,8 @@ test("arcium_media_session_impl_unittest
+     check_includes = false
+   }
+ 
+-  sources = [ "../browser/media/session/media_session_impl_unittest.cc" ]
++  sources = [
++    "../browser/media/session/media_session_controller_unittest.cc", "../browser/media/session/media_session_impl_unittest.cc" ]
+   data = [ "data/" ]
+   public_deps = [ "//content:content_resources" ]
+ 
+--- a/third_party/blink/renderer/controller/BUILD.gn
++++ b/third_party/blink/renderer/controller/BUILD.gn
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ import("//build/config/ui.gni")
++import("//media/media_options.gni")
+ import("//testing/test.gni")
+ import("//third_party/blink/renderer/bindings/bindings.gni")
+ import("//third_party/blink/renderer/config.gni")
+@@ -338,3 +339,48 @@ if (is_ios) {
+     outputs = [ "{{bundle_resources_dir}}/content_shell.pak" ]
+   }
+ }
++
++# Keep automatic PiP media-player regressions separate from all Blink tests.
++if (media_use_ffmpeg && !is_android && !is_ios) {
++  test("arcium_web_media_player_unittests") {
++    sources = [
++      "../core/exported/web_media_player_impl_unittest.cc",
++      "tests/run_all_tests.cc",
++      "tests/thread_state_test_environment.h",
++    ]
++    configs += [
++      "//third_party/blink/renderer:config",
++      "//third_party/blink/renderer:inside_blink",
++      "//third_party/blink/renderer/core:blink_core_pch",
++      "//build/config/compiler:no_exit_time_destructors",
++    ]
++    deps = [
++      ":controller",
++      "//base",
++      "//base/test:test_support",
++      "//cc",
++      "//components/viz/test:test_support",
++      "//content/test:test_support",
++      "//media",
++      "//media:test_support",
++      "//media/mojo/mojom",
++      "//media/mojo/services",
++      "//mojo/public/cpp/bindings",
++      "//testing/gmock",
++      "//testing/gtest",
++      "//third_party/blink/public:blink",
++      "//third_party/blink/public:test_support",
++      "//third_party/blink/public/common/tokens:tokens_headers",
++      "//third_party/blink/public/platform/media",
++      "//third_party/blink/renderer/core",
++      "//third_party/blink/renderer/core:testing",
++      "//third_party/blink/renderer/core:unit_test_support",
++      "//third_party/blink/renderer/platform",
++      "//third_party/blink/renderer/platform:test_support",
++      "//third_party/blink/renderer/platform/wtf",
++      "//ui/gfx/geometry",
++    ]
++    data = [ "//media/test/data/" ]
++    data_deps = [ "//content/shell:pak" ]
++  }
++}
+--- a/third_party/blink/renderer/core/exported/web_media_player_impl_unittest.cc
++++ b/third_party/blink/renderer/core/exported/web_media_player_impl_unittest.cc
+@@ -86,6 +86,7 @@
+ #include "third_party/blink/renderer/platform/media/video_frame_compositor.h"
+ #include "third_party/blink/renderer/platform/media/web_audio_source_provider_client.h"
+ #include "third_party/blink/renderer/platform/media/web_content_decryption_module_impl.h"
++#include "third_party/blink/renderer/platform/testing/runtime_enabled_features_test_helpers.h"
+ #include "third_party/blink/renderer/platform/testing/task_environment.h"
+ #include "third_party/blink/renderer/platform/weborigin/kurl.h"
+ #include "third_party/blink/renderer/platform/wtf/functional.h"
+@@ -193,6 +194,7 @@ class MockWebMediaPlayerClient : public
+   MOCK_METHOD0(HasNativeControls, bool());
+   MOCK_METHOD0(IsAudioElement, bool());
+   MOCK_CONST_METHOD0(GetDisplayType, WebMediaPlayer::DisplayType());
++  MOCK_CONST_METHOD0(SupportsPictureInPicture, bool());
+   MOCK_CONST_METHOD0(IsInAutoPIP, bool());
+   MOCK_METHOD1(MediaRemotingStarted, void(const WebString&));
+   MOCK_METHOD1(MediaRemotingStopped, void(int));
+@@ -716,6 +718,14 @@ class WebMediaPlayerImplTest
+   void ScheduleIdlePauseTimer() { wmpi_->ScheduleIdlePauseTimer(); }
+   void FireIdlePauseTimer() { wmpi_->background_pause_timer_.FireNow(); }
+ 
++  void FireAutomaticPipGraceTimer() {
++    wmpi_->automatic_pip_grace_timer_.FireNow();
++  }
++
++  bool IsAutomaticPipGraceTimerRunning() {
++    return wmpi_->automatic_pip_grace_timer_.IsRunning();
++  }
++
+   bool IsIdlePauseTimerRunning() {
+     return wmpi_->background_pause_timer_.IsRunning();
+   }
+@@ -2980,6 +2990,133 @@ TEST_F(WebMediaPlayerImplTest,
+   EXPECT_FALSE(IsPausedBecauseFrameHidden());
+ }
+ 
++class WebMediaPlayerImplAutomaticPipTest : public WebMediaPlayerImplTest {
++ protected:
++  void PrepareVideoForAutomaticPip(bool activate = true) {
++    auto demuxer = std::make_unique<NiceMock<media::MockDemuxer>>();
++    ON_CALL(*demuxer, IsSeekable()).WillByDefault(Return(true));
++    SetUpMediaSuspend(true);
++    InitializeWebMediaPlayerImpl(std::move(demuxer));
++    Load(kVideoOnlyTestFile);
++    ASSERT_FALSE(IsSuspended());
++
++    media::PipelineMetadata metadata;
++    metadata.has_video = true;
++    metadata.video_decoder_config = TestVideoConfig::Normal();
++    EXPECT_CALL(delegate_, DidMediaMetadataChange(_, false, true, _)).Times(2);
++    OnMetadata(metadata);
++    ON_CALL(client_, SupportsPictureInPicture()).WillByDefault(Return(true));
++    if (activate) {
++      GetWebLocalFrame()->NotifyUserActivation(
++          mojom::UserActivationNotificationType::kTest);
++    }
++    SetReadyState(WebMediaPlayer::kReadyStateHaveFutureData);
++    SetSeeking(false);
++    Play();
++  }
++
++ private:
++  ScopedBrowserInitiatedAutomaticPictureInPictureForTest automatic_pip_{true};
++};
++
++TEST_F(WebMediaPlayerImplAutomaticPipTest, KeepsPlayingUntilPipCanOpen) {
++  PrepareVideoForAutomaticPip();
++  EXPECT_CALL(client_, PausePlayback(_)).Times(0);
++  BackgroundPlayer(BackgroundBehaviorType::Page);
++  EXPECT_TRUE(IsAutomaticPipGraceTimerRunning());
++  EXPECT_FALSE(IsPausedBecausePageHidden());
++
++  ON_CALL(client_, GetDisplayType())
++      .WillByDefault(
++          Return(WebMediaPlayer::DisplayType::kVideoPictureInPicture));
++  EXPECT_CALL(client_, SetCcLayer(nullptr));
++  wmpi_->OnDisplayTypeChanged(
++      WebMediaPlayer::DisplayType::kVideoPictureInPicture);
++  FireAutomaticPipGraceTimer();
++  EXPECT_FALSE(IsPausedBecausePageHidden());
++}
++
++TEST_F(WebMediaPlayerImplAutomaticPipTest, PausesAfterGraceIfPipDoesNotOpen) {
++  PrepareVideoForAutomaticPip();
++  EXPECT_CALL(client_, PausePlayback(_)).Times(0);
++  BackgroundPlayer(BackgroundBehaviorType::Page);
++  EXPECT_FALSE(IsPausedBecausePageHidden());
++  testing::Mock::VerifyAndClearExpectations(&client_);
++
++  EXPECT_CALL(client_, PausePlayback(WebMediaPlayer::PauseReason::kPageHidden));
++  FireAutomaticPipGraceTimer();
++  EXPECT_TRUE(IsPausedBecausePageHidden());
++}
++
++TEST_F(WebMediaPlayerImplAutomaticPipTest, ReturningCancelsPendingPause) {
++  PrepareVideoForAutomaticPip();
++  EXPECT_CALL(client_, PausePlayback(_)).Times(0);
++  EXPECT_CALL(client_, ResumePlayback()).Times(0);
++  BackgroundPlayer(BackgroundBehaviorType::Page);
++  ForegroundPlayer(BackgroundBehaviorType::Page);
++  EXPECT_FALSE(IsAutomaticPipGraceTimerRunning());
++  EXPECT_FALSE(IsPausedBecausePageHidden());
++}
++
++TEST_F(WebMediaPlayerImplAutomaticPipTest, ExplicitPauseCancelsGrace) {
++  PrepareVideoForAutomaticPip();
++  EXPECT_CALL(client_, PausePlayback(_)).Times(0);
++  EXPECT_CALL(client_, ResumePlayback()).Times(0);
++  BackgroundPlayer(BackgroundBehaviorType::Page);
++  Pause(WebMediaPlayer::PauseReason::kPauseCalled);
++  EXPECT_FALSE(IsAutomaticPipGraceTimerRunning());
++  ForegroundPlayer(BackgroundBehaviorType::Page);
++  EXPECT_FALSE(IsPausedBecausePageHidden());
++}
++
++TEST_F(WebMediaPlayerImplAutomaticPipTest, FrameHiddenPolicyTakesPrecedence) {
++  PrepareVideoForAutomaticPip();
++  wmpi_->SetShouldPauseWhenFrameIsHidden(true);
++  EXPECT_CALL(client_,
++              PausePlayback(WebMediaPlayer::PauseReason::kFrameHidden));
++  BackgroundPlayer(BackgroundBehaviorType::Page);
++  BackgroundPlayer(BackgroundBehaviorType::Frame);
++  EXPECT_TRUE(IsPausedBecauseFrameHidden());
++}
++
++TEST_F(WebMediaPlayerImplAutomaticPipTest, ShutdownCancelsPendingPause) {
++  PrepareVideoForAutomaticPip();
++  BackgroundPlayer(BackgroundBehaviorType::Page);
++  ASSERT_TRUE(IsAutomaticPipGraceTimerRunning());
++  EXPECT_CALL(client_, SetCcLayer(nullptr));
++  EXPECT_CALL(client_, MediaRemotingStopped(_));
++  wmpi_->Shutdown();
++  EXPECT_FALSE(IsAutomaticPipGraceTimerRunning());
++  wmpi_.reset();
++  CycleThreads();
++}
++
++TEST_F(WebMediaPlayerImplAutomaticPipTest, FeatureDisabledPausesImmediately) {
++  ScopedBrowserInitiatedAutomaticPictureInPictureForTest disabled(false);
++  PrepareVideoForAutomaticPip();
++  EXPECT_CALL(client_, PausePlayback(WebMediaPlayer::PauseReason::kPageHidden));
++  BackgroundPlayer(BackgroundBehaviorType::Page);
++  EXPECT_FALSE(IsAutomaticPipGraceTimerRunning());
++  EXPECT_TRUE(IsPausedBecausePageHidden());
++}
++
++TEST_F(WebMediaPlayerImplAutomaticPipTest, UnsupportedPipPausesImmediately) {
++  PrepareVideoForAutomaticPip();
++  ON_CALL(client_, SupportsPictureInPicture()).WillByDefault(Return(false));
++  EXPECT_CALL(client_, PausePlayback(WebMediaPlayer::PauseReason::kPageHidden));
++  BackgroundPlayer(BackgroundBehaviorType::Page);
++  EXPECT_FALSE(IsAutomaticPipGraceTimerRunning());
++  EXPECT_TRUE(IsPausedBecausePageHidden());
++}
++
++TEST_F(WebMediaPlayerImplAutomaticPipTest, WithoutActivationPausesImmediately) {
++  PrepareVideoForAutomaticPip(/*activate=*/false);
++  EXPECT_CALL(client_, PausePlayback(WebMediaPlayer::PauseReason::kPageHidden));
++  BackgroundPlayer(BackgroundBehaviorType::Page);
++  EXPECT_FALSE(IsAutomaticPipGraceTimerRunning());
++  EXPECT_TRUE(IsPausedBecausePageHidden());
++}
++
+ TEST_F(WebMediaPlayerImplTest, PauseMutedVideoWhenPageIsHidden) {
+   // Adding a demuxer and loading a media is necessary to make sure that the
+   // pipeline will start and that `WebMediaPlayerImpl::PauseVideoIfNeeded` won't
+--- a/third_party/blink/renderer/core/frame/frame_test_helpers.cc
++++ b/third_party/blink/renderer/core/frame/frame_test_helpers.cc
+@@ -791,7 +791,8 @@ void WebViewHelper::InitializeWebView(
+       /*page_base_background_color=*/std::nullopt, browsing_context_group_token,
+       /*color_provider_colors=*/nullptr,
+       /*history_index=*/-1,
+-      /*history_length=*/0));
++      /*history_length=*/0,
++      /*noise_tokens=*/{}));
+   // This property must be set at initialization time, it is not supported to be
+   // changed afterward, and does nothing.
+   web_view_->GetSettings()->SetViewportEnabled(viewport_enabled_);
+@@ -835,7 +836,8 @@ WebViewImpl* WebViewHelper::CreateWebVie
+       /*browsing_context_group_token=*/base::UnguessableToken::Create(),
+       /*color_provider_colors=*/nullptr,
+       /*history_index=*/-1,
+-      /*history_length=*/0));
++      /*history_length=*/0,
++      /*noise_tokens=*/{}));
+ }
+ 
+ int TestWebFrameClient::loads_in_progress_ = 0;
+--- a/third_party/blink/renderer/core/html/media/html_media_element.h
++++ b/third_party/blink/renderer/core/html/media/html_media_element.h
+@@ -294,7 +294,7 @@ class CORE_EXPORT HTMLMediaElement
+   void setVolume(double, ExceptionState& = ASSERT_NO_EXCEPTION);
+   bool muted() const;
+   void setMuted(bool);
+-  virtual bool SupportsPictureInPicture() const { return false; }
++  bool SupportsPictureInPicture() const override { return false; }
+   void SetUserWantsControlsVisible(bool visible);
+   bool UserWantsControlsVisible() const;
+ 
+--- a/third_party/blink/renderer/platform/media/media_player_client.h
++++ b/third_party/blink/renderer/platform/media/media_player_client.h
+@@ -124,6 +124,8 @@ class PLATFORM_EXPORT MediaPlayerClient
+   // Returns the current display type of the media element.
+   virtual WebMediaPlayer::DisplayType GetDisplayType() const = 0;
+ 
++  virtual bool SupportsPictureInPicture() const { return false; }
++
+   // Returns the color space to render media into if.
+   // Rendering media into this color space may avoid some conversions.
+   virtual gfx::ColorSpace TargetColorSpace() { return gfx::ColorSpace(); }
+--- a/third_party/blink/renderer/platform/media/web_media_player_impl.cc
++++ b/third_party/blink/renderer/platform/media/web_media_player_impl.cc
+@@ -102,6 +102,7 @@
+ #include "third_party/blink/renderer/platform/media/watch_time_reporter.h"
+ #include "third_party/blink/renderer/platform/media/web_content_decryption_module_impl.h"
+ #include "third_party/blink/renderer/platform/media/web_media_source_impl.h"
++#include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ #include "third_party/blink/renderer/platform/scheduler/public/post_cross_thread_task.h"
+ #include "third_party/blink/renderer/platform/scheduler/public/worker_pool.h"
+ #include "third_party/blink/renderer/platform/weborigin/kurl.h"
+@@ -632,11 +633,13 @@ WebMediaPlayerImpl::WebMediaPlayerImpl(
+ }
+ 
+ WebMediaPlayerImpl::~WebMediaPlayerImpl() {
++  automatic_pip_grace_timer_.Stop();
+   // Ensure Shutdown() has been called.
+   CHECK(!client_);
+ }
+ 
+ void WebMediaPlayerImpl::Shutdown() {
++  automatic_pip_grace_timer_.Stop();
+   DVLOG(1) << __func__;
+   DCHECK(main_task_runner_->BelongsToCurrentThread());
+ 
+@@ -734,6 +737,7 @@ WebMediaPlayer::LoadTiming WebMediaPlaye
+     const WebMediaPlayerSource& source,
+     CorsMode cors_mode,
+     bool is_cache_disabled) {
++  automatic_pip_grace_timer_.Stop();
+   // Only URL or MSE blob URL is supported.
+   DCHECK(source.IsURL());
+   WebURL url = source.GetAsURL();
+@@ -1046,6 +1050,7 @@ void WebMediaPlayerImpl::Play() {
+ }
+ 
+ void WebMediaPlayerImpl::Pause(PauseReason pause_reason) {
++  automatic_pip_grace_timer_.Stop();
+   DVLOG(1) << __func__;
+   DCHECK(main_task_runner_->BelongsToCurrentThread());
+ 
+@@ -1088,6 +1093,7 @@ void WebMediaPlayerImpl::Pause(PauseReas
+ }
+ 
+ void WebMediaPlayerImpl::OnFrozen() {
++  automatic_pip_grace_timer_.Stop();
+   DVLOG(1) << __func__;
+   DCHECK(main_task_runner_->BelongsToCurrentThread());
+ 
+@@ -2654,6 +2660,22 @@ void WebMediaPlayerImpl::OnPageHidden()
+   if (video_decode_stats_reporter_)
+     video_decode_stats_reporter_->OnHidden();
+ 
++  if (IsPageHidden() && !paused_ && HasVideo() &&
++      frame_->IsOutermostMainFrame() && frame_->HasStickyUserActivation() &&
++      client_->SupportsPictureInPicture() &&
++      RuntimeEnabledFeatures::
++          BrowserInitiatedAutomaticPictureInPictureEnabled()) {
++    automatic_pip_grace_timer_.Start(
++        FROM_HERE, base::Seconds(3),
++        BindOnce(
++            [](WebMediaPlayerImpl* player) {
++              player->UpdateBackgroundVideoOptimizationState();
++              player->UpdatePlayState();
++              player->ScheduleIdlePauseTimer();
++            },
++            Unretained(this)));
++  }
++
+   UpdateBackgroundVideoOptimizationState();
+   UpdatePlayState();
+ 
+@@ -2670,6 +2692,7 @@ void WebMediaPlayerImpl::OnPageHidden()
+ }
+ 
+ void WebMediaPlayerImpl::SuspendForFrameClosed() {
++  automatic_pip_grace_timer_.Stop();
+   DCHECK(main_task_runner_->BelongsToCurrentThread());
+ 
+   was_suspended_for_frame_closed_or_frozen_ = true;
+@@ -2678,6 +2701,7 @@ void WebMediaPlayerImpl::SuspendForFrame
+ }
+ 
+ void WebMediaPlayerImpl::OnPageShown() {
++  automatic_pip_grace_timer_.Stop();
+   DCHECK(main_task_runner_->BelongsToCurrentThread());
+   background_pause_timer_.Stop();
+ 
+@@ -3766,6 +3790,13 @@ bool WebMediaPlayerImpl::ShouldPausePlay
+     return false;
+   }
+ 
++  // The browser checks URL safety asynchronously on tab departure. Keep an
++  // eligible video playing briefly so that it can enter PiP without resuming
++  // a video the user explicitly paused. Frame-hidden policy takes precedence.
++  if (IsPageHidden() && automatic_pip_grace_timer_.IsRunning()) {
++    return false;
++  }
++
+   // This takes precedent over every restriction except PiP.
+   if (!is_background_video_playback_enabled_)
+     return true;
+--- a/third_party/blink/renderer/platform/media/web_media_player_impl.h
++++ b/third_party/blink/renderer/platform/media/web_media_player_impl.h
+@@ -967,6 +967,9 @@ class PLATFORM_EXPORT WebMediaPlayerImpl
+   // OnFrameHidden(), causing the state to change to paused.
+   base::OneShotTimer background_pause_timer_;
+ 
++  // Allows browser eligibility checks to finish before hidden video pauses.
++  base::OneShotTimer automatic_pip_grace_timer_;
++
+   // Monitors the watch time of the played content.
+   std::unique_ptr<WatchTimeReporter> watch_time_reporter_;
+   media::AudioDecoderType audio_decoder_type_ =
+--- a/third_party/blink/renderer/platform/runtime_enabled_features.json5
++++ b/third_party/blink/renderer/platform/runtime_enabled_features.json5
+@@ -987,6 +987,7 @@
+       name: "BrowserInitiatedAutomaticPictureInPicture",
+       public: true,
+       status: "experimental",
++      base_feature_status: "enabled",
+     },
+     {
+       name: "BufferedBytesConsumerLimitSize",
